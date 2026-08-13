@@ -1,118 +1,87 @@
-
-
-
 local CONFIG = {
+    version = "18.36-public-release",
     Enabled = true,
-
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
-
-    RefreshSeconds = 20,
+    RefreshSeconds = 60,
     LinkedImagesRefreshSeconds = 8,
-
+    PlayerValuesRefreshSeconds = 8,
+    PlayerSweepSeconds = 2,
+    InventoryRefreshSeconds = 5,
+    InventoryDiscoverySeconds = 20,
+    ProfileRefreshSeconds = 5,
+    TradeRefreshSeconds = 2,
+    RemoteTimeoutSeconds = 5,
+    RemoteStaleSeconds = 24,
+    MinimumCatalogItems = 200,
     TradeHelperDefault = true,
     ShouldTradeScore = 8,
-
     MaxOfferSlots = 4,
-
     ValueBadgeOnInventory = true,
     ValueBadgeOnTrade = true,
     ValueBadgeOnProfile = true,
     StatsButtons = true,
     TradePanel = true,
-
-
-    
     PreferNativeIdentity = true,
     LinkedImagesFallback = true,
-
-
-    
-
-    
     ConservativeResolution = true,
-
-
-    
     ProfileRequireTrustedMatches = true,
-
-
-    
     UseDecompiledSyncFallback = true,
-
     SafeColor = Color3.fromRGB(83, 218, 142),
     BestColor = Color3.fromRGB(255, 210, 74),
-
     Weights = {
         valuePerPercent = 1.5,
         valueCap = 60,
-
         demandPerPoint = 4,
         demandCap = 20,
-
         flipPerPoint = 5,
         flipCap = 15,
-
         stabilityPerPoint = 2.5,
         stabilityCap = 10,
-
         trendPerPercent = 0.75,
         trendCap = 10,
-
         rarityPerPoint = 1.25,
         rarityCap = 5,
-
         itemCountPerItem = 2,
         itemCountCap = 5,
     },
 }
-
 if not CONFIG.Enabled then
     return
 end
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
-
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
     error("SupremeValues_PC_PublicHelper requires a LocalPlayer.")
 end
-
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-
 local httpRequest =
     (type(request) == "function" and request)
     or (type(http_request) == "function" and http_request)
     or (type(syn) == "table" and type(syn.request) == "function" and syn.request)
-
 if type(httpRequest) ~= "function" then
     warn("[SV Public] No request(options) HTTP function is available.")
 end
-
 local GLOBAL_KEY = "__SUPREME_VALUES_PC_PUBLIC_HELPER"
-
 do
     local old = rawget(_G, GLOBAL_KEY)
     if type(old) == "table" and type(old.Destroy) == "function" then
         pcall(old.Destroy)
     end
 end
-
 local THEME = {
     bg = Color3.fromRGB(15, 17, 22),
     panel = Color3.fromRGB(22, 25, 32),
     panel2 = Color3.fromRGB(28, 32, 40),
     panel3 = Color3.fromRGB(35, 40, 50),
     border = Color3.fromRGB(57, 64, 78),
-
     text = Color3.fromRGB(242, 245, 250),
     muted = Color3.fromRGB(157, 166, 182),
     faint = Color3.fromRGB(105, 115, 134),
-
     green = Color3.fromRGB(83, 218, 142),
     yellow = Color3.fromRGB(255, 210, 74),
     red = Color3.fromRGB(245, 105, 118),
@@ -120,23 +89,18 @@ local THEME = {
     purple = Color3.fromRGB(128, 111, 255),
     orange = Color3.fromRGB(255, 156, 86),
 }
-
 local Connections = {}
 local Destroyed = false
-
 local State = {
     UnresolvedCards = setmetatable({}, {__mode = "k"}),
     PendingCardDecorations = setmetatable({}, {__mode = "k"}),
     LastGameDatabase = nil,
-
     TradeWeaponRoot = nil,
     TradePetRoot = nil,
     TradeInventoryConnections = {},
     TradeHelperGeneration = 0,
-
     TradeInventoryRoots = {},
     TradeDiscoveryCandidates = {},
-
     LastTradeHelperStats = {
         cards = 0,
         numeric = 0,
@@ -144,12 +108,9 @@ local State = {
         evaluable = 0,
         safe = 0,
     },
-
     TradeInventoryRefreshGeneration = 0,
-
     TradeHelperRetryGeneration = 0,
     TradeHelperRetryCount = 0,
-
     Profile = {
         root = nil,
         weaponItems = nil,
@@ -161,7 +122,6 @@ local State = {
         remoteCardHintsByUserId = {},
         leaderboardBadges = setmetatable({}, {__mode = "k"}),
         visibleRemoteGeneration = 0,
-
         summaryDisplay = {
             username = nil,
             total = 0,
@@ -169,37 +129,27 @@ local State = {
             source = nil,
             breakdownValues = {},
         },
-
         remoteTotals = {
             running = false,
             generation = 0,
             pendingSweep = false,
+            forceSweep = false,
             pendingNativeResweep = false,
-            resultsByUserId = {},
-            lastSweepAt = nil,
+            rawByUserId = {},
+            lastSuccessByUserId = {},
+            failureCountByUserId = {},
+            retryAfterByUserId = {},
+            inFlightByUserId = {},
+            requestSerial = 0,
         },
-    },
-
-    Debug = {
-        version =
-            "18.34-public-helper",
-        startedAt =
-            os.time(),
-        startedClock =
-            os.clock(),
-        maxEvents = 40,
-        events = {},
-        counters = {},
     },
 }
 local UI = {}
-
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
     table.insert(Connections, connection)
     return connection
 end
-
 local function safeDisconnectAll()
     for _, connection in ipairs(Connections) do
         pcall(function()
@@ -208,299 +158,90 @@ local function safeDisconnectAll()
     end
     table.clear(Connections)
 end
-
 local function clamp(n, a, b)
     return math.max(a, math.min(b, n))
 end
-
 local function trim(value)
     return tostring(value or ""):match("^%s*(.-)%s*$")
 end
-
 local function normalize(value)
     local s = string.lower(trim(value))
     s = s:gsub("[’`]", "'")
     s = s:gsub("%s+", " ")
     return s
 end
-
-State.Debug.Sanitize = function(value, depth, seen)
-    depth = depth or 0
-    seen = seen or {}
-
-    if depth > 6 then
-        return "<max-depth>"
-    end
-
-    local luaType = type(value)
-
-    if luaType == "nil" then
-        return nil
-    elseif luaType == "boolean" then
-        return value
-    elseif luaType == "number" then
-        if value ~= value
-            or value == math.huge
-            or value == -math.huge then
-            return tostring(value)
-        end
-        return value
-    elseif luaType == "string" then
-        if #value > 4000 then
-            return value:sub(1, 4000) .. "<truncated>"
-        end
-        return value
-    end
-
-    local robloxType = typeof(value)
-
-    if robloxType == "Instance" then
-        local result = {
-            __type = "Instance",
-            class = value.ClassName,
-            name = value.Name,
-        }
-
-        local ok, path = pcall(function()
-            return value:GetFullName()
-        end)
-
-        result.path = ok and path or value.Name
-
-        if value:IsA("Player") then
-            result.userId = value.UserId
-        end
-
-        return result
-    elseif robloxType == "Vector2" then
-        return {
-            __type = "Vector2",
-            x = value.X,
-            y = value.Y,
-        }
-    elseif robloxType == "Vector3" then
-        return {
-            __type = "Vector3",
-            x = value.X,
-            y = value.Y,
-            z = value.Z,
-        }
-    elseif robloxType == "UDim2" then
-        return {
-            __type = "UDim2",
-            xScale = value.X.Scale,
-            xOffset = value.X.Offset,
-            yScale = value.Y.Scale,
-            yOffset = value.Y.Offset,
-        }
-    elseif robloxType == "UDim" then
-        return {
-            __type = "UDim",
-            scale = value.Scale,
-            offset = value.Offset,
-        }
-    elseif robloxType == "Color3" then
-        return {
-            __type = "Color3",
-            r = value.R,
-            g = value.G,
-            b = value.B,
-        }
-    elseif robloxType == "EnumItem" then
-        return tostring(value)
-    end
-
-    if luaType ~= "table" then
-        return "<" .. tostring(robloxType or luaType) .. ">"
-    end
-
-    if seen[value] then
-        return "<cycle>"
-    end
-
-    seen[value] = true
-
-    local result = {}
-    local count = 0
-
-    for key, child in pairs(value) do
-        count = count + 1
-
-        if count > 100 then
-            result.__truncated = true
-            break
-        end
-
-        local safeKey =
-            type(key) == "number"
-            and key
-            or tostring(key)
-
-        local keyText = tostring(key)
-        local lowerKey = string.lower(keyText)
-
-        if lowerKey:find("token", 1, true)
-            or lowerKey:find("authorization", 1, true)
-            or lowerKey:find("password", 1, true)
-            or lowerKey:find("secret", 1, true) then
-
-            result[safeKey] = "<redacted>"
-        else
-            local safeChild =
-                State.Debug.Sanitize(
-                    child,
-                    depth + 1,
-                    seen
-                )
-
-            if safeChild ~= nil then
-                result[safeKey] = safeChild
-            end
-        end
-    end
-
-    seen[value] = nil
-    return result
-end
-
-State.Debug.Record = function(kind, data)
-    local events = State.Debug.events
-
-    table.insert(events, {
-        elapsed =
-            math.floor(
-                (os.clock() - State.Debug.startedClock) * 1000
-            ) / 1000,
-        unix = os.time(),
-        kind = tostring(kind or "event"),
-        data = State.Debug.Sanitize(data, 0, {}),
-    })
-
-    while #events > State.Debug.maxEvents do
-        table.remove(events, 1)
-    end
-end
-
-State.Debug.Count = function(name, amount)
-    amount = amount or 1
-
-    State.Debug.counters[name] =
-        (tonumber(State.Debug.counters[name]) or 0)
-        + amount
-end
-
-State.Debug.InstancePath = function(instance)
-    if not instance then
-        return nil
-    end
-
-    local ok, path = pcall(function()
-        return instance:GetFullName()
-    end)
-
-    return ok and path or tostring(instance)
-end
-
-State.Debug.Record("session_started", {
-    placeId = game.PlaceId,
-    gameId = game.GameId,
-    placeVersion = game.PlaceVersion,
-    jobId = game.JobId,
-    playerUserId = LocalPlayer.UserId,
-})
-
 local function canonicalName(value)
     local s = normalize(value)
-
     s = s:gsub("^chroma%s+", "")
     s = s:gsub("^c%.%s*", "")
     s = s:gsub("%s*%(knife%)%s*$", " knife")
     s = s:gsub("%s*%(gun%)%s*$", " gun")
     s = s:gsub("[^%w%s]", "")
     s = s:gsub("%s+", " ")
-
     return trim(s)
 end
-
 local function tonumberSafe(value)
     if type(value) == "number" then
         return value
     end
-
     if type(value) == "string" then
         return tonumber(value)
     end
-
     return nil
 end
-
 local function parsePercent(value)
     if type(value) ~= "string" then
         return nil
     end
-
     local numberText = value:match("([+-]?[%d%.]+)%%")
     return numberText and tonumber(numberText) or nil
 end
-
 local function numericValue(item)
     if type(item) ~= "table" then
         return nil
     end
-
     if type(item.raw_value) == "number" then
         return item.raw_value
     end
-
     if type(item.value) == "number" then
         return item.value
     end
-
     if type(item.value) == "string" then
         local cleaned = item.value:gsub(",", ""):gsub("%s+", "")
         if cleaned:match("^%d+%.?%d*$") then
             return tonumber(cleaned)
         end
     end
-
     return nil
 end
-
 local function formatNumber(value)
     if value == nil then
         return "?"
     end
-
     local rounded
     if math.abs(value - math.floor(value)) < 0.000001 then
         rounded = tostring(math.floor(value))
     else
         rounded = string.format("%.2f", value):gsub("0+$", ""):gsub("%.$", "")
     end
-
     local sign, whole, fraction = rounded:match("^(-?)(%d+)(%.?%d*)$")
     if not whole then
         return rounded
     end
-
     whole = whole:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
     return sign .. whole .. fraction
 end
-
 local function formatCompact(value)
     if value == nil then
         return "?"
     end
-
     local absValue = math.abs(value)
-
     if absValue >= 1000000 then
         local n = value / 1000000
         return (math.abs(n) >= 100 and string.format("%.0fM", n)
             or math.abs(n) >= 10 and string.format("%.1fM", n)
             or string.format("%.2fM", n)):gsub("%.0M", "M")
     end
-
     if absValue >= 1000 then
         local n = value / 1000
         return (math.abs(n) >= 100 and string.format("%.0fk", n)
@@ -509,24 +250,19 @@ local function formatCompact(value)
             :gsub("%.0k", "k")
             :gsub("(%..-)0k$", "%1k")
     end
-
     return formatNumber(value)
 end
-
 local function formatPercent(value, includePlus)
     if value == nil then
         return "?"
     end
-
     local prefix = includePlus and value > 0 and "+" or ""
     return prefix .. string.format("%.1f%%", value)
 end
-
 local function getTextFromItemName(frame)
     if not frame then
         return nil
     end
-
     local itemName = frame:FindFirstChild("ItemName")
     if itemName then
         if itemName:IsA("TextLabel") or itemName:IsA("TextButton") then
@@ -535,7 +271,6 @@ local function getTextFromItemName(frame)
                 return text
             end
         end
-
         local label = itemName:FindFirstChild("Label")
         if label and (label:IsA("TextLabel") or label:IsA("TextButton")) then
             local text = trim(label.Text)
@@ -544,24 +279,19 @@ local function getTextFromItemName(frame)
             end
         end
     end
-
     return nil
 end
-
 local function getAmountFromCard(frame)
     local container = frame and frame:FindFirstChild("Container")
     local amountObject = container and container:FindFirstChild("Amount")
-
     if amountObject and (amountObject:IsA("TextLabel") or amountObject:IsA("TextButton")) then
         local n = tostring(amountObject.Text):match("(%d+)")
         if n then
             return tonumber(n)
         end
     end
-
     return nil
 end
-
 local function hasAncestorNamed(instance, name)
     local current = instance
     while current do
@@ -572,54 +302,42 @@ local function hasAncestorNamed(instance, name)
     end
     return false
 end
-
 local function findFirstDescendantByName(root, targetName)
     if not root then
         return nil
     end
-
     for _, descendant in ipairs(root:GetDescendants()) do
         if descendant.Name == targetName then
             return descendant
         end
     end
-
     return nil
 end
-
 local function safeFindPath(root, names)
     local current = root
-
     for _, name in ipairs(names) do
         if not current then
             return nil
         end
         current = current:FindFirstChild(name)
     end
-
     return current
 end
-
 local function create(className, properties, parent)
     local object = Instance.new(className)
-
     for key, value in pairs(properties or {}) do
         object[key] = value
     end
-
     if parent then
         object.Parent = parent
     end
-
     return object
 end
-
 local function addCorner(parent, radius)
     return create("UICorner", {
         CornerRadius = UDim.new(0, radius or 8),
     }, parent)
 end
-
 local function addStroke(parent, color, thickness, transparency)
     return create("UIStroke", {
         Color = color or THEME.border,
@@ -628,7 +346,6 @@ local function addStroke(parent, color, thickness, transparency)
         ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
     }, parent)
 end
-
 local function makeLabel(parent, text, textSize, color, font)
     return create("TextLabel", {
         BackgroundTransparency = 1,
@@ -641,7 +358,6 @@ local function makeLabel(parent, text, textSize, color, font)
         TextYAlignment = Enum.TextYAlignment.Center,
     }, parent)
 end
-
 local function makeButton(parent, text, size, color)
     local button = create("TextButton", {
         Size = size,
@@ -653,11 +369,9 @@ local function makeButton(parent, text, size, color)
         TextSize = 12,
         Font = Enum.Font.GothamMedium,
     }, parent)
-
     addCorner(button, 7)
     return button
 end
-
 local function setButtonHover(button, normalColor, hoverColor)
     connect(button.MouseEnter, function()
         if button.Parent then
@@ -666,7 +380,6 @@ local function setButtonHover(button, normalColor, hoverColor)
             }):Play()
         end
     end)
-
     connect(button.MouseLeave, function()
         if button.Parent then
             TweenService:Create(button, TweenInfo.new(0.12), {
@@ -675,7 +388,6 @@ local function setButtonHover(button, normalColor, hoverColor)
         end
     end)
 end
-
 local function listText(values)
     if #values == 0 then
         return ""
@@ -684,30 +396,26 @@ local function listText(values)
     elseif #values == 2 then
         return tostring(values[1]) .. " and " .. tostring(values[2])
     end
-
     local first = {}
     for i = 1, #values - 1 do
         table.insert(first, tostring(values[i]))
     end
-
     return table.concat(first, ", ") .. ", and " .. tostring(values[#values])
 end
-
-local BASE64_CHARS =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
 local LinkedImages = {}
 local LastLinkedImagesBody = nil
-
+local LastSupremeBody = nil
+local HttpState = {
+    linkedETag = nil,
+    supremeETag = nil,
+}
 State.Mapping = {
     ItemLinks = {},
     Revision = 0,
 }
-
 State.Mapping.MakeItemKey = function(itemType, itemId)
     local normalizedType =
         normalize(itemType or "")
-
     local prefix =
         normalizedType:find(
             "pet",
@@ -716,50 +424,34 @@ State.Mapping.MakeItemKey = function(itemType, itemId)
         )
         and "Pets"
         or "Weapons"
-
     return prefix
         .. "|"
         .. tostring(
             itemId or ""
         )
 end
-
 State.Mapping.Touch = function()
     State.Mapping.Revision =
         State.Mapping.Revision + 1
 end
-
 local requestFullUiRefresh = function() end
-
-local function countDictionary(dictionary)
-    local count = 0
-    for _ in pairs(dictionary or {}) do
-        count = count + 1
-    end
-    return count
-end
-
 local function numericAssetId(value)
     if value == nil then
         return nil
     end
-
     if type(value) == "number" then
         if value <= 0 then
             return nil
         end
         return tostring(math.floor(value))
     end
-
     if type(value) ~= "string" then
         return nil
     end
-
     local s = trim(value)
     if s == "" then
         return nil
     end
-
     local id =
         s:match("rbxassetid://(%d+)")
         or s:match("rbxthumb://.-[?&][Ii][Dd]=(%d+)")
@@ -768,281 +460,138 @@ local function numericAssetId(value)
         or s:match("[Aa]sset[Ii][Dd][:=/]+(%d+)")
         or s:match("/(%d+)[^%d]*$")
         or s:match("^%s*(%d+)%s*$")
-
     if not id then
         return nil
     end
-
     id = id:gsub("^0+", "")
-
     if id == "" or tonumber(id) == 0 then
         return nil
     end
-
     return id
 end
-
 local function verdictColor(verdict)
     verdict = tostring(verdict or "")
-
     if verdict:find("WIN", 1, true) then
         return THEME.green
     end
-
     if verdict:find("LOSS", 1, true) or verdict == "QUESTIONABLE" then
         return THEME.red
     end
-
     if verdict == "FAIR" or verdict == "EVEN" then
         return THEME.yellow
     end
-
     return THEME.muted
 end
-
 local SupremeDatabase = nil
 local LastDatabaseLoad = 0
 local DatabaseStatus = "Loading..."
 local IndexExact = {}
 local IndexCanonical = {}
 local Catalog = {}
-
 local CATEGORY_ALIAS = {
     ancient = "ancients",
     ancients = "ancients",
-
     classic = "vintages",
     vintage = "vintages",
     vintages = "vintages",
-
     chroma = "chromas",
     chromas = "chromas",
-
     godly = "godlies",
     godlies = "godlies",
-
     legendary = "legendaries",
     legendaries = "legendaries",
-
     rare = "rares",
     rares = "rares",
-
     uncommon = "uncommons",
     uncommons = "uncommons",
-
     common = "commons",
     commons = "commons",
-
     pet = "pets",
     pets = "pets",
-
     misc = "misc",
 }
-
 local function normalizeCategory(value)
     if value == nil then
         return nil
     end
-
     local n = normalize(value)
     return CATEGORY_ALIAS[n] or n
 end
-
 local function addRecordToIndex(index, key, record)
     key = normalize(key)
-
     if key == "" or key == "n/a" then
         return
     end
-
     index[key] = index[key] or {}
-
     for _, existing in ipairs(index[key]) do
         if existing.category == record.category
             and tostring(existing.key or "")
                 == tostring(record.key or "") then
-
             return
         end
     end
-
     table.insert(index[key], record)
 end
-
-local function buildSupremeIndex()
-    table.clear(IndexExact)
-    table.clear(IndexCanonical)
-    table.clear(Catalog)
-
-    if type(SupremeDatabase) ~= "table" then
-        return
+local function buildSupremeIndex(database)
+    local exactIndex = {}
+    local canonicalIndex = {}
+    local catalog = {}
+    if type(database) ~= "table" then
+        return exactIndex, canonicalIndex, catalog
     end
-
-    local function ingestRecord(
-        category,
-        sourceKey,
-        itemData,
-        variantIndex
-    )
+    local function ingestRecord(category, sourceKey, itemData, variantIndex)
         if type(itemData) ~= "table" then
             return
         end
-
-        local recordKey =
-            itemData.record_key
-            or itemData.recordKey
-
-        if type(recordKey) ~= "string"
-            or recordKey == "" then
-
-            recordKey =
-                tostring(sourceKey)
-
+        local recordKey = itemData.record_key or itemData.recordKey
+        if type(recordKey) ~= "string" or recordKey == "" then
+            recordKey = tostring(sourceKey)
             if variantIndex then
-                recordKey =
-                    recordKey
-                    .. "#"
-                    .. tostring(
-                        variantIndex
-                    )
+                recordKey = recordKey .. "#" .. tostring(variantIndex)
             end
         end
-
         local record = {
             key = recordKey,
-            sourceKey =
-                tostring(sourceKey),
-            name =
-                itemData.name
-                or sourceKey,
+            sourceKey = tostring(sourceKey),
+            name = itemData.name or sourceKey,
             category = category,
             data = itemData,
-            variantIndex =
-                variantIndex,
+            variantIndex = variantIndex,
         }
-
-        table.insert(
-            Catalog,
-            record
-        )
-
-        addRecordToIndex(
-            IndexExact,
-            record.name,
-            record
-        )
-
-        addRecordToIndex(
-            IndexCanonical,
-            canonicalName(
-                record.name
-            ),
-            record
-        )
-
-
-        if normalize(
-            record.sourceKey
-        ) ~= normalize(
-            record.name
-        ) then
-
-            addRecordToIndex(
-                IndexExact,
-                record.sourceKey,
-                record
-            )
-
-            addRecordToIndex(
-                IndexCanonical,
-                canonicalName(
-                    record.sourceKey
-                ),
-                record
-            )
+        table.insert(catalog, record)
+        addRecordToIndex(exactIndex, record.name, record)
+        addRecordToIndex(canonicalIndex, canonicalName(record.name), record)
+        if normalize(record.sourceKey) ~= normalize(record.name) then
+            addRecordToIndex(exactIndex, record.sourceKey, record)
+            addRecordToIndex(canonicalIndex, canonicalName(record.sourceKey), record)
         end
-
-        if type(itemData.aliases)
-                == "string"
-            and normalize(
-                itemData.aliases
-            ) ~= "n/a" then
-
-            for alias in itemData.aliases:gmatch(
-                "([^,]+)"
-            ) do
+        if type(itemData.aliases) == "string" and normalize(itemData.aliases) ~= "n/a" then
+            for alias in itemData.aliases:gmatch("([^,]+)") do
                 alias = trim(alias)
-
                 if alias ~= "" then
-                    addRecordToIndex(
-                        IndexExact,
-                        alias,
-                        record
-                    )
-
-                    addRecordToIndex(
-                        IndexCanonical,
-                        canonicalName(
-                            alias
-                        ),
-                        record
-                    )
+                    addRecordToIndex(exactIndex, alias, record)
+                    addRecordToIndex(canonicalIndex, canonicalName(alias), record)
                 end
             end
         end
     end
-
-    for category, categoryData in pairs(
-        SupremeDatabase
-    ) do
-        if category ~= "_metadata"
-            and type(categoryData)
-                == "table" then
-
-            for itemKey, itemData in pairs(
-                categoryData
-            ) do
-                if type(itemData)
-                    == "table" then
-
-
-                    
-
-                    
-
-                    
-
-                    
-                    if type(
-                        itemData[1]
-                    ) == "table" then
-
-                        for variantIndex,
-                            variantData in ipairs(
-                                itemData
-                            ) do
-
-                            ingestRecord(
-                                category,
-                                itemKey,
-                                variantData,
-                                variantIndex
-                            )
+    for category, categoryData in pairs(database) do
+        if category ~= "_metadata" and type(categoryData) == "table" then
+            for itemKey, itemData in pairs(categoryData) do
+                if type(itemData) == "table" then
+                    if type(itemData[1]) == "table" then
+                        for variantIndex, variantData in ipairs(itemData) do
+                            ingestRecord(category, itemKey, variantData, variantIndex)
                         end
                     else
-                        ingestRecord(
-                            category,
-                            itemKey,
-                            itemData,
-                            nil
-                        )
+                        ingestRecord(category, itemKey, itemData, nil)
                     end
                 end
             end
         end
     end
+    return exactIndex, canonicalIndex, catalog
 end
-
 local function getSupremeRecord(
     category,
     name,
@@ -1052,32 +601,24 @@ local function getSupremeRecord(
     if not SupremeDatabase then
         return nil
     end
-
     local wantedCategory =
         normalizeCategory(category)
-
     local wantedName =
         normalize(name)
-
     local wantedKey =
         supremeKey
         and tostring(supremeKey)
         or nil
-
     local wantedYear =
         tonumber(year)
-
     local nameMatches = {}
     local yearMatches = {}
-
     for _, record in ipairs(
         Catalog
     ) do
         if normalizeCategory(
             record.category
         ) == wantedCategory then
-
-
             if wantedKey
                 and (
                     tostring(
@@ -1089,38 +630,29 @@ local function getSupremeRecord(
                         or ""
                     ) == wantedKey
                 ) then
-
-
-                
                 if tostring(
                     record.key
                     or ""
                 ) == wantedKey then
-
                     return record
                 end
             end
-
             if wantedName ~= ""
                 and normalize(
                     record.name
                 ) == wantedName then
-
                 table.insert(
                     nameMatches,
                     record
                 )
-
                 local recordYear =
                     tonumber(
                         record.data
                         and record.data.year
                     )
-
                 if wantedYear
                     and recordYear
                         == wantedYear then
-
                     table.insert(
                         yearMatches,
                         record
@@ -1129,26 +661,18 @@ local function getSupremeRecord(
             end
         end
     end
-
     if #yearMatches == 1 then
         return yearMatches[1]
     end
-
     if #nameMatches == 1 then
         return nameMatches[1]
     end
-
-
-    
-
     return nil
 end
-
 State.Mapping.ResolveLinkRecord = function(link)
     if type(link) ~= "table" then
         return nil
     end
-
     return getSupremeRecord(
         link.category,
         link.name,
@@ -1156,7 +680,6 @@ State.Mapping.ResolveLinkRecord = function(link)
         link.year
     )
 end
-
 local function rebuildManualLinkIndexes()
     for assetId, link in pairs(
         LinkedImages
@@ -1164,27 +687,21 @@ local function rebuildManualLinkIndexes()
         if type(link) == "table" then
             local numericId =
                 numericAssetId(assetId)
-
             if numericId then
                 link.asset_id =
                     numericId
             end
         end
     end
-
     State.Mapping.Touch()
 end
-
 local function normalizeLinkedImagesDocument(decoded)
     local imageResult = {}
     local itemResult = {}
-
     if type(decoded) ~= "table" then
         return imageResult, itemResult
     end
-
     local imageSource = decoded.links or decoded
-
     for assetId, link in pairs(imageSource) do
         if assetId ~= "_metadata"
             and assetId ~= "item_links"
@@ -1192,11 +709,9 @@ local function normalizeLinkedImagesDocument(decoded)
             and type(link) == "table"
             and type(link.name) == "string"
             and type(link.category) == "string" then
-
             local numericId =
                 numericAssetId(assetId)
                 or numericAssetId(link.asset_id)
-
             if numericId then
                 imageResult[numericId] = {
                     name = link.name,
@@ -1211,9 +726,7 @@ local function normalizeLinkedImagesDocument(decoded)
             end
         end
     end
-
     local itemSource = decoded.item_links
-
     if type(itemSource) == "table" then
         for itemKey, link in pairs(itemSource) do
             if type(itemKey) == "string"
@@ -1221,7 +734,6 @@ local function normalizeLinkedImagesDocument(decoded)
                 and type(link) == "table"
                 and type(link.name) == "string"
                 and type(link.category) == "string" then
-
                 itemResult[itemKey] = {
                     name = link.name,
                     category = link.category,
@@ -1232,272 +744,257 @@ local function normalizeLinkedImagesDocument(decoded)
             end
         end
     end
-
     return imageResult, itemResult
 end
-
+local function getResponseHeader(response, wantedName)
+    if type(response) ~= "table" or type(response.Headers) ~= "table" then
+        return nil
+    end
+    local wanted = string.lower(tostring(wantedName or ""))
+    for key, value in pairs(response.Headers) do
+        if string.lower(tostring(key)) == wanted then
+            return tostring(value)
+        end
+    end
+    return nil
+end
+local function mappingEntryCount(imageLinks, itemLinks)
+    local count = 0
+    for _ in pairs(imageLinks or {}) do
+        count = count + 1
+    end
+    for _ in pairs(itemLinks or {}) do
+        count = count + 1
+    end
+    return count
+end
 local function loadLinkedImages()
     if type(httpRequest) ~= "function" then
-        return false,
-            "request(options) is unavailable.",
-            false
+        return false, "request(options) is unavailable.", false
     end
-
-    local ok,
-        response =
-        pcall(function()
-            return httpRequest({
-                Url =
-                    CONFIG.LinkedImagesUrl
-                    .. "?t="
-                    .. tostring(
-                        os.time()
-                    ),
-                Method = "GET",
-                Headers = {
-                    ["Accept"] =
-                        "application/json",
-                    ["Cache-Control"] =
-                        "no-cache",
-                },
-            })
-        end)
-
-    if not ok then
-        return false,
-            tostring(response),
-            false
+    local headers = {
+        ["Accept"] = "application/json",
+        ["Cache-Control"] = "no-cache",
+    }
+    if HttpState.linkedETag then
+        headers["If-None-Match"] = HttpState.linkedETag
     end
-
-    if type(response)
-        ~= "table" then
-
-        return false,
-            "Invalid linked-images response.",
-            false
-    end
-
-    if response.StatusCode == 404 then
-        local changed =
-            LastLinkedImagesBody
-                ~= "__MISSING__"
-            or next(LinkedImages)
-                ~= nil
-            or next(
-                State.Mapping.ItemLinks
-            ) ~= nil
-
-        LastLinkedImagesBody =
-            "__MISSING__"
-
-        if changed then
-            LinkedImages = {}
-            State.Mapping.ItemLinks = {}
-            rebuildManualLinkIndexes()
-        end
-
-        return true,
-            nil,
-            changed
-    end
-
-    if response.Success ~= true then
-        return false,
-            "HTTP "
-            .. tostring(
-                response.StatusCode
-                or "?"
-            ),
-            false
-    end
-
-    local body =
-        response.Body
-        or ""
-
-    if body == ""
-        then
-
-        return false,
-            "linked_images.json returned an empty body.",
-            false
-    end
-
-    if LastLinkedImagesBody
-        == body then
-
-        return true,
-            nil,
-            false
-    end
-
-    local decodeOK,
-        decoded =
-        pcall(function()
-            return HttpService
-                :JSONDecode(
-                    body
-                )
-        end)
-
-    if not decodeOK then
-        return false,
-            "linked_images.json could not be decoded.",
-            false
-    end
-
-    LinkedImages,
-        State.Mapping.ItemLinks =
-        normalizeLinkedImagesDocument(
-            decoded
-        )
-
-    LastLinkedImagesBody =
-        body
-
-    rebuildManualLinkIndexes()
-
-    return true,
-        nil,
-        true
-end
-
-local function fetchSupremeDatabase()
-    if type(httpRequest) ~= "function" then
-        return false, "The custom request(options) function is not available."
-    end
-
-    local requestUrl = CONFIG.JsonUrl .. "?t=" .. tostring(os.time())
-
-    local requestOK, response = pcall(function()
+    local ok, response = pcall(function()
         return httpRequest({
-            Url = requestUrl,
+            Url = CONFIG.LinkedImagesUrl,
             Method = "GET",
-            Headers = {
-                ["Accept"] = "application/json",
-                ["Cache-Control"] = "no-cache",
-            },
+            Headers = headers,
         })
     end)
-
-    if not requestOK then
-        return false, "HTTP error: " .. tostring(response)
+    if not ok then
+        return false, tostring(response), false
     end
-
     if type(response) ~= "table" then
-        return false, "request(options) returned something other than a response table."
+        return false, "Invalid linked-images response.", false
     end
-
+    if tonumber(response.StatusCode) == 304 then
+        return true, nil, false
+    end
+    if tonumber(response.StatusCode) == 404 then
+        return false, "linked_images.json returned HTTP 404; keeping last-known-good mappings.", false
+    end
+    if response.Success ~= true then
+        return false, "HTTP " .. tostring(response.StatusCode or "?"), false
+    end
+    local body = response.Body or ""
+    if body == "" then
+        return false, "linked_images.json returned an empty body; keeping last-known-good mappings.", false
+    end
+    if LastLinkedImagesBody == body then
+        HttpState.linkedETag = getResponseHeader(response, "etag") or HttpState.linkedETag
+        return true, nil, false
+    end
+    local decodeOK, decoded = pcall(function()
+        return HttpService:JSONDecode(body)
+    end)
+    if not decodeOK or type(decoded) ~= "table" then
+        return false, "linked_images.json could not be decoded; keeping last-known-good mappings.", false
+    end
+    local normalizeOK, nextImages, nextItems =
+        pcall(
+            normalizeLinkedImagesDocument,
+            decoded
+        )
+    if not normalizeOK then
+        return false, "linked_images.json normalization failed; keeping last-known-good mappings.", false
+    end
+    local oldCount = mappingEntryCount(LinkedImages, State.Mapping.ItemLinks)
+    local newCount = mappingEntryCount(nextImages, nextItems)
+    if oldCount > 0 and newCount == 0 then
+        return false, "linked_images.json became unexpectedly empty; keeping last-known-good mappings.", false
+    end
+    LinkedImages = nextImages
+    State.Mapping.ItemLinks = nextItems
+    LastLinkedImagesBody = body
+    HttpState.linkedETag = getResponseHeader(response, "etag") or HttpState.linkedETag
+    rebuildManualLinkIndexes()
+    return true, nil, true
+end
+local function validateSupremeCandidate(decoded, candidateCatalog)
+    if type(decoded) ~= "table" or type(decoded._metadata) ~= "table" then
+        return false, "The JSON is not the expected Supreme Values database."
+    end
+    if decoded._metadata.complete == false then
+        return false, "The latest JSON says the scrape is incomplete."
+    end
+    local candidateCount = #candidateCatalog
+    if candidateCount < CONFIG.MinimumCatalogItems then
+        return false, "The candidate database is suspiciously small (" .. tostring(candidateCount) .. " items)."
+    end
+    local previousCount = #Catalog
+    if previousCount > 0 then
+        local minimumRelative = math.max(
+            CONFIG.MinimumCatalogItems,
+            math.floor(previousCount * 0.65)
+        )
+        if candidateCount < minimumRelative then
+            return false, "The candidate database dropped from " .. tostring(previousCount) .. " to " .. tostring(candidateCount) .. " items."
+        end
+    end
+    local metadataCount = tonumber(decoded._metadata.total_items)
+    if metadataCount and metadataCount > 0 then
+        local minimumIndexed = math.floor(metadataCount * 0.80)
+        if candidateCount < minimumIndexed then
+            return false, "The candidate database indexed fewer items than its metadata claims."
+        end
+    end
+    return true
+end
+local function fetchSupremeDatabase()
+    if type(httpRequest) ~= "function" then
+        return false, "The custom request(options) function is not available.", false
+    end
+    local headers = {
+        ["Accept"] = "application/json",
+        ["Cache-Control"] = "no-cache",
+    }
+    if HttpState.supremeETag then
+        headers["If-None-Match"] = HttpState.supremeETag
+    end
+    local requestOK, response = pcall(function()
+        return httpRequest({
+            Url = CONFIG.JsonUrl,
+            Method = "GET",
+            Headers = headers,
+        })
+    end)
+    if not requestOK then
+        return false, "HTTP error: " .. tostring(response), false
+    end
+    if type(response) ~= "table" then
+        return false, "request(options) returned something other than a response table.", false
+    end
+    if tonumber(response.StatusCode) == 304 then
+        if SupremeDatabase then
+            LastDatabaseLoad = os.time()
+            DatabaseStatus = "Ready"
+            return true, nil, false
+        end
+        DatabaseStatus = "Unavailable"
+        return false, "HTTP 304 received before an initial database load.", false
+    end
     if response.Success ~= true then
         return false, string.format(
             "HTTP %s %s",
             tostring(response.StatusCode or "?"),
             tostring(response.StatusMessage or "request failed")
-        )
+        ), false
     end
-
-    if type(response.Body) ~= "string" or response.Body == "" then
-        return false, "GitHub returned an empty response body."
+    local body = response.Body
+    if type(body) ~= "string" or body == "" then
+        return false, "GitHub returned an empty response body; keeping last-known-good values.", false
     end
-
+    if LastSupremeBody == body and SupremeDatabase then
+        HttpState.supremeETag = getResponseHeader(response, "etag") or HttpState.supremeETag
+        LastDatabaseLoad = os.time()
+        DatabaseStatus = "Ready"
+        return true, nil, false
+    end
     local decodeOK, decoded = pcall(function()
-        return HttpService:JSONDecode(response.Body)
+        return HttpService:JSONDecode(body)
     end)
-
     if not decodeOK then
-        return false, "JSON decode failed: " .. tostring(decoded)
+        return false, "JSON decode failed: " .. tostring(decoded), false
     end
-
-    if type(decoded) ~= "table" or type(decoded._metadata) ~= "table" then
-        return false, "The JSON is not the expected Supreme Values database."
+    local indexOK, candidateExact, candidateCanonical, candidateCatalog =
+        pcall(
+            buildSupremeIndex,
+            decoded
+        )
+    if not indexOK then
+        return false, "The candidate database could not be indexed; keeping last-known-good values.", false
     end
-
-    if decoded._metadata.complete == false then
-        return false, "The latest JSON says the scrape is incomplete."
+    local valid, validationError =
+        validateSupremeCandidate(decoded, candidateCatalog)
+    if not valid then
+        return false, validationError, false
     end
-
     SupremeDatabase = decoded
-    buildSupremeIndex()
-
-    if #Catalog == 0 then
-        SupremeDatabase = nil
-        return false, "The JSON loaded, but no items were indexed."
-    end
-
+    IndexExact = candidateExact
+    IndexCanonical = candidateCanonical
+    Catalog = candidateCatalog
+    LastSupremeBody = body
+    HttpState.supremeETag = getResponseHeader(response, "etag") or HttpState.supremeETag
     LastDatabaseLoad = os.time()
     DatabaseStatus = "Ready"
-
-    return true
+    return true, nil, true
 end
-
 local function ensureSupremeDatabase(force)
     if not force
         and SupremeDatabase
         and os.time() - LastDatabaseLoad < CONFIG.RefreshSeconds then
-
-        return true
+        return true, nil, false
     end
-
     DatabaseStatus = "Refreshing..."
-
-    local ok, err = fetchSupremeDatabase()
-
+    local ok, err, changed = fetchSupremeDatabase()
     if ok then
-        return true
+        return true, nil, changed
     end
-
     if SupremeDatabase then
         DatabaseStatus = "Cached"
         warn("[SV Public] Refresh failed; using cached data:", err)
-        return true, err
+        return true, err, false
     end
-
     DatabaseStatus = "Unavailable"
     warn("[SV Public] Could not load values:", err)
-    return false, err
+    return false, err, false
 end
-
 local ResolveCache = {}
-
 State.ResolveMetaCache =
     State.ResolveMetaCache
     or {}
-
 State.GameSyncDatabase =
     State.GameSyncDatabase
     or nil
-
 State.GameSyncDatabaseAttempted =
     State.GameSyncDatabaseAttempted
     or false
-
 State.GameSyncDatabaseAttempts =
     State.GameSyncDatabaseAttempts
     or 0
-
 State.GameSyncDatabaseNextAttempt =
     State.GameSyncDatabaseNextAttempt
     or 0
-
 State.GameSyncDatabaseLoading =
     State.GameSyncDatabaseLoading
     or false
-
 State.GameSyncDatabaseReadyAt =
     State.GameSyncDatabaseReadyAt
     or nil
-
 State.GameDatabaseSource =
     State.GameDatabaseSource
     or nil
-
 State.GameDataAliasIndex =
     State.GameDataAliasIndex
     or {
         Weapons = {},
         Pets = {},
     }
-
 State.RebuildGameDataAliasIndex = function(
     database
 )
@@ -1505,11 +1002,9 @@ State.RebuildGameDataAliasIndex = function(
         Weapons = {},
         Pets = {},
     }
-
     if type(database) ~= "table" then
         return
     end
-
     local function indexBucket(
         bucketName,
         bucket
@@ -1517,12 +1012,10 @@ State.RebuildGameDataAliasIndex = function(
         if type(bucket) ~= "table" then
             return
         end
-
         local index =
             State.GameDataAliasIndex[
                 bucketName
             ]
-
         local function addAlias(
             alias,
             record
@@ -1531,14 +1024,11 @@ State.RebuildGameDataAliasIndex = function(
                 and type(alias) ~= "number" then
                 return
             end
-
             local raw =
                 tostring(alias)
-
             if raw == "" then
                 return
             end
-
             for _, key in ipairs({
                 raw,
                 normalize(raw),
@@ -1546,21 +1036,17 @@ State.RebuildGameDataAliasIndex = function(
                 if key ~= "" then
                     local existing =
                         index[key]
-
                     if existing == nil then
                         index[key] =
                             record
                     elseif existing
                         ~= record then
-
-
                         index[key] =
                             false
                     end
                 end
             end
         end
-
         for internalId, record in pairs(
             bucket
         ) do
@@ -1569,7 +1055,6 @@ State.RebuildGameDataAliasIndex = function(
                     internalId,
                     record
                 )
-
                 for _, field in ipairs({
                     "DataID",
                     "DataId",
@@ -1588,21 +1073,18 @@ State.RebuildGameDataAliasIndex = function(
             end
         end
     end
-
     indexBucket(
         "Weapons",
         database.Weapons
             or database.weapons
             or database.Item
     )
-
     indexBucket(
         "Pets",
         database.Pets
             or database.pets
     )
 end
-
 State.TryGetExecutorGlobal = function(name)
     local okDirect, direct =
         pcall(function()
@@ -1619,77 +1101,58 @@ State.TryGetExecutorGlobal = function(name)
             elseif name == "Database" then
                 return Database
             end
-
             return nil
         end)
-
     if okDirect
         and direct ~= nil then
-
         return direct
     end
-
     local okGetgenv, getgenvFunction =
         pcall(function()
             return getgenv
         end)
-
     if not okGetgenv
         or type(getgenvFunction)
             ~= "function" then
-
         getgenvFunction =
             rawget(_G, "getgenv")
     end
-
     if type(getgenvFunction)
         == "function" then
-
         local okEnv, env =
             pcall(getgenvFunction)
-
         if okEnv
             and type(env) == "table" then
-
             local value =
                 rawget(env, name)
-
             if value ~= nil then
                 return value
             end
         end
     end
-
     local okGetfenv, getfenvFunction =
         pcall(function()
             return getfenv
         end)
-
     if okGetfenv
         and type(getfenvFunction)
             == "function" then
-
         local okEnv, env =
             pcall(
                 getfenvFunction,
                 0
             )
-
         if okEnv
             and type(env) == "table" then
-
             local value =
                 rawget(env, name)
-
             if value ~= nil then
                 return value
             end
         end
     end
-
     return rawget(_G, name)
 end
-
 State.TryDecompileDataModule = function(
     moduleScript
 )
@@ -1698,49 +1161,39 @@ State.TryDecompileDataModule = function(
         or not moduleScript:IsA(
             "ModuleScript"
         ) then
-
         return nil,
             "disabled-or-missing"
     end
-
     local decompileFunction =
         State.TryGetExecutorGlobal(
             "decompile"
         )
-
     local loadstringFunction =
         State.TryGetExecutorGlobal(
             "loadstring"
         )
         or rawget(_G, "loadstring")
-
     if type(decompileFunction)
             ~= "function"
         or type(loadstringFunction)
             ~= "function" then
-
         return nil,
             "decompile/loadstring unavailable"
     end
-
     local okSource, source =
         pcall(
             decompileFunction,
             moduleScript
         )
-
     if not okSource
         or type(source) ~= "string"
         or source == ""
         or #source > 8000000 then
-
         return nil,
             "decompile failed"
     end
-
     local lowered =
         string.lower(source)
-
     for _, forbidden in ipairs({
         ":fireserver",
         ":invokeserver",
@@ -1763,29 +1216,23 @@ State.TryDecompileDataModule = function(
                 .. forbidden
         end
     end
-
     local okChunk, chunkOrError =
         pcall(
             loadstringFunction,
             source
         )
-
     if not okChunk
         or type(chunkOrError)
             ~= "function" then
-
         return nil,
             "loadstring failed"
     end
-
     local setfenvFunction =
         State.TryGetExecutorGlobal(
             "setfenv"
         )
-
     if type(setfenvFunction)
         == "function" then
-
         pcall(
             setfenvFunction,
             chunkOrError,
@@ -1824,253 +1271,151 @@ State.TryDecompileDataModule = function(
             }
         )
     end
-
     local okResult, result =
         pcall(
             chunkOrError
         )
-
     if not okResult
         or type(result) ~= "table" then
-
         return nil,
             "decompiled module execution failed"
     end
-
-    State.Debug.Count(
-        "decompiledSyncLoads"
-    )
-
     return result
 end
-
 State.TryBuildDecompiledSync = function()
     local databaseFolder =
         ReplicatedStorage:FindFirstChild(
             "Database"
         )
-
     local syncContainer =
         databaseFolder
         and databaseFolder:FindFirstChild(
             "Sync"
         )
-
     if not syncContainer then
         return nil
     end
-
     local itemModule =
         syncContainer:FindFirstChild(
             "Item"
         )
-
     local petsModule =
         syncContainer:FindFirstChild(
             "Pets"
         )
-
     local itemTable, itemError =
         State.TryDecompileDataModule(
             itemModule
         )
-
     local petsTable, petsError =
         State.TryDecompileDataModule(
             petsModule
         )
-
     if type(itemTable) ~= "table"
         and type(petsTable)
             ~= "table" then
-
-        State.Debug.Count(
-            "decompiledSyncFailures"
-        )
-
-        State.Debug.Record(
-            "decompiled_sync_failed",
-            {
-                itemError = itemError,
-                petsError = petsError,
-            }
-        )
-
         return nil
     end
-
     local database = {
         Weapons =
             type(itemTable) == "table"
             and itemTable
             or {},
-
         Item =
             type(itemTable) == "table"
             and itemTable
             or {},
-
         Pets =
             type(petsTable) == "table"
             and petsTable
             or {},
     }
-
     local weaponCount = 0
     local petCount = 0
-
     for _ in pairs(
         database.Weapons
     ) do
         weaponCount += 1
     end
-
     for _ in pairs(
         database.Pets
     ) do
         petCount += 1
     end
-
-    State.Debug.Record(
-        "decompiled_sync_ready",
-        {
-            weapons = weaponCount,
-            pets = petCount,
-        }
-    )
-
     return database
 end
-
 local function getGameDatabase()
     if type(State.GameSyncDatabase)
         == "table" then
-
         return State.GameSyncDatabase
     end
-
     local fallback =
         rawget(_G, "Database")
-
     if type(fallback) == "table" then
         State.GameSyncDatabase =
             fallback
-
         State.GameDatabaseSource =
             "_G.Database"
-
         State.RebuildGameDataAliasIndex(
             fallback
         )
-
         return fallback
     end
-
     local executorDatabase =
         State.TryGetExecutorGlobal(
             "Database"
         )
-
     if type(executorDatabase)
         == "table" then
-
         State.GameSyncDatabase =
             executorDatabase
-
         State.GameDatabaseSource =
             "executor Database"
-
         State.RebuildGameDataAliasIndex(
             executorDatabase
         )
-
         return executorDatabase
     end
-
     local now =
         os.clock()
-
     if State.GameSyncDatabaseLoading then
         return nil
     end
-
     if State.GameSyncDatabaseAttempts < 4
         and now
             >= State.GameSyncDatabaseNextAttempt then
-
         State.GameSyncDatabaseAttempted =
             true
-
         State.GameSyncDatabaseLoading =
             true
-
         State.GameSyncDatabaseAttempts =
             State.GameSyncDatabaseAttempts
             + 1
-
         local attempt =
             State.GameSyncDatabaseAttempts
-
-        State.Debug.Record(
-            "native_loader_attempt",
-            {
-                attempt = attempt,
-                decompileType =
-                    type(
-                        State.TryGetExecutorGlobal(
-                            "decompile"
-                        )
-                    ),
-                loadstringType =
-                    type(
-                        State.TryGetExecutorGlobal(
-                            "loadstring"
-                        )
-                    ),
-            }
-        )
-
         local decompiled =
             State.TryBuildDecompiledSync()
-
         State.GameSyncDatabaseLoading =
             false
-
         if type(decompiled)
             == "table" then
-
             State.GameSyncDatabase =
                 decompiled
-
             State.GameSyncDatabaseReadyAt =
                 os.clock()
-
             State.GameDatabaseSource =
                 "decompiled Sync.Item/Pets"
-
             State.RebuildGameDataAliasIndex(
                 decompiled
             )
-
-            State.Debug.Record(
-                "native_loader_ready",
-                {
-                    attempt = attempt,
-                    source =
-                        State.GameDatabaseSource,
-                }
-            )
-
             return decompiled
         end
-
         local retryDelays = {
             0.20,
             0.60,
             1.20,
             2.00,
         }
-
         State.GameSyncDatabaseNextAttempt =
             now
             + (
@@ -2083,31 +1428,23 @@ local function getGameDatabase()
                 or 2
             )
     end
-
     if State.GameSyncDatabaseAttempts
         >= 4 then
-
         State.GameDatabaseSource =
             "Unavailable after retries"
     else
         State.GameDatabaseSource =
             "Waiting for executor native loader"
     end
-
     return nil
 end
-
 local function getGameItemData(itemType, itemId)
     local database = getGameDatabase()
-
     if type(database) ~= "table" then
         return nil
     end
-
     local normalizedType = normalize(itemType or "")
-
     local firstKeys = {}
-
     if normalizedType:find("pet", 1, true) then
         firstKeys = {"Pets", "pets"}
     elseif normalizedType:find("weapon", 1, true)
@@ -2117,39 +1454,25 @@ local function getGameItemData(itemType, itemId)
     else
         firstKeys = {"Weapons", "Pets", "weapons", "pets"}
     end
-
     for _, key in ipairs(firstKeys) do
         local bucket =
             database[key]
-
         if type(bucket) == "table" then
             local record =
                 bucket[itemId]
-
             if type(record) ~= "table" then
                 local numericId =
                     tonumber(itemId)
-
                 if numericId then
                     record =
                         bucket[numericId]
                 end
             end
-
             if type(record) == "table" then
-                State.Debug.Count(
-                    "exactSyncItemLookups"
-                )
-
                 return record, key
             end
         end
     end
-
-    State.Debug.Count(
-        "exactSyncItemMisses"
-    )
-
     local aliasBucketName =
         normalizedType:find(
             "pet",
@@ -2158,20 +1481,13 @@ local function getGameItemData(itemType, itemId)
         )
         and "Pets"
         or "Weapons"
-
     local aliasBucket =
         State.GameDataAliasIndex
         and State.GameDataAliasIndex[
             aliasBucketName
         ]
-
     if type(aliasBucket)
         == "table" then
-
-        State.Debug.Count(
-            "nativeAliasLookups"
-        )
-
         local aliasRecord =
             aliasBucket[
                 tostring(itemId)
@@ -2179,24 +1495,15 @@ local function getGameItemData(itemType, itemId)
             or aliasBucket[
                 normalize(itemId)
             ]
-
         if type(aliasRecord)
             == "table" then
-
-            State.Debug.Count(
-                "nativeAliasHits"
-            )
-
             return aliasRecord,
                 aliasBucketName
                     .. "Alias"
         end
     end
-
     return nil
 end
-
-
 local function getGameDisplayName(
     gameData,
     fallback
@@ -2204,28 +1511,22 @@ local function getGameDisplayName(
     if type(gameData) ~= "table" then
         return fallback
     end
-
     local candidates = {
         gameData.ItemName,
         gameData.DisplayName,
         gameData.Name,
         gameData.Item,
     }
-
     for _, candidate in ipairs(
         candidates
     ) do
         if type(candidate) == "string"
             and trim(candidate) ~= "" then
-
             return candidate
         end
     end
-
     return fallback
 end
-
-
 State.GetNativeIdentityEvidence = function(
     gameData,
     itemId
@@ -2237,11 +1538,9 @@ State.GetNativeIdentityEvidence = function(
         nameSources = {},
         yearSources = {},
     }
-
     local seenNames = {}
     local seenYears = {}
     local seenEvents = {}
-
     local function addName(
         value,
         source
@@ -2249,39 +1548,31 @@ State.GetNativeIdentityEvidence = function(
         if type(value) ~= "string" then
             return
         end
-
         for part in value:gmatch(
             "([^,;|]+)"
         ) do
             part = trim(part)
-
             local key =
                 normalize(part)
-
             if key ~= ""
                 and key ~= "n/a"
                 and not seenNames[key] then
-
                 seenNames[key] = true
-
                 table.insert(
                     evidence.names,
                     part
                 )
-
                 evidence.nameSources[
                     part
                 ] = source
             end
         end
     end
-
     local function addYear(
         value,
         source
     )
         local year = nil
-
         if type(value) == "number" then
             year =
                 math.floor(value)
@@ -2296,25 +1587,20 @@ State.GetNativeIdentityEvidence = function(
                     )
                 )
         end
-
         if year
             and year >= 2015
             and year <= 2035
             and not seenYears[year] then
-
             seenYears[year] = true
-
             table.insert(
                 evidence.years,
                 year
             )
-
             evidence.yearSources[
                 tostring(year)
             ] = source
         end
     end
-
     local function addEvent(
         value,
         source
@@ -2322,40 +1608,29 @@ State.GetNativeIdentityEvidence = function(
         if type(value) ~= "string" then
             return
         end
-
         local cleaned = trim(value)
         local key =
             normalize(cleaned)
-
         if key ~= ""
             and key ~= "n/a"
             and not seenEvents[key] then
-
             seenEvents[key] = true
-
             table.insert(
                 evidence.events,
                 cleaned
             )
         end
-
         addYear(
             value,
             source
         )
     end
-
     addName(
         tostring(itemId or ""),
         "remote/internal id"
     )
-
-
-    
-
     local rawId =
         tostring(itemId or "")
-
     local spacedId =
         rawId
             :gsub(
@@ -2366,7 +1641,6 @@ State.GetNativeIdentityEvidence = function(
                 "_",
                 " "
             )
-
     spacedId =
         trim(
             spacedId:gsub(
@@ -2374,17 +1648,13 @@ State.GetNativeIdentityEvidence = function(
                 " "
             )
         )
-
     if normalize(spacedId)
         ~= normalize(rawId) then
-
         addName(
             spacedId,
             "camel/internal id"
         )
-
         local words = {}
-
         for word in spacedId:gmatch(
             "%S+"
         ) do
@@ -2393,14 +1663,9 @@ State.GetNativeIdentityEvidence = function(
                 word
             )
         end
-
-
-        
-
         if #words == 2
             and words[1]:match("^%a+$")
             and words[2]:match("^%a+$") then
-
             addName(
                 words[2]
                     .. " "
@@ -2409,7 +1674,6 @@ State.GetNativeIdentityEvidence = function(
             )
         end
     end
-
     if type(gameData) == "table" then
         for _, field in ipairs({
             "ItemName",
@@ -2435,7 +1699,6 @@ State.GetNativeIdentityEvidence = function(
                 "gameData." .. field
             )
         end
-
         for key, value in pairs(
             gameData
         ) do
@@ -2443,27 +1706,23 @@ State.GetNativeIdentityEvidence = function(
                 normalize(
                     tostring(key)
                 )
-
             if keyName:find(
                 "year",
                 1,
                 true
             ) then
-
                 addYear(
                     value,
                     "gameData."
                         .. tostring(key)
                 )
             end
-
             if keyName == "event"
                 or keyName == "origin"
                 or keyName == "season"
                 or keyName == "holiday"
                 or keyName == "release"
                 or keyName == "released" then
-
                 addEvent(
                     value,
                     "gameData."
@@ -2471,54 +1730,43 @@ State.GetNativeIdentityEvidence = function(
                 )
             end
         end
-
         evidence.rarity =
             gameData.Rarity
             or gameData.rarity
             or gameData.Tier
-
         evidence.image =
             gameData.Image
             or gameData.image
             or gameData.Icon
             or gameData.icon
-
         evidence.chroma =
             gameData.Chroma
     end
-
     if #evidence.years == 1 then
         evidence.year =
             evidence.years[1]
     end
-
     if #evidence.events == 1 then
         evidence.event =
             evidence.events[1]
     end
-
     return evidence
 end
-
 State.SummarizeScoredCandidates = function(
     scored,
     limit
 )
     local output = {}
     limit = limit or 6
-
     for index = 1,
         math.min(
             #scored,
             limit
         ) do
-
         local candidate =
             scored[index]
-
         local record =
             candidate.record
-
         table.insert(
             output,
             {
@@ -2559,23 +1807,18 @@ State.SummarizeScoredCandidates = function(
             }
         )
     end
-
     return output
 end
-
 State.GameResolverRawImageIndex =
     State.GameResolverRawImageIndex
     or {}
-
 State.GameRarityColorCache =
     State.GameRarityColorCache
     or nil
-
 State.GetGameRarityColors = function()
     if State.GameRarityColorCache then
         return State.GameRarityColorCache
     end
-
     local colors = {
         Common =
             Color3.fromRGB(
@@ -2583,70 +1826,60 @@ State.GetGameRarityColors = function()
                 255,
                 255
             ),
-
         Uncommon =
             Color3.fromRGB(
                 0,
                 255,
                 255
             ),
-
         Rare =
             Color3.fromRGB(
                 0,
                 255,
                 0
             ),
-
         Legendary =
             Color3.fromRGB(
                 255,
                 0,
                 0
             ),
-
         Godly =
             Color3.fromRGB(
                 255,
                 0,
                 255
             ),
-
         Ancient =
             Color3.fromRGB(
                 100,
                 10,
                 255
             ),
-
         Classic =
             Color3.fromRGB(
                 255,
                 255,
                 0
             ),
-
         Victim =
             Color3.fromRGB(
                 255,
                 140,
                 0
             ),
-
         Unique =
             Color3.fromRGB(
                 255,
                 140,
                 0
             ),
-
         Christmas =
             Color3.fromRGB(
                 30,
                 214,
                 205
             ),
-
         Halloween =
             Color3.fromRGB(
                 221,
@@ -2654,18 +1887,14 @@ State.GetGameRarityColors = function()
                 2
             ),
     }
-
     State.GameRarityColorCache =
         colors
-
     return colors
 end
-
 State.GameRarityToSupremeCategory = function(
     rarity
 )
     local n = normalize(rarity or "")
-
     local map = {
         common = "commons",
         uncommon = "uncommons",
@@ -2675,50 +1904,38 @@ State.GameRarityToSupremeCategory = function(
         ancient = "ancients",
         classic = "vintages",
     }
-
     return map[n]
 end
-
 State.GetCardRarityHint = function(frame)
     if not frame then
         return nil
     end
-
     local itemName =
         frame:FindFirstChild("ItemName")
-
     if not itemName then
         return nil
     end
-
     local observed = nil
-
     if itemName:IsA("GuiObject") then
         observed =
             itemName.BackgroundColor3
     end
-
     if not observed then
         local rarityBar =
             itemName:FindFirstChild(
                 "RarityBar"
             )
-
         if rarityBar
             and rarityBar:IsA("GuiObject") then
-
             observed =
                 rarityBar.BackgroundColor3
         end
     end
-
     if not observed then
         return nil
     end
-
     local bestName = nil
     local bestDistance = math.huge
-
     for rarityName, color in pairs(
         State.GetGameRarityColors()
     ) do
@@ -2728,78 +1945,60 @@ State.GetCardRarityHint = function(frame)
                     observed.R
                     - color.R
                 ) * 255
-
             local dg =
                 (
                     observed.G
                     - color.G
                 ) * 255
-
             local db =
                 (
                     observed.B
                     - color.B
                 ) * 255
-
             local distance =
                 dr * dr
                 + dg * dg
                 + db * db
-
             if distance < bestDistance then
                 bestDistance = distance
                 bestName = rarityName
             end
         end
     end
-
-
-    
     if bestName
         and bestDistance <= 36 then
-
         return tostring(bestName)
     end
-
     return nil
 end
-
 State.NormalizeGameImageKey = function(value)
     if type(value) ~= "string" then
         return nil
     end
-
     local key = trim(value)
-
     if key == "" then
         return nil
     end
-
     key =
         key:gsub(
             "[&?]bust=%d+$",
             ""
         )
-
     return string.lower(key)
 end
-
 State.GetCardDisplayedImage = function(frame)
     if not frame then
         return nil
     end
-
     local container =
         frame:FindFirstChild(
             "Container"
         )
-
     local icon =
         container
         and container:FindFirstChild(
             "Icon"
         )
-
     if not icon then
         icon =
             frame:FindFirstChild(
@@ -2807,16 +2006,13 @@ State.GetCardDisplayedImage = function(frame)
                 true
             )
     end
-
     if icon
         and (
             icon:IsA("ImageLabel")
             or icon:IsA("ImageButton")
         ) then
-
         return icon.Image
     end
-
     if icon then
         for _, descendant in ipairs(
             icon:GetDescendants()
@@ -2827,15 +2023,12 @@ State.GetCardDisplayedImage = function(frame)
                 or descendant:IsA(
                     "ImageButton"
                 ) then
-
                 return descendant.Image
             end
         end
     end
-
     return nil
 end
-
 State.GetCardRawImageKey = function(frame)
     return State.NormalizeGameImageKey(
         State.GetCardDisplayedImage(
@@ -2843,58 +2036,47 @@ State.GetCardRawImageKey = function(frame)
         )
     )
 end
-
 local GameResolverDatabase = nil
 local GameResolverLastBuild = 0
 local GameNameIndex = {}
 local GameCanonicalIndex = {}
 local GameIconIndex = {}
-
 local function normalizeAssetId(value)
     return numericAssetId(value)
 end
-
 local function assetNameScore(name)
     local n = normalize(name or "")
     local score = 0
-
     if n == "icon" then
         score = score + 95
     elseif n:find("icon", 1, true) then
         score = score + 70
     end
-
     if n:find("item", 1, true) then
         score = score + 25
     end
-
     if n:find("weapon", 1, true)
         or n:find("knife", 1, true)
         or n:find("gun", 1, true)
         or n:find("pet", 1, true) then
         score = score + 20
     end
-
     if n:find("rarity", 1, true)
         or n:find("tag", 1, true)
         or n:find("background", 1, true)
         or n:find("frame", 1, true) then
         score = score - 50
     end
-
     return score
 end
-
 local function getInstanceAssetCandidates(frame)
     local candidates = {}
     local byId = {}
-
     local function add(value, score, source)
         local id = normalizeAssetId(value)
         if not id then
             return
         end
-
         local existing = byId[id]
         if existing then
             if score > existing.score then
@@ -2903,45 +2085,37 @@ local function getInstanceAssetCandidates(frame)
             end
             return
         end
-
         local entry = {
             id = id,
             score = score,
             source = source,
         }
-
         byId[id] = entry
         table.insert(candidates, entry)
     end
-
     local function inspect(instance)
         local nameBonus = assetNameScore(instance.Name)
         local containerBonus =
             hasAncestorNamed(instance, "Container") and 12 or 0
-
         if instance:IsA("ImageLabel")
             or instance:IsA("ImageButton") then
-
             add(
                 instance.Image,
                 105 + nameBonus + containerBonus,
                 instance:GetFullName() .. ".Image"
             )
-
         elseif instance:IsA("Decal") then
             add(
                 instance.Texture,
                 78 + nameBonus,
                 instance:GetFullName() .. ".Texture"
             )
-
         elseif instance:IsA("Texture") then
             add(
                 instance.Texture,
                 74 + nameBonus,
                 instance:GetFullName() .. ".Texture"
             )
-
         elseif instance:IsA("MeshPart") then
             add(
                 instance.TextureID,
@@ -2953,7 +2127,6 @@ local function getInstanceAssetCandidates(frame)
                 30 + nameBonus,
                 instance:GetFullName() .. ".MeshId"
             )
-
         elseif instance:IsA("SpecialMesh") then
             add(
                 instance.TextureId,
@@ -2965,7 +2138,6 @@ local function getInstanceAssetCandidates(frame)
                 28 + nameBonus,
                 instance:GetFullName() .. ".MeshId"
             )
-
         elseif instance:IsA("SurfaceAppearance") then
             add(
                 instance.ColorMap,
@@ -2978,17 +2150,14 @@ local function getInstanceAssetCandidates(frame)
                 instance:GetFullName() .. ".NormalMap"
             )
         end
-
         for attributeName, attributeValue in pairs(instance:GetAttributes()) do
             local n = normalize(attributeName)
-
             if n:find("image", 1, true)
                 or n:find("icon", 1, true)
                 or n:find("asset", 1, true)
                 or n:find("texture", 1, true)
                 or n:find("decal", 1, true)
                 or n:find("thumbnail", 1, true) then
-
                 add(
                     attributeValue,
                     60 + assetNameScore(attributeName) + nameBonus,
@@ -2996,19 +2165,15 @@ local function getInstanceAssetCandidates(frame)
                 )
             end
         end
-
         if instance:IsA("StringValue")
             or instance:IsA("IntValue")
             or instance:IsA("NumberValue") then
-
             local n = normalize(instance.Name)
-
             if n:find("image", 1, true)
                 or n:find("icon", 1, true)
                 or n:find("asset", 1, true)
                 or n:find("texture", 1, true)
                 or n:find("decal", 1, true) then
-
                 add(
                     instance.Value,
                     56 + nameBonus,
@@ -3017,82 +2182,64 @@ local function getInstanceAssetCandidates(frame)
             end
         end
     end
-
     inspect(frame)
-
     for _, descendant in ipairs(frame:GetDescendants()) do
         inspect(descendant)
     end
-
     table.sort(candidates, function(a, b)
         if a.score == b.score then
             return tonumber(a.id) > tonumber(b.id)
         end
         return a.score > b.score
     end)
-
     return candidates
 end
-
 local function getCardIconAssetId(frame)
     if not frame then
         return nil
     end
-
     local function extractFromIconNode(iconNode)
         if not iconNode then
             return nil
         end
-
         if iconNode:IsA("ImageLabel")
             or iconNode:IsA("ImageButton") then
-
             local direct = numericAssetId(iconNode.Image)
             if direct then
                 return direct
             end
         end
-
         for _, descendant in ipairs(iconNode:GetDescendants()) do
             if descendant:IsA("ImageLabel")
                 or descendant:IsA("ImageButton") then
-
                 local id = numericAssetId(descendant.Image)
                 if id then
                     return id
                 end
             end
         end
-
         return nil
     end
-
     local container = frame:FindFirstChild("Container")
     local explicitIcon =
         container and container:FindFirstChild("Icon")
-
     local id = extractFromIconNode(explicitIcon)
     if id then
         return id
     end
-
     local namedIcon = frame:FindFirstChild("Icon", true)
     id = extractFromIconNode(namedIcon)
     if id then
         return id
     end
-
     local candidates = getInstanceAssetCandidates(frame)
     return candidates[1] and numericAssetId(candidates[1].id) or nil
 end
-
 local function collectGameImageIds(value, output, seen, depth)
     if depth > 3 then
         return
     end
-
     local valueType = type(value)
-
     if valueType == "string" or valueType == "number" then
         local id = normalizeAssetId(value)
         if id then
@@ -3100,25 +2247,20 @@ local function collectGameImageIds(value, output, seen, depth)
         end
         return
     end
-
     if valueType ~= "table" then
         return
     end
-
     if seen[value] then
         return
     end
     seen[value] = true
-
     for key, child in pairs(value) do
         local keyText = normalize(tostring(key))
-
         if type(child) == "string" or type(child) == "number" then
             if keyText:find("image", 1, true)
                 or keyText:find("icon", 1, true)
                 or keyText:find("decal", 1, true)
                 or keyText:find("texture", 1, true) then
-
                 local id = normalizeAssetId(child)
                 if id then
                     output[id] = true
@@ -3129,59 +2271,46 @@ local function collectGameImageIds(value, output, seen, depth)
         end
     end
 end
-
 local function getBestGameDataAssetId(gameData)
     if type(gameData) ~= "table" then
         return nil
     end
-
     local candidates = {}
     local byId = {}
-
     local function add(value, score)
         local id = normalizeAssetId(value)
         if not id then
             return
         end
-
         if byId[id] and byId[id] >= score then
             return
         end
-
         byId[id] = score
         table.insert(candidates, {
             id = id,
             score = score,
         })
     end
-
     local function walk(value, depth, seen, keyName)
         if depth > 5 then
             return
         end
-
         if typeof(value) == "Instance" then
             local instanceCandidates =
                 getInstanceAssetCandidates(value)
-
             for index, candidate in ipairs(instanceCandidates) do
                 add(
                     candidate.id,
                     math.max(25, 82 - (index - 1) * 4)
                 )
             end
-
             return
         end
-
         local valueType = type(value)
-
         if valueType == "string"
             or valueType == "number" then
-
             local key = normalize(keyName or "")
             local score = nil
-
             if key:find("icon", 1, true) then
                 score = 110
             elseif key:find("image", 1, true)
@@ -3195,122 +2324,96 @@ local function getBestGameDataAssetId(gameData)
             elseif key:find("mesh", 1, true) then
                 score = 22
             end
-
             if score then
                 add(value, score)
             end
             return
         end
-
         if valueType ~= "table"
             or seen[value] then
             return
         end
-
         seen[value] = true
-
         for key, child in pairs(value) do
             walk(child, depth + 1, seen, tostring(key))
         end
     end
-
     walk(gameData, 0, {}, "")
-
     table.sort(candidates, function(a, b)
         return a.score > b.score
     end)
-
     return candidates[1] and candidates[1].id or nil
 end
-
 local function addGameIndex(index, key, entry)
     if not key or key == "" then
         return
     end
-
     index[key] = index[key] or {}
     table.insert(index[key], entry)
 end
-
 local function rebuildGameResolverIndexes()
-
     table.clear(GameNameIndex)
     table.clear(GameCanonicalIndex)
     table.clear(GameIconIndex)
-
     State.GameResolverRawImageIndex =
         State.GameResolverRawImageIndex
         or {}
-
     table.clear(
         State.GameResolverRawImageIndex
     )
-
     local database = getGameDatabase()
     GameResolverDatabase = database
     GameResolverLastBuild = os.clock()
-
     if type(database) ~= "table" then
         return
     end
-
     local buckets = {
         {"Weapons", database.Weapons or database.weapons},
         {"Pets", database.Pets or database.pets},
     }
-
     for _, pair in ipairs(buckets) do
         local bucketName = pair[1]
         local bucket = pair[2]
-
         if type(bucket) == "table" then
             for internalId, gameData in pairs(bucket) do
                 if type(gameData) == "table" then
                     local displayName =
                         getGameDisplayName(gameData, tostring(internalId))
-
                     local entry = {
                         id = tostring(internalId),
                         data = gameData,
                         bucket = bucketName,
                         displayName = displayName,
                     }
-
                     addGameIndex(
                         GameNameIndex,
                         normalize(displayName),
                         entry
                     )
-
                     addGameIndex(
                         GameCanonicalIndex,
                         canonicalName(displayName),
                         entry
                     )
-
                     addGameIndex(
                         GameNameIndex,
                         normalize(tostring(internalId)),
                         entry
                     )
-
                     addGameIndex(
                         GameCanonicalIndex,
                         canonicalName(tostring(internalId)),
                         entry
                     )
-
                     local rawImage =
                         gameData.Image
                         or gameData.image
                         or gameData.Icon
                         or gameData.icon
-
                     local rawImageKey =
                         State.NormalizeGameImageKey(
                             rawImage
                         )
-
                     if rawImageKey then
                         addGameIndex(
                             State.GameResolverRawImageIndex,
@@ -3318,7 +2421,6 @@ local function rebuildGameResolverIndexes()
                             entry
                         )
                     end
-
                     local imageIds = {}
                     collectGameImageIds(
                         gameData,
@@ -3326,7 +2428,6 @@ local function rebuildGameResolverIndexes()
                         {},
                         0
                     )
-
                     for imageId in pairs(imageIds) do
                         addGameIndex(
                             GameIconIndex,
@@ -3339,18 +2440,13 @@ local function rebuildGameResolverIndexes()
         end
     end
 end
-
 local function ensureGameResolverIndexes()
     local database = getGameDatabase()
-
     if database ~= GameResolverDatabase
         or GameResolverLastBuild == 0 then
-
         rebuildGameResolverIndexes()
     end
 end
-
-
 State.QueueNativeDatabaseWarmup = function()
     for _, delaySeconds in ipairs({
         0,
@@ -3366,75 +2462,38 @@ State.QueueNativeDatabaseWarmup = function()
                     or type(
                         State.GameSyncDatabase
                     ) == "table" then
-
                     return
                 end
-
                 local database =
                     getGameDatabase()
-
                 if type(database)
                     == "table" then
-
                     table.clear(
                         ResolveCache
                     )
-
                     table.clear(
                         State.ResolveMetaCache
                     )
-
                     GameResolverDatabase =
                         nil
-
                     GameResolverLastBuild =
                         0
-
                     rebuildGameResolverIndexes()
-
-                    State.Debug.Record(
-                        "native_database_refresh",
-                        {
-                            source =
-                                State.GameDatabaseSource,
-                        }
-                    )
-
-
-                    
                     if State.Profile
                         and type(
                             State.Profile.QueueScan
                         ) == "function" then
-
                         State.Profile.QueueScan()
                     end
-
                     if State.Profile
                         and type(
                             State.Profile
                                 .QueueRemoteLeaderboardSweep
                         ) == "function" then
-
-                        State.Debug.Count(
-                            "nativeRemoteResweeps"
-                        )
-
-                        State.Debug.Record(
-                            "native_remote_resweep_queued",
-                            {
-                                source =
-                                    State.GameDatabaseSource,
-                                players =
-                                    #Players:GetPlayers(),
-                            }
-                        )
-
                         State.Profile
                             .QueueRemoteLeaderboardSweep()
                     elseif State.Profile
                         and State.Profile.remoteTotals then
-
                         State.Profile.remoteTotals
                             .pendingNativeResweep =
                             true
@@ -3444,17 +2503,13 @@ State.QueueNativeDatabaseWarmup = function()
         )
     end
 end
-
 local function gameBucketMatches(entry, itemType)
     local normalizedType = normalize(itemType or "")
-
     if normalizedType:find("pet", 1, true) then
         return entry.bucket == "Pets"
     end
-
     return entry.bucket == "Weapons"
 end
-
 local function findInternalGameItemId(
     displayName,
     itemType,
@@ -3463,22 +2518,17 @@ local function findInternalGameItemId(
     rawImageKey
 )
     ensureGameResolverIndexes()
-
     local wantedNormal = normalize(displayName or "")
     local wantedCanonical = canonicalName(displayName or "")
     local wantedIcon = normalizeAssetId(iconAssetId)
-
     local wantedRarity =
         normalize(rarityHint or "")
-
     local wantedRawImage =
         State.NormalizeGameImageKey(
             rawImageKey
         )
-
     local candidates = {}
     local seen = {}
-
     local function addCandidates(entries)
         for _, entry in ipairs(entries or {}) do
             if gameBucketMatches(entry, itemType) then
@@ -3490,7 +2540,6 @@ local function findInternalGameItemId(
             end
         end
     end
-
     if wantedRawImage then
         addCandidates(
             State.GameResolverRawImageIndex[
@@ -3498,39 +2547,31 @@ local function findInternalGameItemId(
             ]
         )
     end
-
     if wantedIcon then
         addCandidates(GameIconIndex[wantedIcon])
     end
-
     if wantedNormal ~= "" then
         addCandidates(GameNameIndex[wantedNormal])
     end
-
     if wantedCanonical ~= "" then
         addCandidates(GameCanonicalIndex[wantedCanonical])
     end
-
     if #candidates == 0 then
         return nil
     end
-
     local best = nil
     local bestScore = -math.huge
     local secondScore = -math.huge
-
     for _, entry in ipairs(candidates) do
         local score = 0
         local displayNormal = normalize(entry.displayName)
         local displayCanonical = canonicalName(entry.displayName)
         local idNormal = normalize(entry.id)
         local idCanonical = canonicalName(entry.id)
-
         if wantedRawImage
             and State.GameResolverRawImageIndex[
                 wantedRawImage
             ] then
-
             for _, imageEntry in ipairs(
                 State.GameResolverRawImageIndex[
                     wantedRawImage
@@ -3542,7 +2583,6 @@ local function findInternalGameItemId(
                 end
             end
         end
-
         if wantedIcon and GameIconIndex[wantedIcon] then
             for _, iconEntry in ipairs(GameIconIndex[wantedIcon]) do
                 if iconEntry == entry then
@@ -3551,7 +2591,6 @@ local function findInternalGameItemId(
                 end
             end
         end
-
         if wantedRarity ~= "" then
             local entryRarity =
                 normalize(
@@ -3562,18 +2601,15 @@ local function findInternalGameItemId(
                     )
                     or ""
                 )
-
             if entryRarity ~= "" then
                 if entryRarity
                     == wantedRarity then
-
                     score = score + 48
                 else
                     score = score - 24
                 end
             end
         end
-
         if wantedNormal ~= "" then
             if displayNormal == wantedNormal then
                 score = score + 100
@@ -3581,7 +2617,6 @@ local function findInternalGameItemId(
                 score = score + 95
             end
         end
-
         if wantedCanonical ~= "" then
             if displayCanonical == wantedCanonical then
                 score = score + 82
@@ -3589,7 +2624,6 @@ local function findInternalGameItemId(
                 score = score + 76
             end
         end
-
         if score > bestScore then
             secondScore = bestScore
             bestScore = score
@@ -3598,64 +2632,47 @@ local function findInternalGameItemId(
             secondScore = score
         end
     end
-
     local minimum =
         wantedRawImage and 150
         or wantedIcon and 120
         or 75
-
     if not best or bestScore < minimum then
         return nil
     end
-
     if secondScore > -math.huge
         and math.abs(bestScore - secondScore) <= 3 then
-
         return nil
     end
-
     return best.id
 end
-
 local function inferPreferredCategory(itemType, gameData)
     local normalizedType = normalize(itemType or "")
-
     if normalizedType:find("pet", 1, true) then
         return "pets"
     end
-
     if type(gameData) ~= "table" then
         return nil
     end
-
     if gameData.Chroma == true
         or normalize(gameData.Chroma) == "true"
         or normalize(gameData.Rarity) == "chroma" then
-
         return "chromas"
     end
-
     local rarity = normalize(gameData.Rarity or gameData.Tier or "")
-
     if CATEGORY_ALIAS[rarity] then
         return CATEGORY_ALIAS[rarity]
     end
-
     if rarity == "ancient" then
         return "ancients"
     elseif rarity == "classic" then
         return "vintages"
     end
-
     return nil
 end
-
 local function parseInternalItemIdHints(itemId)
     local raw = tostring(itemId or "")
     local upper = string.upper(raw)
-
     local kind = nil
-
     if upper:match("_G_%d%d%d%d$")
         or upper:match("_G$")
         or upper:find("_G_", 1, true) then
@@ -3665,16 +2682,13 @@ local function parseInternalItemIdHints(itemId)
         or upper:find("_K_", 1, true) then
         kind = "knife"
     end
-
     local year =
         tonumber(
             raw:match(
                 "_(%d%d%d%d)$"
             )
         )
-
     local compactTerminalYear = false
-
     if not year then
         local candidateYear =
             tonumber(
@@ -3682,39 +2696,29 @@ local function parseInternalItemIdHints(itemId)
                     "(%d%d%d%d)$"
                 )
             )
-
         if candidateYear
             and candidateYear >= 2015
             and candidateYear <= 2035 then
-
             year = candidateYear
             compactTerminalYear = true
-
-            State.Debug.Count(
-                "legacyTerminalYearIds"
-            )
         end
     end
-
     local base = raw
     base =
         base:gsub(
             "_[GgKk]_%d%d%d%d$",
             ""
         )
-
     base =
         base:gsub(
             "_[GgKk]$",
             ""
         )
-
     base =
         base:gsub(
             "_%d%d%d%d$",
             ""
         )
-
     if compactTerminalYear then
         base =
             base:gsub(
@@ -3722,21 +2726,17 @@ local function parseInternalItemIdHints(itemId)
                 ""
             )
     end
-
     base =
         base:gsub(
             "_",
             " "
         )
-
     base = trim(base)
-
     return base,
         kind,
         year,
         compactTerminalYear
 end
-
 local function inferWeaponKind(itemType, gameData)
     local candidates = {
         itemType,
@@ -3744,112 +2744,85 @@ local function inferWeaponKind(itemType, gameData)
         type(gameData) == "table" and gameData.WeaponType or nil,
         type(gameData) == "table" and gameData.Type or nil,
     }
-
     for _, candidate in ipairs(candidates) do
         local n = normalize(candidate or "")
-
         if n:find("knife", 1, true) then
             return "knife"
         elseif n:find("gun", 1, true) then
             return "gun"
         end
     end
-
     return nil
 end
-
 local function candidateScore(record, searchNames, preferredCategory, weaponKind, chromaExpected, expectedYear, expectedEvent)
     local score = 0
-
     local recordName = normalize(record.name)
     local recordCanonical = canonicalName(record.name)
     local recordCategory = normalizeCategory(record.category)
-
     for _, sourceName in ipairs(searchNames) do
         local n = normalize(sourceName)
         local c = canonicalName(sourceName)
-
         if n ~= "" then
             local aliasExact = false
             local aliasCanonical =
                 false
-
             local aliases =
                 record.data
                 and record.data.aliases
-
             if type(aliases)
                 == "string"
                 and normalize(aliases)
                     ~= "n/a" then
-
                 for alias in aliases:gmatch(
                     "([^,]+)"
                 ) do
                     alias = trim(alias)
-
                     if normalize(alias)
                         == n then
-
                         aliasExact = true
                         break
                     end
-
                     if c ~= ""
                         and canonicalName(
                             alias
                         ) == c then
-
                         aliasCanonical =
                             true
                     end
                 end
             end
-
             if aliasExact then
                 score =
                     math.max(
                         score,
                         150
                     )
-
-                State.Debug.Count(
-                    "supremeAliasExactHits"
-                )
-
             elseif recordName == n then
                 score = math.max(score, 130)
-
             elseif aliasCanonical then
                 score =
                     math.max(
                         score,
                         112
                     )
-
             elseif recordCanonical == c
                 and c ~= "" then
-
                 score = math.max(score, 95)
-
             elseif recordName:find(n, 1, true)
                 or n:find(
                     recordName,
                     1,
                     true
                 ) then
-
                 score = math.max(score, 72)
             end
         end
     end
-
     if preferredCategory and recordCategory == preferredCategory then
         score = score + 38
     elseif preferredCategory then
         score = score - 25
     end
-
     if chromaExpected == true then
         if recordCategory == "chromas" then
             score = score + 28
@@ -3859,52 +2832,40 @@ local function candidateScore(record, searchNames, preferredCategory, weaponKind
     elseif chromaExpected == false and recordCategory == "chromas" then
         score = score - 20
     end
-
     if weaponKind then
         local lowerName = normalize(record.name)
         local lowerOrigin = normalize(record.data.origin or "")
-
         if lowerName:find("(" .. weaponKind .. ")", 1, true)
             or lowerOrigin:find(weaponKind, 1, true) then
-
             score = score + 12
         elseif lowerName:find("(knife)", 1, true)
             or lowerName:find("(gun)", 1, true) then
-
             score = score - 8
         end
     end
-
     if expectedYear then
         local recordYear =
             tonumber(
                 record.data.year
             )
-
         if recordYear
             == expectedYear then
-
             score = score + 18
-
         elseif recordYear then
             score = score - 5
         end
     end
-
     if expectedEvent
         and expectedEvent ~= "" then
-
         local origin =
             normalize(
                 record.data.origin
                 or ""
             )
-
         local event =
             normalize(
                 expectedEvent
             )
-
         if origin ~= ""
             and event ~= ""
             and (
@@ -3919,15 +2880,11 @@ local function candidateScore(record, searchNames, preferredCategory, weaponKind
                     true
                 )
             ) then
-
             score = score + 8
         end
     end
-
     return score
 end
-
-
 State.AssessCandidateEvidence = function(
     record,
     directNames,
@@ -3956,26 +2913,21 @@ State.AssessCandidateEvidence = function(
         eventMatch = false,
         hardConflict = false,
     }
-
     if type(record) ~= "table" then
         evidence.hardConflict = true
         return evidence
     end
-
     local recordName =
         normalize(
             record.name
             or ""
         )
-
     local recordCanonical =
         canonicalName(
             record.name
             or ""
         )
-
     local aliases = {}
-
     if record.data
         and type(
             record.data.aliases
@@ -3983,12 +2935,10 @@ State.AssessCandidateEvidence = function(
         and normalize(
             record.data.aliases
         ) ~= "n/a" then
-
         for alias in record.data.aliases:gmatch(
             "([^,]+)"
         ) do
             alias = trim(alias)
-
             if alias ~= "" then
                 table.insert(
                     aliases,
@@ -3997,7 +2947,6 @@ State.AssessCandidateEvidence = function(
             end
         end
     end
-
     local function inspectNames(
         names,
         direct
@@ -4010,108 +2959,86 @@ State.AssessCandidateEvidence = function(
                 normalize(
                     candidateName
                 )
-
             local canonicalCandidate =
                 canonicalName(
                     candidateName
                 )
-
             local exactName =
                 normalizedCandidate ~= ""
                 and normalizedCandidate
                     == recordName
-
             local canonicalNameMatch =
                 canonicalCandidate ~= ""
                 and canonicalCandidate
                     == recordCanonical
-
             local exactAlias = false
             local canonicalAlias =
                 false
-
             for _, alias in ipairs(
                 aliases
             ) do
                 if normalize(alias)
                     == normalizedCandidate then
-
                     exactAlias = true
                     break
                 end
-
                 if canonicalCandidate ~= ""
                     and canonicalName(
                         alias
                     ) == canonicalCandidate then
-
                     canonicalAlias =
                         true
                 end
             end
-
             if direct then
                 if exactName
                     or exactAlias then
-
                     evidence.directExact =
                         true
                 end
-
                 if canonicalNameMatch
                     or canonicalAlias then
-
                     evidence.directCanonical =
                         true
                 end
             else
                 if exactName
                     or exactAlias then
-
                     evidence.syntheticExact =
                         true
                 end
-
                 if canonicalNameMatch
                     or canonicalAlias then
-
                     evidence.syntheticCanonical =
                         true
                 end
             end
-
             if exactName then
                 evidence.exactName =
                     true
             end
-
             if exactAlias then
                 evidence.exactAlias =
                     true
             end
         end
     end
-
     inspectNames(
         directNames,
         true
     )
-
     inspectNames(
         syntheticNames,
         false
     )
-
     local recordCategory =
         normalizeCategory(
             record.category
             or ""
         )
-
     if preferredCategory then
         if recordCategory
             == preferredCategory then
-
             evidence.categoryMatch =
                 true
         else
@@ -4119,59 +3046,48 @@ State.AssessCandidateEvidence = function(
                 true
         end
     end
-
     local recordYear =
         tonumber(
             record.data
             and record.data.year
         )
-
     if expectedYear then
         if recordYear
             == expectedYear then
-
             evidence.yearMatch =
                 true
-
         elseif recordYear then
             evidence.yearConflict =
                 true
         end
     end
-
     if chromaExpected == true then
         if recordCategory
             == "chromas" then
-
             evidence.chromaMatch =
                 true
         else
             evidence.chromaConflict =
                 true
         end
-
     elseif chromaExpected == false
         and recordCategory
             == "chromas" then
-
         evidence.chromaConflict =
             true
     end
-
     if weaponKind then
         local lowerName =
             normalize(
                 record.name
                 or ""
             )
-
         local lowerOrigin =
             normalize(
                 record.data
                 and record.data.origin
                 or ""
             )
-
         local explicitKnife =
             lowerName:find(
                 "(knife)",
@@ -4183,7 +3099,6 @@ State.AssessCandidateEvidence = function(
                 1,
                 true
             )
-
         local explicitGun =
             lowerName:find(
                 "(gun)",
@@ -4195,7 +3110,6 @@ State.AssessCandidateEvidence = function(
                 1,
                 true
             )
-
         if weaponKind == "knife" then
             if explicitKnife then
                 evidence.kindMatch =
@@ -4214,22 +3128,18 @@ State.AssessCandidateEvidence = function(
             end
         end
     end
-
     if expectedEvent
         and expectedEvent ~= "" then
-
         local origin =
             normalize(
                 record.data
                 and record.data.origin
                 or ""
             )
-
         local event =
             normalize(
                 expectedEvent
             )
-
         if origin ~= ""
             and event ~= ""
             and (
@@ -4244,18 +3154,15 @@ State.AssessCandidateEvidence = function(
                     true
                 )
             ) then
-
             evidence.eventMatch =
                 true
         end
     end
-
     evidence.hardConflict =
         evidence.yearConflict
         or evidence.categoryConflict
         or evidence.kindConflict
         or evidence.chromaConflict
-
     evidence.corrobatorCount =
         (
             evidence.yearMatch
@@ -4282,14 +3189,11 @@ State.AssessCandidateEvidence = function(
             and 1
             or 0
         )
-
     return evidence
 end
-
 local function gatherCandidatesByNames(searchNames)
     local seen = {}
     local candidates = {}
-
     local function add(record)
         local key = record.category .. "\0" .. record.name
         if not seen[key] then
@@ -4297,7 +3201,6 @@ local function gatherCandidatesByNames(searchNames)
             table.insert(candidates, record)
         end
     end
-
     for _, searchName in ipairs(searchNames) do
         local exact = IndexExact[normalize(searchName)]
         if exact then
@@ -4305,7 +3208,6 @@ local function gatherCandidatesByNames(searchNames)
                 add(record)
             end
         end
-
         local canonical = IndexCanonical[canonicalName(searchName)]
         if canonical then
             for _, record in ipairs(canonical) do
@@ -4313,7 +3215,6 @@ local function gatherCandidatesByNames(searchNames)
             end
         end
     end
-
     if #candidates == 0 then
         local wantedCanonical = {}
         for _, searchName in ipairs(searchNames) do
@@ -4322,25 +3223,20 @@ local function gatherCandidatesByNames(searchNames)
                 wantedCanonical[c] = true
             end
         end
-
         for _, record in ipairs(Catalog) do
             local rc = canonicalName(record.name)
-
             for wanted in pairs(wantedCanonical) do
                 if rc == wanted
                     or rc:find(wanted, 1, true)
                     or wanted:find(rc, 1, true) then
-
                     add(record)
                     break
                 end
             end
         end
     end
-
     return candidates
 end
-
 local function resolveGameItem(itemId, itemType, displayName)
     if not SupremeDatabase then
         return nil, "NO_DATABASE", {
@@ -4348,45 +3244,37 @@ local function resolveGameItem(itemId, itemType, displayName)
             reason = "NO_DATABASE",
         }
     end
-
     itemId = tostring(itemId or "")
     itemType = tostring(itemType or "")
-
     local gameData, gameBucket =
         getGameItemData(
             itemType,
             itemId
         )
-
     local gameDisplay =
         getGameDisplayName(
             gameData,
             displayName or itemId
         )
-
     local nativeEvidence =
         State.GetNativeIdentityEvidence(
             gameData,
             itemId
         )
-
     local manualItemKey =
         State.Mapping.MakeItemKey(
             itemType,
             itemId
         )
-
     local manualItemLink =
         State.Mapping.ItemLinks[
             manualItemKey
         ]
-
     if type(manualItemLink) == "table" then
         local manualRecord =
             State.Mapping.ResolveLinkRecord(
                 manualItemLink
             )
-
         if manualRecord then
             return manualRecord,
                 "MANUAL_ITEM_LINK",
@@ -4403,7 +3291,6 @@ local function resolveGameItem(itemId, itemType, displayName)
                 }
         end
     end
-
     local cacheKey =
         tostring(
             State.GameDatabaseSource
@@ -4436,16 +3323,13 @@ local function resolveGameItem(itemId, itemType, displayName)
         .. tostring(
             State.Mapping.Revision
         )
-
     if ResolveCache[cacheKey] ~= nil then
         local cached =
             ResolveCache[cacheKey]
-
         local meta =
             State.ResolveMetaCache[
                 cacheKey
             ]
-
         if cached == false then
             return nil,
                 meta
@@ -4453,18 +3337,15 @@ local function resolveGameItem(itemId, itemType, displayName)
                     or "UNRESOLVED",
                 meta
         end
-
         return cached,
             "RESOLVED",
             meta
     end
-
     local preferredCategory =
         inferPreferredCategory(
             itemType,
             gameData
         )
-
     local internalBase,
         internalKind,
         internalYear,
@@ -4472,109 +3353,78 @@ local function resolveGameItem(itemId, itemType, displayName)
         parseInternalItemIdHints(
             itemId
         )
-
     local weaponKind =
         inferWeaponKind(
             itemType,
             gameData
         )
         or internalKind
-
     local nativeYear =
         nativeEvidence.year
-
     local yearConflict =
         internalYear
         and nativeYear
         and internalYear
             ~= nativeYear
         or false
-
     local expectedYear = nil
-
     if not yearConflict then
         expectedYear =
             internalYear
             or nativeYear
     end
-
-    if nativeYear
-        and not internalYear
-        and not yearConflict then
-
-        State.Debug.Count(
-            "nativeMetadataYearsUsed"
-        )
-    end
-
     local expectedEvent =
         nativeEvidence.event
-
     local chromaExpected = nil
-
     if type(gameData) == "table" then
         if gameData.Chroma == true
             or normalize(
                 gameData.Rarity
             ) == "chroma" then
-
             chromaExpected = true
-
         elseif gameData.Chroma == false then
             chromaExpected = false
         end
     end
-
     local searchNames = {}
     local directSearchNames = {}
     local syntheticSearchNames = {}
-
     local function addUniqueName(
         target,
         value
     )
         if type(value) ~= "string"
             or trim(value) == "" then
-
             return false
         end
-
         local n =
             normalize(value)
-
         for _, existing in ipairs(
             target
         ) do
             if normalize(existing)
                 == n then
-
                 return false
             end
         end
-
         table.insert(
             target,
             value
         )
-
         return true
     end
-
     local function addSearchName(
         value,
         direct
     )
         if type(value) ~= "string"
             or trim(value) == "" then
-
             return
         end
-
         addUniqueName(
             searchNames,
             value
         )
-
         addUniqueName(
             direct
             and directSearchNames
@@ -4582,63 +3432,43 @@ local function resolveGameItem(itemId, itemType, displayName)
             value
         )
     end
-
     addSearchName(
         gameDisplay,
         true
     )
-
     addSearchName(
         displayName,
         true
     )
-
     addSearchName(
         itemId,
         true
     )
-
     for _, nativeName in ipairs(
         nativeEvidence.names
         or {}
     ) do
-        local before =
-            #searchNames
-
         local source =
             nativeEvidence.nameSources
             and nativeEvidence.nameSources[
                 nativeName
             ]
             or ""
-
         local direct =
             source ~= "camel/internal id"
             and source
                 ~= "reversed camel id"
-
         addSearchName(
             nativeName,
             direct
         )
-
-        if #searchNames
-            > before then
-
-            State.Debug.Count(
-                "nativeIdentityNamesUsed"
-            )
-        end
     end
-
     if internalBase
         and internalBase ~= "" then
-
         addSearchName(
             internalBase,
             false
         )
-
         if weaponKind then
             addSearchName(
                 internalBase
@@ -4653,7 +3483,6 @@ local function resolveGameItem(itemId, itemType, displayName)
             )
         end
     end
-
     if weaponKind and gameDisplay then
         addSearchName(
             gameDisplay
@@ -4667,11 +3496,9 @@ local function resolveGameItem(itemId, itemType, displayName)
             false
         )
     end
-
     if chromaExpected == true
         and type(gameDisplay)
             == "string" then
-
         if not normalize(
             gameDisplay
         ):find(
@@ -4679,13 +3506,11 @@ local function resolveGameItem(itemId, itemType, displayName)
             1,
             true
         ) then
-
             addSearchName(
                 "Chroma "
                 .. gameDisplay,
                 false
             )
-
             addSearchName(
                 "C. "
                 .. gameDisplay,
@@ -4693,22 +3518,16 @@ local function resolveGameItem(itemId, itemType, displayName)
             )
         end
     end
-
     local candidates =
         gatherCandidatesByNames(
             searchNames
         )
-
     local candidateCountBeforeYearNarrow =
         #candidates
-
     local yearNarrowed = false
-
     if expectedYear
         and #candidates > 1 then
-
         local exactYearCandidates = {}
-
         for _, record in ipairs(
             candidates
         ) do
@@ -4717,39 +3536,27 @@ local function resolveGameItem(itemId, itemType, displayName)
                     record.data
                     and record.data.year
                 )
-
             if recordYear
                 == expectedYear then
-
                 table.insert(
                     exactYearCandidates,
                     record
                 )
             end
         end
-
         if #exactYearCandidates > 0
             and #exactYearCandidates
                 < #candidates then
-
             candidates =
                 exactYearCandidates
-
             yearNarrowed = true
-
-            State.Debug.Count(
-                "yearNarrowedCandidates"
-            )
         end
     end
-
     local exactYearLabelNarrowed =
         false
-
     if compactTerminalYear
         and internalYear
         and #candidates > 1 then
-
         local wantedYearLabel =
             normalize(
                 tostring(
@@ -4762,9 +3569,7 @@ local function resolveGameItem(itemId, itemType, displayName)
                 )
                 .. ")"
             )
-
         local exactLabelCandidates = {}
-
         for _, record in ipairs(
             candidates
         ) do
@@ -4772,27 +3577,19 @@ local function resolveGameItem(itemId, itemType, displayName)
                 record.name
                 or ""
             ) == wantedYearLabel then
-
                 table.insert(
                     exactLabelCandidates,
                     record
                 )
             end
         end
-
         if #exactLabelCandidates == 1 then
             candidates =
                 exactLabelCandidates
-
             exactYearLabelNarrowed =
                 true
-
-            State.Debug.Count(
-                "exactYearLabelNarrowed"
-            )
         end
     end
-
     if #candidates == 0 then
         local meta = {
             trusted = false,
@@ -4820,19 +3617,14 @@ local function resolveGameItem(itemId, itemType, displayName)
             yearConflict =
                 yearConflict,
         }
-
         ResolveCache[cacheKey] =
             false
-
         State.ResolveMetaCache[
             cacheKey
         ] = meta
-
         return nil, "MISSING", meta
     end
-
     local scored = {}
-
     for _, record in ipairs(
         candidates
     ) do
@@ -4846,7 +3638,6 @@ local function resolveGameItem(itemId, itemType, displayName)
                 expectedYear,
                 expectedEvent
             )
-
         table.insert(
             scored,
             {
@@ -4855,7 +3646,6 @@ local function resolveGameItem(itemId, itemType, displayName)
             }
         )
     end
-
     table.sort(
         scored,
         function(a, b)
@@ -4865,30 +3655,23 @@ local function resolveGameItem(itemId, itemType, displayName)
                         a.record.data
                     )
                     or -1
-
                 local bv =
                     numericValue(
                         b.record.data
                     )
                     or -1
-
                 if av == bv then
                     return a.record.name
                         < b.record.name
                 end
-
                 return av > bv
             end
-
             return a.score > b.score
         end
     )
-
     local best = scored[1]
-
     if not best
         or best.score < 60 then
-
         local meta = {
             trusted = false,
             level = "weak",
@@ -4924,21 +3707,16 @@ local function resolveGameItem(itemId, itemType, displayName)
                     scored
                 ),
         }
-
         ResolveCache[cacheKey] =
             false
-
         State.ResolveMetaCache[
             cacheKey
         ] = meta
-
         return nil,
             "LOW_CONFIDENCE",
             meta
     end
-
     local second = scored[2]
-
     local margin =
         second
         and (
@@ -4946,7 +3724,6 @@ local function resolveGameItem(itemId, itemType, displayName)
             - second.score
         )
         or math.huge
-
     if second
         and math.abs(
             best.score
@@ -4958,7 +3735,6 @@ local function resolveGameItem(itemId, itemType, displayName)
             or best.record.category
                 ~= second.record.category
         ) then
-
         local meta = {
             trusted = false,
             level = "ambiguous",
@@ -4998,22 +3774,17 @@ local function resolveGameItem(itemId, itemType, displayName)
                     scored
                 ),
         }
-
         ResolveCache[cacheKey] =
             false
-
         State.ResolveMetaCache[
             cacheKey
         ] = meta
-
         return nil,
             "AMBIGUOUS",
             meta
     end
-
     local hasExactGameData =
         type(gameData) == "table"
-
     local bestEvidence =
         State.AssessCandidateEvidence(
             best.record,
@@ -5025,7 +3796,6 @@ local function resolveGameItem(itemId, itemType, displayName)
             expectedYear,
             expectedEvent
         )
-
     local secondEvidence =
         second
         and State.AssessCandidateEvidence(
@@ -5039,10 +3809,8 @@ local function resolveGameItem(itemId, itemType, displayName)
             expectedEvent
         )
         or nil
-
     local trusted = false
     local level = "weak"
-
     local structuredYearExact =
         internalYear ~= nil
         and #candidates == 1
@@ -5050,27 +3818,15 @@ local function resolveGameItem(itemId, itemType, displayName)
             best.record.data
             and best.record.data.year
         ) == internalYear
-
     local structuredTypedId =
         internalKind == "knife"
         or internalKind == "gun"
-
     local deterministicYearId =
         structuredYearExact
         and (
             structuredTypedId
             or compactTerminalYear
         )
-
-
-    
-
-    
-
-    
-
-    
-
     if CONFIG.ConservativeResolution then
         local directExactUnique =
             bestEvidence.directExact
@@ -5083,7 +3839,6 @@ local function resolveGameItem(itemId, itemType, displayName)
                         .directExact
                 )
             )
-
         local directCorroborated =
             (
                 bestEvidence.directExact
@@ -5116,7 +3871,6 @@ local function resolveGameItem(itemId, itemType, displayName)
                     )
                 )
             )
-
         local syntheticCorroborated =
             (
                 bestEvidence.syntheticExact
@@ -5135,98 +3889,59 @@ local function resolveGameItem(itemId, itemType, displayName)
                         .yearMatch
                 )
             )
-
         if deterministicYearId
             and #candidates == 1
             and not bestEvidence
                 .hardConflict then
-
             trusted = true
             level =
                 compactTerminalYear
                 and "legacy-year-id"
                 or "structured-id"
-
-            State.Debug.Count(
-                "structuredIdTrusted"
-            )
-
         elseif directExactUnique then
             trusted = true
             level = "exact-evidence"
-
-            State.Debug.Count(
-                "exactEvidenceTrusted"
-            )
-
         elseif directCorroborated
             or syntheticCorroborated then
-
             trusted = true
             level =
                 directCorroborated
                 and "corroborated-evidence"
                 or "synthetic-year-corroborated"
-
-            State.Debug.Count(
-                "corroboratedEvidenceTrusted"
-            )
-
-        elseif (
-            bestEvidence.syntheticExact
-            or bestEvidence
-                .syntheticCanonical
-        )
-            and not bestEvidence
-                .directExact then
-
-            State.Debug.Count(
-                "syntheticOnlyRejected"
-            )
         end
     else
-
         if hasExactGameData
             and best.score >= 120
             and (
                 not second
                 or margin >= 8
             ) then
-
             trusted = true
             level = "strong"
-
         elseif hasExactGameData
             and #candidates == 1
             and best.score >= 90 then
-
             trusted = true
             level = "strong-single"
-
         elseif hasExactGameData
             and best.score >= 105
             and (
                 not second
                 or margin >= 18
             ) then
-
             trusted = true
             level = "medium"
-
         elseif not hasExactGameData
             and best.score >= 145
             and (
                 not second
                 or margin >= 18
             ) then
-
             trusted = true
             level = "metadata"
-
         elseif not hasExactGameData
             and deterministicYearId
             and #candidates == 1 then
-
             trusted = true
             level =
                 compactTerminalYear
@@ -5234,7 +3949,6 @@ local function resolveGameItem(itemId, itemType, displayName)
                 or "structured-id"
         end
     end
-
     local meta = {
         trusted = trusted,
         level = level,
@@ -5311,42 +4025,28 @@ local function resolveGameItem(itemId, itemType, displayName)
         suggestedCategory =
             best.record.category,
     }
-
     if CONFIG.ConservativeResolution
         and not trusted then
-
         meta.reason =
             "INSUFFICIENT_EVIDENCE"
-
-        State.Debug.Count(
-            "conservativeRejects"
-        )
-
         ResolveCache[cacheKey] =
             false
-
         State.ResolveMetaCache[
             cacheKey
         ] = meta
-
         return nil,
             "INSUFFICIENT_EVIDENCE",
             meta
     end
-
     ResolveCache[cacheKey] =
         best.record
-
     State.ResolveMetaCache[
         cacheKey
     ] = meta
-
     return best.record,
         "RESOLVED",
         meta
 end
-
-
 local STABILITY_SCORE = {
     ["Overpaid For"] = 2.5,
     ["Improving"] = 2,
@@ -5357,42 +4057,33 @@ local STABILITY_SCORE = {
     ["Receding"] = -2,
     ["Untradable"] = -4,
 }
-
 local FLIP_SCORE = {
     ["Highly Flippable"] = 2,
     ["Flippable"] = 1,
     ["Rarely Flippable"] = -1,
 }
-
 local function weightedMetric(resolvedEntries, getter)
     local weightedSum = 0
     local coveredValue = 0
     local totalValue = 0
-
     for _, entry in ipairs(resolvedEntries) do
         local value = entry.unitValue
         local quantity = entry.quantity or 1
-
         if value and value > 0 then
             local weightedValue = value * quantity
             totalValue = totalValue + weightedValue
-
             local metric = getter(entry.record.data)
-
             if metric ~= nil then
                 weightedSum = weightedSum + metric * weightedValue
                 coveredValue = coveredValue + weightedValue
             end
         end
     end
-
     if coveredValue == 0 then
         return nil, 0
     end
-
     return weightedSum / coveredValue, totalValue > 0 and coveredValue / totalValue or 0
 end
-
 local function summarizeResolvedOffer(entries)
     local summary = {
         entries = {},
@@ -5400,26 +4091,20 @@ local function summarizeResolvedOffer(entries)
         totalValue = 0,
         slotCount = 0,
         unitCount = 0,
-
         unresolved = {},
         nonNumeric = {},
-
         stabilityShares = {},
     }
-
     for _, entry in ipairs(entries or {}) do
         local quantity = math.max(1, tonumber(entry.quantity) or 1)
         local record = entry.record
-
         summary.slotCount = summary.slotCount + 1
         summary.unitCount = summary.unitCount + quantity
-
         if not record then
             table.insert(summary.unresolved, tostring(entry.itemId or entry.name or "Unknown item"))
         else
             local item = record.data
             local unitValue = numericValue(item)
-
             local resolvedEntry = {
                 record = record,
                 itemId = entry.itemId,
@@ -5427,16 +4112,13 @@ local function summarizeResolvedOffer(entries)
                 quantity = quantity,
                 unitValue = unitValue,
             }
-
             table.insert(summary.entries, resolvedEntry)
-
             table.insert(summary.items, {
                 name = record.name,
                 category = record.category,
                 quantity = quantity,
                 value = item.value,
                 rawValue = unitValue,
-
                 demand = tonumberSafe(item.demand),
                 rarity = tonumberSafe(item.rarity),
                 stability = item.stability,
@@ -5445,7 +4127,6 @@ local function summarizeResolvedOffer(entries)
                     parsePercent(item.change_pct)
                     or parsePercent(item.change_in_value),
             })
-
             if not unitValue then
                 table.insert(
                     summary.nonNumeric,
@@ -5454,7 +4135,6 @@ local function summarizeResolvedOffer(entries)
             else
                 local weightedValue = unitValue * quantity
                 summary.totalValue = summary.totalValue + weightedValue
-
                 if item.stability then
                     summary.stabilityShares[item.stability] =
                         (summary.stabilityShares[item.stability] or 0) + weightedValue
@@ -5462,47 +4142,38 @@ local function summarizeResolvedOffer(entries)
             end
         end
     end
-
     if summary.totalValue > 0 then
         for key, value in pairs(summary.stabilityShares) do
             summary.stabilityShares[key] = value / summary.totalValue
         end
     end
-
     summary.demand, summary.demandCoverage =
         weightedMetric(summary.entries, function(item)
             return tonumberSafe(item.demand)
         end)
-
     summary.rarity, summary.rarityCoverage =
         weightedMetric(summary.entries, function(item)
             return tonumberSafe(item.rarity)
         end)
-
     summary.flip, summary.flipCoverage =
         weightedMetric(summary.entries, function(item)
             return item.flippability and FLIP_SCORE[item.flippability] or nil
         end)
-
     summary.stability, summary.stabilityCoverage =
         weightedMetric(summary.entries, function(item)
             return item.stability and STABILITY_SCORE[item.stability] or nil
         end)
-
     summary.trend, summary.trendCoverage =
         weightedMetric(summary.entries, function(item)
             return
                 parsePercent(item.change_pct)
                 or parsePercent(item.change_in_value)
         end)
-
     return summary
 end
-
 local function comparableCoverage(a, b)
     return (a or 0) >= 0.5 and (b or 0) >= 0.5
 end
-
 local function differenceVerdict(difference, slight, strong)
     if difference == nil then
         return "UNKNOWN"
@@ -5518,7 +4189,6 @@ local function differenceVerdict(difference, slight, strong)
         return "EVEN"
     end
 end
-
 local function scoreVerdict(score)
     if score >= 35 then
         return "HUGE WIN"
@@ -5533,77 +4203,58 @@ local function scoreVerdict(score)
     elseif score > -35 then
         return "LOSS"
     end
-
     return "BIG LOSS"
 end
-
 local function wording(amount, noticeable, substantial)
     amount = math.abs(amount)
-
     if amount >= substantial then
         return "substantially"
     elseif amount >= noticeable then
         return "noticeably"
     end
-
     return "slightly"
 end
-
 local function addNote(notes, text)
     if type(text) == "string" and text ~= "" then
         table.insert(notes, text)
     end
 end
-
 local function strongestComponent(components, wantPositive)
     local best = nil
-
     for _, component in ipairs(components) do
         local valid =
             wantPositive and component.score > 0
             or (not wantPositive and component.score < 0)
-
         if valid
             and (
                 not best
                 or math.abs(component.score) > math.abs(best.score)
             ) then
-
             best = component
         end
     end
-
     return best
 end
-
 local function unknownTradeResult(localSummary, otherSummary, notes)
     return {
         shouldTrade = false,
         evaluable = false,
-
         verdict = "UNKNOWN",
         score = 0,
-
         confidence = 0,
         confidenceLabel = "LOW",
-
         tradeType = "UNKNOWN",
-
         localOffer = localSummary,
         otherOffer = otherSummary,
-
         comparisons = {},
         scoreBreakdown = {},
         notes = notes or {},
     }
 end
-
 local function evaluateResolvedTrade(localEntries, otherEntries)
     local give = summarizeResolvedOffer(localEntries)
     local receive = summarizeResolvedOffer(otherEntries)
-
     local notes = {}
-
     if #give.unresolved > 0 then
         addNote(
             notes,
@@ -5612,7 +4263,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 .. " from your offer to Supreme Values."
         )
     end
-
     if #receive.unresolved > 0 then
         addNote(
             notes,
@@ -5621,7 +4271,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 .. " from the other offer to Supreme Values."
         )
     end
-
     if #give.nonNumeric > 0 then
         addNote(
             notes,
@@ -5630,7 +4279,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 .. "."
         )
     end
-
     if #receive.nonNumeric > 0 then
         addNote(
             notes,
@@ -5639,30 +4287,23 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 .. "."
         )
     end
-
     if #give.unresolved > 0
         or #receive.unresolved > 0
         or #give.nonNumeric > 0
         or #receive.nonNumeric > 0 then
-
         addNote(
             notes,
             "The helper will not guess around missing, Priceless, or relative-value items, so the recommendation is disabled."
         )
-
         return unknownTradeResult(give, receive, notes)
     end
-
     if give.slotCount == 0 and receive.slotCount == 0 then
         addNote(notes, "Both offers are empty.")
         return unknownTradeResult(give, receive, notes)
     end
-
     local weights = CONFIG.Weights
-
     local valueDifference = receive.totalValue - give.totalValue
     local valuePercent
-
     if give.totalValue > 0 then
         valuePercent = valueDifference / give.totalValue * 100
     elseif receive.totalValue > 0 then
@@ -5670,17 +4311,14 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
     else
         valuePercent = 0
     end
-
     local valueScore =
         clamp(
             valuePercent * weights.valuePerPercent,
             -weights.valueCap,
             weights.valueCap
         )
-
     local demandDifference = nil
     local demandScore = 0
-
     if comparableCoverage(give.demandCoverage, receive.demandCoverage) then
         demandDifference = receive.demand - give.demand
         demandScore =
@@ -5690,10 +4328,8 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 weights.demandCap
             )
     end
-
     local flipDifference = nil
     local flipScore = 0
-
     if comparableCoverage(give.flipCoverage, receive.flipCoverage) then
         flipDifference = receive.flip - give.flip
         flipScore =
@@ -5703,10 +4339,8 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 weights.flipCap
             )
     end
-
     local stabilityDifference = nil
     local stabilityScore = 0
-
     if comparableCoverage(give.stabilityCoverage, receive.stabilityCoverage) then
         stabilityDifference = receive.stability - give.stability
         stabilityScore =
@@ -5716,10 +4350,8 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 weights.stabilityCap
             )
     end
-
     local trendDifference = nil
     local trendScore = 0
-
     if comparableCoverage(give.trendCoverage, receive.trendCoverage) then
         trendDifference = receive.trend - give.trend
         trendScore =
@@ -5729,10 +4361,8 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 weights.trendCap
             )
     end
-
     local rarityDifference = nil
     local rarityScore = 0
-
     if comparableCoverage(give.rarityCoverage, receive.rarityCoverage) then
         rarityDifference = receive.rarity - give.rarity
         rarityScore =
@@ -5742,7 +4372,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 weights.rarityCap
             )
     end
-
     local itemCountDifference = give.slotCount - receive.slotCount
     local itemCountScore =
         clamp(
@@ -5750,12 +4379,10 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
             -weights.itemCountCap,
             weights.itemCountCap
         )
-
     local tradeType =
         itemCountDifference > 0 and "UPGRADE"
         or itemCountDifference < 0 and "DOWNGRADE"
         or "SIDEGRADE"
-
     local score =
         valueScore
         + demandScore
@@ -5764,38 +4391,30 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
         + trendScore
         + rarityScore
         + itemCountScore
-
     score = math.floor(score * 10 + 0.5) / 10
-
     local shouldTrade = score >= CONFIG.ShouldTradeScore
-
     local coverage =
         math.min(give.demandCoverage or 0, receive.demandCoverage or 0) * 0.25
         + math.min(give.flipCoverage or 0, receive.flipCoverage or 0) * 0.20
         + math.min(give.stabilityCoverage or 0, receive.stabilityCoverage or 0) * 0.20
         + math.min(give.trendCoverage or 0, receive.trendCoverage or 0) * 0.20
         + math.min(give.rarityCoverage or 0, receive.rarityCoverage or 0) * 0.15
-
     local risk =
         (receive.stabilityShares["Fluctuating"] or 0) * 0.5
         + (receive.stabilityShares["Receding"] or 0) * 0.75
         + (receive.stabilityShares["Underpaid For"] or 0) * 0.6
         + (receive.stabilityShares["Untradable"] or 0)
-
     local confidence =
         clamp(
             0.55 + coverage * 0.4 - risk * 0.2,
             0.25,
             0.98
         )
-
     confidence = math.floor(confidence * 100 + 0.5) / 100
-
     local confidenceLabel =
         confidence >= 0.85 and "HIGH"
         or confidence >= 0.65 and "MEDIUM"
         or "LOW"
-
     if valueDifference > 0 then
         addNote(
             notes,
@@ -5817,7 +4436,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
     else
         addNote(notes, "Both sides have the same total listed value.")
     end
-
     if demandDifference and math.abs(demandDifference) >= 0.35 then
         if demandDifference > 0 then
             addNote(
@@ -5835,7 +4453,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
             )
         end
     end
-
     if flipDifference and math.abs(flipDifference) >= 0.25 then
         if flipDifference > 0 then
             addNote(
@@ -5853,7 +4470,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
             )
         end
     end
-
     local untradable = receive.stabilityShares["Untradable"] or 0
     local receding = receive.stabilityShares["Receding"] or 0
     local underpaid = receive.stabilityShares["Underpaid For"] or 0
@@ -5862,7 +4478,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
         (receive.stabilityShares["Doing Well"] or 0)
         + (receive.stabilityShares["Improving"] or 0)
         + (receive.stabilityShares["Overpaid For"] or 0)
-
     if untradable > 0 then
         addNote(
             notes,
@@ -5900,7 +4515,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 or "The incoming offer has a weaker stability/market-condition profile."
         )
     end
-
     if trendDifference and math.abs(trendDifference) >= 1 then
         if trendDifference > 0 then
             addNote(
@@ -5922,7 +4536,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
             )
         end
     end
-
     if rarityDifference and math.abs(rarityDifference) >= 0.5 then
         addNote(
             notes,
@@ -5931,7 +4544,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 or "The incoming offer is less rare overall; rarity only has a small weight."
         )
     end
-
     if tradeType == "UPGRADE" then
         addNote(
             notes,
@@ -5951,7 +4563,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
                 .. ", so it receives a small downgrade penalty."
         )
     end
-
     local components = {
         {label = "listed value", score = valueScore},
         {label = "demand", score = demandScore},
@@ -5961,10 +4572,8 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
         {label = "rarity", score = rarityScore},
         {label = "item consolidation", score = itemCountScore},
     }
-
     local positive = strongestComponent(components, true)
     local negative = strongestComponent(components, false)
-
     if shouldTrade then
         if positive and negative then
             addNote(
@@ -6005,26 +4614,20 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
             addNote(notes, "Overall, I would pass on this trade.")
         end
     end
-
     return {
         shouldTrade = shouldTrade,
         evaluable = true,
-
         verdict = scoreVerdict(score),
         score = score,
-
         confidence = confidence,
         confidenceLabel = confidenceLabel,
-
         tradeType = tradeType,
-
         value = {
             giving = give.totalValue,
             receiving = receive.totalValue,
             difference = valueDifference,
             percentage = valuePercent,
         },
-
         comparisons = {
             value = differenceVerdict(valuePercent, 2, 8),
             demand = differenceVerdict(demandDifference, 0.35, 1),
@@ -6033,7 +4636,6 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
             trend = differenceVerdict(trendDifference, 1, 3),
             rarity = differenceVerdict(rarityDifference, 0.5, 1.5),
         },
-
         scoreBreakdown = {
             value = valueScore,
             demand = demandScore,
@@ -6043,75 +4645,56 @@ local function evaluateResolvedTrade(localEntries, otherEntries)
             rarity = rarityScore,
             itemCount = itemCountScore,
         },
-
         localOffer = give,
         otherOffer = receive,
-
         notes = notes,
     }
 end
-
 State.CurrentTrade = nil
 State.LastEvaluation = nil
 State.TradeHelperEnabled = CONFIG.TradeHelperDefault
-
 local function sideMatchesLocalPlayer(side)
     if type(side) ~= "table" then
         return false
     end
-
     local player = side.Player or side.player
-
     if player == LocalPlayer then
         return true
     end
-
     if typeof(player) == "Instance" and player:IsA("Player") then
         return player == LocalPlayer
     end
-
     if type(player) == "string" then
         return player == LocalPlayer.Name
     end
-
     if type(player) == "number" then
         return player == LocalPlayer.UserId
     end
-
     if type(player) == "table" then
         local id = player.UserId or player.userId
         local name = player.Name or player.name
-
         return id == LocalPlayer.UserId or name == LocalPlayer.Name
     end
-
     return false
 end
-
 local function getTradeSides(trade)
     if type(trade) ~= "table" then
         return nil, nil
     end
-
     local player1 = trade.Player1 or trade.player1
     local player2 = trade.Player2 or trade.player2
-
     if sideMatchesLocalPlayer(player1) then
         return player1, player2
     end
-
     if sideMatchesLocalPlayer(player2) then
         return player2, player1
     end
-
     return player1, player2
 end
-
 local function parseOfferEntry(rawEntry)
     if type(rawEntry) ~= "table" then
         return nil
     end
-
     local itemId =
         rawEntry[1]
         or rawEntry.ItemID
@@ -6120,7 +4703,6 @@ local function parseOfferEntry(rawEntry)
         or rawEntry.itemId
         or rawEntry.Item
         or rawEntry.item
-
     local quantity =
         rawEntry[2]
         or rawEntry.Quantity
@@ -6128,7 +4710,6 @@ local function parseOfferEntry(rawEntry)
         or rawEntry.Amount
         or rawEntry.amount
         or 1
-
     local itemType =
         rawEntry[3]
         or rawEntry.ItemType
@@ -6136,11 +4717,9 @@ local function parseOfferEntry(rawEntry)
         or rawEntry.Category
         or rawEntry.category
         or "Weapons"
-
     if itemId == nil then
         return nil
     end
-
     return {
         itemId = tostring(itemId),
         itemType = tostring(itemType),
@@ -6148,27 +4727,20 @@ local function parseOfferEntry(rawEntry)
         raw = rawEntry,
     }
 end
-
 local function resolveTradeOffer(side)
     local result = {}
-
     if type(side) ~= "table" then
         return result
     end
-
     local offer = side.Offer or side.offer
-
     if type(offer) ~= "table" then
         return result
     end
-
     for _, rawEntry in ipairs(offer) do
         local parsed = parseOfferEntry(rawEntry)
-
         if parsed then
             local gameData = getGameItemData(parsed.itemType, parsed.itemId)
             local displayName = getGameDisplayName(gameData, parsed.itemId)
-
             parsed.record =
                 select(
                     1,
@@ -6178,17 +4750,13 @@ local function resolveTradeOffer(side)
                         displayName
                     )
                 )
-
             table.insert(result, parsed)
         end
     end
-
     return result
 end
-
 local function cloneOfferEntries(entries)
     local copy = {}
-
     for _, entry in ipairs(entries or {}) do
         table.insert(copy, {
             itemId = entry.itemId,
@@ -6197,10 +4765,8 @@ local function cloneOfferEntries(entries)
             record = entry.record,
         })
     end
-
     return copy
 end
-
 local function normalizeTradeItemType(itemType)
     local n = normalize(itemType or "")
     if n:find("pet", 1, true) then
@@ -6208,28 +4774,22 @@ local function normalizeTradeItemType(itemType)
     end
     return "weapons"
 end
-
 local function offerKey(itemId, itemType)
     return normalizeTradeItemType(itemType) .. "\0" .. tostring(itemId)
 end
-
 local function findOfferEntry(entries, itemId, itemType)
     local wanted = offerKey(itemId, itemType)
-
     for index, entry in ipairs(entries) do
         if offerKey(entry.itemId, entry.itemType) == wanted then
             return entry, index
         end
     end
-
     return nil
 end
-
 local ExistingRoot = PlayerGui:FindFirstChild("SV_PC_PublicHelper")
 if ExistingRoot then
     ExistingRoot:Destroy()
 end
-
 UI.RootGui = create("ScreenGui", {
     Name = "SV_PC_PublicHelper",
     ResetOnSpawn = false,
@@ -6237,7 +4797,6 @@ UI.RootGui = create("ScreenGui", {
     DisplayOrder = 999,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, PlayerGui)
-
 UI.DetailsBackdrop = create("TextButton", {
     Name = "SV_DetailsBackdrop",
     Size = UDim2.fromScale(1, 1),
@@ -6249,7 +4808,6 @@ UI.DetailsBackdrop = create("TextButton", {
     Visible = false,
     ZIndex = 2000,
 }, UI.RootGui)
-
 UI.Details = create("Frame", {
     Name = "SV_DetailsPopup",
     AnchorPoint = Vector2.new(0.5, 0.5),
@@ -6260,10 +4818,8 @@ UI.Details = create("Frame", {
     Visible = false,
     ZIndex = 2001,
 }, UI.RootGui)
-
 addCorner(UI.Details, 14)
 addStroke(UI.Details, THEME.border, 1, 0.1)
-
 UI.DetailsTitle = makeLabel(
     UI.Details,
     "Item",
@@ -6274,7 +4830,6 @@ UI.DetailsTitle = makeLabel(
 UI.DetailsTitle.Position = UDim2.fromOffset(18, 15)
 UI.DetailsTitle.Size = UDim2.new(1, -72, 0, 28)
 UI.DetailsTitle.ZIndex = 2002
-
 UI.DetailsSubtitle = makeLabel(
     UI.Details,
     "",
@@ -6285,7 +4840,6 @@ UI.DetailsSubtitle = makeLabel(
 UI.DetailsSubtitle.Position = UDim2.fromOffset(18, 43)
 UI.DetailsSubtitle.Size = UDim2.new(1, -72, 0, 20)
 UI.DetailsSubtitle.ZIndex = 2002
-
 UI.DetailsClose = makeButton(
     UI.Details,
     "X",
@@ -6300,7 +4854,6 @@ setButtonHover(
     Color3.fromRGB(55, 34, 40),
     Color3.fromRGB(78, 42, 50)
 )
-
 UI.DetailsAction = makeButton(
     UI.Details,
     "Identify / Update Listing",
@@ -6310,7 +4863,6 @@ UI.DetailsAction = makeButton(
 UI.DetailsAction.Position = UDim2.new(0, 14, 1, -52)
 UI.DetailsAction.ZIndex = 2003
 UI.DetailsAction.Visible = false
-
 UI.DetailsScroll = create("ScrollingFrame", {
     Position = UDim2.fromOffset(14, 75),
     Size = UDim2.new(1, -28, 1, -139),
@@ -6322,7 +4874,6 @@ UI.DetailsScroll = create("ScrollingFrame", {
     ScrollBarImageColor3 = THEME.border,
     ZIndex = 2002,
 }, UI.Details)
-
 UI.DetailsContent = create("Frame", {
     Size = UDim2.new(1, -5, 0, 0),
     AutomaticSize = Enum.AutomaticSize.Y,
@@ -6330,12 +4881,10 @@ UI.DetailsContent = create("Frame", {
     BorderSizePixel = 0,
     ZIndex = 2002,
 }, UI.DetailsScroll)
-
 UI.DetailsList = create("UIListLayout", {
     SortOrder = Enum.SortOrder.LayoutOrder,
     Padding = UDim.new(0, 8),
 }, UI.DetailsContent)
-
 local function clearDetailsRows()
     for _, child in ipairs(UI.DetailsContent:GetChildren()) do
         if not child:IsA("UIListLayout") then
@@ -6343,7 +4892,6 @@ local function clearDetailsRows()
         end
     end
 end
-
 local function addDetailRow(labelText, valueText, valueColor)
     local row = create("Frame", {
         Size = UDim2.new(1, 0, 0, 42),
@@ -6351,9 +4899,7 @@ local function addDetailRow(labelText, valueText, valueColor)
         BorderSizePixel = 0,
         ZIndex = 2002,
     }, UI.DetailsContent)
-
     addCorner(row, 8)
-
     local left = makeLabel(
         row,
         labelText,
@@ -6364,7 +4910,6 @@ local function addDetailRow(labelText, valueText, valueColor)
     left.Position = UDim2.fromOffset(11, 4)
     left.Size = UDim2.new(1, -22, 0, 15)
     left.ZIndex = 2003
-
     local right = makeLabel(
         row,
         valueText,
@@ -6376,43 +4921,33 @@ local function addDetailRow(labelText, valueText, valueColor)
     right.Size = UDim2.new(1, -22, 0, 18)
     right.TextWrapped = true
     right.ZIndex = 2003
-
     return row
 end
-
 local function closeDetails()
     UI.Details.Visible = false
     UI.DetailsBackdrop.Visible = false
 end
-
 connect(UI.DetailsClose.MouseButton1Click, closeDetails)
 connect(UI.DetailsBackdrop.MouseButton1Click, closeDetails)
-
 local function showItemDetails(
     record,
     context
 )
     clearDetailsRows()
-
     context =
         context
         or {}
-
     if record
         and type(record.data)
             == "table" then
-
         local item =
             record.data
-
         UI.DetailsTitle.Text =
             record.name
-
         UI.DetailsSubtitle.Text =
             tostring(
                 record.category
             )
-
         addDetailRow(
             "VALUE",
             tostring(
@@ -6420,7 +4955,6 @@ local function showItemDetails(
                 or "N/A"
             )
         )
-
         addDetailRow(
             "DEMAND",
             item.demand
@@ -6432,7 +4966,6 @@ local function showItemDetails(
                 )
                 or "N/A"
         )
-
         addDetailRow(
             "RARITY",
             item.rarity
@@ -6444,7 +4977,6 @@ local function showItemDetails(
                 )
                 or "N/A"
         )
-
         addDetailRow(
             "STABILITY",
             tostring(
@@ -6452,7 +4984,6 @@ local function showItemDetails(
                 or "N/A"
             )
         )
-
         addDetailRow(
             "FLIPPABILITY",
             tostring(
@@ -6460,7 +4991,6 @@ local function showItemDetails(
                 or "N/A"
             )
         )
-
         local trend =
             parsePercent(
                 item.change_pct
@@ -6468,7 +4998,6 @@ local function showItemDetails(
             or parsePercent(
                 item.change_in_value
             )
-
         local trendColor =
             trend
             and trend > 0
@@ -6477,7 +5006,6 @@ local function showItemDetails(
             and trend < 0
             and THEME.red
             or THEME.muted
-
         addDetailRow(
             "RECENT CHANGE",
             item.change_in_value
@@ -6485,7 +5013,6 @@ local function showItemDetails(
                 or "No recent change listed",
             trendColor
         )
-
         addDetailRow(
             "TIER",
             tostring(
@@ -6493,7 +5020,6 @@ local function showItemDetails(
                 or "N/A"
             )
         )
-
         addDetailRow(
             "ORIGIN",
             tostring(
@@ -6501,7 +5027,6 @@ local function showItemDetails(
                 or "N/A"
             )
         )
-
         addDetailRow(
             "EVENT",
             tostring(
@@ -6509,7 +5034,6 @@ local function showItemDetails(
                 or "N/A"
             )
         )
-
         addDetailRow(
             "YEAR",
             tostring(
@@ -6517,7 +5041,6 @@ local function showItemDetails(
                 or "N/A"
             )
         )
-
         addDetailRow(
             "ALIASES",
             tostring(
@@ -6532,22 +5055,18 @@ local function showItemDetails(
                 or context.itemId
                 or "Unknown Item"
             )
-
         UI.DetailsSubtitle.Text =
             "No verified Supreme match"
-
         addDetailRow(
             "VALUE",
             "Unknown",
             THEME.yellow
         )
-
         addDetailRow(
             "STATUS",
             "This item is not confidently mapped yet.",
             THEME.yellow
         )
-
         if context.gameRarity then
             addDetailRow(
                 "GAME RARITY",
@@ -6558,140 +5077,104 @@ local function showItemDetails(
             )
         end
     end
-
     UI.DetailsAction.Visible =
         false
-
     State.ActiveDetailsContext =
         context
-
     UI.DetailsScroll.CanvasPosition =
         Vector2.new(
             0,
             0
         )
-
     UI.DetailsBackdrop.Visible =
         true
-
     UI.Details.Visible =
         true
 end
-
 State.DecoratedCards = setmetatable({}, {__mode = "k"})
-
 local function looksLikeItemCard(frame)
     if not frame or not frame:IsA("GuiObject") then
         return false
     end
-
     if frame.Name:sub(1, 3) == "SV_" then
         return false
     end
-
     local container = frame:FindFirstChild("Container")
     if not container then
         return false
     end
-
     local icon = container:FindFirstChild("Icon")
     if not icon then
         return false
     end
-
     local itemName = frame:FindFirstChild("ItemName")
-
     return itemName ~= nil or frame.Name:match("^NewItem%d+$") ~= nil
 end
-
 local function inferCardItemType(frame)
     if hasAncestorNamed(frame, "Pets") then
         return "Pets"
     end
-
     if hasAncestorNamed(frame, "Weapons") then
         return "Weapons"
     end
-
     return nil
 end
-
 local function inferCardItemId(frame, forcedId)
     if forcedId then
         return tostring(forcedId)
     end
-
     local attributes = {
         "ItemID",
         "ItemId",
         "ID",
         "Item",
     }
-
     for _, attribute in ipairs(attributes) do
         local value = frame:GetAttribute(attribute)
         if value ~= nil and tostring(value) ~= "" then
             return tostring(value)
         end
     end
-
     local display = getTextFromItemName(frame)
-
     if frame.Name ~= "Item"
         and not frame.Name:match("^NewItem%d+$")
         and frame.Name ~= "NewItem" then
-
         return frame.Name
     end
-
     return display
 end
-
 local function getLooseCardDisplayName(frame)
     local normal = getTextFromItemName(frame)
-
     if normal and trim(normal) ~= "" then
         return normal
     end
-
     local bestText = nil
     local bestScore = -math.huge
-
     for _, descendant in ipairs(frame:GetDescendants()) do
         if descendant:IsA("TextLabel")
             or descendant:IsA("TextButton") then
-
             local candidate = trim(descendant.Text)
-
             if candidate ~= ""
                 and candidate ~= "i"
                 and candidate ~= "?"
                 and not candidate:match("^x?%d+$") then
-
                 local score = 0
                 local n = normalize(descendant.Name)
-
                 if n:find("item", 1, true) then
                     score = score + 50
                 end
-
                 if n:find("name", 1, true)
                     or n == "label" then
-
                     score = score + 35
                 end
-
                 if candidate == "Weapons"
                     or candidate == "Pets"
                     or candidate == "Search"
                     or candidate == "Accept"
                     or candidate == "Decline" then
-
                     score = score - 100
                 end
-
                 score = score - math.max(0, #candidate - 24)
-
                 if score > bestScore then
                     bestScore = score
                     bestText = candidate
@@ -6699,45 +5182,34 @@ local function getLooseCardDisplayName(frame)
             end
         end
     end
-
     if bestText then
         return bestText
     end
-
     if frame.Name ~= "Item"
         and frame.Name ~= "NewItem"
         and not frame.Name:match("^NewItem%d+$")
         and frame.Name:sub(1, 3) ~= "SV_" then
-
         return frame.Name
     end
-
     return nil
 end
-
 local function looksLikeTradeInventoryCardLoose(frame)
     if not frame
         or not frame:IsA("GuiObject")
         or frame.Name:sub(1, 3) == "SV_" then
-
         return false
     end
-
     if looksLikeItemCard(frame) then
         return true
     end
-
     local iconId = getCardIconAssetId(frame)
     if not iconId then
         return false
     end
-
     local displayName = getLooseCardDisplayName(frame)
-
     return displayName ~= nil
         and trim(displayName) ~= ""
 end
-
 local function tradeCardIsInsideOffers(frame)
     return (
         State.TradeOffer1
@@ -6747,11 +5219,9 @@ local function tradeCardIsInsideOffers(frame)
         and frame:IsDescendantOf(State.TradeOffer2)
     )
 end
-
 local function classifyTradeCard(frame, preferredType)
     local displayName = getLooseCardDisplayName(frame)
     local iconAssetId = getCardIconAssetId(frame)
-
     if preferredType then
         local id =
             findInternalGameItemId(
@@ -6759,46 +5229,37 @@ local function classifyTradeCard(frame, preferredType)
                 preferredType,
                 iconAssetId
             )
-
         if id then
             return preferredType, id, displayName, iconAssetId
         end
     end
-
     local weaponId =
         findInternalGameItemId(
             displayName or "",
             "Weapons",
             iconAssetId
         )
-
     local petId =
         findInternalGameItemId(
             displayName or "",
             "Pets",
             iconAssetId
         )
-
     if weaponId and not petId then
         return "Weapons", weaponId, displayName, iconAssetId
     end
-
     if petId and not weaponId then
         return "Pets", petId, displayName, iconAssetId
     end
-
     if preferredType then
         return preferredType, nil, displayName, iconAssetId
     end
-
     return nil, nil, displayName, iconAssetId
 end
-
 local function removeCardDecoration(frame)
     if not frame then
         return
     end
-
     for _, name in ipairs({
         "SV_ValueBadge",
         "SV_InfoButton",
@@ -6810,35 +5271,27 @@ local function removeCardDecoration(frame)
             child:Destroy()
         end
     end
-
     State.DecoratedCards[frame] = nil
     State.UnresolvedCards[frame] = nil
 end
-
 local function formatBadgeValue(record)
     local itemValue = numericValue(record.data)
-
     if itemValue then
         return formatCompact(itemValue), THEME.text, false
     end
-
     local rawText = tostring(record.data.value or "?")
-
     rawText = rawText:gsub("^x(%d+)%s+", "%1x ")
     rawText = rawText:gsub("Legendaries$", "Leg.")
     rawText = rawText:gsub("Uncommons$", "Unc.")
     rawText = rawText:gsub("Commons$", "Com.")
     rawText = rawText:gsub("Rares$", "Rare")
-
     return rawText, THEME.yellow, true
 end
-
 local function addUnknownValueBadge(frame, compactMode)
     local existing = frame:FindFirstChild("SV_ValueBadge")
     if existing then
         existing:Destroy()
     end
-
     local badge = create("TextLabel", {
         Name = "SV_ValueBadge",
         AnchorPoint = Vector2.new(0.5, 0),
@@ -6846,65 +5299,50 @@ local function addUnknownValueBadge(frame, compactMode)
         Size = compactMode
             and UDim2.new(0.76, 0, 0, 19)
             or UDim2.new(0.84, 0, 0, 22),
-
         BackgroundColor3 = Color3.fromRGB(36, 18, 21),
         BackgroundTransparency = 0.02,
         BorderSizePixel = 0,
-
         Text = "?",
         TextColor3 = THEME.red,
         TextSize = compactMode and 14 or 16,
         Font = Enum.Font.ArialBold,
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
-
         ZIndex = 95,
         Active = false,
     }, frame)
-
     addCorner(badge, 6)
     addStroke(badge, THEME.red, 1, 0.08)
 end
-
 local function addValueBadge(frame, record, compactMode)
     local existing = frame:FindFirstChild("SV_ValueBadge")
     if existing then
         existing:Destroy()
     end
-
     local text, textColor, longText = formatBadgeValue(record)
-
     local badge = create("TextLabel", {
         Name = "SV_ValueBadge",
-
         AnchorPoint = Vector2.new(0.5, 0),
         Position = UDim2.new(0.5, 0, 0, 4),
-
         Size = compactMode
             and UDim2.new(0.76, 0, 0, 19)
             or UDim2.new(0.84, 0, 0, 22),
-
         BackgroundColor3 = Color3.fromRGB(10, 12, 16),
         BackgroundTransparency = 0.03,
         BorderSizePixel = 0,
-
         Text = text,
         TextColor3 = textColor,
-
         TextSize = longText
             and (compactMode and 10 or 11)
             or (compactMode and 13 or 15),
         TextScaled = false,
         TextWrapped = false,
-
         Font = Enum.Font.ArialBold,
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
-
         ZIndex = 95,
         Active = false,
     }, frame)
-
     addCorner(badge, 6)
     addStroke(
         badge,
@@ -6914,33 +5352,26 @@ local function addValueBadge(frame, record, compactMode)
         1,
         0.12
     )
-
     badge:SetAttribute("SV_RecordName", record.name)
     badge:SetAttribute("SV_Category", record.category)
 end
-
 local function addInfoButton(frame, record, compactMode, context)
     if not CONFIG.StatsButtons then
         return
     end
-
     local existing = frame:FindFirstChild("SV_InfoButton")
     if existing then
         existing:Destroy()
     end
-
     local resolved = record ~= nil
     local buttonColor =
         resolved
         and Color3.fromRGB(19, 23, 30)
         or Color3.fromRGB(105, 35, 43)
-
     local accent =
         resolved and THEME.blue or THEME.red
-
     local button = create("TextButton", {
         Name = "SV_InfoButton",
-
         AnchorPoint = Vector2.new(0.5, 0),
         Position = UDim2.new(
             0.5,
@@ -6951,37 +5382,28 @@ local function addInfoButton(frame, record, compactMode, context)
         Size = compactMode
             and UDim2.fromOffset(17, 17)
             or UDim2.fromOffset(19, 19),
-
         BackgroundColor3 = buttonColor,
         BackgroundTransparency = 0.02,
         BorderSizePixel = 0,
-
         Text = resolved and "i" or "?",
         TextColor3 = accent,
         TextSize = compactMode and 10 or 11,
         Font = Enum.Font.GothamBold,
         AutoButtonColor = false,
-
         ZIndex = 100,
     }, frame)
-
     addCorner(button, 99)
     addStroke(button, accent, resolved and 1 or 2, 0.12)
-
     connect(button.MouseButton1Click, function()
         showItemDetails(record, context)
     end)
 end
-
 local function decorateCard(frame, options)
     options = options or {}
-
     if not frame
         or not frame.Parent then
-
         return nil
     end
-
     if not looksLikeItemCard(frame)
         and not (
             options.allowLooseCard
@@ -6989,56 +5411,35 @@ local function decorateCard(frame, options)
                 frame
             )
         ) then
-
         return nil
     end
-
     local itemType =
         options.itemType
         or inferCardItemType(frame)
-
     if not itemType then
         removeCardDecoration(frame)
         return nil
     end
-
     local itemId =
         inferCardItemId(
             frame,
             options.itemId
         )
-
     local displayName =
         options.displayName
         or getTextFromItemName(frame)
-
     local iconAssetId =
         getCardIconAssetId(frame)
-
     local rarityHint =
         options.rarityHint
         or State.GetCardRarityHint(
             frame
         )
-
     local rawImageKey =
         options.rawImageKey
         or State.GetCardRawImageKey(
             frame
         )
-
-    if rarityHint then
-        State.Debug.Count(
-            "gameRarityHintsSeen"
-        )
-    end
-
-    if rawImageKey then
-        State.Debug.Count(
-            "gameRawImageHintsSeen"
-        )
-    end
-
     local directGameData =
         itemId
         and select(
@@ -7049,34 +5450,27 @@ local function decorateCard(frame, options)
             )
         )
         or nil
-
     local identitySource = nil
-
     if directGameData then
         identitySource =
             "Exact DataID -> Sync"
     end
-
     if not iconAssetId
         and directGameData then
-
         iconAssetId =
             getBestGameDataAssetId(
                 directGameData
             )
     end
-
     if not rarityHint
         and type(directGameData)
             == "table"
         and directGameData.Rarity then
-
         rarityHint =
             tostring(
                 directGameData.Rarity
             )
     end
-
     if displayName
         and (
             not itemId
@@ -7087,7 +5481,6 @@ local function decorateCard(frame, options)
                 "^NewItem%d+$"
             )
         ) then
-
         local discoveredId =
             findInternalGameItemId(
                 displayName,
@@ -7096,10 +5489,8 @@ local function decorateCard(frame, options)
                 rarityHint,
                 rawImageKey
             )
-
         if discoveredId then
             itemId = discoveredId
-
             directGameData =
                 select(
                     1,
@@ -7109,26 +5500,21 @@ local function decorateCard(frame, options)
                     )
                 )
                 or directGameData
-
             identitySource =
                 "GUI image/rarity -> Sync"
         end
-
         if itemId then
             if not iconAssetId
                 and directGameData then
-
                 iconAssetId =
                     getBestGameDataAssetId(
                         directGameData
                     )
             end
-
             if not rarityHint
                 and type(directGameData)
                     == "table"
                 and directGameData.Rarity then
-
                 rarityHint =
                     tostring(
                         directGameData.Rarity
@@ -7136,19 +5522,14 @@ local function decorateCard(frame, options)
             end
         end
     end
-
     if not itemId
         and not displayName then
-
         return nil
     end
-
     local record =
         options.record
-
     local resolutionMeta = nil
     local manualImageLink = nil
-
     if record then
         resolutionMeta = {
             trusted = true,
@@ -7156,13 +5537,9 @@ local function decorateCard(frame, options)
             source = "provided_record",
         }
     end
-
-
-    
     if not record
         and CONFIG.PreferNativeIdentity
         and directGameData then
-
         local nativeRecord,
             _,
             nativeMeta =
@@ -7171,35 +5548,26 @@ local function decorateCard(frame, options)
                 itemType,
                 displayName
             )
-
         if nativeRecord then
             record = nativeRecord
             resolutionMeta =
                 nativeMeta
-
-            State.Debug.Count(
-                "nativeFirstResolutions"
-            )
         end
     end
-
     if not record
         and CONFIG.LinkedImagesFallback
         and iconAssetId then
-
         manualImageLink =
             LinkedImages[
                 numericAssetId(
                     iconAssetId
                 )
             ]
-
         if manualImageLink then
             record =
                 State.Mapping.ResolveLinkRecord(
                     manualImageLink
                 )
-
             if record then
                 resolutionMeta = {
                     trusted = true,
@@ -7208,18 +5576,12 @@ local function decorateCard(frame, options)
                     source =
                         "linked_images.json",
                 }
-
                 identitySource =
                     identitySource
                     or "Manual image fallback"
-
-                State.Debug.Count(
-                    "manualFallbackResolutions"
-                )
             end
         end
     end
-
     if not record then
         local fallbackRecord,
             _,
@@ -7229,29 +5591,20 @@ local function decorateCard(frame, options)
                 itemType,
                 displayName
             )
-
         record = fallbackRecord
         resolutionMeta =
             fallbackMeta
             or resolutionMeta
     end
-
     local suggestedRecord = nil
-
     if record
         and options.requireTrustedResolution
         and resolutionMeta
         and resolutionMeta.trusted
             == false then
-
         suggestedRecord = record
         record = nil
-
-        State.Debug.Count(
-            "weakProfileMatchesRejected"
-        )
     end
-
     local context = {
         frame = frame,
         assetId = iconAssetId,
@@ -7262,7 +5615,6 @@ local function decorateCard(frame, options)
         rawImageKey = rawImageKey,
         gameDatabaseSource =
             State.GameDatabaseSource,
-
         identitySource =
             identitySource
             or (
@@ -7270,13 +5622,10 @@ local function decorateCard(frame, options)
                 and resolutionMeta.source
             )
             or "Supreme name fallback",
-
         resolutionMeta =
             resolutionMeta,
-
         suggestedRecord =
             suggestedRecord,
-
         capturedItem =
             captured
             and {
@@ -7300,27 +5649,21 @@ local function decorateCard(frame, options)
             }
             or nil,
     }
-
     if not record then
         removeCardDecoration(frame)
-
         State.UnresolvedCards[
             frame
         ] = context
-
         if options.showValue
             ~= false then
-
             addUnknownValueBadge(
                 frame,
                 options.compactMode
                     == true
             )
         end
-
         if options.showInfo
             ~= false then
-
             addInfoButton(
                 frame,
                 nil,
@@ -7329,31 +5672,25 @@ local function decorateCard(frame, options)
                 context
             )
         end
-
         return nil, context
     end
-
     State.UnresolvedCards[
         frame
     ] = nil
-
     local previous =
         State.DecoratedCards[
             frame
         ]
-
     local hasRequiredValue =
         options.showValue == false
         or frame:FindFirstChild(
             "SV_ValueBadge"
         ) ~= nil
-
     local hasRequiredInfo =
         options.showInfo == false
         or frame:FindFirstChild(
             "SV_InfoButton"
         ) ~= nil
-
     if previous
         and previous.record
             == record
@@ -7363,12 +5700,10 @@ local function decorateCard(frame, options)
             == itemType
         and hasRequiredValue
         and hasRequiredInfo then
-
         return record,
             previous.context
             or context
     end
-
     State.DecoratedCards[
         frame
     ] = {
@@ -7387,10 +5722,8 @@ local function decorateCard(frame, options)
         resolutionMeta =
             resolutionMeta,
     }
-
     if options.showValue
         ~= false then
-
         addValueBadge(
             frame,
             record,
@@ -7398,10 +5731,8 @@ local function decorateCard(frame, options)
                 == true
         )
     end
-
     if options.showInfo
         ~= false then
-
         addInfoButton(
             frame,
             record,
@@ -7410,34 +5741,25 @@ local function decorateCard(frame, options)
             context
         )
     end
-
     return record, context
 end
-
 State.HighlightedCards = setmetatable({}, {__mode = "k"})
-
 local function clearTradeHighlight(frame)
     local existing = frame and frame:FindFirstChild("SV_TradeHighlight")
     if existing then
         existing:Destroy()
     end
-
     State.HighlightedCards[frame] = nil
 end
-
 local function setTradeHighlight(frame, mode, result)
     if not frame or not frame.Parent then
         return
     end
-
     clearTradeHighlight(frame)
-
     if not mode then
         return
     end
-
     local color = mode == "BEST" and CONFIG.BestColor or CONFIG.SafeColor
-
     local overlay = create("Frame", {
         Name = "SV_TradeHighlight",
         Size = UDim2.fromScale(1, 1),
@@ -7446,21 +5768,16 @@ local function setTradeHighlight(frame, mode, result)
             mode == "BEST" and 0.68 or 0.78,
         BorderSizePixel = 0,
         Active = false,
-
         ZIndex = 85,
     }, frame)
-
     addCorner(overlay, 7)
-
     local stroke = addStroke(
         overlay,
         color,
         mode == "BEST" and 3 or 2,
         0
     )
-
     stroke.Name = "Stroke"
-
     local pill = create("TextLabel", {
         AnchorPoint = Vector2.new(0.5, 0),
         Position = UDim2.new(0.5, 0, 0, 4),
@@ -7476,17 +5793,13 @@ local function setTradeHighlight(frame, mode, result)
         ZIndex = 86,
         Active = false,
     }, overlay)
-
     addCorner(pill, 99)
-
     if result and result.value then
         overlay:SetAttribute("SV_ResultScore", result.score)
         overlay:SetAttribute("SV_ResultDifference", result.value.difference)
     end
-
     State.HighlightedCards[frame] = true
 end
-
 local function clearAllTradeHighlights()
     for frame in pairs(State.HighlightedCards) do
         if frame and frame.Parent then
@@ -7494,7 +5807,6 @@ local function clearAllTradeHighlights()
         end
     end
 end
-
 local TradePanel = create("Frame", {
     Name = "SV_TradePanel",
     AnchorPoint = Vector2.new(1, 0.5),
@@ -7505,10 +5817,41 @@ local TradePanel = create("Frame", {
     Visible = false,
     ZIndex = 1000,
 }, UI.RootGui)
-
 addCorner(TradePanel, 13)
 addStroke(TradePanel, THEME.border, 1, 0.1)
-
+UI.TradePanelScale = create("UIScale", {
+    Scale = 1,
+}, TradePanel)
+UI.DetailsScale = create("UIScale", {
+    Scale = 1,
+}, UI.Details)
+local function updatePublicUiScale()
+    local camera = workspace.CurrentCamera
+    local viewport =
+        camera
+        and camera.ViewportSize
+        or Vector2.new(1366, 768)
+    local scale =
+        clamp(
+            math.min(
+                viewport.X / 1366,
+                viewport.Y / 768
+            ),
+            0.78,
+            1
+        )
+    if UI.TradePanelScale
+        and UI.TradePanelScale.Parent then
+        UI.TradePanelScale.Scale =
+            scale
+    end
+    if UI.DetailsScale
+        and UI.DetailsScale.Parent then
+        UI.DetailsScale.Scale =
+            scale
+    end
+end
+updatePublicUiScale()
 UI.TradePanelTitle = makeLabel(
     TradePanel,
     "TRADE ANALYSIS",
@@ -7519,7 +5862,6 @@ UI.TradePanelTitle = makeLabel(
 UI.TradePanelTitle.Position = UDim2.fromOffset(14, 10)
 UI.TradePanelTitle.Size = UDim2.new(1, -28, 0, 18)
 UI.TradePanelTitle.ZIndex = 1001
-
 UI.TradePanelStatus = makeLabel(
     TradePanel,
     "Waiting for trade...",
@@ -7530,7 +5872,6 @@ UI.TradePanelStatus = makeLabel(
 UI.TradePanelStatus.Position = UDim2.fromOffset(14, 31)
 UI.TradePanelStatus.Size = UDim2.new(1, -28, 0, 28)
 UI.TradePanelStatus.ZIndex = 1001
-
 UI.TradePanelScore = makeLabel(
     TradePanel,
     "",
@@ -7541,7 +5882,6 @@ UI.TradePanelScore = makeLabel(
 UI.TradePanelScore.Position = UDim2.fromOffset(14, 59)
 UI.TradePanelScore.Size = UDim2.new(1, -28, 0, 18)
 UI.TradePanelScore.ZIndex = 1001
-
 UI.ToggleHelper = makeButton(
     TradePanel,
     "",
@@ -7550,7 +5890,6 @@ UI.ToggleHelper = makeButton(
 )
 UI.ToggleHelper.Position = UDim2.fromOffset(14, 84)
 UI.ToggleHelper.ZIndex = 1001
-
 local function refreshToggleText()
     if State.TradeHelperEnabled then
         UI.ToggleHelper.Text = "Trade Helper: ON"
@@ -7562,9 +5901,7 @@ local function refreshToggleText()
         UI.ToggleHelper.TextColor3 = THEME.muted
     end
 end
-
 refreshToggleText()
-
 UI.ValueBox = create("Frame", {
     Position = UDim2.fromOffset(14, 128),
     Size = UDim2.new(1, -28, 0, 82),
@@ -7572,9 +5909,7 @@ UI.ValueBox = create("Frame", {
     BorderSizePixel = 0,
     ZIndex = 1001,
 }, TradePanel)
-
 addCorner(UI.ValueBox, 9)
-
 UI.GiveTitle = makeLabel(
     UI.ValueBox,
     "YOU GIVE",
@@ -7585,7 +5920,6 @@ UI.GiveTitle = makeLabel(
 UI.GiveTitle.Position = UDim2.fromOffset(10, 7)
 UI.GiveTitle.Size = UDim2.fromOffset(100, 14)
 UI.GiveTitle.ZIndex = 1002
-
 UI.ReceiveTitle = makeLabel(
     UI.ValueBox,
     "YOU RECEIVE",
@@ -7597,7 +5931,6 @@ UI.ReceiveTitle.Position = UDim2.new(1, -110, 0, 7)
 UI.ReceiveTitle.Size = UDim2.fromOffset(100, 14)
 UI.ReceiveTitle.TextXAlignment = Enum.TextXAlignment.Right
 UI.ReceiveTitle.ZIndex = 1002
-
 UI.GiveValue = makeLabel(
     UI.ValueBox,
     "0",
@@ -7608,7 +5941,6 @@ UI.GiveValue = makeLabel(
 UI.GiveValue.Position = UDim2.fromOffset(10, 23)
 UI.GiveValue.Size = UDim2.fromOffset(120, 23)
 UI.GiveValue.ZIndex = 1002
-
 UI.ReceiveValue = makeLabel(
     UI.ValueBox,
     "0",
@@ -7620,7 +5952,6 @@ UI.ReceiveValue.Position = UDim2.new(1, -130, 0, 23)
 UI.ReceiveValue.Size = UDim2.fromOffset(120, 23)
 UI.ReceiveValue.TextXAlignment = Enum.TextXAlignment.Right
 UI.ReceiveValue.ZIndex = 1002
-
 UI.DifferenceValue = makeLabel(
     UI.ValueBox,
     "Difference: 0",
@@ -7632,7 +5963,6 @@ UI.DifferenceValue.Position = UDim2.fromOffset(10, 53)
 UI.DifferenceValue.Size = UDim2.new(1, -20, 0, 19)
 UI.DifferenceValue.TextXAlignment = Enum.TextXAlignment.Center
 UI.DifferenceValue.ZIndex = 1002
-
 UI.SignalsTitle = makeLabel(
     TradePanel,
     "SIGNALS",
@@ -7643,7 +5973,6 @@ UI.SignalsTitle = makeLabel(
 UI.SignalsTitle.Position = UDim2.fromOffset(14, 220)
 UI.SignalsTitle.Size = UDim2.new(1, -28, 0, 16)
 UI.SignalsTitle.ZIndex = 1001
-
 UI.SignalBox = create("Frame", {
     Position = UDim2.fromOffset(14, 239),
     Size = UDim2.new(1, -28, 0, 100),
@@ -7651,11 +5980,8 @@ UI.SignalBox = create("Frame", {
     BorderSizePixel = 0,
     ZIndex = 1001,
 }, TradePanel)
-
 addCorner(UI.SignalBox, 9)
-
 UI.SignalLabels = {}
-
 UI.signalNames = {
     {"Demand", "demand"},
     {"Flippability", "flippability"},
@@ -7663,10 +5989,8 @@ UI.signalNames = {
     {"Trend", "trend"},
     {"Rarity", "rarity"},
 }
-
 for index, definition in ipairs(UI.signalNames) do
     local y = 5 + (index - 1) * 18
-
     local nameLabel = makeLabel(
         UI.SignalBox,
         definition[1],
@@ -7677,7 +6001,6 @@ for index, definition in ipairs(UI.signalNames) do
     nameLabel.Position = UDim2.fromOffset(10, y)
     nameLabel.Size = UDim2.new(0.55, -10, 0, 17)
     nameLabel.ZIndex = 1002
-
     local verdictLabel = makeLabel(
         UI.SignalBox,
         "—",
@@ -7689,10 +6012,8 @@ for index, definition in ipairs(UI.signalNames) do
     verdictLabel.Size = UDim2.new(0.45, -10, 0, 17)
     verdictLabel.TextXAlignment = Enum.TextXAlignment.Right
     verdictLabel.ZIndex = 1002
-
     UI.SignalLabels[definition[2]] = verdictLabel
 end
-
 UI.NotesTitle = makeLabel(
     TradePanel,
     "WHY",
@@ -7703,7 +6024,6 @@ UI.NotesTitle = makeLabel(
 UI.NotesTitle.Position = UDim2.fromOffset(14, 349)
 UI.NotesTitle.Size = UDim2.new(1, -28, 0, 16)
 UI.NotesTitle.ZIndex = 1001
-
 UI.NotesScroll = create("ScrollingFrame", {
     Position = UDim2.fromOffset(14, 369),
     Size = UDim2.new(1, -28, 1, -383),
@@ -7715,9 +6035,7 @@ UI.NotesScroll = create("ScrollingFrame", {
     ScrollBarImageColor3 = THEME.border,
     ZIndex = 1001,
 }, TradePanel)
-
 addCorner(UI.NotesScroll, 9)
-
 UI.NotesContent = create("Frame", {
     Size = UDim2.new(1, -7, 0, 0),
     AutomaticSize = Enum.AutomaticSize.Y,
@@ -7725,26 +6043,22 @@ UI.NotesContent = create("Frame", {
     BorderSizePixel = 0,
     ZIndex = 1002,
 }, UI.NotesScroll)
-
 UI.NotesList = create("UIListLayout", {
     Padding = UDim.new(0, 6),
     SortOrder = Enum.SortOrder.LayoutOrder,
 }, UI.NotesContent)
-
 UI.NotesPadding = create("UIPadding", {
     PaddingLeft = UDim.new(0, 9),
     PaddingRight = UDim.new(0, 9),
     PaddingTop = UDim.new(0, 9),
     PaddingBottom = UDim.new(0, 9),
 }, UI.NotesContent)
-
 local function renderNotes(notes)
     for _, child in ipairs(UI.NotesContent:GetChildren()) do
         if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
             child:Destroy()
         end
     end
-
     for index, text in ipairs(notes or {}) do
         local row = create("TextLabel", {
             Size = UDim2.new(1, 0, 0, 0),
@@ -7761,7 +6075,6 @@ local function renderNotes(notes)
             ZIndex = 1003,
         }, UI.NotesContent)
     end
-
     if #(notes or {}) == 0 then
         local empty = makeLabel(
             UI.NotesContent,
@@ -7774,62 +6087,47 @@ local function renderNotes(notes)
         empty.TextWrapped = true
         empty.ZIndex = 1003
     end
-
     UI.NotesScroll.CanvasPosition = Vector2.new(0, 0)
 end
-
 local function renderTradePanel(result)
     State.LastEvaluation = result
-
     if not result then
         UI.TradePanelStatus.Text = "Waiting for trade..."
         UI.TradePanelStatus.TextColor3 = THEME.text
         UI.TradePanelScore.Text = "Supreme Values " .. DatabaseStatus
-
         UI.GiveValue.Text = "0"
         UI.ReceiveValue.Text = "0"
         UI.DifferenceValue.Text = "Difference: 0"
-
         for _, label in pairs(UI.SignalLabels) do
             label.Text = "—"
             label.TextColor3 = THEME.faint
         end
-
         renderNotes({})
         return
     end
-
     if not result.evaluable then
         UI.TradePanelStatus.Text = "CAN'T SCORE"
         UI.TradePanelStatus.TextColor3 = THEME.yellow
         UI.TradePanelScore.Text = "Missing or nonnumeric item data"
-
         local giveTotal =
             result.localOffer and result.localOffer.totalValue or 0
-
         local receiveTotal =
             result.otherOffer and result.otherOffer.totalValue or 0
-
         UI.GiveValue.Text = formatNumber(giveTotal)
         UI.ReceiveValue.Text = formatNumber(receiveTotal)
         UI.DifferenceValue.Text = "Recommendation disabled"
-
         for _, label in pairs(UI.SignalLabels) do
             label.Text = "UNKNOWN"
             label.TextColor3 = THEME.faint
         end
-
         renderNotes(result.notes)
         return
     end
-
     UI.TradePanelStatus.Text =
         (result.shouldTrade and "TAKE · " or "PASS · ")
         .. result.verdict
-
     UI.TradePanelStatus.TextColor3 =
         result.shouldTrade and THEME.green or THEME.red
-
     UI.TradePanelScore.Text =
         string.format(
             "Score %.1f · %s confidence · %s",
@@ -7837,15 +6135,12 @@ local function renderTradePanel(result)
             result.confidenceLabel,
             result.tradeType
         )
-
     UI.GiveValue.Text = formatNumber(result.value.giving)
     UI.ReceiveValue.Text = formatNumber(result.value.receiving)
-
     local differenceColor =
         result.value.difference > 0 and THEME.green
         or result.value.difference < 0 and THEME.red
         or THEME.yellow
-
     UI.DifferenceValue.TextColor3 = differenceColor
     UI.DifferenceValue.Text =
         "Difference: "
@@ -7854,119 +6149,91 @@ local function renderTradePanel(result)
         .. "  ("
         .. formatPercent(result.value.percentage, true)
         .. ")"
-
     for key, label in pairs(UI.SignalLabels) do
         local signalVerdict = result.comparisons[key] or "UNKNOWN"
         label.Text = signalVerdict
         label.TextColor3 = verdictColor(signalVerdict)
     end
-
     renderNotes(result.notes)
 end
-
 connect(UI.ToggleHelper.MouseButton1Click, function()
     State.TradeHelperEnabled = not State.TradeHelperEnabled
     refreshToggleText()
-
     if not State.TradeHelperEnabled then
         clearAllTradeHighlights()
     end
 end)
-
 State.MainGUI = nil
 State.InventoryRoot = nil
 State.TradeGui = nil
 State.TradeInventoryRoot = nil
 State.TradeOffer1 = nil
 State.TradeOffer2 = nil
-
 local function discoverMainGui()
     State.MainGUI = PlayerGui:FindFirstChild("MainGUI")
-
     if not State.MainGUI then
         return
     end
-
     State.InventoryRoot =
         safeFindPath(State.MainGUI, {"Game", "Inventory"})
         or findFirstDescendantByName(State.MainGUI, "Inventory")
 end
-
 local isTradeVisible
 local scheduleTradeRefresh
 local reconnectGuiWatchers
-
 local function discoverTradeInventoryRoots(hostGui)
     State.TradeInventoryRoots = {}
     State.TradeDiscoveryCandidates = {}
     State.TradeWeaponRoot = nil
     State.TradePetRoot = nil
-
     if not hostGui then
         return
     end
-
     local function pathType(instance)
         local path = normalize(instance:GetFullName())
-
         if path:find("pet", 1, true) then
             return "Pets"
         end
-
         if path:find("weapon", 1, true) then
             return "Weapons"
         end
-
         return nil
     end
-
     local function directLooseCards(container)
         local cards = {}
-
         for _, child in ipairs(container:GetChildren()) do
             if child:IsA("GuiObject")
                 and not tradeCardIsInsideOffers(child)
                 and looksLikeTradeInventoryCardLoose(child) then
-
                 table.insert(cards, child)
             end
         end
-
         return cards
     end
-
     for _, descendant in ipairs(hostGui:GetDescendants()) do
         if descendant:IsA("GuiObject")
             and not tradeCardIsInsideOffers(descendant) then
-
             local cards = directLooseCards(descendant)
             local count = #cards
-
             if count >= 2 then
                 local path = normalize(descendant:GetFullName())
                 local detectedType = pathType(descendant)
                 local score = count * 100
-
                 if detectedType then
                     score = score + 80
                 end
-
                 if path:find("items", 1, true) then
                     score = score + 35
                 end
-
                 if path:find("current", 1, true) then
                     score = score + 25
                 end
-
                 if descendant.Visible then
                     score = score + 15
                 end
-
                 if count > CONFIG.MaxOfferSlots then
                     score = score + 180
                 end
-
                 table.insert(
                     State.TradeDiscoveryCandidates,
                     {
@@ -7980,43 +6247,33 @@ local function discoverTradeInventoryRoots(hostGui)
             end
         end
     end
-
     table.sort(
         State.TradeDiscoveryCandidates,
         function(a, b)
             if a.score ~= b.score then
                 return a.score > b.score
             end
-
             return a.count > b.count
         end
     )
-
     local selected = {}
     local usedRoots = {}
-
     local function addCandidate(candidate, forcedType)
         if not candidate
             or usedRoots[candidate.root] then
-
             return
         end
-
         usedRoots[candidate.root] = true
-
         local detectedType =
             forcedType
             or candidate.itemType
-
         if not detectedType then
             local weaponHits = 0
             local petHits = 0
-
             for index = 1, math.min(5, #candidate.cards) do
                 local card = candidate.cards[index]
                 local displayName = getLooseCardDisplayName(card)
                 local iconId = getCardIconAssetId(card)
-
                 if findInternalGameItemId(
                     displayName or "",
                     "Weapons",
@@ -8024,7 +6281,6 @@ local function discoverTradeInventoryRoots(hostGui)
                 ) then
                     weaponHits = weaponHits + 1
                 end
-
                 if findInternalGameItemId(
                     displayName or "",
                     "Pets",
@@ -8033,14 +6289,12 @@ local function discoverTradeInventoryRoots(hostGui)
                     petHits = petHits + 1
                 end
             end
-
             if weaponHits > petHits then
                 detectedType = "Weapons"
             elseif petHits > weaponHits then
                 detectedType = "Pets"
             end
         end
-
         if detectedType then
             table.insert(
                 selected,
@@ -8049,83 +6303,57 @@ local function discoverTradeInventoryRoots(hostGui)
                     itemType = detectedType,
                 }
             )
-
             if detectedType == "Weapons"
                 and not State.TradeWeaponRoot then
-
                 State.TradeWeaponRoot = candidate.root
-
             elseif detectedType == "Pets"
                 and not State.TradePetRoot then
-
                 State.TradePetRoot = candidate.root
             end
         end
     end
-
     for _, candidate in ipairs(State.TradeDiscoveryCandidates) do
         if candidate.itemType == "Weapons"
             and not State.TradeWeaponRoot then
-
             addCandidate(candidate, "Weapons")
         end
-
         if candidate.itemType == "Pets"
             and not State.TradePetRoot then
-
             addCandidate(candidate, "Pets")
         end
     end
-
     if not State.TradeWeaponRoot
         or not State.TradePetRoot then
-
         for _, candidate in ipairs(State.TradeDiscoveryCandidates) do
             if #selected >= 2 then
                 break
             end
-
             addCandidate(candidate)
         end
     end
-
     State.TradeInventoryRoots = selected
-
-    State.Debug.Record("trade_inventory_discovery", {
-        selectedRoots = #selected,
-        candidateGroups = #State.TradeDiscoveryCandidates,
-        roots = selected,
-    })
-
     if #selected > 0 then
         State.TradeInventoryRoot =
             selected[1].root.Parent
             or selected[1].root
-
         if State.CurrentTrade then
             State.TradeInventoryRefreshGeneration =
                 State.TradeInventoryRefreshGeneration + 1
-
             local generation =
                 State.TradeInventoryRefreshGeneration
-
             task.delay(0.18, function()
                 if Destroyed
                     or generation ~= State.TradeInventoryRefreshGeneration then
-
                     return
                 end
-
                 if State.CurrentTrade
                     and isTradeVisible() then
-
                     scheduleTradeRefresh(0)
                 end
             end)
         end
     end
 end
-
 local function discoverTradeGui(force)
     if not force
         and State.TradeOffer1
@@ -8134,10 +6362,8 @@ local function discoverTradeGui(force)
         and State.TradeOffer2.Parent
         and State.TradeGui
         and State.TradeGui.Parent then
-
         return true
     end
-
     local function clearTradeGuiState()
         State.TradeGui = nil
         State.TradeInventoryRoot = nil
@@ -8146,180 +6372,137 @@ local function discoverTradeGui(force)
         State.TradeOffer1 = nil
         State.TradeOffer2 = nil
     end
-
     local function commonAncestor(a, b)
         if not a or not b then
             return nil
         end
-
         local ancestors = {}
         local current = a
-
         while current do
             ancestors[current] = true
             current = current.Parent
         end
-
         current = b
-
         while current do
             if ancestors[current] then
                 return current
             end
-
             current = current.Parent
         end
-
         return nil
     end
-
     local function nearestScreenGui(instance)
         local current = instance
-
         while current and current ~= PlayerGui do
             if current:IsA("ScreenGui") then
                 return current
             end
-
             current = current.Parent
         end
-
         return nil
     end
-
     local function directItemCount(container)
         local count = 0
-
         if not container then
             return 0
         end
-
         for _, child in ipairs(container:GetChildren()) do
             if child:IsA("GuiObject")
                 and looksLikeItemCard(child) then
-
                 count = count + 1
             end
         end
-
         return count
     end
-
     local function bestCardContainer(categoryNode)
         if not categoryNode then
             return nil
         end
-
         local best = nil
         local bestCount = 0
-
         if categoryNode:IsA("GuiObject") then
             local ownCount = directItemCount(categoryNode)
-
             if ownCount > 0 then
                 best = categoryNode
                 bestCount = ownCount
             end
         end
-
         for _, descendant in ipairs(
             categoryNode:GetDescendants()
         ) do
             if descendant:IsA("GuiObject") then
                 local count =
                     directItemCount(descendant)
-
                 if count > bestCount then
                     best = descendant
                     bestCount = count
                 end
             end
         end
-
         return best
     end
-
     local function findItemsNearTrade(tradeCommon, hostGui)
         local current = tradeCommon
-
         while current and current ~= hostGui do
             local parent = current.Parent
-
             if parent then
                 local items =
                     parent:FindFirstChild("Items")
-
                 if items then
                     return items
                 end
             end
-
             current = parent
         end
-
         local best = nil
         local bestScore = -1
-
         for _, descendant in ipairs(
             hostGui:GetDescendants()
         ) do
             if descendant.Name == "Items"
                 and descendant:IsA("GuiObject") then
-
                 local score = 0
-
                 if descendant:FindFirstChild(
                     "Weapons",
                     true
                 ) then
                     score = score + 5
                 end
-
                 if descendant:FindFirstChild(
                     "Pets",
                     true
                 ) then
                     score = score + 5
                 end
-
                 if descendant:FindFirstChild(
                     "Main"
                 ) then
                     score = score + 3
                 end
-
                 if score > bestScore then
                     best = descendant
                     bestScore = score
                 end
             end
         end
-
         return best
     end
-
     clearTradeGuiState()
-
     local offer1 =
         PlayerGui:FindFirstChild("Offer1", true)
-
     local offer2 =
         PlayerGui:FindFirstChild("Offer2", true)
-
     if not offer1 or not offer2 then
         local offerCandidates = {}
-
         for _, descendant in ipairs(
             PlayerGui:GetDescendants()
         ) do
             if descendant:IsA("GuiObject") then
                 local container =
                     descendant:FindFirstChild("Container")
-
                 if container
                     and container:FindFirstChild("NewItem1")
                     and container:FindFirstChild("NewItem2") then
-
                     table.insert(
                         offerCandidates,
                         descendant
@@ -8327,35 +6510,27 @@ local function discoverTradeGui(force)
                 end
             end
         end
-
         if #offerCandidates >= 2 then
             offer1 = offerCandidates[1]
             offer2 = offerCandidates[2]
         end
     end
-
     if not offer1 or not offer2 then
         return false
     end
-
     local tradeCommon =
         commonAncestor(offer1, offer2)
-
     local hostGui =
         nearestScreenGui(tradeCommon)
         or nearestScreenGui(offer1)
         or nearestScreenGui(offer2)
-
     if not tradeCommon or not hostGui then
         return false
     end
-
     State.TradeGui = hostGui
     State.TradeOffer1 = offer1
     State.TradeOffer2 = offer2
-
     discoverTradeInventoryRoots(hostGui)
-
     if TradePanel.Parent ~= hostGui then
         TradePanel.Parent = hostGui
         TradePanel.AnchorPoint =
@@ -8364,60 +6539,47 @@ local function discoverTradeGui(force)
             UDim2.new(1, -12, 0.5, 0)
         TradePanel.ZIndex = 1000
     end
-
     return true
 end
-
 isTradeVisible = function()
     if not State.TradeOffer1
         or not State.TradeOffer1.Parent
         or not State.TradeOffer2
         or not State.TradeOffer2.Parent then
-
         if not discoverTradeGui(false) then
             return false
         end
     end
-
     local function chainVisible(instance)
         local current = instance
-
         while current and current ~= PlayerGui do
             if current:IsA("ScreenGui") then
                 if not current.Enabled then
                     return false
                 end
-
             elseif current:IsA("GuiObject") then
                 if not current.Visible then
                     return false
                 end
             end
-
             current = current.Parent
         end
-
         return true
     end
-
     return
         chainVisible(State.TradeOffer1)
         or chainVisible(State.TradeOffer2)
 end
-
 local function scanInventoryCards()
     if not SupremeDatabase then
         return
     end
-
     if not State.InventoryRoot or not State.InventoryRoot.Parent then
         discoverMainGui()
     end
-
     if not State.InventoryRoot then
         return
     end
-
     for _, descendant in ipairs(State.InventoryRoot:GetDescendants()) do
         if looksLikeItemCard(descendant) then
             decorateCard(descendant, {
@@ -8428,10 +6590,8 @@ local function scanInventoryCards()
         end
     end
 end
-
 local function refreshTrackedCards()
     local resolvedSnapshot = {}
-
     for frame, info in pairs(State.DecoratedCards) do
         if frame and frame.Parent and info then
             table.insert(resolvedSnapshot, {
@@ -8440,10 +6600,8 @@ local function refreshTrackedCards()
             })
         end
     end
-
     for _, entry in ipairs(resolvedSnapshot) do
         local info = entry.info
-
         decorateCard(entry.frame, {
             itemId = info.itemId,
             itemType = info.itemType,
@@ -8453,9 +6611,7 @@ local function refreshTrackedCards()
             compactMode = info.compactMode,
         })
     end
-
     local unresolvedSnapshot = {}
-
     for frame, context in pairs(State.UnresolvedCards) do
         if frame and frame.Parent and context then
             table.insert(unresolvedSnapshot, {
@@ -8464,10 +6620,8 @@ local function refreshTrackedCards()
             })
         end
     end
-
     for _, entry in ipairs(unresolvedSnapshot) do
         local context = entry.context
-
         decorateCard(entry.frame, {
             itemId = context.itemId,
             itemType = context.itemType,
@@ -8481,44 +6635,34 @@ local function refreshTrackedCards()
         })
     end
 end
-
 local function getTradeOfferSlots(offerRoot)
     local slots = {}
-
     if not offerRoot then
         return slots
     end
-
     local container = offerRoot:FindFirstChild("Container")
     if not container then
         return slots
     end
-
     for index = 1, CONFIG.MaxOfferSlots do
         local slot =
             container:FindFirstChild(
                 "NewItem" .. tostring(index)
             )
-
         if slot and slot:IsA("GuiObject") then
             table.insert(slots, slot)
         end
     end
-
     return slots
 end
-
 local function annotateOfferSlots(localEntries, otherEntries)
     if not State.TradeOffer1 or not State.TradeOffer2 then
         discoverTradeGui()
     end
-
     local localSlots = getTradeOfferSlots(State.TradeOffer1)
     local otherSlots = getTradeOfferSlots(State.TradeOffer2)
-
     for index, slot in ipairs(localSlots) do
         removeCardDecoration(slot)
-
         local entry = localEntries[index]
         if entry and entry.record then
             decorateCard(slot, {
@@ -8531,10 +6675,8 @@ local function annotateOfferSlots(localEntries, otherEntries)
             })
         end
     end
-
     for index, slot in ipairs(otherSlots) do
         removeCardDecoration(slot)
-
         local entry = otherEntries[index]
         if entry and entry.record then
             decorateCard(slot, {
@@ -8548,29 +6690,23 @@ local function annotateOfferSlots(localEntries, otherEntries)
         end
     end
 end
-
 local function gatherTradeInventoryCards()
     local cards = {}
-
     if not State.TradeGui
         or not State.TradeGui.Parent
         or #State.TradeInventoryRoots == 0 then
-
         discoverTradeGui(true)
     end
-
     for _, discovered in ipairs(
         State.TradeInventoryRoots
     ) do
         local root = discovered.root
         local preferredType = discovered.itemType
-
         if root and root.Parent then
             for _, child in ipairs(root:GetChildren()) do
                 if child:IsA("GuiObject")
                     and not tradeCardIsInsideOffers(child)
                     and looksLikeTradeInventoryCardLoose(child) then
-
                     local itemType,
                         itemId,
                         displayName,
@@ -8579,16 +6715,13 @@ local function gatherTradeInventoryCards()
                             child,
                             preferredType
                         )
-
                     if itemType then
                         local record = nil
-
                         if iconAssetId then
                             local manual =
                                 LinkedImages[
                                     numericAssetId(iconAssetId)
                                 ]
-
                             if manual then
                                 record =
                                     State.Mapping.ResolveLinkRecord(
@@ -8596,7 +6729,6 @@ local function gatherTradeInventoryCards()
                                     )
                             end
                         end
-
                         if not record then
                             record =
                                 select(
@@ -8608,7 +6740,6 @@ local function gatherTradeInventoryCards()
                                     )
                                 )
                         end
-
                         decorateCard(child, {
                             itemId = itemId,
                             itemType = itemType,
@@ -8619,7 +6750,6 @@ local function gatherTradeInventoryCards()
                             compactMode = true,
                             allowLooseCard = true,
                         })
-
                         if record then
                             local candidateId =
                                 itemId
@@ -8629,7 +6759,6 @@ local function gatherTradeInventoryCards()
                                     iconAssetId
                                     and ("ICON_" .. tostring(iconAssetId))
                                 )
-
                             if candidateId then
                                 table.insert(
                                     cards,
@@ -8650,10 +6779,8 @@ local function gatherTradeInventoryCards()
             end
         end
     end
-
     return cards
 end
-
 local function offeredQuantityForCandidate(entries, candidate)
     local exact =
         findOfferEntry(
@@ -8661,11 +6788,9 @@ local function offeredQuantityForCandidate(entries, candidate)
             candidate.itemId,
             candidate.itemType
         )
-
     if exact then
         return exact.quantity or 0
     end
-
     if candidate.record then
         local wantedName =
             normalize(candidate.record.name or "")
@@ -8673,7 +6798,6 @@ local function offeredQuantityForCandidate(entries, candidate)
             normalizeCategory(
                 candidate.record.category or ""
             )
-
         for _, entry in ipairs(entries) do
             if entry.record then
                 local entryName =
@@ -8682,29 +6806,23 @@ local function offeredQuantityForCandidate(entries, candidate)
                     normalizeCategory(
                         entry.record.category or ""
                     )
-
                 if entryName == wantedName
                     and entryCategory == wantedCategory then
-
                     return entry.quantity or 0
                 end
             end
         end
     end
-
     return 0
 end
-
 local function createHypotheticalOffer(currentEntries, candidate)
     local copy = cloneOfferEntries(currentEntries)
-
     local existing =
         findOfferEntry(
             copy,
             candidate.itemId,
             candidate.itemType
         )
-
     if not existing and candidate.record then
         local wantedName =
             normalize(candidate.record.name or "")
@@ -8712,20 +6830,17 @@ local function createHypotheticalOffer(currentEntries, candidate)
             normalizeCategory(
                 candidate.record.category or ""
             )
-
         for _, entry in ipairs(copy) do
             if entry.record
                 and normalize(entry.record.name or "") == wantedName
                 and normalizeCategory(
                     entry.record.category or ""
                 ) == wantedCategory then
-
                 existing = entry
                 break
             end
         end
     end
-
     if existing then
         existing.quantity = existing.quantity + 1
     else
@@ -8736,19 +6851,14 @@ local function createHypotheticalOffer(currentEntries, candidate)
             record = candidate.record,
         })
     end
-
     return copy
 end
-
 local function queueBoundedTradeHelperRetry()
     State.TradeHelperRetryGeneration =
         State.TradeHelperRetryGeneration + 1
-
     local generation =
         State.TradeHelperRetryGeneration
-
     State.TradeHelperRetryCount = 0
-
     local delays = {
         0.15,
         0.35,
@@ -8756,52 +6866,38 @@ local function queueBoundedTradeHelperRetry()
         1.10,
         1.60,
     }
-
     for index, delaySeconds in ipairs(delays) do
         task.delay(delaySeconds, function()
             if Destroyed
                 or generation ~= State.TradeHelperRetryGeneration
                 or not State.CurrentTrade
                 or not isTradeVisible() then
-
                 return
             end
-
             if State.LastTradeHelperStats
                 and (State.LastTradeHelperStats.cards or 0) > 0 then
-
                 return
             end
-
             State.TradeHelperRetryCount = index
-
             discoverTradeGui(true)
             scheduleTradeRefresh(0)
         end)
     end
 end
-
 local function recalculateTradeHelper(localEntries, otherEntries)
     State.TradeHelperGeneration =
         State.TradeHelperGeneration + 1
-
     local generation = State.TradeHelperGeneration
-
     clearAllTradeHighlights()
-
     if not State.TradeHelperEnabled
         or not isTradeVisible()
         or not SupremeDatabase then
-
         return
     end
-
     if #localEntries >= CONFIG.MaxOfferSlots then
         return
     end
-
     local cards = gatherTradeInventoryCards()
-
     State.LastTradeHelperStats = {
         cards = #cards,
         numeric = 0,
@@ -8809,55 +6905,34 @@ local function recalculateTradeHelper(localEntries, otherEntries)
         evaluable = 0,
         safe = 0,
     }
-
-    State.Debug.Count("tradeHelperPasses")
-    State.Debug.Record("trade_helper_pass_started", {
-        cards = #cards,
-        localOfferCount = #localEntries,
-        otherOfferCount = #otherEntries,
-        retryAttempt = State.TradeHelperRetryCount,
-        discoveredRoots = #State.TradeInventoryRoots,
-    })
-
     if #cards == 0
         and State.TradeHelperRetryCount == 0 then
-
         queueBoundedTradeHelperRetry()
     end
-
     if #cards > 0 then
         State.TradeHelperRetryGeneration =
             State.TradeHelperRetryGeneration + 1
-
         State.TradeHelperRetryCount = 0
     end
-
     task.spawn(function()
         local safeCandidates = {}
-
         for index, candidate in ipairs(cards) do
             if Destroyed
                 or generation ~= State.TradeHelperGeneration then
-
                 return
             end
-
             local unitValue =
                 numericValue(candidate.record.data)
-
             if unitValue then
                 State.LastTradeHelperStats.numeric =
                     State.LastTradeHelperStats.numeric + 1
-
                 local alreadyOffered =
                     offeredQuantityForCandidate(
                         localEntries,
                         candidate
                     )
-
                 local visibleAmount =
                     getAmountFromCard(candidate.frame)
-
                 local canOffer =
                     (
                         visibleAmount
@@ -8867,34 +6942,27 @@ local function recalculateTradeHelper(localEntries, otherEntries)
                         not visibleAmount
                         and alreadyOffered == 0
                     )
-
                 if canOffer then
                     State.LastTradeHelperStats.offerable =
                         State.LastTradeHelperStats.offerable + 1
-
                     local hypothetical =
                         createHypotheticalOffer(
                             localEntries,
                             candidate
                         )
-
                     local result =
                         evaluateResolvedTrade(
                             hypothetical,
                             otherEntries
                         )
-
                     if result.evaluable then
                         State.LastTradeHelperStats.evaluable =
                             State.LastTradeHelperStats.evaluable + 1
                     end
-
                     if result.evaluable
                         and result.shouldTrade then
-
                         State.LastTradeHelperStats.safe =
                             State.LastTradeHelperStats.safe + 1
-
                         table.insert(
                             safeCandidates,
                             {
@@ -8906,119 +6974,81 @@ local function recalculateTradeHelper(localEntries, otherEntries)
                     end
                 end
             end
-
             if index % 12 == 0 then
                 RunService.Heartbeat:Wait()
             end
         end
-
         if Destroyed
             or generation ~= State.TradeHelperGeneration then
-
             return
         end
-
         table.sort(safeCandidates, function(a, b)
             if a.unitValue ~= b.unitValue then
                 return a.unitValue > b.unitValue
             end
-
             local aDistance =
                 math.abs(
                     a.result.score
                     - CONFIG.ShouldTradeScore
                 )
-
             local bDistance =
                 math.abs(
                     b.result.score
                     - CONFIG.ShouldTradeScore
                 )
-
             return aDistance < bDistance
         end)
-
         local best = safeCandidates[1]
-
         for _, safe in ipairs(safeCandidates) do
             if Destroyed
                 or generation ~= State.TradeHelperGeneration then
-
                 return
             end
-
             setTradeHighlight(
                 safe.candidate.frame,
                 safe == best and "BEST" or "SAFE",
                 safe.result
             )
         end
-
-        State.Debug.Record("trade_helper_pass_completed", {
-            stats = State.LastTradeHelperStats,
-            highlighted = #safeCandidates,
-            best = best
-                and {
-                    itemId = best.candidate.itemId,
-                    name = best.candidate.record.name,
-                    value = best.unitValue,
-                    score = best.result.score,
-                }
-                or nil,
-        })
     end)
 end
-
 State.PendingTradeRefresh = false
-
 local function updateFromTradeState()
     State.PendingTradeRefresh = false
-
     if Destroyed then
         return
     end
-
     if not State.TradeGui or not State.TradeGui.Parent then
         discoverTradeGui()
     end
-
     local visible = isTradeVisible()
-
     TradePanel.Visible =
         visible and CONFIG.TradePanel
-
     if not visible then
         clearAllTradeHighlights()
         return
     end
-
     if not State.CurrentTrade then
         renderTradePanel(nil)
         clearAllTradeHighlights()
         return
     end
-
     local localSide, otherSide =
         getTradeSides(State.CurrentTrade)
-
     if not localSide or not otherSide then
         renderTradePanel(nil)
         clearAllTradeHighlights()
         return
     end
-
     local localEntries =
         resolveTradeOffer(localSide)
-
     local otherEntries =
         resolveTradeOffer(otherSide)
-
     local result =
         evaluateResolvedTrade(
             localEntries,
             otherEntries
         )
-
     annotateOfferSlots(localEntries, otherEntries)
     renderTradePanel(result)
     recalculateTradeHelper(
@@ -9026,145 +7056,90 @@ local function updateFromTradeState()
         otherEntries
     )
 end
-
 scheduleTradeRefresh = function(delaySeconds)
     if State.PendingTradeRefresh then
         return
     end
-
     State.PendingTradeRefresh = true
-
     task.delay(delaySeconds or 0.05, function()
         if Destroyed then
             return
         end
-
         updateFromTradeState()
     end)
 end
-
 requestFullUiRefresh = function()
     if Destroyed then
         return
     end
-
     table.clear(ResolveCache)
         table.clear(State.ResolveMetaCache)
     GameResolverLastBuild = 0
     refreshTrackedCards()
     scheduleTradeRefresh(0)
 end
-
 local TradeFolder =
     ReplicatedStorage:FindFirstChild("Trade")
     or ReplicatedStorage:WaitForChild("Trade", 10)
 local UpdateTradeRemote =
     TradeFolder
     and TradeFolder:FindFirstChild("UpdateTrade")
-
 local StartTradeRemote =
     TradeFolder
     and TradeFolder:FindFirstChild("StartTrade")
-
 local GetTradeStatus =
     ReplicatedStorage:FindFirstChild("GetTradeStatus")
     or (
         TradeFolder
         and TradeFolder:FindFirstChild("GetTradeStatus")
     )
-
 if not GetTradeStatus then
     GetTradeStatus = ReplicatedStorage:WaitForChild("GetTradeStatus", 3)
 end
-
 local recoverTradeStatus
-
 if UpdateTradeRemote
     and UpdateTradeRemote:IsA("RemoteEvent") then
-
     connect(
         UpdateTradeRemote.OnClientEvent,
         function(trade)
-            State.Debug.Count("tradeUpdates")
-            State.Debug.Record("update_trade_remote", {
-                player1 = trade
-                    and trade.Player1
-                    and trade.Player1.Player
-                    or nil,
-                player1OfferCount = trade
-                    and trade.Player1
-                    and trade.Player1.Offer
-                    and #trade.Player1.Offer
-                    or 0,
-                player2 = trade
-                    and trade.Player2
-                    and trade.Player2.Player
-                    or nil,
-                player2OfferCount = trade
-                    and trade.Player2
-                    and trade.Player2.Offer
-                    and #trade.Player2.Offer
-                    or 0,
-            })
-
             if type(trade) == "table"
                 and trade.Player1
                 and trade.Player2 then
-
                 State.CurrentTrade = trade
-
                 if not State.TradeOffer1
                     or not State.TradeOffer1.Parent then
-
                     discoverTradeGui(true)
                 end
             end
-
             scheduleTradeRefresh(0.08)
-
             if not State.LastTradeHelperStats
                 or (State.LastTradeHelperStats.cards or 0) == 0 then
-
                 queueBoundedTradeHelperRetry()
             end
         end
     )
 end
-
 if StartTradeRemote
     and StartTradeRemote:IsA("RemoteEvent") then
-
     connect(
         StartTradeRemote.OnClientEvent,
         function()
-            State.Debug.Count("tradeStarts")
-            State.Debug.Record("start_trade_remote", {
-                tradeGui = State.Debug.InstancePath(State.TradeGui),
-            })
-
             task.delay(0.08, function()
                 if Destroyed then
                     return
                 end
-
                 discoverTradeGui(true)
-
                 if State.TradeGui then
                     TradePanel.Visible = CONFIG.TradePanel
                 end
-
                 recoverTradeStatus()
                 scheduleTradeRefresh(0.10)
-
                 queueBoundedTradeHelperRetry()
-
                 task.delay(0.35, function()
                     if Destroyed
                         or not isTradeVisible() then
-
                         return
                     end
-
                     if #State.TradeInventoryRoots == 0 then
                         discoverTradeGui(true)
                         reconnectGuiWatchers()
@@ -9175,128 +7150,83 @@ if StartTradeRemote
         end
     )
 end
-
 recoverTradeStatus = function()
     if not GetTradeStatus
         or not GetTradeStatus:IsA("RemoteFunction") then
-
         return false
     end
-
     local ok, status, data = pcall(function()
         return GetTradeStatus:InvokeServer()
     end)
-
-    State.Debug.Record("get_trade_status", {
-        success = ok,
-        status = status,
-        hasData = type(data) == "table",
-        player1OfferCount = type(data) == "table"
-            and data.Player1
-            and data.Player1.Offer
-            and #data.Player1.Offer
-            or 0,
-        player2OfferCount = type(data) == "table"
-            and data.Player2
-            and data.Player2.Offer
-            and #data.Player2.Offer
-            or 0,
-    })
-
     if not ok then
         return false
     end
-
     if status == "StartTrade"
         and type(data) == "table"
         and data.Player1
         and data.Player2 then
-
         State.CurrentTrade = data
         scheduleTradeRefresh(0.06)
         return true
     end
-
     return false
 end
-
 local function isInsideInjectedUi(instance, stopAt)
     local current = instance
-
     while current and current ~= stopAt do
         if current.Name
             and current.Name:sub(1, 3) == "SV_" then
-
             return true
         end
-
         current = current.Parent
     end
-
     return false
 end
-
 local function findItemCardFromDescendant(descendant, stopAt)
     if not descendant then
         return nil
     end
-
     if isInsideInjectedUi(descendant, stopAt) then
         return nil
     end
-
     local current = descendant
-
     while current and current ~= stopAt do
         if looksLikeItemCard(current) then
             return current
         end
-
         current = current.Parent
     end
-
     return nil
 end
-
 local function queueCardDecoration(card, options)
     if not card
         or not card.Parent
         or State.PendingCardDecorations[card] then
-
         return
     end
-
     State.PendingCardDecorations[card] = true
-
     task.defer(function()
         State.PendingCardDecorations[card] = nil
-
         if Destroyed
             or not card
             or not card.Parent
             or isInsideInjectedUi(card, nil) then
-
             return
         end
-
         decorateCard(card, options)
     end)
 end
-
 State.Profile.Disconnect = function()
     if State.Profile.root
         and State.Profile.root.Parent then
-
         local tooltip =
             State.Profile.root:FindFirstChild(
                 "SV_TotalBreakdownTooltip"
             )
-
         if tooltip then
             tooltip:Destroy()
         end
     end
-
     for _, connection in ipairs(
         State.Profile.connections
     ) do
@@ -9304,17 +7234,13 @@ State.Profile.Disconnect = function()
             connection:Disconnect()
         end)
     end
-
     State.Profile.connections = {}
 end
-
 State.Profile.GetRoots = function()
     if not State.MainGUI
         or not State.MainGUI.Parent then
-
         discoverMainGui()
     end
-
     local profileRoot =
         State.MainGUI
         and safeFindPath(
@@ -9325,7 +7251,6 @@ State.Profile.GetRoots = function()
             }
         )
         or nil
-
     State.Profile.root = profileRoot
     State.Profile.weaponItems =
         profileRoot
@@ -9338,7 +7263,6 @@ State.Profile.GetRoots = function()
             }
         )
         or nil
-
     State.Profile.petItems =
         profileRoot
         and safeFindPath(
@@ -9350,13 +7274,10 @@ State.Profile.GetRoots = function()
             }
         )
         or nil
-
     return profileRoot
 end
-
 State.Profile.ColorForValue = function(total)
     total = tonumber(total) or 0
-
     if total >= 5000 then
         return THEME.yellow
     elseif total >= 1000 then
@@ -9366,90 +7287,69 @@ State.Profile.ColorForValue = function(total)
     elseif total >= 50 then
         return THEME.green
     end
-
     return THEME.muted
 end
-
 State.Profile.GetUsername = function()
     local profileRoot =
         State.Profile.root
         or State.Profile.GetRoots()
-
     local main =
         profileRoot
         and profileRoot:FindFirstChild("Main")
-
     if not main then
         return nil
     end
-
     for _, tabName in ipairs({
         "Weapons",
         "Pets",
     }) do
         local section =
             main:FindFirstChild(tabName)
-
         local title =
             section
             and section:FindFirstChild("Title")
-
         local usernameLabel =
             title
             and title:FindFirstChild("Username")
-
         if usernameLabel
             and usernameLabel:IsA("TextLabel") then
-
             local value =
                 trim(usernameLabel.Text or "")
-
             local username =
                 value:match("^(.-)'s%s+Weapons$")
                 or value:match("^(.-)'s%s+Pets$")
-
             if username and trim(username) ~= "" then
                 return trim(username)
             end
         end
     end
-
     return nil
 end
-
 State.Profile.MakeSummaryLabel = function(section, name)
     if not section then
         return nil
     end
-
     local title =
         section:FindFirstChild("Title")
         or section
-
     local existing =
         title:FindFirstChild(name)
-
     if existing
         and existing:IsA("TextLabel") then
-
         return existing
     end
-
     if existing then
         existing:Destroy()
     end
-
     local label = create("TextLabel", {
         Name = name,
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, -8, 0, 5),
         Size = UDim2.fromOffset(154, 22),
-
         BackgroundColor3 =
             Color3.fromRGB(12, 15, 20),
         BackgroundTransparency = 0.08,
         BorderSizePixel = 0,
-
         Text = "Total Value: ?",
         TextColor3 = THEME.muted,
         TextSize = 12,
@@ -9458,11 +7358,9 @@ State.Profile.MakeSummaryLabel = function(section, name)
             Enum.TextXAlignment.Center,
         TextYAlignment =
             Enum.TextYAlignment.Center,
-
         ZIndex = 120,
         Active = true,
     }, title)
-
     addCorner(label, 6)
     addStroke(
         label,
@@ -9470,176 +7368,144 @@ State.Profile.MakeSummaryLabel = function(section, name)
         1,
         0.18
     )
-
     return label
 end
-
-
 State.Profile.FormatBreakdown = function(
     values,
     total,
-    partial
+    partial,
+    stale
 )
     local sorted = {}
-
     for _, value in ipairs(values or {}) do
         local numeric = tonumber(value)
-
         if numeric then
             table.insert(sorted, numeric)
         end
     end
-
     table.sort(
         sorted,
         function(a, b)
             return a > b
         end
     )
-
     if #sorted == 0 then
         if tonumber(total) and total ~= 0 then
             return formatNumber(total)
         end
-
         return "No numeric items counted"
     end
-
     local parts = {}
     local limit = math.min(#sorted, 90)
-
     for index = 1, limit do
         table.insert(
             parts,
             formatNumber(sorted[index])
         )
     end
-
     if #sorted > limit then
         table.insert(parts, "…")
     end
-
     local text =
         table.concat(parts, " + ")
-
     if #sorted <= limit then
         text =
             text
             .. " = "
             .. formatNumber(total or 0)
     end
-
     if partial then
         text =
             text
             .. "\nKnown numeric items only"
     end
-
+    if stale then
+        text =
+            text
+            .. "\nLast known value; live refresh is delayed"
+    end
     return text
 end
-
 State.Profile.AttachSummaryHover = function(label)
     if not label
         or not label.Parent
         or label:GetAttribute(
             "SV_BreakdownHoverBound"
         ) then
-
         return
     end
-
     label:SetAttribute(
         "SV_BreakdownHoverBound",
         true
     )
-
     connect(
         label.MouseEnter,
         function()
             local profileRoot =
                 State.Profile.root
-
             if not profileRoot
                 or not profileRoot.Parent then
-
                 return
             end
-
             local old =
                 profileRoot:FindFirstChild(
                     "SV_TotalBreakdownTooltip"
                 )
-
             if old then
                 old:Destroy()
             end
-
             local tooltip =
                 create("Frame", {
                     Name =
                         "SV_TotalBreakdownTooltip",
-
                     AnchorPoint =
                         Vector2.new(1, 0),
-
                     Size =
                         UDim2.fromOffset(
                             350,
                             104
                         ),
-
                     BackgroundColor3 =
                         Color3.fromRGB(
                             10,
                             12,
                             16
                         ),
-
                     BackgroundTransparency =
                         0.02,
-
                     BorderSizePixel = 0,
                     ZIndex = 500,
                     Active = false,
                 }, profileRoot)
-
             addCorner(tooltip, 7)
-
             addStroke(
                 tooltip,
                 THEME.border,
                 1,
                 0.08
             )
-
             local rootPosition =
                 profileRoot.AbsolutePosition
-
             local x =
                 label.AbsolutePosition.X
                 - rootPosition.X
                 + label.AbsoluteSize.X
-
             local y =
                 label.AbsolutePosition.Y
                 - rootPosition.Y
                 + label.AbsoluteSize.Y
                 + 5
-
             tooltip.Position =
                 UDim2.fromOffset(x, y)
-
             local info =
                 State.Profile.summaryDisplay
                 or {}
-
             create("TextLabel", {
                 Position =
                     UDim2.fromOffset(
                         10,
                         8
                     ),
-
                 Size =
                     UDim2.new(
                         1,
@@ -9647,56 +7513,46 @@ State.Profile.AttachSummaryHover = function(label)
                         1,
                         -16
                     ),
-
                 BackgroundTransparency = 1,
                 BorderSizePixel = 0,
-
                 Text =
                     State.Profile
                         .FormatBreakdown(
                             info.breakdownValues,
                             info.total,
-                            info.partial
+                            info.partial,
+                            info.stale
                         ),
-
                 TextColor3 = THEME.text,
                 TextSize = 11,
                 Font =
                     Enum.Font.GothamMedium,
-
                 TextWrapped = true,
-
                 TextXAlignment =
                     Enum.TextXAlignment.Left,
-
                 TextYAlignment =
                     Enum.TextYAlignment.Top,
-
                 ZIndex = 501,
                 Active = false,
             }, tooltip)
         end
     )
-
     connect(
         label.MouseLeave,
         function()
             local profileRoot =
                 State.Profile.root
-
             local tooltip =
                 profileRoot
                 and profileRoot:FindFirstChild(
                     "SV_TotalBreakdownTooltip"
                 )
-
             if tooltip then
                 tooltip:Destroy()
             end
         end
     )
 end
-
 State.Profile.UpdateSummaryUI = function(
     total,
     partial,
@@ -9705,106 +7561,97 @@ State.Profile.UpdateSummaryUI = function(
 )
     local profileRoot =
         State.Profile.root
-
     if not profileRoot
         or not profileRoot.Parent then
-
         return
     end
-
     local main =
         profileRoot:FindFirstChild("Main")
-
     if not main then
         return
     end
-
     info = info or {}
-
     State.Profile.summaryDisplay = {
         username = username,
         total = total or 0,
         partial = partial == true,
+        stale = info.stale == true,
         source = info.source,
         breakdownValues =
             info.breakdownValues
             or {},
     }
-
+    local stalePrefix =
+        info.stale
+        and "~"
+        or ""
     local valueText =
-        formatCompact(total or 0)
-        .. (partial and "+" or "")
-
+        partial and (tonumber(total) or 0) == 0
+        and (stalePrefix .. "?")
+        or (
+            stalePrefix
+            .. formatCompact(total or 0)
+            .. (partial and "+" or "")
+        )
     local color =
-        State.Profile.ColorForValue(total)
-
+        info.stale
+        and THEME.muted
+        or (
+            partial and (tonumber(total) or 0) == 0
+            and THEME.yellow
+            or State.Profile.ColorForValue(total)
+        )
     for _, tabName in ipairs({
         "Weapons",
         "Pets",
     }) do
         local section =
             main:FindFirstChild(tabName)
-
         if section then
             local totalLabel =
                 State.Profile.MakeSummaryLabel(
                     section,
                     "SV_ProfileTotal"
                 )
-
             if totalLabel then
                 State.Profile.AttachSummaryHover(
                     totalLabel
                 )
-
                 totalLabel.Text =
                     "Total Value: " .. valueText
-
                 totalLabel.TextColor3 = color
-
                 local stroke =
                     totalLabel:FindFirstChildOfClass(
                         "UIStroke"
                     )
-
                 if stroke then
                     stroke.Color = color
                 end
             end
-
         end
     end
 end
-
 State.Profile.QueueVisibleRemoteRefresh = function()
     State.Profile.visibleRemoteGeneration =
         State.Profile.visibleRemoteGeneration
         + 1
-
     local generation =
         State.Profile.visibleRemoteGeneration
-
     task.delay(0.04, function()
         if Destroyed
             or generation
                 ~= State.Profile
                     .visibleRemoteGeneration then
-
             return
         end
-
         local username =
             State.Profile.GetUsername()
-
         if not username
             or username == "" then
-
             return
         end
-
         local target =
             Players:FindFirstChild(username)
-
         if not target then
             for _, player in ipairs(
                 Players:GetPlayers()
@@ -9814,28 +7661,22 @@ State.Profile.QueueVisibleRemoteRefresh = function()
                     or normalize(
                         player.DisplayName
                     ) == normalize(username) then
-
                     target = player
                     break
                 end
             end
         end
-
         if not target then
             return
         end
-
         local fetch =
             State.Profile
                 .FetchRemoteTotalForPlayer
-
         if type(fetch) ~= "function" then
             return
         end
-
         task.spawn(function()
-            local ok = fetch(target)
-
+            local ok = fetch(target, true)
             if ok then
                 State.Profile
                     .RefreshLeaderboardBadges()
@@ -9843,7 +7684,6 @@ State.Profile.QueueVisibleRemoteRefresh = function()
         end)
     end)
 end
-
 State.Profile.DecorateLeaderboardFor = function(
     username,
     info
@@ -9852,10 +7692,8 @@ State.Profile.DecorateLeaderboardFor = function(
         or not info
         or not State.MainGUI
         or not State.MainGUI.Parent then
-
         return 0
     end
-
     local container =
         safeFindPath(
             State.MainGUI,
@@ -9865,92 +7703,88 @@ State.Profile.DecorateLeaderboardFor = function(
                 "Container",
             }
         )
-
     if not container then
         return 0
     end
-
     local row =
         container:FindFirstChild(username)
-
     if not row then
         local normalizedUsername =
             normalize(username)
-
         for _, child in ipairs(
             container:GetChildren()
         ) do
             if normalize(child.Name)
                 == normalizedUsername then
-
                 row = child
                 break
             end
         end
     end
-
     if not row then
         return 0
     end
-
     local playerLabel =
         row:FindFirstChild("PlayerLabel")
-
     if not playerLabel
         or not (
             playerLabel:IsA("TextLabel")
             or playerLabel:IsA("TextButton")
         ) then
-
         return 0
     end
-
-
     local oldPill =
         playerLabel:FindFirstChild(
             "SV_ProfileValuePill"
         )
-
     if oldPill then
         oldPill:Destroy()
     end
-
+    local stalePrefix =
+        info.stale
+        and "~"
+        or ""
     local display =
-        formatCompact(
-            info.total or 0
+        info.partial
+            and (tonumber(info.total) or 0) == 0
+        and (stalePrefix .. "?")
+        or (
+            stalePrefix
+            .. formatCompact(
+                info.total or 0
+            )
+            .. (
+                info.partial
+                and "+"
+                or ""
+            )
         )
-        .. (
-            info.partial
-            and "+"
-            or ""
-        )
-
     local color =
-        State.Profile.ColorForValue(
-            info.total
+        info.stale
+        and THEME.muted
+        or (
+            info.partial
+                and (tonumber(info.total) or 0) == 0
+            and THEME.yellow
+            or State.Profile.ColorForValue(
+                info.total
+            )
         )
-
     local valueLabel =
         playerLabel:FindFirstChild(
             "SV_LeaderboardValue"
         )
-
     local added = 0
-
     if not valueLabel
         or not valueLabel:IsA("TextLabel") then
-
         if valueLabel then
             valueLabel:Destroy()
         end
-
         valueLabel = create("TextLabel", {
             Name =
                 "SV_LeaderboardValue",
-
             AnchorPoint =
                 Vector2.new(1, 0.5),
-
             Position =
                 UDim2.new(
                     0,
@@ -9958,48 +7792,37 @@ State.Profile.DecorateLeaderboardFor = function(
                     0.5,
                     0
                 ),
-
             Size =
                 UDim2.fromOffset(
                     52,
                     22
                 ),
-
             BackgroundTransparency = 1,
             BorderSizePixel = 0,
-
             Text = display,
             TextColor3 = color,
             TextSize = 15,
-
             TextStrokeColor3 =
                 Color3.fromRGB(
                     5,
                     7,
                     10
                 ),
-
             TextStrokeTransparency =
                 0.10,
-
             Font =
                 Enum.Font.GothamBold,
-
             TextXAlignment =
                 Enum.TextXAlignment.Center,
-
             TextYAlignment =
                 Enum.TextYAlignment.Center,
-
             ZIndex =
                 math.max(
                     120,
                     playerLabel.ZIndex + 5
                 ),
-
             Active = false,
         }, playerLabel)
-
         added = 1
     else
         valueLabel.Text = display
@@ -10008,24 +7831,14 @@ State.Profile.DecorateLeaderboardFor = function(
         valueLabel.TextSize = 15
         valueLabel.TextStrokeTransparency = 0.10
     end
-
     State.Profile.leaderboardBadges[
         playerLabel
     ] = {
         username = username,
         total = info.total,
     }
-
-    if added > 0 then
-        State.Debug.Count(
-            "profileLeaderboardBadges",
-            added
-        )
-    end
-
     return added
 end
-
 State.Profile.RefreshLeaderboardBadges = function()
     for username, info in pairs(
         State.Profile.totalsByName
@@ -10036,8 +7849,6 @@ State.Profile.RefreshLeaderboardBadges = function()
         )
     end
 end
-
-
 State.Profile.FindRemoteCardHint = function(
     username,
     itemType,
@@ -10048,117 +7859,89 @@ State.Profile.FindRemoteCardHint = function(
         or username == ""
         or type(displayName) ~= "string"
         or displayName == "" then
-
         return nil
     end
-
     local targetPlayer =
         Players:FindFirstChild(
             username
         )
-
     if not targetPlayer then
         local normalizedUsername =
             normalize(username)
-
         local displayMatch = nil
-
         for _, player in ipairs(
             Players:GetPlayers()
         ) do
             if normalize(player.Name)
                 == normalizedUsername then
-
                 targetPlayer = player
                 break
             end
-
             if normalize(
                 player.DisplayName
             ) == normalizedUsername then
-
                 if displayMatch then
-
                     displayMatch = false
                 elseif displayMatch
                     ~= false then
-
                     displayMatch = player
                 end
             end
         end
-
         if not targetPlayer
             and displayMatch
             and displayMatch ~= false then
-
             targetPlayer =
                 displayMatch
         end
     end
-
     if not targetPlayer then
         return nil
     end
-
     local allHints =
         State.Profile
             .remoteCardHintsByUserId[
                 targetPlayer.UserId
             ]
-
     if type(allHints)
         ~= "table" then
-
         return nil
     end
-
     local hints =
         allHints[
             itemType == "Pets"
             and "Pets"
             or "Weapons"
         ]
-
     if type(hints)
         ~= "table" then
-
         return nil
     end
-
     local function simpleName(value)
         local name =
             normalize(value or "")
-
         name =
             name:gsub(
                 "%s*%(knife%)%s*$",
                 ""
             )
-
         name =
             name:gsub(
                 "%s*%(gun%)%s*$",
                 ""
             )
-
         name =
             name:gsub(
                 "%s*%(%d%d%d%d%)%s*$",
                 ""
             )
-
         return trim(name)
     end
-
     local visibleName =
         normalize(displayName)
-
     local visibleSimple =
         simpleName(displayName)
-
     local matches = {}
-
     local function addMatch(hint)
         for _, existing in ipairs(
             matches
@@ -10167,33 +7950,27 @@ State.Profile.FindRemoteCardHint = function(
                     == hint.itemId
                 and existing.record
                     == hint.record then
-
                 return
             end
         end
-
         table.insert(
             matches,
             hint
         )
     end
-
     for _, hint in ipairs(hints) do
         local record =
             hint.record
-
         if type(record) == "table" then
             local recordName =
                 normalize(
                     record.name
                     or ""
                 )
-
             local recordSimple =
                 simpleName(
                     record.name
                 )
-
             local idBase =
                 select(
                     1,
@@ -10201,10 +7978,8 @@ State.Profile.FindRemoteCardHint = function(
                         hint.itemId
                     )
                 )
-
             local idSimple =
                 simpleName(idBase)
-
             if visibleName ~= ""
                 and (
                     recordName
@@ -10217,56 +7992,43 @@ State.Profile.FindRemoteCardHint = function(
                             == visibleSimple
                     )
                 ) then
-
                 addMatch(hint)
             end
         end
     end
-
     if #matches == 0 then
         return nil
     end
-
-
     if #matches > 1 then
         local exact = {}
-
         for _, hint in ipairs(matches) do
             if normalize(
                 hint.record
                 and hint.record.name
                 or ""
             ) == visibleName then
-
                 table.insert(
                     exact,
                     hint
                 )
             end
         end
-
         if #exact > 0 then
             matches = exact
         end
     end
-
-
     if #matches > 1
         and frame then
-
         local rarity =
             State.GetCardRarityHint(
                 frame
             )
-
         local preferredCategory =
             State.GameRarityToSupremeCategory(
                 rarity
             )
-
         if preferredCategory then
             local rarityMatches = {}
-
             for _, hint in ipairs(
                 matches
             ) do
@@ -10275,33 +8037,26 @@ State.Profile.FindRemoteCardHint = function(
                     and hint.record.category
                     or ""
                 ) == preferredCategory then
-
                     table.insert(
                         rarityMatches,
                         hint
                     )
                 end
             end
-
             if #rarityMatches > 0 then
                 matches =
                     rarityMatches
             end
         end
     end
-
-
     if #matches > 1
         and frame then
-
         local visibleQuantity =
             getAmountFromCard(
                 frame
             )
-
         if visibleQuantity then
             local quantityMatches = {}
-
             for _, hint in ipairs(
                 matches
             ) do
@@ -10310,36 +8065,23 @@ State.Profile.FindRemoteCardHint = function(
                 ) == tonumber(
                     visibleQuantity
                 ) then
-
                     table.insert(
                         quantityMatches,
                         hint
                     )
                 end
             end
-
             if #quantityMatches > 0 then
                 matches =
                     quantityMatches
             end
         end
     end
-
     if #matches ~= 1 then
-        State.Debug.Count(
-            "remoteProfileCardHintsAmbiguous"
-        )
-
         return nil
     end
-
-    State.Debug.Count(
-        "remoteProfileCardHintsUsed"
-    )
-
     return matches[1]
 end
-
 State.Profile.ScanRoot = function(root, itemType, username)
     local result = {
         cardsSeen = 0,
@@ -10349,18 +8091,12 @@ State.Profile.ScanRoot = function(root, itemType, username)
         unresolved = 0,
         numericContributions = {},
     }
-
     if not CONFIG.ValueBadgeOnProfile
         or not SupremeDatabase
         or not root
         or not root.Parent then
-
         return result
     end
-
-
-    
-
     for _, descendant in ipairs(
         root:GetDescendants()
     ) do
@@ -10370,7 +8106,6 @@ State.Profile.ScanRoot = function(root, itemType, username)
                 descendant,
                 root
             ) then
-
             local displayName =
                 getTextFromItemName(
                     descendant
@@ -10378,40 +8113,30 @@ State.Profile.ScanRoot = function(root, itemType, username)
                 or getLooseCardDisplayName(
                     descendant
                 )
-
             local normalizedName =
                 normalize(displayName or "")
-
             if normalizedName ~= ""
                 and normalizedName ~= "loading"
                 and normalizedName ~= "loading..." then
-
                 result.cardsSeen =
                     result.cardsSeen + 1
-
                 local cardOptions = {
                     itemType = itemType,
                     displayName = displayName,
                     showValue = true,
                     showInfo = CONFIG.StatsButtons,
-
-
-                    
                     compactMode = true,
                     allowLooseCard = false,
                     requireTrustedResolution =
                         CONFIG.ProfileRequireTrustedMatches,
                 }
-
                 local record =
                     decorateCard(
                         descendant,
                         cardOptions
                     )
-
                 if not record
                     and username then
-
                     local remoteHint =
                         State.Profile
                             .FindRemoteCardHint(
@@ -10420,16 +8145,12 @@ State.Profile.ScanRoot = function(root, itemType, username)
                                 displayName,
                                 descendant
                             )
-
                     if remoteHint
                         and remoteHint.record then
-
                         cardOptions.itemId =
                             remoteHint.itemId
-
                         cardOptions.record =
                             remoteHint.record
-
                         record =
                             decorateCard(
                                 descendant,
@@ -10437,22 +8158,18 @@ State.Profile.ScanRoot = function(root, itemType, username)
                             )
                     end
                 end
-
                 if record then
                     result.resolved =
                         result.resolved + 1
-
                     local quantity =
                         getAmountFromCard(
                             descendant
                         )
                         or 1
-
                     local unitValue =
                         numericValue(
                             record.data
                         )
-
                     if unitValue then
                         result.numericTotal =
                             result.numericTotal
@@ -10460,7 +8177,6 @@ State.Profile.ScanRoot = function(root, itemType, username)
                                 unitValue
                                 * quantity
                             )
-
                         for _ = 1, math.min(
                             math.max(
                                 1,
@@ -10479,61 +8195,45 @@ State.Profile.ScanRoot = function(root, itemType, username)
                             + quantity
                     end
                 else
-
-                    
-
-                    
                     result.unresolved =
                         result.unresolved + 1
                 end
             end
         end
     end
-
     return result
 end
-
 State.Profile.Scan = function()
     if Destroyed
         or not CONFIG.ValueBadgeOnProfile
         or not SupremeDatabase then
-
         return
     end
-
     local profileRoot =
         State.Profile.GetRoots()
-
     if not profileRoot
         or not profileRoot.Parent then
-
         return
     end
-
     local username =
         State.Profile.GetUsername()
-
     State.Profile.currentUsername =
         username
-
     local weapons =
         State.Profile.ScanRoot(
             State.Profile.weaponItems,
             "Weapons",
             username
         )
-
     local pets =
         State.Profile.ScanRoot(
             State.Profile.petItems,
             "Pets",
             username
         )
-
     local visibleTotal =
         weapons.numericTotal
         + pets.numericTotal
-
     local visiblePartial =
         weapons.nonNumericUnits > 0
         or pets.nonNumericUnits > 0
@@ -10541,9 +8241,7 @@ State.Profile.Scan = function()
         or pets.unresolved > 0
         or weapons.cardsSeen == 0
         or pets.cardsSeen == 0
-
     local breakdownValues = {}
-
     for _, value in ipairs(
         weapons.numericContributions
         or {}
@@ -10553,7 +8251,6 @@ State.Profile.Scan = function()
             value
         )
     end
-
     for _, value in ipairs(
         pets.numericContributions
         or {}
@@ -10563,21 +8260,17 @@ State.Profile.Scan = function()
             value
         )
     end
-
     local verifiedInfo =
         username
         and State.Profile.totalsByName[
             username
         ]
         or nil
-
     if verifiedInfo
         and verifiedInfo.source
             ~= "GetFullInventoryVerified" then
-
         verifiedInfo = nil
     end
-
     local displayInfo =
         verifiedInfo
         or {
@@ -10597,7 +8290,6 @@ State.Profile.Scan = function()
             breakdownValues =
                 breakdownValues,
         }
-
     State.Profile.UpdateSummaryUI(
         displayInfo.total,
         displayInfo.partial,
@@ -10605,17 +8297,11 @@ State.Profile.Scan = function()
         displayInfo
     )
 end
-
-
 State.Profile.QueueScan = function()
     State.Profile.scanGeneration =
         State.Profile.scanGeneration + 1
-
     local generation =
         State.Profile.scanGeneration
-
-
-    
     for _, delaySeconds in ipairs({
         0,
         0.06,
@@ -10626,25 +8312,19 @@ State.Profile.QueueScan = function()
             if Destroyed
                 or generation
                     ~= State.Profile.scanGeneration then
-
                 return
             end
-
             State.Profile.Scan()
         end)
     end
 end
-
 State.Profile.Bind = function()
     State.Profile.Disconnect()
-
     local profileRoot =
         State.Profile.GetRoots()
-
     if not profileRoot then
         return false
     end
-
     local function keep(connection)
         table.insert(
             State.Profile.connections,
@@ -10655,7 +8335,6 @@ State.Profile.Bind = function()
             connection
         )
     end
-
     if profileRoot:IsA("GuiObject") then
         keep(
             profileRoot:GetPropertyChangedSignal(
@@ -10668,7 +8347,6 @@ State.Profile.Bind = function()
             end)
         )
     end
-
     keep(
         profileRoot.DescendantAdded:Connect(
             function(descendant)
@@ -10676,15 +8354,12 @@ State.Profile.Bind = function()
                     descendant,
                     profileRoot
                 ) then
-
                     return
                 end
-
                 local path =
                     normalize(
                         descendant:GetFullName()
                     )
-
                 if path:find(
                     "viewprofile.main.weapons",
                     1,
@@ -10695,19 +8370,15 @@ State.Profile.Bind = function()
                         1,
                         true
                     ) then
-
                     State.Profile.QueueScan()
                 end
             end
         )
     )
-
     local main =
         profileRoot:FindFirstChild("Main")
-
     local nav =
         profileRoot:FindFirstChild("Nav")
-
     if main then
         for _, tabName in ipairs({
             "Weapons",
@@ -10715,10 +8386,8 @@ State.Profile.Bind = function()
         }) do
             local section =
                 main:FindFirstChild(tabName)
-
             if section
                 and section:IsA("GuiObject") then
-
                 keep(
                     section:GetPropertyChangedSignal(
                         "Visible"
@@ -10728,19 +8397,15 @@ State.Profile.Bind = function()
                         end
                     end)
                 )
-
                 local title =
                     section:FindFirstChild("Title")
-
                 local username =
                     title
                     and title:FindFirstChild(
                         "Username"
                     )
-
                 if username
                     and username:IsA("TextLabel") then
-
                     keep(
                         username:GetPropertyChangedSignal(
                             "Text"
@@ -10753,7 +8418,6 @@ State.Profile.Bind = function()
             end
         end
     end
-
     if nav then
         for _, tabName in ipairs({
             "Weapons",
@@ -10761,10 +8425,8 @@ State.Profile.Bind = function()
         }) do
             local button =
                 nav:FindFirstChild(tabName)
-
             if button
                 and button:IsA("GuiButton") then
-
                 keep(
                     button.MouseButton1Click:Connect(
                         function()
@@ -10775,7 +8437,6 @@ State.Profile.Bind = function()
             end
         end
     end
-
     local leaderboardContainer =
         State.MainGUI
         and safeFindPath(
@@ -10787,7 +8448,6 @@ State.Profile.Bind = function()
             }
         )
         or nil
-
     if leaderboardContainer then
         keep(
             leaderboardContainer.ChildAdded:Connect(
@@ -10795,38 +8455,31 @@ State.Profile.Bind = function()
                     task.delay(0.03, function()
                         if Destroyed
                             or not row.Parent then
-
                             return
                         end
-
                         local player =
                             Players:FindFirstChild(
                                 row.Name
                             )
-
                         local cached =
                             State.Profile.totalsByName[
                                 row.Name
                             ]
-
                         if cached then
                             State.Profile
                                 .DecorateLeaderboardFor(
                                     row.Name,
                                     cached
                                 )
-
                         elseif player
                             and State.Profile
                                 .FetchRemoteTotalForPlayer then
-
                             task.spawn(function()
                                 local ok =
                                     State.Profile
                                         .FetchRemoteTotalForPlayer(
                                             player
                                         )
-
                                 if ok then
                                     State.Profile
                                         .DecorateLeaderboardFor(
@@ -10844,32 +8497,45 @@ State.Profile.Bind = function()
             )
         )
     end
-
     State.Profile.QueueScan()
     State.Profile.QueueVisibleRemoteRefresh()
     State.Profile.RefreshLeaderboardBadges()
     return true
 end
-
-
 State.Profile.RemovePlayerCache = function(player)
     if not player then
         return
     end
-
     State.Profile.totalsByName[
         player.Name
     ] = nil
-
-    State.Profile.remoteTotals
-        .resultsByUserId[
-            player.UserId
-        ] = nil
-
     State.Profile.remoteCardHintsByUserId[
         player.UserId
     ] = nil
-
+    local remoteState =
+        State.Profile.remoteTotals
+    remoteState.rawByUserId[
+        player.UserId
+    ] = nil
+    remoteState.lastSuccessByUserId[
+        player.UserId
+    ] = nil
+    remoteState.failureCountByUserId[
+        player.UserId
+    ] = nil
+    remoteState.retryAfterByUserId[
+        player.UserId
+    ] = nil
+    local inFlight =
+        remoteState.inFlightByUserId[
+            player.UserId
+        ]
+    if inFlight then
+        inFlight.expired = true
+        remoteState.inFlightByUserId[
+            player.UserId
+        ] = nil
+    end
     for label, info in pairs(
         State.Profile.leaderboardBadges
     ) do
@@ -10877,10 +8543,8 @@ State.Profile.RemovePlayerCache = function(player)
             and normalize(
                 info.username or ""
             ) == normalize(player.Name) then
-
             if label
                 and label.Parent then
-
                 for _, valueName in ipairs({
                     "SV_LeaderboardValue",
                     "SV_ProfileValuePill",
@@ -10889,7 +8553,6 @@ State.Profile.RemovePlayerCache = function(player)
                         label:FindFirstChild(
                             valueName
                         )
-
                     if valueLabel then
                         pcall(function()
                             valueLabel:Destroy()
@@ -10897,26 +8560,15 @@ State.Profile.RemovePlayerCache = function(player)
                     end
                 end
             end
-
             State.Profile.leaderboardBadges[
                 label
             ] = nil
         end
     end
-
-    State.Debug.Record(
-        "profile_player_cache_removed",
-        {
-            username = player.Name,
-            userId = player.UserId,
-        }
-    )
 end
-
 State.InventoryDescendantConnection = nil
 State.TradeDescendantConnection = nil
 State.TradeEnabledConnection = nil
-
 local function disconnectExactTradeInventoryConnections()
     for _, connection in ipairs(
         State.TradeInventoryConnections
@@ -10925,57 +8577,42 @@ local function disconnectExactTradeInventoryConnections()
             connection:Disconnect()
         end)
     end
-
     State.TradeInventoryConnections = {}
 end
-
 local function queueTradeInventoryPopulationRefresh()
     State.TradeInventoryRefreshGeneration =
         State.TradeInventoryRefreshGeneration + 1
-
     local generation =
         State.TradeInventoryRefreshGeneration
-
     task.delay(0.18, function()
         if Destroyed
             or generation ~= State.TradeInventoryRefreshGeneration then
-
             return
         end
-
         if State.CurrentTrade
             and isTradeVisible() then
-
             scheduleTradeRefresh(0)
         end
     end)
 end
-
 local function bindTradeInventoryRoot(root, itemType)
     if not root then
         return
     end
-
     local added =
         root.ChildAdded:Connect(function(child)
-            State.Debug.Count("tradeInventoryCardEvents")
-
             if not SupremeDatabase
                 or isInsideInjectedUi(child, root) then
-
                 return
             end
-
             task.defer(function()
                 if Destroyed
                     or not child
                     or not child.Parent
                     or not child:IsA("GuiObject")
                     or not looksLikeTradeInventoryCardLoose(child) then
-
                     return
                 end
-
                 local resolvedType,
                     itemId,
                     displayName =
@@ -10983,7 +8620,6 @@ local function bindTradeInventoryRoot(root, itemType)
                         child,
                         itemType
                     )
-
                 if resolvedType then
                     decorateCard(child, {
                         itemId = itemId,
@@ -10994,21 +8630,17 @@ local function bindTradeInventoryRoot(root, itemType)
                         compactMode = true,
                         allowLooseCard = true,
                     })
-
                     queueTradeInventoryPopulationRefresh()
                 end
             end)
         end)
-
     local removed =
         root.ChildRemoved:Connect(function(child)
             if isInsideInjectedUi(child, root) then
                 return
             end
-
             queueTradeInventoryPopulationRefresh()
         end)
-
     table.insert(
         State.TradeInventoryConnections,
         added
@@ -11017,11 +8649,9 @@ local function bindTradeInventoryRoot(root, itemType)
         State.TradeInventoryConnections,
         removed
     )
-
     table.insert(Connections, added)
     table.insert(Connections, removed)
 end
-
 reconnectGuiWatchers = function()
     if State.InventoryDescendantConnection then
         pcall(function()
@@ -11029,19 +8659,15 @@ reconnectGuiWatchers = function()
         end)
         State.InventoryDescendantConnection = nil
     end
-
     if State.TradeEnabledConnection then
         pcall(function()
             State.TradeEnabledConnection:Disconnect()
         end)
         State.TradeEnabledConnection = nil
     end
-
     disconnectExactTradeInventoryConnections()
-
     discoverMainGui()
     discoverTradeGui()
-
     if State.InventoryRoot then
         State.InventoryDescendantConnection =
             State.InventoryRoot.DescendantAdded:Connect(function(descendant)
@@ -11050,19 +8676,14 @@ reconnectGuiWatchers = function()
                         descendant,
                         State.InventoryRoot
                     ) then
-
                     return
                 end
-
                 local card =
                     findItemCardFromDescendant(
                         descendant,
                         State.InventoryRoot
                     )
-
                 if card then
-                    State.Debug.Count("inventoryCardEvents")
-
                     queueCardDecoration(card, {
                         showValue = CONFIG.ValueBadgeOnInventory,
                         showInfo = CONFIG.StatsButtons,
@@ -11070,13 +8691,11 @@ reconnectGuiWatchers = function()
                     })
                 end
             end)
-
         table.insert(
             Connections,
             State.InventoryDescendantConnection
         )
     end
-
     if State.TradeGui then
         for _, discovered in ipairs(
             State.TradeInventoryRoots
@@ -11086,7 +8705,6 @@ reconnectGuiWatchers = function()
                 discovered.itemType
             )
         end
-
         if State.TradeGui.Name == "Trade" then
             State.TradeEnabledConnection =
                 State.TradeGui:GetPropertyChangedSignal(
@@ -11095,8 +8713,10 @@ reconnectGuiWatchers = function()
                     if State.TradeGui.Enabled then
                         TradePanel.Visible =
                             CONFIG.TradePanel
-
                         task.delay(0.06, function()
+                            if Destroyed then
+                                return
+                            end
                             recoverTradeStatus()
                             scheduleTradeRefresh(0.08)
                         end)
@@ -11104,12 +8724,10 @@ reconnectGuiWatchers = function()
                         State.CurrentTrade = nil
                         State.TradeHelperGeneration =
                             State.TradeHelperGeneration + 1
-
                         TradePanel.Visible = false
                         clearAllTradeHighlights()
                     end
                 end)
-
             table.insert(
                 Connections,
                 State.TradeEnabledConnection
@@ -11117,48 +8735,24 @@ reconnectGuiWatchers = function()
         end
     end
 end
-
 connect(PlayerGui.ChildAdded, function(child)
     if child.Name == "MainGUI" then
         task.delay(0.12, function()
             if Destroyed then
                 return
             end
-
             reconnectGuiWatchers()
             scanInventoryCards()
             State.Profile.Bind()
             State.Profile.QueueRemoteLeaderboardSweep()
-
-            State.Debug.Count(
-                "profileRespawnRebinds"
-            )
-
-            State.Debug.Record(
-                "profile_main_gui_rebind",
-                {
-                    mainGui =
-                        State.Debug.InstancePath(
-                            State.MainGUI
-                        ),
-                    profileRoot =
-                        State.Debug.InstancePath(
-                            State.Profile.root
-                        ),
-                }
-            )
         end)
-
     elseif child.Name == "Trade"
         and child:IsA("ScreenGui") then
-
         task.delay(0.12, function()
             if Destroyed then
                 return
             end
-
             reconnectGuiWatchers()
-
             if child.Enabled then
                 recoverTradeStatus()
                 scheduleTradeRefresh(0.08)
@@ -11166,21 +8760,9 @@ connect(PlayerGui.ChildAdded, function(child)
         end)
     end
 end)
-
-
 connect(
     Players.PlayerAdded,
     function(player)
-
-        
-        State.Debug.Record(
-            "profile_player_join_detected",
-            {
-                username = player.Name,
-                userId = player.UserId,
-            }
-        )
-
         for _, delaySeconds in ipairs({
             0.15,
             0.45,
@@ -11193,32 +8775,25 @@ connect(
             task.delay(delaySeconds, function()
                 if Destroyed
                     or not player.Parent then
-
                     return
                 end
-
                 local cached =
                     State.Profile.totalsByName[
                         player.Name
                     ]
-
                 if cached
                     and cached.source
                         == "GetFullInventoryVerified" then
-
                     State.Profile.DecorateLeaderboardFor(
                         player.Name,
                         cached
                     )
-
                     return
                 end
-
                 local ok =
                     State.Profile.FetchRemoteTotalForPlayer(
                         player
                     )
-
                 if ok then
                     State.Profile.RefreshLeaderboardBadges()
                 end
@@ -11226,7 +8801,6 @@ connect(
         end
     end
 )
-
 connect(
     Players.PlayerRemoving,
     function(player)
@@ -11235,13 +8809,9 @@ connect(
         )
     end
 )
-
 connect(
     LocalPlayer.CharacterAdded,
     function()
-
-        
-
         for _, delaySeconds in ipairs({
             0.35,
             0.85,
@@ -11251,20 +8821,17 @@ connect(
                 if Destroyed then
                     return
                 end
-
                 discoverMainGui()
                 State.Profile.Bind()
             end)
         end
     end
 )
-
 local function removeInjectedChildren()
     local maintenanceRoot =
         PlayerGui:FindFirstChild(
             "SV_PC_Maintenance"
         )
-
     for _, descendant in ipairs(
         PlayerGui:GetDescendants()
     ) do
@@ -11277,7 +8844,6 @@ local function removeInjectedChildren()
                     maintenanceRoot
                 )
             )
-
         if descendant
                 ~= UI.RootGui
             and not insideMaintenance
@@ -11286,15 +8852,12 @@ local function removeInjectedChildren()
                 1,
                 3
             ) == "SV_" then
-
             pcall(function()
                 descendant:Destroy()
             end)
         end
     end
 end
-
-
 State.Profile.ResolveRemoteInventoryItem = function(
     itemId,
     itemType,
@@ -11302,13 +8865,10 @@ State.Profile.ResolveRemoteInventoryItem = function(
 )
     if type(itemId) ~= "string"
         or itemId == "" then
-
         return nil
     end
-
     local normalizedId =
         normalize(itemId)
-
     if normalizedId == ""
         or normalizedId == "weapons"
         or normalizedId == "pets"
@@ -11317,7 +8877,12 @@ State.Profile.ResolveRemoteInventoryItem = function(
         or normalizedId == "current"
         or normalizedId == "classic"
         or normalizedId == "holiday"
+        or normalizedId == "holidays"
+        or normalizedId == "halloween"
+        or normalizedId == "christmas"
+        or normalizedId == "seasonal"
         or normalizedId == "season1"
+        or normalizedId == "season2"
         or normalizedId == "equipped"
         or normalizedId == "default"
         or normalizedId == "owned"
@@ -11325,10 +8890,8 @@ State.Profile.ResolveRemoteInventoryItem = function(
         or normalizedId == "converted"
         or normalizedId == "defaultgun"
         or normalizedId == "defaultknife" then
-
         return nil
     end
-
     local record,
         reason,
         resolutionMeta =
@@ -11337,54 +8900,33 @@ State.Profile.ResolveRemoteInventoryItem = function(
             itemType,
             itemId
         )
-
     local trusted =
         not CONFIG.ProfileRequireTrustedMatches
         or not resolutionMeta
         or resolutionMeta.trusted
             ~= false
-
     local remoteExactUnique = false
-
     if record
         and not trusted
         and resolutionMeta
         and tonumber(
             resolutionMeta.candidateCount
         ) == 1 then
-
         local rawIdName =
             normalize(itemId)
-
         local supremeName =
             normalize(
                 record.name
                 or ""
             )
-
         if rawIdName ~= ""
             and rawIdName == supremeName then
-
             remoteExactUnique = true
             trusted = true
-
-            State.Debug.Count(
-                "remoteExactUniqueTrusted"
-            )
         end
     end
-
     if not record
         or not trusted then
-
-        if record
-            and not trusted then
-
-            State.Debug.Count(
-                "weakProfileMatchesRejected"
-            )
-        end
-
         return {
             itemId = itemId,
             itemType = itemType,
@@ -11400,21 +8942,16 @@ State.Profile.ResolveRemoteInventoryItem = function(
                 resolutionMeta,
         }
     end
-
     local unitValue =
         numericValue(
             record.data
         )
-
     local returnedMeta =
         resolutionMeta
-
     if remoteExactUnique then
         returnedMeta = {}
-
         if type(resolutionMeta)
             == "table" then
-
             for key, value in pairs(
                 resolutionMeta
             ) do
@@ -11422,14 +8959,12 @@ State.Profile.ResolveRemoteInventoryItem = function(
                     value
             end
         end
-
         returnedMeta.trusted = true
         returnedMeta.level =
             "remote-exact-unique"
         returnedMeta.source =
             "GetFullInventory exact unique name"
     end
-
     return {
         itemId = itemId,
         itemType = itemType,
@@ -11441,7 +8976,6 @@ State.Profile.ResolveRemoteInventoryItem = function(
             returnedMeta,
     }
 end
-
 State.Profile.CalculateRemoteSection = function(
     section,
     itemType,
@@ -11459,43 +8993,32 @@ State.Profile.CalculateRemoteSection = function(
         cardHints = {},
         unresolvedAll = {},
     }
-
     if type(section) ~= "table" then
         result.partial = true
         return result
     end
-
     local visited = setmetatable(
         {},
         {__mode = "k"}
     )
-
     local nodeCount = 0
-
     local function addResult(
         itemId,
         quantity
     )
         quantity = tonumber(quantity) or 1
-
         if quantity <= 0 then
             return false
         end
-
-
-        
         if quantity > 10000 then
             return false
         end
-
         if type(seenQuantities)
             == "table" then
-
             local seenKey =
                 tostring(itemType)
                 .. "|"
                 .. tostring(itemId)
-
             local previous =
                 tonumber(
                     seenQuantities[
@@ -11503,31 +9026,25 @@ State.Profile.CalculateRemoteSection = function(
                     ]
                 )
                 or 0
-
             if quantity <= previous then
                 return true
             end
-
             seenQuantities[
                 seenKey
             ] = quantity
-
             quantity =
                 quantity
                 - previous
         end
-
         local resolved =
             State.Profile.ResolveRemoteInventoryItem(
                 tostring(itemId),
                 itemType,
                 quantity
             )
-
         if not resolved then
             return false
         end
-
         if resolved.resolved then
             table.insert(
                 result.cardHints,
@@ -11544,14 +9061,11 @@ State.Profile.CalculateRemoteSection = function(
                         resolved.resolutionMeta,
                 }
             )
-
             result.resolvedItems =
                 result.resolvedItems + 1
-
             result.resolvedUnits =
                 result.resolvedUnits
                 + quantity
-
             if resolved.unitValue then
                 result.total =
                     result.total
@@ -11559,7 +9073,6 @@ State.Profile.CalculateRemoteSection = function(
                         resolved.unitValue
                         * quantity
                     )
-
                 for _ = 1, math.min(
                     math.max(
                         1,
@@ -11576,10 +9089,8 @@ State.Profile.CalculateRemoteSection = function(
                 result.nonNumericUnits =
                     result.nonNumericUnits
                     + quantity
-
                 result.partial = true
             end
-
             if #result.samples < 30 then
                 table.insert(
                     result.samples,
@@ -11608,9 +9119,7 @@ State.Profile.CalculateRemoteSection = function(
         else
             result.unresolvedLeaves =
                 result.unresolvedLeaves + 1
-
             result.partial = true
-
             table.insert(
                 result.unresolvedAll,
                 {
@@ -11626,7 +9135,6 @@ State.Profile.CalculateRemoteSection = function(
                         resolved.resolutionMeta,
                 }
             )
-
             if #result.samples < 30 then
                 table.insert(
                     result.samples,
@@ -11651,10 +9159,8 @@ State.Profile.CalculateRemoteSection = function(
                 )
             end
         end
-
         return true
     end
-
     local function walk(
         node,
         depth,
@@ -11662,23 +9168,17 @@ State.Profile.CalculateRemoteSection = function(
     )
         if depth > 5
             or nodeCount > 2500 then
-
             result.partial = true
             return
         end
-
         if type(node) ~= "table" then
             return
         end
-
         if visited[node] then
             return
         end
-
         visited[node] = true
         nodeCount = nodeCount + 1
-
-
         local objectId =
             node.ItemId
             or node.ItemID
@@ -11689,7 +9189,6 @@ State.Profile.CalculateRemoteSection = function(
             or node.id
             or node.Name
             or node.name
-
         local objectQuantity =
             node.Amount
             or node.amount
@@ -11699,11 +9198,9 @@ State.Profile.CalculateRemoteSection = function(
             or node.count
             or node.Owned
             or node.owned
-
         if type(objectId) == "string"
             and objectQuantity ~= nil
             and tonumber(objectQuantity) then
-
             if addResult(
                 objectId,
                 objectQuantity
@@ -11712,28 +9209,19 @@ State.Profile.CalculateRemoteSection = function(
                 return
             end
         end
-
         for key, value in pairs(node) do
             if type(key) == "string"
                 and type(value) == "number" then
-
                 addResult(key, value)
-
             elseif type(key) == "string"
                 and type(value) == "boolean" then
-
                 if value then
                     addResult(key, 1)
                 end
-
             elseif type(value) == "string"
                 and type(key) == "number" then
-
                 addResult(value, 1)
-
             elseif type(value) == "table" then
-
-                
                 local nestedQuantity =
                     value.Amount
                     or value.amount
@@ -11743,19 +9231,15 @@ State.Profile.CalculateRemoteSection = function(
                     or value.count
                     or value.Owned
                     or value.owned
-
                 local handled = false
-
                 if type(key) == "string"
                     and tonumber(nestedQuantity) then
-
                     handled =
                         addResult(
                             key,
                             nestedQuantity
                         )
                 end
-
                 if not handled then
                     walk(
                         value,
@@ -11765,101 +9249,224 @@ State.Profile.CalculateRemoteSection = function(
                 end
             end
         end
-
         visited[node] = nil
     end
-
     walk(section, 0, nil)
-
     return result
 end
-
 State.Profile.CalculateRemoteInventory = function(data)
     if type(data) ~= "table" then
         return nil, "not_table"
     end
-
-    local inventory =
-        type(data.Inventory)
-            == "table"
-        and data.Inventory
-        or nil
-
-    local weapons =
-        data.Weapons
-        or data.weapons
-        or (
-            inventory
-            and (
-                inventory.Weapons
-                or inventory.weapons
-            )
-        )
-
-    local pets =
-        data.Pets
-        or data.pets
-        or (
-            inventory
-            and (
-                inventory.Pets
-                or inventory.pets
-            )
-        )
-
+    local inventory = type(data.Inventory) == "table" and data.Inventory or nil
     local weaponSections = {}
-    local seenSectionTables =
-        setmetatable(
-            {},
-            {__mode = "k"}
-        )
-
-    local function addWeaponSection(
-        candidate
-    )
-        if type(candidate)
-                == "table"
-            and not seenSectionTables[
-                candidate
-            ] then
-
-            seenSectionTables[
-                candidate
-            ] = true
-
-            table.insert(
-                weaponSections,
-                candidate
-            )
+    local petSections = {}
+    local seenSectionTables = setmetatable({}, {__mode = "k"})
+    local excludedSectionNames = {
+        userid = true,
+        userId = true,
+        playerid = true,
+        playerId = true,
+        inventory = true,
+        currencies = true,
+        currency = true,
+        coins = true,
+        gems = true,
+        emotes = true,
+        toys = true,
+        effects = true,
+        perks = true,
+        powers = true,
+        radios = true,
+        settings = true,
+        stats = true,
+        metadata = true,
+        profile = true,
+        trades = true,
+        offers = true,
+        achievements = true,
+        badges = true,
+        titles = true,
+        crafting = true,
+        recipes = true,
+        materials = true,
+        crates = true,
+        boxes = true,
+        equipped = true,
+        slots = true,
+        converted = true,
+    }
+    local structuralNames = {
+        weapons = true,
+        weapon = true,
+        pets = true,
+        pet = true,
+        items = true,
+        current = true,
+        owned = true,
+        inventory = true,
+        slots = true,
+        converted = true,
+        default = true,
+        defaultgun = true,
+        defaultknife = true,
+    }
+    local function addSection(target, candidate)
+        if type(candidate) == "table" and not seenSectionTables[candidate] then
+            seenSectionTables[candidate] = true
+            table.insert(target, candidate)
         end
     end
-
-    addWeaponSection(
-        weapons
-    )
-
-    addWeaponSection(
-        data.Holiday
-        or data.holiday
-    )
-
-    addWeaponSection(
-        data.Holidays
-        or data.holidays
-    )
-
-    if inventory then
-        addWeaponSection(
-            inventory.Holiday
-            or inventory.holiday
-        )
-
-        addWeaponSection(
-            inventory.Holidays
-            or inventory.holidays
-        )
+    local function knownItemType(itemId)
+        if type(itemId) ~= "string" and type(itemId) ~= "number" then
+            return nil
+        end
+        local id = tostring(itemId)
+        if id == "" or structuralNames[normalize(id)] then
+            return nil
+        end
+        if State.Mapping.ItemLinks[
+            State.Mapping.MakeItemKey("Weapons", id)
+        ] then
+            return "Weapons"
+        end
+        if State.Mapping.ItemLinks[
+            State.Mapping.MakeItemKey("Pets", id)
+        ] then
+            return "Pets"
+        end
+        if getGameItemData("Weapons", id) then
+            return "Weapons"
+        end
+        if getGameItemData("Pets", id) then
+            return "Pets"
+        end
+        return nil
     end
-
+    local function detectSectionType(candidate)
+        if type(candidate) ~= "table" then
+            return nil
+        end
+        local visited = setmetatable({}, {__mode = "k"})
+        local checked = 0
+        local weaponHits = 0
+        local petHits = 0
+        local function walk(node, depth)
+            if depth > 4 or checked >= 24 or visited[node] then
+                return
+            end
+            visited[node] = true
+            for key, value in pairs(node) do
+                if checked >= 24 then
+                    break
+                end
+                local candidateId = nil
+                if type(value) == "table" then
+                    candidateId =
+                        value.ItemID
+                        or value.ItemId
+                        or value.DataID
+                        or value.DataId
+                        or value.ID
+                        or value.Id
+                end
+                if candidateId == nil
+                    and (type(key) == "string" or type(key) == "number")
+                    and not structuralNames[normalize(key)] then
+                    candidateId = key
+                end
+                if candidateId ~= nil then
+                    checked = checked + 1
+                    local itemType = knownItemType(candidateId)
+                    if itemType == "Weapons" then
+                        weaponHits = weaponHits + 1
+                    elseif itemType == "Pets" then
+                        petHits = petHits + 1
+                    end
+                end
+                if type(value) == "table" then
+                    walk(value, depth + 1)
+                end
+            end
+        end
+        walk(candidate, 0)
+        if weaponHits > petHits and weaponHits > 0 then
+            return "Weapons"
+        end
+        if petHits > weaponHits and petHits > 0 then
+            return "Pets"
+        end
+        return nil
+    end
+    local function considerNamedSection(name, candidate)
+        if type(candidate) ~= "table" then
+            return
+        end
+        local normalizedName = normalize(name)
+        if excludedSectionNames[normalizedName] then
+            return
+        end
+        if normalizedName == "pets" or normalizedName == "pet" then
+            addSection(petSections, candidate)
+            return
+        end
+        if normalizedName == "weapons"
+            or normalizedName == "weapon"
+            or normalizedName == "holiday"
+            or normalizedName == "holidays"
+            or normalizedName == "classic"
+            or normalizedName == "season1"
+            or normalizedName:find("halloween", 1, true)
+            or normalizedName:find("christmas", 1, true)
+            or normalizedName:find("season", 1, true) then
+            addSection(weaponSections, candidate)
+            return
+        end
+        local detected = detectSectionType(candidate)
+        if detected == "Weapons" then
+            addSection(weaponSections, candidate)
+        elseif detected == "Pets" then
+            addSection(petSections, candidate)
+        end
+    end
+    considerNamedSection("Weapons", data.Weapons or data.weapons)
+    considerNamedSection("Pets", data.Pets or data.pets)
+    considerNamedSection("Holiday", data.Holiday or data.holiday)
+    considerNamedSection("Holidays", data.Holidays or data.holidays)
+    if inventory then
+        considerNamedSection("Weapons", inventory.Weapons or inventory.weapons)
+        considerNamedSection("Pets", inventory.Pets or inventory.pets)
+        considerNamedSection("Holiday", inventory.Holiday or inventory.holiday)
+        considerNamedSection("Holidays", inventory.Holidays or inventory.holidays)
+    end
+    for name, candidate in pairs(data) do
+        if name ~= "Inventory"
+            and name ~= "inventory"
+            and name ~= "Weapons"
+            and name ~= "weapons"
+            and name ~= "Pets"
+            and name ~= "pets"
+            and name ~= "Holiday"
+            and name ~= "holiday"
+            and name ~= "Holidays"
+            and name ~= "holidays" then
+            considerNamedSection(name, candidate)
+        end
+    end
+    if inventory then
+        for name, candidate in pairs(inventory) do
+            if name ~= "Weapons"
+                and name ~= "weapons"
+                and name ~= "Pets"
+                and name ~= "pets"
+                and name ~= "Holiday"
+                and name ~= "holiday"
+                and name ~= "Holidays"
+                and name ~= "holidays" then
+                considerNamedSection(name, candidate)
+            end
+        end
+    end
     local function emptyResult()
         return {
             total = 0,
@@ -11874,179 +9481,83 @@ State.Profile.CalculateRemoteInventory = function(data)
             unresolvedAll = {},
         }
     end
-
-    local function mergeResult(
-        target,
-        source
-    )
-        target.total =
-            target.total
-            + (
-                source.total
-                or 0
-            )
-
-        target.partial =
-            target.partial
-            or source.partial
-
-        target.resolvedItems =
-            target.resolvedItems
-            + (
-                source.resolvedItems
-                or 0
-            )
-
-        target.resolvedUnits =
-            target.resolvedUnits
-            + (
-                source.resolvedUnits
-                or 0
-            )
-
-        target.unresolvedLeaves =
-            target.unresolvedLeaves
-            + (
-                source.unresolvedLeaves
-                or 0
-            )
-
-        target.nonNumericUnits =
-            target.nonNumericUnits
-            + (
-                source.nonNumericUnits
-                or 0
-            )
-
-        for _, value in ipairs(
-            source.numericContributions
-            or {}
-        ) do
-            table.insert(
-                target.numericContributions,
-                value
-            )
+    local function mergeResult(target, source)
+        target.total = target.total + (source.total or 0)
+        target.partial = target.partial or source.partial
+        target.resolvedItems = target.resolvedItems + (source.resolvedItems or 0)
+        target.resolvedUnits = target.resolvedUnits + (source.resolvedUnits or 0)
+        target.unresolvedLeaves = target.unresolvedLeaves + (source.unresolvedLeaves or 0)
+        target.nonNumericUnits = target.nonNumericUnits + (source.nonNumericUnits or 0)
+        for _, value in ipairs(source.numericContributions or {}) do
+            table.insert(target.numericContributions, value)
         end
-
-        for _, hint in ipairs(
-            source.cardHints
-            or {}
-        ) do
-            table.insert(
-                target.cardHints,
-                hint
-            )
+        for _, hint in ipairs(source.cardHints or {}) do
+            table.insert(target.cardHints, hint)
         end
-
-        for _, miss in ipairs(
-            source.unresolvedAll
-            or {}
-        ) do
-            table.insert(
-                target.unresolvedAll,
-                miss
-            )
+        for _, miss in ipairs(source.unresolvedAll or {}) do
+            table.insert(target.unresolvedAll, miss)
         end
-
-        for _, sample in ipairs(
-            source.samples
-            or {}
-        ) do
-            if #target.samples
-                >= 30 then
-
+        for _, sample in ipairs(source.samples or {}) do
+            if #target.samples >= 30 then
                 break
             end
-
-            table.insert(
-                target.samples,
-                sample
-            )
+            table.insert(target.samples, sample)
         end
     end
-
-    local weaponResult =
-        emptyResult()
-
+    local weaponResult = emptyResult()
+    local petResult = emptyResult()
     local weaponSeenQuantities = {}
-
+    local petSeenQuantities = {}
     if #weaponSections == 0 then
         weaponResult.partial = true
     else
-        for _, weaponSection in ipairs(
-            weaponSections
-        ) do
+        for _, candidate in ipairs(weaponSections) do
             mergeResult(
                 weaponResult,
-                State.Profile
-                    .CalculateRemoteSection(
-                        weaponSection,
-                        "Weapons",
-                        weaponSeenQuantities
-                    )
+                State.Profile.CalculateRemoteSection(
+                    candidate,
+                    "Weapons",
+                    weaponSeenQuantities
+                )
             )
         end
     end
-
-    local petResult =
-        State.Profile.CalculateRemoteSection(
-            pets,
-            "Pets",
-            {}
-        )
-
-    local total =
-        weaponResult.total
-        + petResult.total
-
+    if #petSections == 0 then
+        petResult.partial = true
+    else
+        for _, candidate in ipairs(petSections) do
+            mergeResult(
+                petResult,
+                State.Profile.CalculateRemoteSection(
+                    candidate,
+                    "Pets",
+                    petSeenQuantities
+                )
+            )
+        end
+    end
+    local total = weaponResult.total + petResult.total
     local breakdownValues = {}
-
-    for _, value in ipairs(
-        weaponResult.numericContributions
-        or {}
-    ) do
-        table.insert(
-            breakdownValues,
-            value
-        )
+    for _, value in ipairs(weaponResult.numericContributions or {}) do
+        table.insert(breakdownValues, value)
     end
-
-    for _, value in ipairs(
-        petResult.numericContributions
-        or {}
-    ) do
-        table.insert(
-            breakdownValues,
-            value
-        )
+    for _, value in ipairs(petResult.numericContributions or {}) do
+        table.insert(breakdownValues, value)
     end
-
-    local partial =
-        weaponResult.partial
-        or petResult.partial
-
     return {
         total = total,
-        partial = partial,
+        partial = weaponResult.partial or petResult.partial,
         weapons = weaponResult,
         pets = petResult,
-        resolvedItems =
-            weaponResult.resolvedItems
-            + petResult.resolvedItems,
-        resolvedUnits =
-            weaponResult.resolvedUnits
-            + petResult.resolvedUnits,
-        breakdownValues =
-            breakdownValues,
+        resolvedItems = weaponResult.resolvedItems + petResult.resolvedItems,
+        resolvedUnits = weaponResult.resolvedUnits + petResult.resolvedUnits,
+        breakdownValues = breakdownValues,
     }
 end
-
-
 State.Profile.ExtractReturnedUserId = function(data)
     if type(data) ~= "table" then
         return nil
     end
-
     local candidates = {
         data.userId,
         data.UserId,
@@ -12057,249 +9568,69 @@ State.Profile.ExtractReturnedUserId = function(data)
         data.playerID,
         data.PlayerID,
     }
-
     for _, value in ipairs(candidates) do
         local numeric = tonumber(value)
-
         if numeric
             and numeric > 0 then
-
             return math.floor(numeric)
         end
     end
-
     return nil
 end
-
-State.Profile.ShallowInventoryShape = function(data)
-    local result = {
-        returnedUserId =
-            State.Profile.ExtractReturnedUserId(
-                data
-            ),
-        weaponsType = nil,
-        petsType = nil,
-        weaponKeyCount = 0,
-        petKeyCount = 0,
-        weaponKeySample = {},
-        petKeySample = {},
-    }
-
-    if type(data) ~= "table" then
-        return result
+State.Profile.MarkRemoteFailure = function(player, reason)
+    if not player then
+        return
     end
-
-    local inventory =
-        type(data.Inventory) == "table"
-        and data.Inventory
-        or nil
-
-    local weapons =
-        data.Weapons
-        or data.weapons
-        or (
-            inventory
-            and (
-                inventory.Weapons
-                or inventory.weapons
+    local userId = player.UserId
+    local remoteState = State.Profile.remoteTotals
+    remoteState.failureCountByUserId[userId] =
+        (remoteState.failureCountByUserId[userId] or 0) + 1
+    local cached = State.Profile.totalsByName[player.Name]
+    local lastSuccess = remoteState.lastSuccessByUserId[userId]
+    if cached
+        and lastSuccess
+        and os.clock() - lastSuccess >= CONFIG.RemoteStaleSeconds then
+        cached.stale = true
+        cached.lastFailureReason = tostring(reason or "refresh_failed")
+        State.Profile.DecorateLeaderboardFor(player.Name, cached)
+        if State.Profile.currentUsername
+            and normalize(State.Profile.currentUsername) == normalize(player.Name) then
+            State.Profile.UpdateSummaryUI(
+                cached.total,
+                cached.partial,
+                player.Name,
+                cached
             )
-        )
-
-    local pets =
-        data.Pets
-        or data.pets
-        or (
-            inventory
-            and (
-                inventory.Pets
-                or inventory.pets
-            )
-        )
-
-    result.weaponsType = type(weapons)
-    result.petsType = type(pets)
-
-    if type(weapons) == "table" then
-        for key in pairs(weapons) do
-            result.weaponKeyCount =
-                result.weaponKeyCount + 1
-
-            if #result.weaponKeySample < 20 then
-                table.insert(
-                    result.weaponKeySample,
-                    tostring(key)
-                )
-            end
         end
     end
-
-    if type(pets) == "table" then
-        for key in pairs(pets) do
-            result.petKeyCount =
-                result.petKeyCount + 1
-
-            if #result.petKeySample < 20 then
-                table.insert(
-                    result.petKeySample,
-                    tostring(key)
-                )
-            end
-        end
-    end
-
-    return result
 end
-
-State.Profile.FetchRemoteTotalForPlayer = function(player)
+State.Profile.ApplyRemoteInventoryData = function(player, data, freshRemote)
     if Destroyed
-        or not SupremeDatabase
         or not player
-        or not player.Parent then
-
-        return false
-    end
-
-    local remote =
-        safeFindPath(
-            ReplicatedStorage,
-            {
-                "Remotes",
-                "Extras",
-                "GetFullInventory",
-            }
-        )
-
-    if not remote
-        or not remote:IsA("RemoteFunction") then
-
-        State.Debug.Count(
-            "profileRemoteValueFailures"
-        )
-
-        return false
-    end
-
-    State.Debug.Count(
-        "profileRemoteValueFetches"
-    )
-
-    local ok, data =
-        pcall(function()
-            return remote:InvokeServer(player)
-        end)
-
-    if not ok
+        or not player.Parent
         or type(data) ~= "table" then
-
-        State.Debug.Count(
-            "profileRemoteValueFailures"
-        )
-
-        State.Debug.Record(
-            "profile_remote_value_failed",
-            {
-                username = player.Name,
-                userId = player.UserId,
-                error =
-                    not ok
-                    and tostring(data)
-                    or "non-table result",
-            }
-        )
-
-        return false
+        return false, "invalid_result"
     end
-
     local returnedUserId =
-        State.Profile.ExtractReturnedUserId(
-            data
-        )
-
+        State.Profile.ExtractReturnedUserId(data)
     if not returnedUserId then
-        State.Debug.Count(
-            "profileRemoteValueFailures"
-        )
-
-        State.Debug.Count(
-            "profileRemoteIdentityMissing"
-        )
-
-        State.Debug.Record(
-            "profile_remote_identity_missing",
-            {
-                requestedUsername =
-                    player.Name,
-                requestedUserId =
-                    player.UserId,
-                shape =
-                    State.Profile
-                        .ShallowInventoryShape(
-                            data
-                        ),
-            }
-        )
-
-        return false
+        return false, "missing_identity"
     end
-
     if returnedUserId ~= player.UserId then
-        State.Debug.Count(
-            "profileRemoteValueFailures"
-        )
-
-        State.Debug.Count(
-            "profileRemoteIdentityMismatches"
-        )
-
-        State.Debug.Record(
-            "profile_remote_identity_mismatch",
-            {
-                requestedUsername =
-                    player.Name,
-                requestedUserId =
-                    player.UserId,
-                returnedUserId =
-                    returnedUserId,
-                returnedLocalPlayer =
-                    returnedUserId
-                    == LocalPlayer.UserId,
-                shape =
-                    State.Profile
-                        .ShallowInventoryShape(
-                            data
-                        ),
-            }
-        )
-
-        return false
+        return false, "identity_mismatch"
     end
-
-    State.Debug.Count(
-        "profileRemoteIdentityVerified"
-    )
-
     local calculated, reason =
-        State.Profile.CalculateRemoteInventory(
-            data
-        )
-
+        State.Profile.CalculateRemoteInventory(data)
     if not calculated then
-        State.Debug.Count(
-            "profileRemoteValueFailures"
-        )
-
-        State.Debug.Record(
-            "profile_remote_value_failed",
-            {
-                username = player.Name,
-                userId = player.UserId,
-                error = reason,
-            }
-        )
-
-        return false
+        return false, reason or "calculate_failed"
     end
-
+    local remoteState = State.Profile.remoteTotals
+    if freshRemote then
+        remoteState.rawByUserId[player.UserId] = data
+        remoteState.lastSuccessByUserId[player.UserId] = os.clock()
+        remoteState.failureCountByUserId[player.UserId] = 0
+        remoteState.retryAfterByUserId[player.UserId] = nil
+    end
     local remoteCardHints = {
         Weapons =
             calculated.weapons
@@ -12310,213 +9641,263 @@ State.Profile.FetchRemoteTotalForPlayer = function(player)
             and calculated.pets.cardHints
             or {},
     }
-
-    State.Profile.remoteCardHintsByUserId[
-        player.UserId
-    ] = remoteCardHints
-
+    State.Profile.remoteCardHintsByUserId[player.UserId] =
+        remoteCardHints
     if calculated.weapons then
         calculated.weapons.cardHints = nil
         calculated.weapons.unresolvedAll = nil
     end
-
     if calculated.pets then
         calculated.pets.cardHints = nil
         calculated.pets.unresolvedAll = nil
     end
-
+    local lastSuccess =
+        remoteState.lastSuccessByUserId[player.UserId]
+    local stale =
+        lastSuccess ~= nil
+        and os.clock() - lastSuccess >= CONFIG.RemoteStaleSeconds
+    local previousInfo =
+        State.Profile.totalsByName[
+            player.Name
+        ]
     local info = {
         total = calculated.total,
         partial = calculated.partial,
         cards = calculated.resolvedUnits,
         resolved = calculated.resolvedItems,
-        updatedAt = os.time(),
+        updatedAt =
+            freshRemote
+            and os.time()
+            or (
+                previousInfo
+                and previousInfo.updatedAt
+                or os.time()
+            ),
         source = "GetFullInventoryVerified",
         returnedUserId = returnedUserId,
-        breakdownValues =
-            calculated.breakdownValues
-            or {},
+        breakdownValues = calculated.breakdownValues or {},
+        stale = stale,
     }
-
-    State.Profile.remoteTotals
-        .resultsByUserId[player.UserId] =
-        calculated
-
-    local activeInfo = info
-
-
-    
-    State.Profile.totalsByName[
-        player.Name
-    ] = info
-
-    State.Debug.Count(
-        "profileRemoteValueSuccesses"
-    )
-
-    State.Debug.Count(
-        "profileRemoteValueResolvedItems",
-        calculated.resolvedItems
-    )
-
-    State.Profile.DecorateLeaderboardFor(
-        player.Name,
-        activeInfo
-    )
-
-
-    
+    State.Profile.totalsByName[player.Name] = info
+    State.Profile.DecorateLeaderboardFor(player.Name, info)
     if State.Profile.currentUsername
-        and normalize(
-            State.Profile.currentUsername
-        ) == normalize(player.Name) then
-
+        and normalize(State.Profile.currentUsername) == normalize(player.Name) then
         State.Profile.UpdateSummaryUI(
-            activeInfo.total,
-            activeInfo.partial,
+            info.total,
+            info.partial,
             player.Name,
-            activeInfo
+            info
         )
-
         State.Profile.QueueScan()
     end
-
-    State.Debug.Record(
-        "profile_remote_value_success",
-        {
-            username = player.Name,
-            userId = player.UserId,
-            returnedUserId = returnedUserId,
-            identityVerified = true,
-            remote =
-                "ReplicatedStorage.Remotes.Extras.GetFullInventory",
-            total = info.total,
-            partial = info.partial,
-            activeDisplayedTotal =
-                activeInfo.total,
-            activeSource =
-                activeInfo.source,
-            resolvedItems =
-                calculated.resolvedItems,
-            resolvedUnits =
-                calculated.resolvedUnits,
-            weapons = {
-                total =
-                    calculated.weapons.total,
-                resolvedItems =
-                    calculated.weapons
-                    .resolvedItems,
-                nonNumericUnits =
-                    calculated.weapons
-                    .nonNumericUnits,
-                unresolvedLeaves =
-                    calculated.weapons
-                    .unresolvedLeaves,
-                samples =
-                    calculated.weapons.samples,
-            },
-            pets = {
-                total =
-                    calculated.pets.total,
-                resolvedItems =
-                    calculated.pets
-                    .resolvedItems,
-                nonNumericUnits =
-                    calculated.pets
-                    .nonNumericUnits,
-                unresolvedLeaves =
-                    calculated.pets
-                    .unresolvedLeaves,
-                samples =
-                    calculated.pets.samples,
-            },
-        }
-    )
-
     return true
 end
-
-State.Profile.QueueRemoteLeaderboardSweep = function()
-    if Destroyed
-        or not SupremeDatabase then
-
+State.Profile.RecalculateCachedRemoteTotals = function()
+    if Destroyed or not SupremeDatabase then
         return
     end
-
-    if State.Profile.remoteTotals.running then
-        State.Profile.remoteTotals.pendingSweep =
-            true
-
-        State.Debug.Count(
-            "remoteSweepDeferred"
-        )
-
-        return
-    end
-
-    State.Profile.remoteTotals.generation =
-        State.Profile.remoteTotals.generation
-        + 1
-
-    local generation =
-        State.Profile.remoteTotals.generation
-
-    State.Profile.remoteTotals.running =
-        true
-
-    State.Profile.remoteTotals.pendingSweep =
-        false
-
-    State.Profile.remoteTotals.lastSweepAt =
-        os.time()
-
-    task.spawn(function()
-        local playerList =
-            Players:GetPlayers()
-
-        for _, player in ipairs(playerList) do
-            if Destroyed
-                or generation
-                    ~= State.Profile
-                        .remoteTotals
-                        .generation then
-
-                break
-            end
-
-            State.Profile.FetchRemoteTotalForPlayer(
-                player
+    for _, player in ipairs(Players:GetPlayers()) do
+        local raw =
+            State.Profile.remoteTotals.rawByUserId[player.UserId]
+        if type(raw) == "table" then
+            pcall(
+                State.Profile.ApplyRemoteInventoryData,
+                player,
+                raw,
+                false
             )
-
-            task.wait(0.07)
         end
-
-        State.Profile.remoteTotals.running =
-            false
-
-        State.Profile.RefreshLeaderboardBadges()
-
-        if not Destroyed
-            and State.Profile.remoteTotals
-                .pendingSweep then
-
-            State.Profile.remoteTotals
-                .pendingSweep = false
-
+    end
+    State.Profile.RefreshLeaderboardBadges()
+end
+State.Profile.FetchRemoteTotalForPlayer = function(player, force)
+    if Destroyed
+        or not SupremeDatabase
+        or not player
+        or not player.Parent then
+        return false, "unavailable"
+    end
+    local remoteState = State.Profile.remoteTotals
+    local userId = player.UserId
+    local now = os.clock()
+    local lastSuccess = remoteState.lastSuccessByUserId[userId]
+    local userJitter =
+        ((userId % 17) / 17 - 0.5) * 1.6
+    if not force
+        and lastSuccess
+        and now - lastSuccess <
+            CONFIG.PlayerValuesRefreshSeconds + userJitter then
+        return true, "fresh"
+    end
+    local retryAfter =
+        remoteState.retryAfterByUserId[userId]
+    if retryAfter and now < retryAfter then
+        return false, "cooldown"
+    end
+    if remoteState.inFlightByUserId[userId] then
+        return false, "in_flight"
+    end
+    local remote =
+        safeFindPath(
+            ReplicatedStorage,
+            {"Remotes", "Extras", "GetFullInventory"}
+        )
+    if not remote or not remote:IsA("RemoteFunction") then
+        State.Profile.MarkRemoteFailure(player, "remote_missing")
+        return false, "remote_missing"
+    end
+    remoteState.requestSerial = remoteState.requestSerial + 1
+    local request = {
+        serial = remoteState.requestSerial,
+        done = false,
+        expired = false,
+        ok = false,
+        data = nil,
+    }
+    remoteState.inFlightByUserId[userId] = request
+    task.spawn(function()
+        local ok, data =
+            pcall(function()
+                return remote:InvokeServer(player)
+            end)
+        request.ok = ok
+        request.data = data
+        request.done = true
+        if request.expired
+            and remoteState.inFlightByUserId[userId] == request then
+            remoteState.inFlightByUserId[userId] = nil
+        end
+    end)
+    local deadline =
+        os.clock() + CONFIG.RemoteTimeoutSeconds
+    while not request.done
+        and not Destroyed
+        and os.clock() < deadline do
+        task.wait(0.05)
+    end
+    if Destroyed then
+        request.expired = true
+        return false, "destroyed"
+    end
+    if not request.done then
+        request.expired = true
+        if remoteState.inFlightByUserId[userId] == request then
+            remoteState.inFlightByUserId[userId] = nil
+        end
+        local failures =
+            (remoteState.failureCountByUserId[userId] or 0) + 1
+        remoteState.retryAfterByUserId[userId] =
+            os.clock()
+            + math.min(
+                120,
+                20 + failures * 10
+            )
+        State.Profile.MarkRemoteFailure(player, "timeout")
+        return false, "timeout"
+    end
+    if remoteState.inFlightByUserId[userId] == request then
+        remoteState.inFlightByUserId[userId] = nil
+    end
+    if not request.ok or type(request.data) ~= "table" then
+        State.Profile.MarkRemoteFailure(
+            player,
+            request.ok and "non_table" or tostring(request.data)
+        )
+        return false, "request_failed"
+    end
+    local applied, reason =
+        State.Profile.ApplyRemoteInventoryData(
+            player,
+            request.data,
+            true
+        )
+    if not applied then
+        State.Profile.MarkRemoteFailure(player, reason)
+        return false, reason
+    end
+    return true
+end
+State.Profile.QueueRemoteLeaderboardSweep = function(forceAll)
+    if Destroyed or not SupremeDatabase then
+        return
+    end
+    local remoteState = State.Profile.remoteTotals
+    if forceAll then
+        remoteState.forceSweep = true
+    end
+    if remoteState.running then
+        remoteState.pendingSweep = true
+        return
+    end
+    remoteState.generation = remoteState.generation + 1
+    local generation = remoteState.generation
+    local forceThisSweep = remoteState.forceSweep
+    remoteState.forceSweep = false
+    remoteState.running = true
+    remoteState.pendingSweep = false
+    task.spawn(function()
+        pcall(function()
+            local playerList = Players:GetPlayers()
+            local currentUsername =
+                normalize(State.Profile.currentUsername or "")
+            table.sort(
+                playerList,
+                function(a, b)
+                    local aCurrent =
+                        currentUsername ~= ""
+                        and normalize(a.Name) == currentUsername
+                    local bCurrent =
+                        currentUsername ~= ""
+                        and normalize(b.Name) == currentUsername
+                    if aCurrent ~= bCurrent then
+                        return aCurrent
+                    end
+                    if (a == LocalPlayer) ~= (b == LocalPlayer) then
+                        return a == LocalPlayer
+                    end
+                    local aLast =
+                        remoteState.lastSuccessByUserId[a.UserId]
+                        or -math.huge
+                    local bLast =
+                        remoteState.lastSuccessByUserId[b.UserId]
+                        or -math.huge
+                    return aLast < bLast
+                end
+            )
+            for _, player in ipairs(playerList) do
+                if Destroyed
+                    or generation ~= remoteState.generation then
+                    break
+                end
+                if player.Parent then
+                    State.Profile.FetchRemoteTotalForPlayer(
+                        player,
+                        forceThisSweep
+                    )
+                end
+                task.wait(0.045 + math.random() * 0.045)
+            end
+        end)
+        if generation == remoteState.generation then
+            remoteState.running = false
+        end
+        if not Destroyed then
+            State.Profile.RefreshLeaderboardBadges()
+        end
+        if not Destroyed and remoteState.pendingSweep then
+            remoteState.pendingSweep = false
             task.defer(function()
-                State.Profile
-                    .QueueRemoteLeaderboardSweep()
+                State.Profile.QueueRemoteLeaderboardSweep(
+                    remoteState.forceSweep
+                )
             end)
         end
     end)
 end
-
 if State.Profile.remoteTotals
     .pendingNativeResweep then
-
     State.Profile.remoteTotals
         .pendingNativeResweep = false
-
     task.defer(function()
         if not Destroyed then
             State.Profile
@@ -12524,280 +9905,282 @@ if State.Profile.remoteTotals
         end
     end)
 end
-
 local Controller = {}
-
 function Controller.Destroy()
     if Destroyed then
         return
     end
-
     Destroyed = true
+    State.TradeHelperGeneration =
+        State.TradeHelperGeneration + 1
+    State.TradeInventoryRefreshGeneration =
+        State.TradeInventoryRefreshGeneration + 1
+    State.Profile.scanGeneration =
+        State.Profile.scanGeneration + 1
+    State.Profile.visibleRemoteGeneration =
+        State.Profile.visibleRemoteGeneration + 1
+    State.Profile.remoteTotals.generation =
+        State.Profile.remoteTotals.generation + 1
+    for userId, request in pairs(
+        State.Profile.remoteTotals.inFlightByUserId
+    ) do
+        request.expired = true
+        State.Profile.remoteTotals.inFlightByUserId[userId] = nil
+    end
     safeDisconnectAll()
     clearAllTradeHighlights()
-
     if UI.RootGui and UI.RootGui.Parent then
         UI.RootGui:Destroy()
     end
-
     removeInjectedChildren()
-
     if rawget(_G, GLOBAL_KEY) == Controller then
         rawset(_G, GLOBAL_KEY, nil)
     end
 end
-
 function Controller.RefreshValues()
-    local ok, err = ensureSupremeDatabase(true)
-
-    if ok then
+    local databaseOK, databaseError, databaseChanged =
+        fetchSupremeDatabase()
+    local linksOK, linksError, linksChanged =
+        loadLinkedImages()
+    if databaseChanged or linksChanged then
         table.clear(ResolveCache)
         table.clear(State.ResolveMetaCache)
         GameResolverLastBuild = 0
+    end
+    if SupremeDatabase then
+        State.Profile.RecalculateCachedRemoteTotals()
+        scanInventoryCards()
         refreshTrackedCards()
         scheduleTradeRefresh(0)
+        State.Profile.QueueScan()
+        State.Profile.QueueRemoteLeaderboardSweep(false)
     end
-
-    return ok, err
+    return SupremeDatabase ~= nil,
+        databaseError
+        or linksError
 end
-
 function Controller.SetTradeHelperEnabled(enabled)
     State.TradeHelperEnabled = enabled == true
     refreshToggleText()
-
     if not State.TradeHelperEnabled then
         clearAllTradeHighlights()
     else
         scheduleTradeRefresh(0)
     end
 end
-
-
+local function refreshResolvedViews(discoverInventory)
+    if not SupremeDatabase then
+        return
+    end
+    table.clear(ResolveCache)
+    table.clear(State.ResolveMetaCache)
+    GameResolverLastBuild = 0
+    State.Profile.RecalculateCachedRemoteTotals()
+    if discoverInventory then
+        scanInventoryCards()
+    end
+    refreshTrackedCards()
+    scheduleTradeRefresh(0)
+    State.Profile.QueueScan()
+    State.Profile.QueueRemoteLeaderboardSweep(false)
+end
+local function jitteredDelay(seconds)
+    return math.max(
+        0.2,
+        seconds * (0.90 + math.random() * 0.20)
+    )
+end
+local function startPeriodic(baseSeconds, backoff, callback)
+    task.spawn(function()
+        local failures = 0
+        task.wait(jitteredDelay(baseSeconds))
+        while not Destroyed do
+            local callOK, result =
+                pcall(callback)
+            local healthy =
+                callOK
+                and result ~= false
+            if healthy then
+                failures = 0
+            else
+                failures =
+                    math.min(
+                        failures + 1,
+                        3
+                    )
+            end
+            if Destroyed then
+                break
+            end
+            local multiplier =
+                backoff
+                and math.min(
+                    2 ^ failures,
+                    4
+                )
+                or 1
+            task.wait(
+                jitteredDelay(
+                    baseSeconds
+                    * multiplier
+                )
+            )
+        end
+    end)
+end
 State.QueueNativeDatabaseWarmup()
-
 rawset(_G, GLOBAL_KEY, Controller)
-
 connect(script.Destroying, function()
     Controller.Destroy()
 end)
-
 task.spawn(function()
-    local ok, initialDatabaseError =
-        ensureSupremeDatabase(false)
-
-    State.Debug.Count("databaseLoads")
-    State.Debug.Record("database_initial_load", {
-        success = ok,
-        error = initialDatabaseError,
-        status = DatabaseStatus,
-        catalogCount = #Catalog,
-    })
-
-    if Destroyed then
-        return
-    end
-
-    reconnectGuiWatchers()
-    State.Profile.Bind()
-
-    if ok then
-        local linksOK, linksError =
-            loadLinkedImages()
-
-        State.Debug.Count("linkedImageLoads")
-        State.Debug.Record("linked_images_load", {
-            success = linksOK,
-            error = linksError,
-            linkedCount = countDictionary(LinkedImages),
-            itemLinkCount = countDictionary(State.Mapping.ItemLinks),
-        })
-
-        if not linksOK then
-            warn(
-                "[SV Public] linked_images.json was not loaded:",
-                linksError
-            )
-        end
-
-        table.clear(ResolveCache)
-        table.clear(State.ResolveMetaCache)
-        scanInventoryCards()
-        State.Profile.QueueScan()
-        State.Profile.QueueRemoteLeaderboardSweep()
-    end
-
-    discoverTradeGui()
-
-    if isTradeVisible() then
-        recoverTradeStatus()
-    end
-end)
-
-task.spawn(function()
-    while not Destroyed do
-        task.wait(CONFIG.RefreshSeconds)
-
-        if Destroyed then
-            break
-        end
-
-        local oldLoad = LastDatabaseLoad
-        local ok, refreshError =
-            ensureSupremeDatabase(true)
-
-        State.Debug.Count("databaseRefreshes")
-        State.Debug.Record("database_periodic_refresh", {
-            success = ok,
-            error = refreshError,
-            status = DatabaseStatus,
-            changed = LastDatabaseLoad ~= oldLoad,
-            catalogCount = #Catalog,
-        })
-
-        if ok
-            and LastDatabaseLoad
-                ~= oldLoad then
-
-            table.clear(
-                ResolveCache
-            )
-
-            table.clear(
-                State.ResolveMetaCache
-            )
-
-            GameResolverLastBuild =
-                0
-
-            refreshTrackedCards()
-            scheduleTradeRefresh(0)
-            State.Profile.QueueScan()
-            State.Profile.QueueRemoteLeaderboardSweep()
-        end
-    end
-end)
-
-task.spawn(function()
-    while not Destroyed do
-        task.wait(
-            CONFIG.LinkedImagesRefreshSeconds
-        )
-
-        if Destroyed then
-            break
-        end
-
-        local ok,
-            refreshError,
-            changed =
-            loadLinkedImages()
-
-        if not ok then
-            State.Debug.Count(
-                "linkedImageRefreshFailures"
-            )
-
-            State.Debug.Record(
-                "linked_images_periodic_refresh",
-                {
-                    success = false,
-                    error = refreshError,
-                }
-            )
-
-        elseif changed then
-            State.Debug.Count(
-                "linkedImageRefreshes"
-            )
-
-            State.Debug.Record(
-                "linked_images_periodic_refresh",
-                {
-                    success = true,
-                    changed = true,
-                    linkedCount =
-                        countDictionary(
-                            LinkedImages
-                        ),
-                    itemLinkCount =
-                        countDictionary(
-                            State.Mapping.ItemLinks
-                        ),
-                }
-            )
-
-            table.clear(
-                ResolveCache
-            )
-
-            table.clear(
-                State.ResolveMetaCache
-            )
-
-            GameResolverLastBuild =
-                0
-
-            if SupremeDatabase then
-                refreshTrackedCards()
-                scheduleTradeRefresh(0)
-                State.Profile.QueueScan()
-                State.Profile.QueueRemoteLeaderboardSweep()
+    pcall(reconnectGuiWatchers)
+    pcall(State.Profile.Bind)
+    pcall(updatePublicUiScale)
+    local initOK, initError =
+        pcall(function()
+            local databaseOK, databaseError =
+                ensureSupremeDatabase(false)
+            if Destroyed then
+                return
             end
-        end
-    end
-end)
-
-task.spawn(function()
-    local lastTradeRecovery = 0
-
-    while not Destroyed do
-        task.wait(1.5)
-
-        if Destroyed then
-            break
-        end
-
-        local currentGameDatabase =
-            getGameDatabase()
-
-        if currentGameDatabase
-            ~= State.LastGameDatabase then
-
-            State.LastGameDatabase =
-                currentGameDatabase
-
-            table.clear(ResolveCache)
-        table.clear(State.ResolveMetaCache)
-            GameResolverLastBuild = 0
-
-            if SupremeDatabase then
-                refreshTrackedCards()
-
-                if State.Profile
-                    and type(
-                        State.Profile
-                            .QueueRemoteLeaderboardSweep
-                    ) == "function" then
-
-                    State.Profile
-                        .QueueRemoteLeaderboardSweep()
-                end
+            local linksOK, linksError, linksChanged =
+                loadLinkedImages()
+            if not linksOK and linksError then
+                warn("[SV Public] linked_images.json was not loaded:", linksError)
             end
-        end
-
-        if State.TradeGui
-            and State.TradeGui.Parent
-            and State.TradeGui.Enabled
-            and not State.CurrentTrade then
-
-            local now = os.clock()
-
-            if now - lastTradeRecovery >= 3 then
-                lastTradeRecovery = now
+            if databaseOK then
+                refreshResolvedViews(true)
+            elseif databaseError then
+                warn("[SV Public] Initial value database unavailable:", databaseError)
+            end
+            if linksChanged and SupremeDatabase then
+                refreshResolvedViews(false)
+            end
+            discoverTradeGui()
+            if isTradeVisible() then
                 recoverTradeStatus()
             end
-        end
+        end)
+    if not initOK and not Destroyed then
+        warn("[SV Public] Initial startup recovered from an error:", initError)
     end
 end)
-
+startPeriodic(
+    CONFIG.RefreshSeconds,
+    true,
+    function()
+        local ok, refreshError, changed =
+            fetchSupremeDatabase()
+        if changed then
+            refreshResolvedViews(false)
+        end
+        if not ok and refreshError and not SupremeDatabase then
+            DatabaseStatus = "Unavailable"
+        end
+        return ok
+    end
+)
+startPeriodic(
+    CONFIG.LinkedImagesRefreshSeconds,
+    true,
+    function()
+        local ok, _, changed =
+            loadLinkedImages()
+        if ok and changed and SupremeDatabase then
+            refreshResolvedViews(false)
+        end
+        return ok
+    end
+)
+startPeriodic(
+    CONFIG.PlayerSweepSeconds,
+    false,
+    function()
+        if SupremeDatabase then
+            State.Profile.QueueRemoteLeaderboardSweep(false)
+        end
+        return true
+    end
+)
+startPeriodic(
+    CONFIG.InventoryRefreshSeconds,
+    false,
+    function()
+        if SupremeDatabase then
+            refreshTrackedCards()
+        end
+        return true
+    end
+)
+startPeriodic(
+    CONFIG.InventoryDiscoverySeconds,
+    false,
+    function()
+        if SupremeDatabase then
+            scanInventoryCards()
+        end
+        return true
+    end
+)
+startPeriodic(
+    CONFIG.ProfileRefreshSeconds,
+    false,
+    function()
+        if SupremeDatabase then
+            State.Profile.QueueScan()
+        end
+        return true
+    end
+)
+startPeriodic(
+    CONFIG.TradeRefreshSeconds,
+    false,
+    function()
+        if SupremeDatabase and isTradeVisible() then
+            scheduleTradeRefresh(0)
+        end
+        return true
+    end
+)
+startPeriodic(
+    5,
+    false,
+    function()
+        updatePublicUiScale()
+        return true
+    end
+)
+do
+    local lastTradeRecovery = 0
+    startPeriodic(
+        1.5,
+        false,
+        function()
+            local currentGameDatabase =
+                getGameDatabase()
+            if currentGameDatabase ~= State.LastGameDatabase then
+                State.LastGameDatabase = currentGameDatabase
+                if SupremeDatabase then
+                    refreshResolvedViews(false)
+                else
+                    table.clear(ResolveCache)
+                    table.clear(State.ResolveMetaCache)
+                    GameResolverLastBuild = 0
+                end
+            end
+            if State.TradeGui
+                and State.TradeGui.Parent
+                and State.TradeGui.Enabled
+                and not State.CurrentTrade then
+                local now = os.clock()
+                if now - lastTradeRecovery >= 3 then
+                    lastTradeRecovery = now
+                    recoverTradeStatus()
+                end
+            end
+            return true
+        end
+    )
+end
 warn("[SV Public] Supreme Values PC Public Helper loaded.")

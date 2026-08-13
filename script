@@ -1,7 +1,5 @@
--- Supreme Values PC Public Trading Helper v18.33
--- Standalone distribution build for sharing.
--- Includes trade/inventory values, trade evaluation/highlights, and Profile/leaderboard values.
--- Read-only mappings only: no Mapping Manager, Matching Mode, debug clipboard UI, GitHub writes, or credentials.
+
+
 
 local CONFIG = {
     Enabled = true,
@@ -9,7 +7,8 @@ local CONFIG = {
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
 
-    RefreshSeconds = 60,
+    RefreshSeconds = 20,
+    LinkedImagesRefreshSeconds = 8,
 
     TradeHelperDefault = true,
     ShouldTradeScore = 8,
@@ -22,23 +21,23 @@ local CONFIG = {
     StatsButtons = true,
     TradePanel = true,
 
-    -- Native identity is preferred whenever the game itself gives us enough
-    -- information. linked_images.json remains a fallback for now.
+
+    
     PreferNativeIdentity = true,
     LinkedImagesFallback = true,
 
-    -- Never consume a merely plausible Supreme match automatically.
-    -- Ambiguous/fuzzy candidates remain available to diagnostics, but UI,
-    -- leaderboard totals, and trade calculations only receive records backed
-    -- by deterministic identity evidence.
+
+    
+
+    
     ConservativeResolution = true,
 
-    -- Profiles/leaderboard should under-count with a "+" rather than count a
-    -- weak Supreme-name guess as if it were certain.
+
+    
     ProfileRequireTrustedMatches = true,
 
-    -- If _G.Database is unavailable, try reconstructing the pure data modules
-    -- Sync.Item and Sync.Pets from Xeno's decompile() output without require().
+
+    
     UseDecompiledSyncFallback = true,
 
     SafeColor = Color3.fromRGB(83, 218, 142),
@@ -183,7 +182,7 @@ local State = {
 
     Debug = {
         version =
-            "18.33-public-helper",
+            "18.34-public-helper",
         startedAt =
             os.time(),
         startedClock =
@@ -698,6 +697,7 @@ local BASE64_CHARS =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 local LinkedImages = {}
+local LastLinkedImagesBody = nil
 
 State.Mapping = {
     ItemLinks = {},
@@ -940,7 +940,7 @@ local function buildSupremeIndex()
             record
         )
 
-        -- Preserve the old dictionary key as a searchable identity too.
+
         if normalize(
             record.sourceKey
         ) ~= normalize(
@@ -1005,14 +1005,14 @@ local function buildSupremeIndex()
                 if type(itemData)
                     == "table" then
 
-                    -- Schema v2:
-                    -- "Same Name": [
-                    --   {listing A},
-                    --   {listing B}
-                    -- ]
-                    --
-                    -- Legacy/singleton:
-                    -- "Name": {listing}
+
+                    
+
+                    
+
+                    
+
+                    
                     if type(
                         itemData[1]
                     ) == "table" then
@@ -1077,7 +1077,7 @@ local function getSupremeRecord(
             record.category
         ) == wantedCategory then
 
-            -- New stable record_key, or the legacy JSON dictionary key.
+
             if wantedKey
                 and (
                     tostring(
@@ -1090,8 +1090,8 @@ local function getSupremeRecord(
                     ) == wantedKey
                 ) then
 
-                -- If the old source key itself is shared by multiple v2
-                -- variants, do not return early unless record_key matched.
+
+                
                 if tostring(
                     record.key
                     or ""
@@ -1138,9 +1138,9 @@ local function getSupremeRecord(
         return nameMatches[1]
     end
 
-    -- Multiple exact same-name Supreme listings are intentionally ambiguous.
-    -- Mapping Manager must select a specific record_key/year instead of us
-    -- silently choosing whichever happened to be iterated first.
+
+    
+
     return nil
 end
 
@@ -1239,7 +1239,8 @@ end
 local function loadLinkedImages()
     if type(httpRequest) ~= "function" then
         return false,
-            "request(options) is unavailable."
+            "request(options) is unavailable.",
+            false
     end
 
     local ok,
@@ -1264,21 +1265,40 @@ local function loadLinkedImages()
 
     if not ok then
         return false,
-            tostring(response)
+            tostring(response),
+            false
     end
 
     if type(response)
         ~= "table" then
 
         return false,
-            "Invalid linked-images response."
+            "Invalid linked-images response.",
+            false
     end
 
     if response.StatusCode == 404 then
-        LinkedImages = {}
-        State.Mapping.ItemLinks = {}
-        rebuildManualLinkIndexes()
-        return true
+        local changed =
+            LastLinkedImagesBody
+                ~= "__MISSING__"
+            or next(LinkedImages)
+                ~= nil
+            or next(
+                State.Mapping.ItemLinks
+            ) ~= nil
+
+        LastLinkedImagesBody =
+            "__MISSING__"
+
+        if changed then
+            LinkedImages = {}
+            State.Mapping.ItemLinks = {}
+            rebuildManualLinkIndexes()
+        end
+
+        return true,
+            nil,
+            changed
     end
 
     if response.Success ~= true then
@@ -1287,7 +1307,28 @@ local function loadLinkedImages()
             .. tostring(
                 response.StatusCode
                 or "?"
-            )
+            ),
+            false
+    end
+
+    local body =
+        response.Body
+        or ""
+
+    if body == ""
+        then
+
+        return false,
+            "linked_images.json returned an empty body.",
+            false
+    end
+
+    if LastLinkedImagesBody
+        == body then
+
+        return true,
+            nil,
+            false
     end
 
     local decodeOK,
@@ -1295,14 +1336,14 @@ local function loadLinkedImages()
         pcall(function()
             return HttpService
                 :JSONDecode(
-                    response.Body
-                    or ""
+                    body
                 )
         end)
 
     if not decodeOK then
         return false,
-            "linked_images.json could not be decoded."
+            "linked_images.json could not be decoded.",
+            false
     end
 
     LinkedImages,
@@ -1311,9 +1352,14 @@ local function loadLinkedImages()
             decoded
         )
 
+    LastLinkedImagesBody =
+        body
+
     rebuildManualLinkIndexes()
 
-    return true
+    return true,
+        nil,
+        true
 end
 
 local function fetchSupremeDatabase()
@@ -1507,7 +1553,7 @@ State.RebuildGameDataAliasIndex = function(
                     elseif existing
                         ~= record then
 
-                        -- Never use an alias shared by multiple native items.
+
                         index[key] =
                             false
                     end
@@ -2304,9 +2350,9 @@ State.GetNativeIdentityEvidence = function(
         "remote/internal id"
     )
 
-    -- Internal identifiers often use CamelCase even when their human-facing
-    -- name contains spaces. Generate exact whole-name forms, never individual
-    -- token guesses.
+
+    
+
     local rawId =
         tostring(itemId or "")
 
@@ -2348,9 +2394,9 @@ State.GetNativeIdentityEvidence = function(
             )
         end
 
-        -- A two-word reversed form catches identifier ordering differences
-        -- such as Color+Base versus Base+Color, while remaining an exact
-        -- whole-name hypothesis rather than fuzzy token matching.
+
+        
+
         if #words == 2
             and words[1]:match("^%a+$")
             and words[2]:match("^%a+$") then
@@ -2707,8 +2753,8 @@ State.GetCardRarityHint = function(frame)
         end
     end
 
-    -- DisplayItem assigns the exact rarity color. A small tolerance just
-    -- protects against UI conversion/rounding without accepting near colors.
+
+    
     if bestName
         and bestDistance <= 36 then
 
@@ -3187,7 +3233,7 @@ local function addGameIndex(index, key, entry)
 end
 
 local function rebuildGameResolverIndexes()
-    -- getGameDatabase() uses a no-require mirror of the game's native item data.
+
     table.clear(GameNameIndex)
     table.clear(GameCanonicalIndex)
     table.clear(GameIconIndex)
@@ -3354,8 +3400,8 @@ State.QueueNativeDatabaseWarmup = function()
                         }
                     )
 
-                    -- Profile refresh is table-dispatched, so it does not rely
-                    -- on a local function declared later in this file.
+
+                    
                     if State.Profile
                         and type(
                             State.Profile.QueueScan
@@ -5016,15 +5062,15 @@ local function resolveGameItem(itemId, itemType, displayName)
             or compactTerminalYear
         )
 
-    -- Conservative identity policy:
-    --
-    -- 1. Exact literal game/GUI/remote name or exact Supreme alias is enough
-    --    only when it uniquely identifies this candidate (or the runner-up
-    --    does not share the exact evidence).
-    -- 2. Synthetic transformations such as CamelCase splitting/reversal never
-    --    authorize a mapping by themselves.
-    -- 3. Structured _K/_G + exact year remains deterministic.
-    -- 4. Any explicit metadata conflict vetoes automatic resolution.
+
+    
+
+    
+
+    
+
+    
+
     if CONFIG.ConservativeResolution then
         local directExactUnique =
             bestEvidence.directExact
@@ -5139,7 +5185,7 @@ local function resolveGameItem(itemId, itemType, displayName)
             )
         end
     else
-        -- Retained only as an emergency compatibility switch.
+
         if hasExactGameData
             and best.score >= 120
             and (
@@ -7111,8 +7157,8 @@ local function decorateCard(frame, options)
         }
     end
 
-    -- Native exact metadata gets first chance. This is the important change:
-    -- linked_images.json is no longer allowed to override an exact Sync item.
+
+    
     if not record
         and CONFIG.PreferNativeIdentity
         and directGameData then
@@ -9859,7 +9905,7 @@ State.Profile.DecorateLeaderboardFor = function(
         return 0
     end
 
-    -- Remove the old pill format if this row survived a hot reload.
+
     local oldPill =
         playerLabel:FindFirstChild(
             "SV_ProfileValuePill"
@@ -10032,7 +10078,7 @@ State.Profile.FindRemoteCardHint = function(
             ) == normalizedUsername then
 
                 if displayMatch then
-                    -- Duplicate DisplayName: do not guess.
+
                     displayMatch = false
                 elseif displayMatch
                     ~= false then
@@ -10181,7 +10227,7 @@ State.Profile.FindRemoteCardHint = function(
         return nil
     end
 
-    -- Exact Supreme display-name match wins over stripped/base-name matches.
+
     if #matches > 1 then
         local exact = {}
 
@@ -10204,7 +10250,7 @@ State.Profile.FindRemoteCardHint = function(
         end
     end
 
-    -- Rarity color is a safe additional discriminator when available.
+
     if #matches > 1
         and frame then
 
@@ -10244,7 +10290,7 @@ State.Profile.FindRemoteCardHint = function(
         end
     end
 
-    -- Quantity can distinguish two same-display variants in the same Profile.
+
     if #matches > 1
         and frame then
 
@@ -10312,9 +10358,9 @@ State.Profile.ScanRoot = function(root, itemType, username)
         return result
     end
 
-    -- Profile must use the strict card test. The old loose-card fallback
-    -- correctly helps TradeGUI, but on ViewProfile it also classified broad
-    -- category/container frames as cards and caused oversized/misplaced badges.
+
+    
+
     for _, descendant in ipairs(
         root:GetDescendants()
     ) do
@@ -10349,8 +10395,8 @@ State.Profile.ScanRoot = function(root, itemType, username)
                     showValue = true,
                     showInfo = CONFIG.StatsButtons,
 
-                    -- Profile cards are visually tighter than the
-                    -- main inventory cards.
+
+                    
                     compactMode = true,
                     allowLooseCard = false,
                     requireTrustedResolution =
@@ -10433,10 +10479,10 @@ State.Profile.ScanRoot = function(root, itemType, username)
                             + quantity
                     end
                 else
-                    -- decorateCard already created the red unknown-value badge
-                    -- and unresolved info button. Keep them so the user can
-                    -- identify/link the item from a Profile exactly like they
-                    -- can from Inventory/Trade.
+
+                    
+
+                    
                     result.unresolved =
                         result.unresolved + 1
                 end
@@ -10568,8 +10614,8 @@ State.Profile.QueueScan = function()
     local generation =
         State.Profile.scanGeneration
 
-    -- Profile contents can be repopulated a fraction of a second after the
-    -- tab/player title changes. These are finite one-shot retries, not polling.
+
+    
     for _, delaySeconds in ipairs({
         0,
         0.06,
@@ -11125,8 +11171,8 @@ end)
 connect(
     Players.PlayerAdded,
     function(player)
-        -- A joining player can appear before Supreme data or their leaderboard
-        -- row is fully ready. Give them a few finite chances, then stop.
+
+        
         State.Debug.Record(
             "profile_player_join_detected",
             {
@@ -11193,9 +11239,9 @@ connect(
 connect(
     LocalPlayer.CharacterAdded,
     function()
-        -- MainGUI is normally recreated around respawn. PlayerGui.ChildAdded
-        -- handles the common path; these finite retries cover clients where
-        -- CharacterAdded and GUI reconstruction arrive in the opposite order.
+
+        
+
         for _, delaySeconds in ipairs({
             0.35,
             0.85,
@@ -11398,7 +11444,8 @@ end
 
 State.Profile.CalculateRemoteSection = function(
     section,
-    itemType
+    itemType,
+    seenQuantities
 )
     local result = {
         total = 0,
@@ -11435,10 +11482,39 @@ State.Profile.CalculateRemoteSection = function(
             return false
         end
 
-        -- Defensive bound against accidentally interpreting currencies/XP
-        -- as quantities if the game changes this table shape.
+
+        
         if quantity > 10000 then
             return false
+        end
+
+        if type(seenQuantities)
+            == "table" then
+
+            local seenKey =
+                tostring(itemType)
+                .. "|"
+                .. tostring(itemId)
+
+            local previous =
+                tonumber(
+                    seenQuantities[
+                        seenKey
+                    ]
+                )
+                or 0
+
+            if quantity <= previous then
+                return true
+            end
+
+            seenQuantities[
+                seenKey
+            ] = quantity
+
+            quantity =
+                quantity
+                - previous
         end
 
         local resolved =
@@ -11602,7 +11678,7 @@ State.Profile.CalculateRemoteSection = function(
         visited[node] = true
         nodeCount = nodeCount + 1
 
-        -- Common object-style item representation.
+
         local objectId =
             node.ItemId
             or node.ItemID
@@ -11656,8 +11732,8 @@ State.Profile.CalculateRemoteSection = function(
                 addResult(value, 1)
 
             elseif type(value) == "table" then
-                -- If the table itself is stored under an item-id key, first
-                -- look for a quantity inside it. If that fails, recurse.
+
+                
                 local nestedQuantity =
                     value.Amount
                     or value.amount
@@ -11703,40 +11779,220 @@ State.Profile.CalculateRemoteInventory = function(data)
         return nil, "not_table"
     end
 
+    local inventory =
+        type(data.Inventory)
+            == "table"
+        and data.Inventory
+        or nil
+
     local weapons =
         data.Weapons
         or data.weapons
+        or (
+            inventory
+            and (
+                inventory.Weapons
+                or inventory.weapons
+            )
+        )
 
     local pets =
         data.Pets
         or data.pets
+        or (
+            inventory
+            and (
+                inventory.Pets
+                or inventory.pets
+            )
+        )
 
-    if type(weapons) ~= "table"
-        and type(data.Inventory) == "table" then
+    local weaponSections = {}
+    local seenSectionTables =
+        setmetatable(
+            {},
+            {__mode = "k"}
+        )
 
-        weapons =
-            data.Inventory.Weapons
-            or data.Inventory.weapons
+    local function addWeaponSection(
+        candidate
+    )
+        if type(candidate)
+                == "table"
+            and not seenSectionTables[
+                candidate
+            ] then
+
+            seenSectionTables[
+                candidate
+            ] = true
+
+            table.insert(
+                weaponSections,
+                candidate
+            )
+        end
     end
 
-    if type(pets) ~= "table"
-        and type(data.Inventory) == "table" then
+    addWeaponSection(
+        weapons
+    )
 
-        pets =
-            data.Inventory.Pets
-            or data.Inventory.pets
+    addWeaponSection(
+        data.Holiday
+        or data.holiday
+    )
+
+    addWeaponSection(
+        data.Holidays
+        or data.holidays
+    )
+
+    if inventory then
+        addWeaponSection(
+            inventory.Holiday
+            or inventory.holiday
+        )
+
+        addWeaponSection(
+            inventory.Holidays
+            or inventory.holidays
+        )
+    end
+
+    local function emptyResult()
+        return {
+            total = 0,
+            partial = false,
+            resolvedItems = 0,
+            resolvedUnits = 0,
+            unresolvedLeaves = 0,
+            nonNumericUnits = 0,
+            samples = {},
+            numericContributions = {},
+            cardHints = {},
+            unresolvedAll = {},
+        }
+    end
+
+    local function mergeResult(
+        target,
+        source
+    )
+        target.total =
+            target.total
+            + (
+                source.total
+                or 0
+            )
+
+        target.partial =
+            target.partial
+            or source.partial
+
+        target.resolvedItems =
+            target.resolvedItems
+            + (
+                source.resolvedItems
+                or 0
+            )
+
+        target.resolvedUnits =
+            target.resolvedUnits
+            + (
+                source.resolvedUnits
+                or 0
+            )
+
+        target.unresolvedLeaves =
+            target.unresolvedLeaves
+            + (
+                source.unresolvedLeaves
+                or 0
+            )
+
+        target.nonNumericUnits =
+            target.nonNumericUnits
+            + (
+                source.nonNumericUnits
+                or 0
+            )
+
+        for _, value in ipairs(
+            source.numericContributions
+            or {}
+        ) do
+            table.insert(
+                target.numericContributions,
+                value
+            )
+        end
+
+        for _, hint in ipairs(
+            source.cardHints
+            or {}
+        ) do
+            table.insert(
+                target.cardHints,
+                hint
+            )
+        end
+
+        for _, miss in ipairs(
+            source.unresolvedAll
+            or {}
+        ) do
+            table.insert(
+                target.unresolvedAll,
+                miss
+            )
+        end
+
+        for _, sample in ipairs(
+            source.samples
+            or {}
+        ) do
+            if #target.samples
+                >= 30 then
+
+                break
+            end
+
+            table.insert(
+                target.samples,
+                sample
+            )
+        end
     end
 
     local weaponResult =
-        State.Profile.CalculateRemoteSection(
-            weapons,
-            "Weapons"
-        )
+        emptyResult()
+
+    local weaponSeenQuantities = {}
+
+    if #weaponSections == 0 then
+        weaponResult.partial = true
+    else
+        for _, weaponSection in ipairs(
+            weaponSections
+        ) do
+            mergeResult(
+                weaponResult,
+                State.Profile
+                    .CalculateRemoteSection(
+                        weaponSection,
+                        "Weapons",
+                        weaponSeenQuantities
+                    )
+            )
+        end
+    end
 
     local petResult =
         State.Profile.CalculateRemoteSection(
             pets,
-            "Pets"
+            "Pets",
+            {}
         )
 
     local total =
@@ -12088,8 +12344,8 @@ State.Profile.FetchRemoteTotalForPlayer = function(player)
 
     local activeInfo = info
 
-    -- Verified GetFullInventory data is authoritative. Opening somebody's
-    -- Profile never changes their cached leaderboard total.
+
+    
     State.Profile.totalsByName[
         player.Name
     ] = info
@@ -12108,8 +12364,8 @@ State.Profile.FetchRemoteTotalForPlayer = function(player)
         activeInfo
     )
 
-    -- If this player's Profile is visible, replace any temporary visible-card
-    -- summary with the verified remote total immediately.
+
+    
     if State.Profile.currentUsername
         and normalize(
             State.Profile.currentUsername
@@ -12317,7 +12573,6 @@ function Controller.SetTradeHelperEnabled(enabled)
 end
 
 
-
 State.QueueNativeDatabaseWarmup()
 
 rawset(_G, GLOBAL_KEY, Controller)
@@ -12416,6 +12671,78 @@ task.spawn(function()
 
             refreshTrackedCards()
             scheduleTradeRefresh(0)
+            State.Profile.QueueScan()
+            State.Profile.QueueRemoteLeaderboardSweep()
+        end
+    end
+end)
+
+task.spawn(function()
+    while not Destroyed do
+        task.wait(
+            CONFIG.LinkedImagesRefreshSeconds
+        )
+
+        if Destroyed then
+            break
+        end
+
+        local ok,
+            refreshError,
+            changed =
+            loadLinkedImages()
+
+        if not ok then
+            State.Debug.Count(
+                "linkedImageRefreshFailures"
+            )
+
+            State.Debug.Record(
+                "linked_images_periodic_refresh",
+                {
+                    success = false,
+                    error = refreshError,
+                }
+            )
+
+        elseif changed then
+            State.Debug.Count(
+                "linkedImageRefreshes"
+            )
+
+            State.Debug.Record(
+                "linked_images_periodic_refresh",
+                {
+                    success = true,
+                    changed = true,
+                    linkedCount =
+                        countDictionary(
+                            LinkedImages
+                        ),
+                    itemLinkCount =
+                        countDictionary(
+                            State.Mapping.ItemLinks
+                        ),
+                }
+            )
+
+            table.clear(
+                ResolveCache
+            )
+
+            table.clear(
+                State.ResolveMetaCache
+            )
+
+            GameResolverLastBuild =
+                0
+
+            if SupremeDatabase then
+                refreshTrackedCards()
+                scheduleTradeRefresh(0)
+                State.Profile.QueueScan()
+                State.Profile.QueueRemoteLeaderboardSweep()
+            end
         end
     end
 end)

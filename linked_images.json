@@ -1,1 +1,1 @@
-{"_metadata":{"updated_at":"2026-08-13T00:04:26Z","version":2,"purpose":"Maps exact Roblox icon asset IDs and exact game internal item IDs to canonical Supreme Values items."},"item_links":[],"links":[]}
+{"_metadata":{"updated_at":"2026-08-13T00:04:44Z","version":2,"purpose":"Maps exact Roblox icon asset IDs and exact game internal item IDs to canonical Supreme Values items."},"item_links":{"Weapons|Camo":{"game_item_id":"Camo","supreme_key":"uncommons::image::camo-gun::9a9bd53c446e","name":"Camo (Gun)","category":"Uncommons","item_type":"Weapons"}},"links":[]}

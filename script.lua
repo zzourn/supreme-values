@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.38-public-auto-trader-v6-serverhop-recovery",
+    version = "18.39-public-auto-trader-v7-botaware-incoming",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -61,7 +61,26 @@ local CONFIG = {
     AutoTraderDiscoveryRetryLimit = 3,
     AutoTraderServerHopGraceSeconds = 2.5,
     AutoTraderServerHopRetrySeconds = 5,
-    AutoTraderServerListPages = 3,
+    AutoTraderServerListPages = 4,
+    AutoTraderServerCandidateLimit = 24,
+    AutoTraderServerPreferredMinOccupancy = 0.60,
+    AutoTraderServerPreferredMaxOccupancy = 0.96,
+    AutoTraderOutgoingNativeConfirmSeconds = 0.85,
+    AutoTraderIncomingResolveSeconds = 5.5,
+    AutoTraderIncomingActionTimeoutSeconds = 2.5,
+    AutoTraderThumbnailBatchSize = 100,
+    AutoTraderBotPreviewMinSamples = 5,
+    AutoTraderBotHardRejectRatio = 0.65,
+    AutoTraderBotSuspectRatio = 0.45,
+    AutoTraderBotConfirmMinJobs = 2,
+    AutoTraderBotConfirmEvidence = 7,
+    AutoTraderBotConfirmConfidence = 0.72,
+    AutoTraderBotSuspectEvidence = 3,
+    AutoTraderBotLearnMinVerifiedZero = 5,
+    AutoTraderBotLearnMinResolvedCoverage = 0.60,
+    AutoTraderBotLearnZeroRatio = 0.80,
+    AutoTraderBotDatabaseMaxIcons = 300,
+    AutoTraderBotDatabaseJobsPerIcon = 24,
     AutoTraderRecentServerTtlSeconds = 1200,
     AutoTraderRecentServerLimit = 30,
     AutoTraderMovementWatchdogEnabled = true,
@@ -104,6 +123,10 @@ local TeleportService = game:GetService("TeleportService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
     error("SupremeValues_PC_PublicHelper requires a LocalPlayer.")
@@ -5980,6 +6003,8 @@ State.AutoTrader = {
     TargetStatsFile = "SV_AutoTrader_TargetStats_v1.json",
     RecentJobsKey = "__SV_AUTO_TRADER_RECENT_JOBS_V1",
     RecentJobsFile = "SV_AutoTrader_RecentJobs_v1.json",
+    BotIconDbKey = "__SV_AUTO_TRADER_BOT_ICONS_V1",
+    BotIconDbFile = "SV_AutoTrader_BotIcons_v1.json",
     TeleportBootstrapKey = "__SV_AUTO_TRADER_TELEPORT_BOOTSTRAP_V1",
     FriendCache = {},
     FriendCacheMeta = {},
@@ -6025,6 +6050,14 @@ State.AutoTrader = {
     LocalDeclineAt = 0,
     LocalDeclineButton = nil,
     RequestCancelButton = nil,
+    RequestConfirmGeneration = 0,
+    IncomingRequestFrame = nil,
+    IncomingRequestUsernameObject = nil,
+    IncomingRequestGeneration = 0,
+    IncomingRequestDecision = nil,
+    IncomingRequestResolvingSignature = nil,
+    IncomingRequestLastSignature = nil,
+    IncomingRequestLastHandledAt = 0,
     ManualAcceptHold = false,
     AutoAcceptGeneration = 0,
     AutoAcceptScheduledKey = nil,
@@ -6050,6 +6083,12 @@ State.AutoTrader = {
     ServerHopInProgress = false,
     LastServerHopAttemptAt = 0,
     RecentJobs = {},
+    BotIconDb = {version = 1, icons = {}},
+    BotIconDbSaveGeneration = 0,
+    BotLearningDoneJobId = nil,
+    LastBotLearning = nil,
+    LastServerScan = nil,
+    AuditedTradesThisServer = 0,
     TeleportQueued = false,
     TeleportInProgress = false,
     LastTeleportReason = nil,
@@ -6220,6 +6259,8 @@ State.AutoTrader.GetPlayerStats = function(player)
     if not stats then
         stats = {
             requests = 0,
+            incomingRequests = 0,
+            incomingAccepted = 0,
             responses = 0,
             declines = 0,
             ignored = 0,
@@ -6245,6 +6286,8 @@ State.AutoTrader.GetPlayerStats = function(player)
         local factor = CONFIG.AutoTraderTargetStatsDecayPerDay ^ elapsedDays
         for _, field in ipairs({
             "requests",
+            "incomingRequests",
+            "incomingAccepted",
             "responses",
             "declines",
             "ignored",
@@ -6270,6 +6313,10 @@ State.AutoTrader.RecordTargetEvent = function(player, kind, data)
     if kind == "request" then
         stats.requests += 1
         stats.lastRequestedAt = os.time()
+    elseif kind == "incomingRequest" then
+        stats.incomingRequests = (tonumber(stats.incomingRequests) or 0) + 1
+    elseif kind == "incomingAccepted" then
+        stats.incomingAccepted = (tonumber(stats.incomingAccepted) or 0) + 1
     elseif kind == "response" then
         stats.responses += 1
         local seconds = tonumber(data.seconds)
@@ -6420,6 +6467,7 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
         and math.max(1, (tonumber(stats.totalProfit) or 0) / stats.successes)
         or math.max(1, math.min(20, math.sqrt(total) * 0.65))
     local freshBonus = (tonumber(stats.requests) or 0) < 0.25 and 1.15 or 1
+    local incomingBonus = 1 + math.min(0.25, (tonumber(stats.incomingRequests) or 0) * 0.04)
     local profile = State.AutoTrader.GetTargetProfile(player)
     local compositionMultiplier = profile and profile.multiplier or 0.70
     local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.35)
@@ -6428,6 +6476,7 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
         * responseRate
         * successRate
         * freshBonus
+        * incomingBonus
         * compositionMultiplier
         * auditPenalty
         / expectedSeconds
@@ -6611,9 +6660,9 @@ State.AutoTrader.IsTerminalServerOutcome = function(outcome)
         or outcome == "no_response"
         or outcome == "traded"
         or outcome == "unavailable"
+        or outcome == "trade_unavailable"
         or outcome == "trade_declined"
         or outcome == "idle"
-        or outcome == "local_cancel"
 end
 State.AutoTrader.GetServerPlayerClassification = function(player)
     local state = State.AutoTrader.EnsureServerPlayer(player)
@@ -6659,13 +6708,10 @@ State.AutoTrader.GetServerDisposition = function()
     local counts = {
         total = 0, valued = 0, zero = 0, unknown = 0, unresolvable = 0,
         friend = 0, exhausted = 0, active = 0,
+        verifiedPositive = 0, verifiedZero = 0, verifiedCount = 0,
     }
-    if not State.AutoTrader.Preferences.automation then
-        return "OFF", counts
-    end
-    if State.AutoTrader.SessionFrozen then
-        return "FROZEN", counts
-    end
+    if not State.AutoTrader.Preferences.automation then return "OFF", counts end
+    if State.AutoTrader.SessionFrozen then return "FROZEN", counts end
     if State.AutoTrader.PostTradeAuditPending or State.AutoTrader.PendingRequest
         or State.CurrentTrade or (isTradeVisible and isTradeVisible()) then
         return "ACTIVE", counts
@@ -6673,7 +6719,15 @@ State.AutoTrader.GetServerDisposition = function()
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and player.Parent then
             counts.total += 1
-            local class = State.AutoTrader.GetServerPlayerClassification(player)
+            local class, total = State.AutoTrader.GetServerPlayerClassification(player)
+            if total ~= nil then
+                counts.verifiedCount += 1
+                if total > 0 then
+                    counts.verifiedPositive += 1
+                else
+                    counts.verifiedZero += 1
+                end
+            end
             if class == "valued" then
                 counts.valued += 1
             elseif class == "zero" then
@@ -6691,21 +6745,11 @@ State.AutoTrader.GetServerDisposition = function()
             end
         end
     end
-    if counts.valued > 0 or counts.active > 0 then
-        return "ACTIVE", counts
-    end
-    if counts.unknown > 0 then
-        return "WAITING_FOR_DISCOVERY", counts
-    end
-    if counts.total == 0 or counts.friend == counts.total then
-        return "EXHAUSTED_NO_ELIGIBLE_PLAYERS", counts
-    end
-    if counts.exhausted > 0 then
-        return "EXHAUSTED_ALL_ATTEMPTED", counts
-    end
-    if counts.unresolvable > 0 then
-        return "EXHAUSTED_UNRESOLVABLE", counts
-    end
+    if counts.valued > 0 or counts.active > 0 then return "ACTIVE", counts end
+    if counts.unknown > 0 then return "WAITING_FOR_DISCOVERY", counts end
+    if counts.total == 0 or counts.friend == counts.total then return "EXHAUSTED_NO_ELIGIBLE_PLAYERS", counts end
+    if counts.exhausted > 0 then return "EXHAUSTED_ALL_ATTEMPTED", counts end
+    if counts.unresolvable > 0 then return "EXHAUSTED_UNRESOLVABLE", counts end
     return "EXHAUSTED_NO_VALUE", counts
 end
 State.AutoTrader.KickServerDiscovery = function()
@@ -6792,6 +6836,163 @@ State.AutoTrader.LoadRecentJobs = function()
     end
     State.AutoTrader.SaveRecentJobs()
 end
+State.AutoTrader.NormalizeBotIconDb = function(value)
+    if type(value) ~= "table" then value = {} end
+    if type(value.icons) ~= "table" then value.icons = {} end
+    value.version = tonumber(value.version) or 1
+    return value
+end
+State.AutoTrader.LoadBotIconDb = function()
+    local loaded = rawget(_G, State.AutoTrader.BotIconDbKey)
+        or rawget(ExecutorEnvironment, State.AutoTrader.BotIconDbKey)
+    if type(loaded) ~= "table" then
+        local isfileFunction = State.TryGetExecutorGlobal("isfile")
+        local readfileFunction = State.TryGetExecutorGlobal("readfile")
+        if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
+            local okExists, exists = pcall(isfileFunction, State.AutoTrader.BotIconDbFile)
+            if okExists and exists then
+                local okRead, body = pcall(readfileFunction, State.AutoTrader.BotIconDbFile)
+                if okRead and type(body) == "string" and body ~= "" then
+                    local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                    if okDecode and type(decoded) == "table" then loaded = decoded end
+                end
+            end
+        end
+    end
+    State.AutoTrader.BotIconDb = State.AutoTrader.NormalizeBotIconDb(loaded)
+    rawset(_G, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+    rawset(ExecutorEnvironment, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+end
+State.AutoTrader.PruneBotIconDb = function()
+    local rows = {}
+    local icons = State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.icons or {}
+    for fingerprint, record in pairs(icons) do
+        if type(fingerprint) == "string" and type(record) == "table" then
+            record.botEvidence = tonumber(record.botEvidence) or 0
+            record.humanEvidence = tonumber(record.humanEvidence) or 0
+            record.lastSeen = tonumber(record.lastSeen) or 0
+            record.botJobs = type(record.botJobs) == "table" and record.botJobs or {}
+            record.humanJobs = type(record.humanJobs) == "table" and record.humanJobs or {}
+            local function pruneJobs(jobTable)
+                local jobs = {}
+                for jobId, stamp in pairs(jobTable) do
+                    if type(jobId) == "string" then
+                        table.insert(jobs, {jobId = jobId, stamp = tonumber(stamp) or 0})
+                    end
+                end
+                table.sort(jobs, function(a, b) return a.stamp > b.stamp end)
+                local nextJobs = {}
+                for index, row in ipairs(jobs) do
+                    if index > CONFIG.AutoTraderBotDatabaseJobsPerIcon then break end
+                    nextJobs[row.jobId] = row.stamp
+                end
+                return nextJobs
+            end
+            record.botJobs = pruneJobs(record.botJobs)
+            record.humanJobs = pruneJobs(record.humanJobs)
+            table.insert(rows, {fingerprint = fingerprint, record = record})
+        end
+    end
+    table.sort(rows, function(a, b)
+        local ae = (a.record.botEvidence or 0) + (a.record.humanEvidence or 0)
+        local be = (b.record.botEvidence or 0) + (b.record.humanEvidence or 0)
+        if ae ~= be then return ae > be end
+        return (a.record.lastSeen or 0) > (b.record.lastSeen or 0)
+    end)
+    local nextIcons = {}
+    for index, row in ipairs(rows) do
+        if index > CONFIG.AutoTraderBotDatabaseMaxIcons then break end
+        nextIcons[row.fingerprint] = row.record
+    end
+    State.AutoTrader.BotIconDb.icons = nextIcons
+end
+State.AutoTrader.FlushBotIconDb = function()
+    State.AutoTrader.PruneBotIconDb()
+    rawset(_G, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+    rawset(ExecutorEnvironment, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+    local writer = State.TryGetExecutorGlobal("writefile")
+    if type(writer) ~= "function" then return false end
+    local okEncode, body = pcall(function() return HttpService:JSONEncode(State.AutoTrader.BotIconDb) end)
+    if not okEncode then return false end
+    return pcall(writer, State.AutoTrader.BotIconDbFile, body)
+end
+State.AutoTrader.SaveBotIconDb = function(immediate)
+    rawset(_G, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+    rawset(ExecutorEnvironment, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+    State.AutoTrader.BotIconDbSaveGeneration += 1
+    local generation = State.AutoTrader.BotIconDbSaveGeneration
+    if immediate then
+        return State.AutoTrader.FlushBotIconDb()
+    end
+    task.delay(0.75, function()
+        if Destroyed or generation ~= State.AutoTrader.BotIconDbSaveGeneration then return end
+        State.AutoTrader.FlushBotIconDb()
+    end)
+    return true
+end
+State.AutoTrader.BotIconJobCount = function(jobTable)
+    local count = 0
+    for _ in pairs(type(jobTable) == "table" and jobTable or {}) do
+        count += 1
+    end
+    return count
+end
+State.AutoTrader.GetBotIconDbCount = function()
+    local count = 0
+    for _ in pairs(State.AutoTrader.BotIconDb.icons or {}) do
+        count += 1
+    end
+    return count
+end
+State.AutoTrader.GetBotIconRecord = function(fingerprint, create)
+    if type(fingerprint) ~= "string" or fingerprint == "" then return nil end
+    local icons = State.AutoTrader.BotIconDb.icons
+    local record = icons[fingerprint]
+    if not record and create then
+        record = {botEvidence = 0, humanEvidence = 0, botJobs = {}, humanJobs = {}, lastSeen = os.time()}
+        icons[fingerprint] = record
+    end
+    if record then
+        record.botEvidence = tonumber(record.botEvidence) or 0
+        record.humanEvidence = tonumber(record.humanEvidence) or 0
+        record.botJobs = type(record.botJobs) == "table" and record.botJobs or {}
+        record.humanJobs = type(record.humanJobs) == "table" and record.humanJobs or {}
+        record.lastSeen = tonumber(record.lastSeen) or 0
+    end
+    return record
+end
+State.AutoTrader.GetBotIconClass = function(fingerprint)
+    local record = State.AutoTrader.GetBotIconRecord(fingerprint, false)
+    if not record then return "unknown", 0, nil end
+    local bot = math.max(0, tonumber(record.botEvidence) or 0)
+    local human = math.max(0, tonumber(record.humanEvidence) or 0)
+    local confidence = bot / math.max(1, bot + human)
+    local botJobs = State.AutoTrader.BotIconJobCount(record.botJobs)
+    if botJobs >= CONFIG.AutoTraderBotConfirmMinJobs
+        and bot >= CONFIG.AutoTraderBotConfirmEvidence
+        and confidence >= CONFIG.AutoTraderBotConfirmConfidence then
+        return "confirmed_bot", confidence, record
+    end
+    if botJobs >= 1 and bot >= CONFIG.AutoTraderBotSuspectEvidence and confidence >= 0.60 then
+        return "suspect_bot", confidence, record
+    end
+    return "unknown", confidence, record
+end
+State.AutoTrader.AddBotIconEvidence = function(fingerprint, kind, amount, jobId)
+    local record = State.AutoTrader.GetBotIconRecord(fingerprint, true)
+    if not record then return end
+    amount = math.max(0, tonumber(amount) or 0)
+    if kind == "bot" then
+        record.botEvidence += amount
+        if type(jobId) == "string" and jobId ~= "" then record.botJobs[jobId] = os.time() end
+    elseif kind == "human" then
+        record.humanEvidence += amount
+        if type(jobId) == "string" and jobId ~= "" then record.humanJobs[jobId] = os.time() end
+    end
+    record.lastSeen = os.time()
+end
+State.AutoTrader.LoadBotIconDb()
+
 State.AutoTrader.GetQueueOnTeleport = function()
     local direct = State.TryGetExecutorGlobal("queue_on_teleport") or State.TryGetExecutorGlobal("queueonteleport")
     if type(direct) == "function" then return direct end
@@ -6837,6 +7038,8 @@ State.AutoTrader.QueueTeleportScript = function(reason)
         return false, "queue_on_teleport unavailable"
     end
     State.AutoTrader.SaveRecentJobs()
+    State.AutoTrader.SaveBotIconDb(true)
+    State.AutoTrader.FlushTargetStats()
     local code, buildError = State.AutoTrader.BuildTeleportBootstrapCode(reason)
     if not code then return false, buildError end
     local ok, err = pcall(queueFunction, code)
@@ -6859,11 +7062,11 @@ State.AutoTrader.HttpGetBody = function(url)
     if ok and type(body) == "string" then return body end
     return nil
 end
-State.AutoTrader.FindPublicServer = function()
+State.AutoTrader.FetchPublicServers = function(maxPages)
     State.AutoTrader.PruneRecentJobs()
-    local candidates, fallback = {}, {}
+    local rows = {}
     local cursor = nil
-    for _ = 1, CONFIG.AutoTraderServerListPages do
+    for _ = 1, math.max(1, tonumber(maxPages) or CONFIG.AutoTraderServerListPages) do
         local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId)
             .. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
         if cursor and cursor ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
@@ -6875,24 +7078,267 @@ State.AutoTrader.FindPublicServer = function()
             local playing = tonumber(server.playing)
             local maxPlayers = tonumber(server.maxPlayers)
             local jobId = server.id
-            if type(jobId) == "string" and jobId ~= "" and jobId ~= game.JobId
-                and playing and maxPlayers and playing < maxPlayers then
-                local row = {id = jobId, playing = playing, maxPlayers = maxPlayers}
-                table.insert(fallback, row)
-                if not State.AutoTrader.RecentJobs[jobId] then table.insert(candidates, row) end
+            if type(jobId) == "string" and jobId ~= "" and playing and maxPlayers and maxPlayers > 0 then
+                table.insert(rows, {
+                    id = jobId,
+                    playing = playing,
+                    maxPlayers = maxPlayers,
+                    occupancy = playing / maxPlayers,
+                    playerTokens = type(server.playerTokens) == "table" and server.playerTokens or {},
+                    ping = tonumber(server.ping),
+                    fps = tonumber(server.fps),
+                })
             end
         end
         cursor = decoded.nextPageCursor
-        if not cursor then break end
+        if not cursor or cursor == "" then break end
+    end
+    return rows
+end
+State.AutoTrader.CanonicalThumbnailFingerprint = function(imageUrl)
+    if type(imageUrl) ~= "string" or imageUrl == "" then return nil end
+    local value = string.lower(imageUrl)
+    value = value:match("^([^?]+)") or value
+    local rbxPath = value:match("^https?://[^/]*rbxcdn%.com/(.+)$")
+    if rbxPath and rbxPath ~= "" then return "rbxcdn:" .. rbxPath end
+    local path = value:match("^https?://[^/]+/(.+)$")
+    if path and path ~= "" then return "urlpath:" .. path end
+    return value
+end
+State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
+    if type(httpRequest) ~= "function" then return false, "request(options) unavailable" end
+    local payload, requestMap = {}, {}
+    for _, server in ipairs(servers or {}) do
+        server.previewFingerprints = {}
+        server.previewThumbnailUrls = {}
+        for tokenIndex, token in ipairs(server.playerTokens or {}) do
+            if type(token) == "string" and token ~= "" then
+                local requestId = tostring(server.id) .. "|" .. tostring(tokenIndex)
+                requestMap[requestId] = server
+                table.insert(payload, {
+                    requestId = requestId,
+                    type = "AvatarHeadShot",
+                    targetId = 0,
+                    token = token,
+                    format = "png",
+                    size = "150x150",
+                })
+            end
+        end
+    end
+    if #payload == 0 then return false, "no playerTokens available" end
+    local completed = 0
+    for first = 1, #payload, CONFIG.AutoTraderThumbnailBatchSize do
+        local chunk = {}
+        for index = first, math.min(#payload, first + CONFIG.AutoTraderThumbnailBatchSize - 1) do
+            table.insert(chunk, payload[index])
+        end
+        local okBody, encoded = pcall(function() return HttpService:JSONEncode(chunk) end)
+        if not okBody then return false, tostring(encoded) end
+        local okRequest, response = pcall(httpRequest, {
+            Url = "https://thumbnails.roblox.com/v1/batch",
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
+            Body = encoded,
+        })
+        if okRequest and type(response) == "table"
+            and tonumber(response.StatusCode or response.Status) == 200 then
+            local body = response.Body or response.body
+            local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body or "") end)
+            if okDecode and type(decoded) == "table" and type(decoded.data) == "table" then
+                for _, item in ipairs(decoded.data) do
+                    local server = requestMap[tostring(item.requestId)]
+                    local imageUrl = item.imageUrl or item.imageURL
+                    local fingerprint = State.AutoTrader.CanonicalThumbnailFingerprint(imageUrl)
+                    if server and fingerprint and (item.state == nil or tostring(item.state) == "Completed") then
+                        table.insert(server.previewFingerprints, fingerprint)
+                        table.insert(server.previewThumbnailUrls, imageUrl)
+                        completed += 1
+                    end
+                end
+            end
+        end
+        if first + CONFIG.AutoTraderThumbnailBatchSize <= #payload then task.wait(0.08) end
+    end
+    return completed > 0, completed > 0 and nil or "thumbnail batch returned no completed previews"
+end
+State.AutoTrader.ClassifyServerPreview = function(server)
+    local fingerprints = server.previewFingerprints or {}
+    local confirmed, suspect = 0, 0
+    local classes = {}
+    for _, fingerprint in ipairs(fingerprints) do
+        local class, confidence = State.AutoTrader.GetBotIconClass(fingerprint)
+        classes[fingerprint] = {class = class, confidence = confidence}
+        if class == "confirmed_bot" then
+            confirmed += 1
+            suspect += 1
+        elseif class == "suspect_bot" then
+            suspect += 1
+        end
+    end
+    local sample = #fingerprints
+    local confirmedRatio = sample > 0 and confirmed / sample or 0
+    local suspectRatio = sample > 0 and suspect / sample or 0
+    local hardReject = sample >= CONFIG.AutoTraderBotPreviewMinSamples
+        and (confirmedRatio >= CONFIG.AutoTraderBotHardRejectRatio or suspectRatio >= 0.85)
+    local suspicious = sample >= CONFIG.AutoTraderBotPreviewMinSamples
+        and suspectRatio >= CONFIG.AutoTraderBotSuspectRatio
+    local occupancy = tonumber(server.occupancy) or ((tonumber(server.playing) or 0) / math.max(1, tonumber(server.maxPlayers) or 1))
+    local occupancyFit = 1 - math.min(1, math.abs(occupancy - 0.86) / 0.50)
+    local score = (tonumber(server.playing) or 0) * 12
+        + occupancyFit * 25
+        - confirmedRatio * 180
+        - math.max(0, suspectRatio - confirmedRatio) * 55
+        + math.min(sample, 12) * 0.25
+    server.botPreview = {
+        sample = sample,
+        confirmed = confirmed,
+        suspect = suspect,
+        confirmedRatio = confirmedRatio,
+        suspectRatio = suspectRatio,
+        hardReject = hardReject,
+        suspicious = suspicious,
+        score = score,
+        classes = classes,
+    }
+    return server.botPreview
+end
+State.AutoTrader.GetCurrentServerPreview = function(rows)
+    for _, server in ipairs(rows or {}) do
+        if server.id == game.JobId then return server end
+    end
+    return nil
+end
+State.AutoTrader.LearnCurrentServerBotIcons = function(counts)
+    if State.AutoTrader.BotLearningDoneJobId == game.JobId then return State.AutoTrader.LastBotLearning end
+    State.AutoTrader.BotLearningDoneJobId = game.JobId
+    counts = counts or select(2, State.AutoTrader.GetServerDisposition())
+    local total = math.max(0, tonumber(counts.total) or 0)
+    local verifiedZero = math.max(0, tonumber(counts.verifiedZero) or 0)
+    local verifiedPositive = math.max(0, tonumber(counts.verifiedPositive) or 0)
+    local verifiedCount = math.max(0, tonumber(counts.verifiedCount) or 0)
+    local resolvedCoverage = total > 0 and verifiedCount / total or 0
+    local zeroRatio = verifiedCount > 0 and verifiedZero / verifiedCount or 0
+    local learning = {
+        jobId = game.JobId,
+        total = total,
+        verifiedZero = verifiedZero,
+        verifiedPositive = verifiedPositive,
+        verifiedCount = verifiedCount,
+        resolvedCoverage = resolvedCoverage,
+        zeroRatio = zeroRatio,
+        auditedTrades = State.AutoTrader.AuditedTradesThisServer,
+        action = "none",
+    }
+    -- All-unknown servers are never allowed to train the icon database.
+    if verifiedCount <= 0 then
+        learning.action = "skip_all_unknown"
+        State.AutoTrader.LastBotLearning = learning
+        return learning
+    end
+    local botLike = verifiedPositive == 0
+        and verifiedZero >= CONFIG.AutoTraderBotLearnMinVerifiedZero
+        and resolvedCoverage >= CONFIG.AutoTraderBotLearnMinResolvedCoverage
+        and zeroRatio >= CONFIG.AutoTraderBotLearnZeroRatio
+    local humanLike = verifiedPositive >= 3 or (State.AutoTrader.AuditedTradesThisServer or 0) > 0
+    if not botLike and not humanLike then
+        learning.action = "skip_ambiguous"
+        State.AutoTrader.LastBotLearning = learning
+        return learning
+    end
+    local rows = State.AutoTrader.FetchPublicServers(CONFIG.AutoTraderServerListPages)
+    local current = State.AutoTrader.GetCurrentServerPreview(rows)
+    if not current then
+        learning.action = "skip_current_job_not_listed"
+        State.AutoTrader.LastBotLearning = learning
+        return learning
+    end
+    local okThumb, thumbReason = State.AutoTrader.ResolveServerPreviewFingerprints({current})
+    if not okThumb or #(current.previewFingerprints or {}) == 0 then
+        learning.action = "skip_no_preview"
+        learning.reason = thumbReason
+        State.AutoTrader.LastBotLearning = learning
+        return learning
+    end
+    local frequencies = {}
+    for _, fingerprint in ipairs(current.previewFingerprints) do
+        frequencies[fingerprint] = (frequencies[fingerprint] or 0) + 1
+    end
+    learning.previewSamples = #current.previewFingerprints
+    learning.frequencies = frequencies
+    if botLike then
+        local strength = resolvedCoverage >= 0.80 and verifiedZero >= 8 and 1.5 or 1.0
+        for fingerprint, amount in pairs(frequencies) do
+            State.AutoTrader.AddBotIconEvidence(fingerprint, "bot", math.min(5, amount) * strength, game.JobId)
+        end
+        learning.action = "learn_bot"
+        learning.strength = strength
+    elseif humanLike then
+        local tradeBoost = (State.AutoTrader.AuditedTradesThisServer or 0) > 0 and 0.8 or 0
+        for fingerprint, amount in pairs(frequencies) do
+            State.AutoTrader.AddBotIconEvidence(fingerprint, "human", math.min(3, amount) * 0.25 + tradeBoost, game.JobId)
+        end
+        learning.action = "learn_human"
+    end
+    State.AutoTrader.SaveBotIconDb(false)
+    State.AutoTrader.LastBotLearning = learning
+    State.AutoTrader.Log("bot_icon_learning", learning)
+    return learning
+end
+State.AutoTrader.FindPublicServer = function()
+    local rows = State.AutoTrader.FetchPublicServers(CONFIG.AutoTraderServerListPages)
+    local candidates, fallback = {}, {}
+    for _, server in ipairs(rows) do
+        if server.id ~= game.JobId and server.playing < server.maxPlayers then
+            table.insert(fallback, server)
+            if not State.AutoTrader.RecentJobs[server.id] then table.insert(candidates, server) end
+        end
     end
     local pool = #candidates > 0 and candidates or fallback
-    if #pool == 0 then return nil end
     table.sort(pool, function(a, b)
+        local aPreferred = a.occupancy >= CONFIG.AutoTraderServerPreferredMinOccupancy
+            and a.occupancy <= CONFIG.AutoTraderServerPreferredMaxOccupancy
+        local bPreferred = b.occupancy >= CONFIG.AutoTraderServerPreferredMinOccupancy
+            and b.occupancy <= CONFIG.AutoTraderServerPreferredMaxOccupancy
+        if aPreferred ~= bPreferred then return aPreferred end
         if a.playing ~= b.playing then return a.playing > b.playing end
         return a.id < b.id
     end)
-    local top = math.min(#pool, 10)
-    return pool[math.random(1, top)]
+    while #pool > CONFIG.AutoTraderServerCandidateLimit do table.remove(pool) end
+    local thumbOK, thumbReason = State.AutoTrader.ResolveServerPreviewFingerprints(pool)
+    local scan = {
+        at = os.clock(),
+        thumbnailAvailable = thumbOK,
+        thumbnailReason = thumbReason,
+        candidates = {},
+    }
+    local best, bestScore = nil, -math.huge
+    for _, server in ipairs(pool) do
+        local botPreview = State.AutoTrader.ClassifyServerPreview(server)
+        local row = {
+            id = server.id,
+            playing = server.playing,
+            maxPlayers = server.maxPlayers,
+            occupancy = server.occupancy,
+            previewSample = botPreview.sample,
+            confirmedBotRatio = botPreview.confirmedRatio,
+            suspectBotRatio = botPreview.suspectRatio,
+            hardReject = botPreview.hardReject,
+            suspicious = botPreview.suspicious,
+            score = botPreview.score,
+            recent = State.AutoTrader.RecentJobs[server.id] ~= nil,
+        }
+        table.insert(scan.candidates, row)
+        if not botPreview.hardReject and botPreview.score > bestScore then
+            best = server
+            bestScore = botPreview.score
+        end
+    end
+    table.sort(scan.candidates, function(a, b) return (a.score or -math.huge) > (b.score or -math.huge) end)
+    while #scan.candidates > 16 do table.remove(scan.candidates) end
+    scan.selected = best and best.id or nil
+    State.AutoTrader.LastServerScan = scan
+    return best, scan
 end
 State.AutoTrader.BeginTeleport = function(reason, sameJob)
     if State.AutoTrader.TeleportInProgress then return false end
@@ -6930,19 +7376,40 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
     State.AutoTrader.StatusDetail = tostring(disposition) .. " · looking for a populated public server."
     State.AutoTrader.Render()
     task.spawn(function()
-        local server = State.AutoTrader.FindPublicServer()
+        State.AutoTrader.LearnCurrentServerBotIcons(counts)
+        local server, serverScan = State.AutoTrader.FindPublicServer()
         if Destroyed then return end
         if not server then
             State.AutoTrader.ServerHopInProgress = false
             State.AutoTrader.Status = "WAIT · SERVER HOP"
             State.AutoTrader.StatusDetail = "No eligible public server was returned; retrying automatically."
-            State.AutoTrader.Log("server_hop_no_server", {disposition = disposition, counts = counts})
+            State.AutoTrader.Log("server_hop_no_server", {disposition = disposition, counts = counts, scan = serverScan})
+            State.AutoTrader.Render()
+            return
+        end
+        local currentDisposition = State.AutoTrader.GetServerDisposition()
+        local _, liveIncoming = State.AutoTrader.GetIncomingRequestUi()
+        if string.sub(tostring(currentDisposition), 1, 9) ~= "EXHAUSTED"
+            or State.AutoTrader.PendingRequest
+            or State.CurrentTrade
+            or (liveIncoming and State.AutoTrader.IsGuiShown(liveIncoming)) then
+            State.AutoTrader.ServerHopInProgress = false
+            State.AutoTrader.Log("server_hop_aborted_new_work", {disposition = currentDisposition})
+            State.AutoTrader.Status = "SERVER HOP CANCELED · NEW WORK"
+            State.AutoTrader.StatusDetail = "A new actionable request/player/trade appeared while candidates were being screened."
             State.AutoTrader.Render()
             return
         end
         State.AutoTrader.RecentJobs[server.id] = os.time()
         State.AutoTrader.SaveRecentJobs()
-        State.AutoTrader.Log("server_hop_selected", {jobId = server.id, playing = server.playing, disposition = disposition})
+        State.AutoTrader.Log("server_hop_selected", {
+            jobId = server.id,
+            playing = server.playing,
+            maxPlayers = server.maxPlayers,
+            occupancy = server.occupancy,
+            botPreview = server.botPreview,
+            disposition = disposition,
+        })
         local queued, queueError = State.AutoTrader.QueueTeleportScript("server_hop:" .. tostring(disposition))
         if not queued then
             State.AutoTrader.ServerHopInProgress = false
@@ -6990,7 +7457,12 @@ State.AutoTrader.SampleMovement = function()
         if not seen[userId] then State.AutoTrader.MovementSamples[userId] = nil end
     end
     if moved or not anyTrackable then State.AutoTrader.LastAnyMovementAt = now end
-    if not State.AutoTrader.Preferences.automation or State.AutoTrader.SessionFrozen or State.AutoTrader.TeleportInProgress then return true end
+    if not State.AutoTrader.Preferences.automation
+        or State.AutoTrader.SessionFrozen
+        or State.AutoTrader.TeleportInProgress
+        or State.AutoTrader.ServerHopInProgress then
+        return true
+    end
     local baseline = math.max(State.AutoTrader.LastAnyMovementAt or now, State.AutoTrader.MovementWatchdogArmedAt or 0)
     if anyTrackable and now - baseline >= CONFIG.AutoTraderMovementTimeoutSeconds
         and now - (State.AutoTrader.LastSameServerRecoveryAt or 0) >= CONFIG.AutoTraderSameServerRecoveryCooldownSeconds then
@@ -7078,28 +7550,30 @@ State.AutoTrader.SelectTarget = function()
     local bestTotal = 0
     local now = os.clock()
     for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer
-            and player.Parent
-            and State.AutoTrader.CooldownRemaining(player) <= 0 then
-            local lastRequest = State.AutoTrader.RequestHistory[player.UserId] or 0
-            if now - lastRequest >= CONFIG.AutoTraderRepeatRequestSeconds then
-                local friend = State.AutoTrader.GetFriendStatus(player)
-                local friendAllowed = not State.AutoTrader.Preferences.ignoreFriends or friend == false
-                if friendAllowed then
-                    local info = State.Profile.totalsByName[player.Name]
-                    local verified = type(info) == "table"
-                        and info.source == "GetFullInventoryVerified"
-                        and not info.stale
-                    local total = verified and tonumber(info.total) or nil
-                    if total and total > 0 then
-                        local score = State.AutoTrader.GetTargetScore(player, total)
-                        if not best
-                            or score > bestScore + 0.000001
-                            or (math.abs(score - bestScore) <= 0.000001 and total > bestTotal)
-                            or (math.abs(score - bestScore) <= 0.000001 and total == bestTotal and player.UserId < best.UserId) then
-                            best = player
-                            bestScore = score
-                            bestTotal = total
+        if player ~= LocalPlayer and player.Parent then
+            local serverEntry = State.AutoTrader.EnsureServerPlayer(player)
+            local terminal = serverEntry and State.AutoTrader.IsTerminalServerOutcome(serverEntry.outcome)
+            if not terminal and State.AutoTrader.CooldownRemaining(player) <= 0 then
+                local lastRequest = State.AutoTrader.RequestHistory[player.UserId] or 0
+                if now - lastRequest >= CONFIG.AutoTraderRepeatRequestSeconds then
+                    local friend = State.AutoTrader.GetFriendStatus(player)
+                    local friendAllowed = not State.AutoTrader.Preferences.ignoreFriends or friend == false
+                    if friendAllowed then
+                        local info = State.Profile.totalsByName[player.Name]
+                        local verified = type(info) == "table"
+                            and info.source == "GetFullInventoryVerified"
+                            and not info.stale
+                        local total = verified and tonumber(info.total) or nil
+                        if total and total > 0 then
+                            local score = State.AutoTrader.GetTargetScore(player, total)
+                            if not best
+                                or score > bestScore + 0.000001
+                                or (math.abs(score - bestScore) <= 0.000001 and total > bestTotal)
+                                or (math.abs(score - bestScore) <= 0.000001 and total == bestTotal and player.UserId < best.UserId) then
+                                best = player
+                                bestScore = score
+                                bestTotal = total
+                            end
                         end
                     end
                 end
@@ -7109,9 +7583,7 @@ State.AutoTrader.SelectTarget = function()
     State.AutoTrader.SelectedTarget = best
     State.AutoTrader.SelectedTargetScore = bestScore
     State.AutoTrader.SelectedTargetValue = bestTotal
-    State.AutoTrader.SelectedTargetProfile = best
-        and State.AutoTrader.GetTargetProfile(best)
-        or nil
+    State.AutoTrader.SelectedTargetProfile = best and State.AutoTrader.GetTargetProfile(best) or nil
     return best
 end
 State.AutoTrader.GetLocalInventory = function(force)
@@ -8655,6 +9127,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
                 })
                 State.AutoTrader.MarkServerPlayerOutcome(partner, "traded", "post-trade audit passed")
             end
+            State.AutoTrader.AuditedTradesThisServer += 1
             State.AutoTrader.Status = "TRADE COMPLETE · VERIFIED"
             State.AutoTrader.StatusDetail = "Server receipt and fresh incoming/outgoing inventory deltas both matched the exact automated trade."
             State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
@@ -8775,49 +9248,261 @@ State.AutoTrader.SetManagedPartner = function(partner)
 end
 State.AutoTrader.GetRequestFrame = function()
     local main = PlayerGui:FindFirstChild("MainGUI")
-    return main
-        and safeFindPath(main, {"Game", "Leaderboard", "Container", "TradeRequest"})
+    return main and safeFindPath(main, {"Game", "Leaderboard", "Container", "TradeRequest"})
 end
-State.AutoTrader.BindRequestCancelObserver = function()
+State.AutoTrader.IsGuiShown = function(object)
+    if not object or not object:IsA("GuiObject") or not object.Visible then return false end
+    local current = object.Parent
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return true
+end
+State.AutoTrader.GetOutgoingRequestUi = function()
     local frame = State.AutoTrader.GetRequestFrame()
     local sending = frame and frame:FindFirstChild("SendingRequest")
-    local cancel = sending and sending:FindFirstChild("Cancel")
-    if not cancel or not cancel:IsA("GuiButton") or State.AutoTrader.RequestCancelButton == cancel then
-        return
+    local username = sending and sending:FindFirstChild("Username")
+    return frame, sending, username
+end
+State.AutoTrader.GetIncomingRequestUi = function()
+    local frame = State.AutoTrader.GetRequestFrame()
+    local receiving = frame and frame:FindFirstChild("ReceivingRequest")
+    local title = receiving and receiving:FindFirstChild("Title")
+    local username = receiving and receiving:FindFirstChild("Username")
+    local accept = receiving and receiving:FindFirstChild("Accept")
+    local decline = receiving and receiving:FindFirstChild("Decline")
+    return frame, receiving, title, username, accept, decline
+end
+State.AutoTrader.GetTextValue = function(object)
+    if object and (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then
+        return tostring(object.Text or "")
     end
+    return ""
+end
+State.AutoTrader.NormalizeRequestName = function(text)
+    text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    text = text:gsub("^@", "")
+    return text
+end
+State.AutoTrader.ResolveIncomingPlayer = function(text)
+    local wanted = State.AutoTrader.NormalizeRequestName(text)
+    if wanted == "" then return nil end
+    local exact = Players:FindFirstChild(wanted)
+    if exact and exact:IsA("Player") then return exact end
+    local lower = string.lower(wanted)
+    local displayMatch = nil
+    for _, player in ipairs(Players:GetPlayers()) do
+        if string.lower(player.Name) == lower then return player end
+        if string.lower(player.DisplayName or "") == lower then
+            if displayMatch then return nil end
+            displayMatch = player
+        end
+    end
+    return displayMatch
+end
+State.AutoTrader.BindRequestCancelObserver = function()
+    local _, sending = State.AutoTrader.GetOutgoingRequestUi()
+    local cancel = sending and sending:FindFirstChild("Cancel")
+    if not cancel or not cancel:IsA("GuiButton") or State.AutoTrader.RequestCancelButton == cancel then return end
     State.AutoTrader.RequestCancelButton = cancel
     connect(cancel.MouseButton1Click, function()
         local pending = State.AutoTrader.PendingRequest
-        if not pending then
-            return
-        end
+        if not pending then return end
         State.AutoTrader.Log("request_canceled_locally", pending)
         local player = Players:GetPlayerByUserId(pending.userId)
         if player then State.AutoTrader.MarkServerPlayerOutcome(player, "local_cancel", "request canceled locally") end
         State.AutoTrader.PendingRequest = nil
+        State.AutoTrader.RequestConfirmGeneration += 1
         State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
         State.AutoTrader.Status = "REQUEST CANCELED"
         State.AutoTrader.StatusDetail = "You canceled the pending request; no unwilling-player cooldown was applied."
         State.AutoTrader.Render()
     end)
 end
-State.AutoTrader.ShowOutgoingRequest = function(target)
-    local frame = State.AutoTrader.GetRequestFrame()
-    if not frame or not frame:IsA("GuiObject") then
-        return
+State.AutoTrader.IsNativeOutgoingPending = function(target)
+    local frame, sending, username = State.AutoTrader.GetOutgoingRequestUi()
+    if not frame or not sending or not State.AutoTrader.IsGuiShown(sending) then return false end
+    local shownName = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
+    if target and shownName ~= "" and string.lower(shownName) ~= string.lower(target.Name) then return false end
+    return true
+end
+State.AutoTrader.ClickNativeGuiButton = function(button, actionName)
+    if not button or not button:IsA("GuiButton") or not State.AutoTrader.IsGuiShown(button) then
+        return false, "button unavailable/hidden"
     end
-    for _, child in ipairs(frame:GetChildren()) do
-        if child:IsA("GuiObject") then
-            child.Visible = child.Name == "SendingRequest"
+    if VirtualInputManager then
+        local center = button.AbsolutePosition + button.AbsoluteSize / 2
+        local ok, err = pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
+            task.wait(0.04)
+            VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0)
+        end)
+        if ok then
+            State.AutoTrader.Log("native_gui_click", {action = actionName, mode = "VirtualInputManager"})
+            return true
+        end
+        State.AutoTrader.Log("native_gui_click_failed", {action = actionName, mode = "VirtualInputManager", error = tostring(err)})
+    end
+    local firesignalFunction = State.TryGetExecutorGlobal("firesignal")
+    if type(firesignalFunction) == "function" then
+        local ok, err = pcall(firesignalFunction, button.MouseButton1Click)
+        if ok then
+            State.AutoTrader.Log("native_gui_click", {action = actionName, mode = "firesignal.MouseButton1Click"})
+            return true
+        end
+        State.AutoTrader.Log("native_gui_click_failed", {action = actionName, mode = "firesignal", error = tostring(err)})
+    end
+    return false, "no working GUI click method"
+end
+State.AutoTrader.CancelOutgoingForIncoming = function(incomingPlayer)
+    local pending = State.AutoTrader.PendingRequest
+    if not pending or (incomingPlayer and pending.userId == incomingPlayer.UserId) then return true end
+    local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
+    local remote = tradeFolder and tradeFolder:FindFirstChild("CancelRequest")
+    if not remote or not remote:IsA("RemoteEvent") then return false, "Trade.CancelRequest unavailable" end
+    local outgoing = Players:GetPlayerByUserId(pending.userId)
+    local ok, err = pcall(function() remote:FireServer() end)
+    if not ok then return false, tostring(err) end
+    if outgoing then
+        State.AutoTrader.MarkServerPlayerOutcome(outgoing, "deferred", "outgoing request canceled for incoming requester")
+    end
+    State.AutoTrader.Log("outgoing_deferred_for_incoming", {outgoing = pending, incoming = incomingPlayer and incomingPlayer.Name or nil})
+    State.AutoTrader.PendingRequest = nil
+    State.AutoTrader.RequestConfirmGeneration += 1
+    State.AutoTrader.NextRequestAt = os.clock() + 0.15
+    return true
+end
+State.AutoTrader.DecideIncomingRequester = function(player)
+    if not player or player == LocalPlayer or not player.Parent then return "decline", "requester unavailable" end
+    if State.AutoTrader.Preferences.ignoreFriends then
+        local friend = State.AutoTrader.GetFriendStatus(player)
+        if friend == true then return "decline", "Ignore Friends is ON" end
+        if friend == nil then return "wait", "friend status pending" end
+    end
+    local info = State.Profile.totalsByName[player.Name]
+    local verified = type(info) == "table" and info.source == "GetFullInventoryVerified" and not info.stale
+    local total = verified and tonumber(info.total) or nil
+    if total == nil then return "wait", "inventory unresolved" end
+    if total <= 0 then return "decline", "verified inventory value is 0" end
+    return "accept", "verified positive inventory value " .. formatCompact(total)
+end
+State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signature)
+    State.AutoTrader.IncomingRequestResolvingSignature = nil
+    local _, receiving, title, username, accept, decline = State.AutoTrader.GetIncomingRequestUi()
+    if not receiving or not State.AutoTrader.IsGuiShown(receiving) then return false end
+    local currentSignature = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
+        .. "|" .. State.AutoTrader.GetTextValue(title)
+    if signature and currentSignature ~= signature then return false end
+    if decision == "accept" then
+        local canceled, cancelReason = State.AutoTrader.CancelOutgoingForIncoming(player)
+        if not canceled then
+            State.AutoTrader.Log("incoming_blocked_cancel_failed", {player = player.Name, reason = cancelReason})
+            return false
         end
     end
-    local sending = frame:FindFirstChild("SendingRequest")
-    local username = sending and sending:FindFirstChild("Username")
-    if username and (username:IsA("TextLabel") or username:IsA("TextButton") or username:IsA("TextBox")) then
-        username.Text = target.Name
+    local button = decision == "accept" and accept or decline
+    local ok, clickReason = State.AutoTrader.ClickNativeGuiButton(button, "incoming_" .. decision)
+    State.AutoTrader.IncomingRequestDecision = {
+        player = player and player.Name or nil,
+        userId = player and player.UserId or nil,
+        decision = decision,
+        reason = reason,
+        signature = signature,
+        at = os.clock(),
+        clickOk = ok,
+        clickReason = clickReason,
+    }
+    State.AutoTrader.IncomingRequestLastHandledAt = os.clock()
+    State.AutoTrader.IncomingRequestLastSignature = signature
+    State.AutoTrader.Log("incoming_request_decision", State.AutoTrader.IncomingRequestDecision)
+    if player then
+        State.AutoTrader.RecordTargetEvent(player, "incomingRequest")
+        if decision == "accept" and ok then State.AutoTrader.RecordTargetEvent(player, "incomingAccepted") end
     end
-    frame.Visible = true
-    State.AutoTrader.BindRequestCancelObserver()
+    State.AutoTrader.Status = decision == "accept" and "INCOMING · ACCEPTING" or "INCOMING · DECLINING"
+    State.AutoTrader.StatusDetail = (player and player.Name or "Unknown requester") .. " · " .. tostring(reason)
+    State.AutoTrader.Render()
+    return ok
+end
+State.AutoTrader.HandleIncomingRequest = function()
+    if Destroyed or not State.AutoTrader.Preferences.automation or State.AutoTrader.SessionFrozen then return end
+    if State.CurrentTrade or (isTradeVisible and isTradeVisible()) or State.AutoTrader.ManagedPartnerUserId then return end
+    local _, receiving, title, username = State.AutoTrader.GetIncomingRequestUi()
+    if not receiving or not State.AutoTrader.IsGuiShown(receiving) then return end
+    local requestName = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
+    local signature = requestName .. "|" .. State.AutoTrader.GetTextValue(title)
+    if requestName == "" then return end
+    if State.AutoTrader.IncomingRequestResolvingSignature == signature then return end
+    if State.AutoTrader.IncomingRequestLastSignature == signature
+        and os.clock() - (State.AutoTrader.IncomingRequestLastHandledAt or 0) < CONFIG.AutoTraderIncomingActionTimeoutSeconds then
+        return
+    end
+    local player = State.AutoTrader.ResolveIncomingPlayer(requestName)
+    if not player then
+        State.AutoTrader.Status = "INCOMING · RESOLVING"
+        State.AutoTrader.StatusDetail = "Could not uniquely resolve incoming requester " .. requestName .. " yet."
+        State.AutoTrader.Render()
+        return
+    end
+    local decision, reason = State.AutoTrader.DecideIncomingRequester(player)
+    if decision ~= "wait" then
+        State.AutoTrader.ActOnIncomingRequest(player, decision, reason, signature)
+        return
+    end
+    State.AutoTrader.IncomingRequestGeneration += 1
+    local generation = State.AutoTrader.IncomingRequestGeneration
+    State.AutoTrader.IncomingRequestResolvingSignature = signature
+    State.AutoTrader.IncomingRequestLastSignature = signature
+    State.AutoTrader.IncomingRequestLastHandledAt = os.clock()
+    State.AutoTrader.Status = "INCOMING · CHECKING"
+    State.AutoTrader.StatusDetail = player.Name .. " requested a trade; prioritizing their verified inventory before deciding."
+    State.AutoTrader.Render()
+    task.spawn(function()
+        local deadline = os.clock() + CONFIG.AutoTraderIncomingResolveSeconds
+        while not Destroyed and generation == State.AutoTrader.IncomingRequestGeneration and os.clock() < deadline do
+            State.AutoTrader.RequestFriendStatus(player, true)
+            if type(State.Profile.FetchRemoteTotalForPlayer) == "function" then
+                State.Profile.FetchRemoteTotalForPlayer(player, true)
+            elseif type(State.Profile.QueueRemoteLeaderboardSweep) == "function" then
+                State.Profile.QueueRemoteLeaderboardSweep(true)
+            end
+            local nextDecision, nextReason = State.AutoTrader.DecideIncomingRequester(player)
+            if nextDecision ~= "wait" then
+                State.AutoTrader.IncomingRequestResolvingSignature = nil
+                State.AutoTrader.ActOnIncomingRequest(player, nextDecision, nextReason, signature)
+                return
+            end
+            task.wait(0.25)
+        end
+        if Destroyed or generation ~= State.AutoTrader.IncomingRequestGeneration then return end
+        State.AutoTrader.IncomingRequestResolvingSignature = nil
+        State.AutoTrader.ActOnIncomingRequest(player, "decline", "inventory/friend verification did not resolve inside the incoming-request window", signature)
+    end)
+end
+State.AutoTrader.BindIncomingRequestObserver = function()
+    local _, receiving, _, username = State.AutoTrader.GetIncomingRequestUi()
+    if not receiving or not receiving:IsA("GuiObject") then return end
+    if State.AutoTrader.IncomingRequestFrame ~= receiving then
+        State.AutoTrader.IncomingRequestFrame = receiving
+        connect(receiving:GetPropertyChangedSignal("Visible"), function()
+            if receiving.Visible then
+                task.defer(State.AutoTrader.HandleIncomingRequest)
+            else
+                State.AutoTrader.IncomingRequestGeneration += 1
+                State.AutoTrader.IncomingRequestResolvingSignature = nil
+            end
+        end)
+    end
+    if username and (username:IsA("TextLabel") or username:IsA("TextButton") or username:IsA("TextBox"))
+        and State.AutoTrader.IncomingRequestUsernameObject ~= username then
+        State.AutoTrader.IncomingRequestUsernameObject = username
+        connect(username:GetPropertyChangedSignal("Text"), function()
+            if receiving.Visible then task.defer(State.AutoTrader.HandleIncomingRequest) end
+        end)
+    end
+    if receiving.Visible then task.defer(State.AutoTrader.HandleIncomingRequest) end
 end
 State.AutoTrader.TrySendRequest = function()
     if Destroyed
@@ -8829,22 +9514,15 @@ State.AutoTrader.TrySendRequest = function()
         or os.clock() < State.AutoTrader.NextRequestAt then
         return
     end
+    local _, receiving = State.AutoTrader.GetIncomingRequestUi()
+    if receiving and State.AutoTrader.IsGuiShown(receiving) then
+        State.AutoTrader.HandleIncomingRequest()
+        return
+    end
     local target = State.AutoTrader.SelectTarget()
-    if not target then
-        State.AutoTrader.Status = "WAIT · TARGET"
-        State.AutoTrader.StatusDetail = State.AutoTrader.Preferences.ignoreFriends
-            and "No verified non-friend target with positive known value is ready."
-            or "No verified target with positive known value is ready."
-        State.AutoTrader.Render()
-        return
-    end
+    if not target then return end
     local friendAllowed, reason = State.AutoTrader.PlayerAllowed(target)
-    if not friendAllowed then
-        State.AutoTrader.Status = "WAIT · TARGET"
-        State.AutoTrader.StatusDetail = tostring(reason)
-        State.AutoTrader.Render()
-        return
-    end
+    if not friendAllowed then return end
     local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
     local remote = tradeFolder and tradeFolder:FindFirstChild("SendRequest")
     if not remote or not remote:IsA("RemoteFunction") then
@@ -8858,51 +9536,56 @@ State.AutoTrader.TrySendRequest = function()
         userId = target.UserId,
         name = target.Name,
         sentAt = os.clock(),
+        phase = "invoking",
+        nativeConfirmed = false,
     }
-    State.AutoTrader.MarkServerPlayerOutcome(target, "request_pending", "request sent")
+    State.AutoTrader.MarkServerPlayerOutcome(target, "request_attempted", "SendRequest invoked")
     State.AutoTrader.Status = "REQUESTING"
-    State.AutoTrader.StatusDetail = "Sending one request to " .. target.Name .. ". No other request can be sent while this is pending."
-    State.AutoTrader.Log("request_send", {
-        userId = target.UserId,
-        name = target.Name,
-    })
+    State.AutoTrader.StatusDetail = "Attempting a request to " .. target.Name .. "; waiting for MM2's native pending UI before treating it as live."
+    State.AutoTrader.Log("request_send", {userId = target.UserId, name = target.Name})
     State.AutoTrader.Render()
     task.spawn(function()
-        local ok, result = pcall(function()
-            return remote:InvokeServer(target)
-        end)
-        if Destroyed then
-            return
-        end
+        local ok, result = pcall(function() return remote:InvokeServer(target) end)
+        if Destroyed then return end
         local pending = State.AutoTrader.PendingRequest
-        if not pending or pending.userId ~= target.UserId then
-            return
-        end
-        if not ok then
+        if not pending or pending.userId ~= target.UserId then return end
+        if not ok or result == true then
             State.AutoTrader.PendingRequest = nil
-            State.AutoTrader.MarkServerPlayerOutcome(target, "unavailable", "request call failed")
-            State.AutoTrader.SetCooldown(target, "request call failed")
-            State.AutoTrader.Status = "WAIT · REQUEST FAILED"
-            State.AutoTrader.StatusDetail = tostring(result)
+            State.AutoTrader.MarkServerPlayerOutcome(target, "trade_unavailable", not ok and "request call failed" or "request unavailable/denied")
+            State.AutoTrader.SetCooldown(target, "trade unavailable", 20)
+            State.AutoTrader.Status = "SKIP · TRADE UNAVAILABLE"
+            State.AutoTrader.StatusDetail = target.Name .. " could not enter MM2's pending-request state; moving on."
+            State.AutoTrader.Log("request_unavailable", {userId = target.UserId, result = result, error = not ok and tostring(result) or nil})
             State.AutoTrader.Render()
             return
         end
-        if result == true then
-            State.AutoTrader.PendingRequest = nil
-            State.AutoTrader.MarkServerPlayerOutcome(target, "unavailable", "request unavailable/denied")
-            State.AutoTrader.SetCooldown(target, "request unavailable/denied")
-            State.AutoTrader.Status = "COOLDOWN · UNAVAILABLE"
-            State.AutoTrader.StatusDetail = target.Name .. " could not be requested; cooling down for about 2 minutes."
-        else
-            State.AutoTrader.ShowOutgoingRequest(target)
-            State.AutoTrader.Status = "REQUEST PENDING"
-            State.AutoTrader.StatusDetail = "Waiting for " .. target.Name .. " to accept or decline. This request is not repeated."
-        end
-        State.AutoTrader.Log("request_result", {
-            userId = target.UserId,
-            result = result,
-        })
-        State.AutoTrader.Render()
+        pending.phase = "awaiting_native"
+        pending.invokeResult = result
+        State.AutoTrader.RequestConfirmGeneration += 1
+        local generation = State.AutoTrader.RequestConfirmGeneration
+        task.delay(CONFIG.AutoTraderOutgoingNativeConfirmSeconds, function()
+            if Destroyed or generation ~= State.AutoTrader.RequestConfirmGeneration then return end
+            local active = State.AutoTrader.PendingRequest
+            if not active or active.userId ~= target.UserId then return end
+            if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return end
+            if State.AutoTrader.IsNativeOutgoingPending(target) then
+                active.phase = "pending"
+                active.nativeConfirmed = true
+                active.confirmedAt = os.clock()
+                State.AutoTrader.MarkServerPlayerOutcome(target, "request_pending", "native SendingRequest confirmed")
+                State.AutoTrader.Status = "REQUEST PENDING"
+                State.AutoTrader.StatusDetail = "MM2 confirmed the native pending request to " .. target.Name .. "."
+                State.AutoTrader.Log("request_native_confirmed", {userId = target.UserId})
+            else
+                State.AutoTrader.PendingRequest = nil
+                State.AutoTrader.MarkServerPlayerOutcome(target, "trade_unavailable", "native SendingRequest never appeared")
+                State.AutoTrader.SetCooldown(target, "trades off/unavailable", 20)
+                State.AutoTrader.Status = "SKIP · TRADES OFF/UNAVAILABLE"
+                State.AutoTrader.StatusDetail = "No native SendingRequest appeared for " .. target.Name .. "; treating them as unavailable for this server visit."
+                State.AutoTrader.Log("request_native_missing", {userId = target.UserId, wait = CONFIG.AutoTraderOutgoingNativeConfirmSeconds})
+            end
+            State.AutoTrader.Render()
+        end)
     end)
 end
 State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, otherEntries)
@@ -8916,6 +9599,13 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     end
     if State.AutoTrader.PendingRequest and State.AutoTrader.PendingRequest.userId == partner.UserId then
         State.AutoTrader.PendingRequest = nil
+        State.AutoTrader.RequestConfirmGeneration += 1
+    end
+    if State.AutoTrader.IncomingRequestDecision
+        and State.AutoTrader.IncomingRequestDecision.userId == partner.UserId then
+        State.AutoTrader.IncomingRequestGeneration += 1
+        State.AutoTrader.IncomingRequestResolvingSignature = nil
+        State.AutoTrader.IncomingRequestDecision = nil
     end
     local allowed, allowReason = State.AutoTrader.PlayerAllowed(partner)
     if not allowed then
@@ -9210,6 +9900,15 @@ State.AutoTrader.OnNoTrade = function()
         State.AutoTrader.Render()
         return
     end
+    State.AutoTrader.BindIncomingRequestObserver()
+    local _, incomingFrame = State.AutoTrader.GetIncomingRequestUi()
+    if State.AutoTrader.Preferences.automation and incomingFrame and State.AutoTrader.IsGuiShown(incomingFrame) then
+        State.AutoTrader.HandleIncomingRequest()
+        State.AutoTrader.Status = "INCOMING REQUEST"
+        State.AutoTrader.StatusDetail = "Handling an incoming trade request before cold outgoing targeting."
+        State.AutoTrader.Render()
+        return
+    end
     if State.AutoTrader.PendingRequest then
         local player = Players:GetPlayerByUserId(State.AutoTrader.PendingRequest.userId)
         if not player then
@@ -9217,8 +9916,11 @@ State.AutoTrader.OnNoTrade = function()
             State.AutoTrader.PendingRequest = nil
             State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
         else
-            State.AutoTrader.Status = "REQUEST PENDING"
-            State.AutoTrader.StatusDetail = "Waiting up to 12s for " .. player.Name .. " to accept or decline."
+            local phase = State.AutoTrader.PendingRequest.phase or "pending"
+            State.AutoTrader.Status = phase == "pending" and "REQUEST PENDING" or "REQUEST · VERIFYING"
+            State.AutoTrader.StatusDetail = phase == "pending"
+                and ("Waiting up to 12s for " .. player.Name .. " to accept or decline.")
+                or ("Waiting briefly for MM2's native SendingRequest confirmation for " .. player.Name .. ".")
             State.AutoTrader.SelectedTarget = player
             State.AutoTrader.Render()
             return
@@ -9343,8 +10045,31 @@ State.AutoTrader.BuildDebug = function()
     for _ in pairs(State.AutoTrader.TargetStats or {}) do
         persistentStatsCount += 1
     end
+    local botIconSummary = {}
+    for fingerprint, record in pairs(State.AutoTrader.BotIconDb.icons or {}) do
+        local class, confidence = State.AutoTrader.GetBotIconClass(fingerprint)
+        table.insert(botIconSummary, {
+            fingerprint = fingerprint,
+            class = class,
+            confidence = confidence,
+            botEvidence = tonumber(record.botEvidence) or 0,
+            humanEvidence = tonumber(record.humanEvidence) or 0,
+            botJobs = State.AutoTrader.BotIconJobCount(record.botJobs),
+            humanJobs = State.AutoTrader.BotIconJobCount(record.humanJobs),
+            lastSeen = record.lastSeen,
+        })
+    end
+    table.sort(botIconSummary, function(a, b)
+        local ae = (a.botEvidence or 0) - (a.humanEvidence or 0)
+        local be = (b.botEvidence or 0) - (b.humanEvidence or 0)
+        if ae ~= be then return ae > be end
+        return (a.botEvidence or 0) > (b.botEvidence or 0)
+    end)
+    while #botIconSummary > 20 do table.remove(botIconSummary) end
+    local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
+    local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V5",
+        format = "SV_AUTO_TRADER_SUPPORT_V7",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -9362,6 +10087,9 @@ State.AutoTrader.BuildDebug = function()
             backgroundTrading = true,
             serverHopEnabled = CONFIG.AutoTraderServerHopEnabled,
             movementWatchdogEnabled = CONFIG.AutoTraderMovementWatchdogEnabled,
+            outgoingNativeConfirmSeconds = CONFIG.AutoTraderOutgoingNativeConfirmSeconds,
+            incomingResolveSeconds = CONFIG.AutoTraderIncomingResolveSeconds,
+            botPreviewHardRejectRatio = CONFIG.AutoTraderBotHardRejectRatio,
         },
         marketSafetyConfig = {
             rejectUntradable = CONFIG.AutoTraderRejectUntradable,
@@ -9411,6 +10139,27 @@ State.AutoTrader.BuildDebug = function()
             playerStates = State.AutoTrader.ServerPlayers,
             lastAnyMovementAt = State.AutoTrader.LastAnyMovementAt,
             watchdogArmedAt = State.AutoTrader.MovementWatchdogArmedAt,
+            auditedTradesThisServer = State.AutoTrader.AuditedTradesThisServer,
+        },
+        incomingRequest = {
+            decision = State.AutoTrader.IncomingRequestDecision,
+            resolvingSignature = State.AutoTrader.IncomingRequestResolvingSignature,
+            lastSignature = State.AutoTrader.IncomingRequestLastSignature,
+            lastHandledAt = State.AutoTrader.IncomingRequestLastHandledAt,
+            liveVisible = liveReceiving and State.AutoTrader.IsGuiShown(liveReceiving) or false,
+            liveUsername = State.AutoTrader.GetTextValue(liveIncomingUsername),
+            liveTitle = State.AutoTrader.GetTextValue(liveIncomingTitle),
+        },
+        outgoingRequestUi = {
+            liveVisible = liveSending and State.AutoTrader.IsGuiShown(liveSending) or false,
+            liveUsername = State.AutoTrader.GetTextValue(liveSendingUsername),
+        },
+        serverSelector = {
+            lastScan = State.AutoTrader.LastServerScan,
+            lastBotLearning = State.AutoTrader.LastBotLearning,
+            botIconDbFile = State.AutoTrader.BotIconDbFile,
+            botIconDbCount = State.AutoTrader.GetBotIconDbCount(),
+            topBotIconEvidence = botIconSummary,
         },
         pendingRequest = State.AutoTrader.PendingRequest,
         partner = partner and {
@@ -9469,7 +10218,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V5\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V7\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -9919,6 +10668,8 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
             State.AutoTrader.ActionInFlight = nil
             State.AutoTrader.LastManagedLocalHash = nil
             local pending = State.AutoTrader.PendingRequest
+            local incoming = State.AutoTrader.IncomingRequestDecision
+            local partnerPlayer = type(partnerName) == "string" and Players:FindFirstChild(partnerName) or nil
             if pending then
                 local player = Players:GetPlayerByUserId(pending.userId)
                 if player then
@@ -9928,12 +10679,18 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                 end
                 if type(partnerName) ~= "string" or partnerName == pending.name then
                     State.AutoTrader.PendingRequest = nil
+                    State.AutoTrader.RequestConfirmGeneration += 1
                 end
+            elseif partnerPlayer then
+                State.AutoTrader.RecordTargetEvent(partnerPlayer, "trade")
+                State.AutoTrader.MarkServerPlayerOutcome(partnerPlayer, "trading", incoming and "incoming request accepted" or "trade started externally")
             end
-            State.AutoTrader.Log("trade_started", {
-                partnerName = partnerName,
-                pending = pending,
-            })
+            if incoming and (not partnerPlayer or incoming.userId == partnerPlayer.UserId) then
+                State.AutoTrader.IncomingRequestGeneration += 1
+                State.AutoTrader.IncomingRequestResolvingSignature = nil
+                State.AutoTrader.IncomingRequestDecision = nil
+            end
+            State.AutoTrader.Log("trade_started", {partnerName = partnerName, pending = pending, incoming = incoming})
             if State.AutoTrader.Preferences.automation then
                 task.defer(function()
                     if not Destroyed then
@@ -10050,6 +10807,7 @@ State.AutoTrader.CancelIgnoredRequest = function()
         return false
     end
     State.AutoTrader.PendingRequest = nil
+    State.AutoTrader.RequestConfirmGeneration += 1
     local requestFrame = State.AutoTrader.GetRequestFrame()
     if requestFrame and requestFrame:IsA("GuiObject") then
         requestFrame.Visible = false
@@ -10118,6 +10876,7 @@ State.AutoTrader.Tick = function()
     end
     State.AutoTrader.BindLocalDeclineObserver()
     State.AutoTrader.BindRequestCancelObserver()
+    State.AutoTrader.BindIncomingRequestObserver()
     if State.AutoTrader.Preferences.automation
         and State.AutoTrader.ManagedPartnerUserId
         and (State.CurrentTrade or isTradeVisible()) then
@@ -10138,7 +10897,8 @@ State.AutoTrader.Tick = function()
             State.AutoTrader.PendingRequest = nil
             State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
         elseif State.AutoTrader.Preferences.automation
-            and os.clock() - State.AutoTrader.PendingRequest.sentAt >= CONFIG.AutoTraderPendingRequestTimeoutSeconds then
+            and State.AutoTrader.PendingRequest.phase == "pending"
+            and os.clock() - (State.AutoTrader.PendingRequest.confirmedAt or State.AutoTrader.PendingRequest.sentAt) >= CONFIG.AutoTraderPendingRequestTimeoutSeconds then
             State.AutoTrader.CancelIgnoredRequest()
         end
     end
@@ -14382,6 +15142,9 @@ function Controller.Destroy()
     end
     if State.AutoTrader and State.AutoTrader.SaveRecentJobs then
         pcall(State.AutoTrader.SaveRecentJobs)
+    end
+    if State.AutoTrader and State.AutoTrader.FlushBotIconDb then
+        pcall(State.AutoTrader.FlushBotIconDb)
     end
     Destroyed = true
     State.TradeHelperGeneration =

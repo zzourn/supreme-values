@@ -6865,7 +6865,7 @@ State.AutoTrader.FindPublicServer = function()
     local cursor = nil
     for _ = 1, CONFIG.AutoTraderServerListPages do
         local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId)
-            .. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
+            .. "/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
         if cursor and cursor ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
         local body = State.AutoTrader.HttpGetBody(url)
         if not body then break end

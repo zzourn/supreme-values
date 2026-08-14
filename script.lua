@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.42-public-auto-trader-v10-prejoin-hash-reputation",
+    version = "18.44-public-auto-trader-v12-overnight-supervisor",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -69,8 +69,19 @@ local CONFIG = {
     AutoTraderRecentServerFallbackMinAgeSeconds = 90,
     AutoTraderServerPreferredMinOccupancy = 0.60,
     AutoTraderServerPreferredMaxOccupancy = 0.96,
-    AutoTraderOutgoingNativeConfirmSeconds = 0.85,
+    AutoTraderOutgoingNativeConfirmSeconds = 1.35,
+    AutoTraderRequestInvokeTimeoutSeconds = 3.25,
+    AutoTraderHttpTimeoutSeconds = 7.5,
     AutoTraderIncomingResolveSeconds = 5.5,
+    AutoTraderIncomingUnresolvedTimeoutSeconds = 7,
+    AutoTraderIncomingStuckTimeoutSeconds = 14,
+    AutoTraderStaleTradeGuiTimeoutSeconds = 12,
+    AutoTraderAbsoluteTradeTimeoutSeconds = 90,
+    AutoTraderServerHopHardTimeoutSeconds = 35,
+    AutoTraderTeleportStartedHardTimeoutSeconds = 22,
+    AutoTraderOperationalRecoveryDelaySeconds = 2.5,
+    AutoTraderRecoveryRetrySeconds = 4,
+    AutoTraderNoEligibleWorkTimeoutSeconds = 45,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
     AutoTraderThumbnailBatchSize = 100,
     AutoTraderBotPreviewMinSamples = 5,
@@ -148,6 +159,10 @@ local VirtualInputManager = nil
 pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
 end)
+local VirtualUser = nil
+pcall(function()
+    VirtualUser = game:GetService("VirtualUser")
+end)
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
     error("SupremeValues_PC_PublicHelper requires a LocalPlayer.")
@@ -159,6 +174,36 @@ local httpRequest =
     or (type(syn) == "table" and type(syn.request) == "function" and syn.request)
 if type(httpRequest) ~= "function" then
     warn("[SV Public] No request(options) HTTP function is available.")
+end
+local function runBoundedExternal(label, timeoutSeconds, callback)
+    local request = {done = false, ok = false, result = nil}
+    task.spawn(function()
+        local ok, result = pcall(callback)
+        request.ok = ok
+        request.result = result
+        request.done = true
+    end)
+    local deadline = os.clock() + math.max(0.25, tonumber(timeoutSeconds) or 5)
+    while not request.done and os.clock() < deadline do
+        task.wait(0.03)
+    end
+    if not request.done then
+        return false, tostring(label or "external call") .. " timed out"
+    end
+    return request.ok, request.result
+end
+local function boundedHttpRequest(options, timeoutSeconds)
+    if type(httpRequest) ~= "function" then
+        return false, "request(options) unavailable"
+    end
+    return runBoundedExternal("HTTP request", timeoutSeconds or 7.5, function()
+        return httpRequest(options)
+    end)
+end
+local function boundedGameHttpGet(url, timeoutSeconds)
+    return runBoundedExternal("game:HttpGet", timeoutSeconds or 7.5, function()
+        return game:HttpGet(url)
+    end)
 end
 local GLOBAL_KEY = "__SUPREME_VALUES_PC_PUBLIC_HELPER"
 do
@@ -873,13 +918,11 @@ local function loadLinkedImages()
     if HttpState.linkedETag then
         headers["If-None-Match"] = HttpState.linkedETag
     end
-    local ok, response = pcall(function()
-        return httpRequest({
-            Url = CONFIG.LinkedImagesUrl,
-            Method = "GET",
-            Headers = headers,
-        })
-    end)
+    local ok, response = boundedHttpRequest({
+        Url = CONFIG.LinkedImagesUrl,
+        Method = "GET",
+        Headers = headers,
+    }, CONFIG.AutoTraderHttpTimeoutSeconds)
     if not ok then
         return false, tostring(response), false
     end
@@ -970,13 +1013,11 @@ local function fetchSupremeDatabase()
     if HttpState.supremeETag then
         headers["If-None-Match"] = HttpState.supremeETag
     end
-    local requestOK, response = pcall(function()
-        return httpRequest({
-            Url = CONFIG.JsonUrl,
-            Method = "GET",
-            Headers = headers,
-        })
-    end)
+    local requestOK, response = boundedHttpRequest({
+        Url = CONFIG.JsonUrl,
+        Method = "GET",
+        Headers = headers,
+    }, CONFIG.AutoTraderHttpTimeoutSeconds)
     if not requestOK then
         return false, "HTTP error: " .. tostring(response), false
     end
@@ -6072,6 +6113,8 @@ State.AutoTrader = {
     LocalDeclineButton = nil,
     RequestCancelButton = nil,
     RequestConfirmGeneration = 0,
+    LastRequestGate = nil,
+    LastRequestAttempt = nil,
     IncomingRequestFrame = nil,
     IncomingRequestUsernameObject = nil,
     IncomingRequestGeneration = 0,
@@ -6079,6 +6122,8 @@ State.AutoTrader = {
     IncomingRequestResolvingSignature = nil,
     IncomingRequestLastSignature = nil,
     IncomingRequestLastHandledAt = 0,
+    IncomingRequestFirstSeenSignature = nil,
+    IncomingRequestFirstSeenAt = 0,
     ManualAcceptHold = false,
     AutoAcceptGeneration = 0,
     AutoAcceptScheduledKey = nil,
@@ -6110,6 +6155,8 @@ State.AutoTrader = {
     ServerHopCurrentDisposition = nil,
     ServerHopAttemptGeneration = 0,
     ServerHopTeleportStarted = false,
+    ServerHopStartedAt = 0,
+    EmptyServerScanCount = 0,
     RecentJobs = {},
     BotIconDb = {version = 2, icons = {}},
     BotIconDbSaveGeneration = 0,
@@ -6126,7 +6173,17 @@ State.AutoTrader = {
     AuditedTradesThisServer = 0,
     TeleportQueued = false,
     TeleportInProgress = false,
+    TeleportAttemptStartedAt = 0,
+    TeleportAttemptOriginJobId = nil,
     LastTeleportReason = nil,
+    RecoveryTeleportRequired = false,
+    RecoveryTeleportReason = nil,
+    RecoveryTeleportLastAttemptAt = 0,
+    StaleTradeGuiSince = 0,
+    NoEligibleWorkSince = 0,
+    OperationalFreezeAt = 0,
+    OperationalFreezeReason = nil,
+    FatalIntegrityStop = false,
     MovementSamples = {},
     LastAnyMovementAt = os.clock(),
     MovementWatchdogArmedAt = os.clock() + CONFIG.AutoTraderMovementJoinGraceSeconds,
@@ -7160,7 +7217,9 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason)
         "local B=H:JSONDecode(" .. quotedJson .. ")",
         "E[" .. quotedKey .. "]=B; _G[" .. quotedKey .. "]=B",
         "task.wait(1)",
-        "loadstring(game:HttpGet(" .. quotedUrl .. "))()",
+        "local U=" .. quotedUrl,
+        "local function F() local R={d=false,o=false,b=nil}; task.spawn(function() local o,b=pcall(function() return game:HttpGet(U) end); R.o=o; R.b=b; R.d=true end); local x=os.clock()+10; while not R.d and os.clock()<x do task.wait(.1) end; if R.d and R.o and type(R.b)=='string' and #R.b>1000 then return R.b end end",
+        "while true do local b=F(); if b then local f,e=loadstring(b); if f then local o=pcall(f); if o then break end end end; task.wait(3) end",
     }, ";")
 end
 State.AutoTrader.QueueTeleportScript = function(reason)
@@ -7170,12 +7229,19 @@ State.AutoTrader.QueueTeleportScript = function(reason)
         State.AutoTrader.Log("queue_on_teleport_unavailable", {reason = reason})
         return false, "queue_on_teleport unavailable"
     end
-    State.AutoTrader.SaveRecentJobs()
-    State.AutoTrader.SaveBotIconDb(true)
-    State.AutoTrader.FlushTargetStats()
+    -- Persistence is best-effort here. A wedged executor file API must never
+    -- prevent an overnight recovery/server hop from happening.
+    runBoundedExternal("teleport persistence", 2.5, function()
+        State.AutoTrader.SaveRecentJobs()
+        State.AutoTrader.SaveBotIconDb(true)
+        State.AutoTrader.FlushTargetStats()
+        return true
+    end)
     local code, buildError = State.AutoTrader.BuildTeleportBootstrapCode(reason)
     if not code then return false, buildError end
-    local ok, err = pcall(queueFunction, code)
+    local ok, err = runBoundedExternal("queue_on_teleport", 2.5, function()
+        return queueFunction(code)
+    end)
     if ok then
         State.AutoTrader.TeleportQueued = true
         State.AutoTrader.LastTeleportReason = tostring(reason or "teleport")
@@ -7186,12 +7252,15 @@ State.AutoTrader.QueueTeleportScript = function(reason)
 end
 State.AutoTrader.HttpGetBody = function(url)
     if type(httpRequest) == "function" then
-        local ok, response = pcall(httpRequest, {Url = url, Method = "GET", Headers = { ["Cache-Control"] = "no-cache" }})
+        local ok, response = boundedHttpRequest(
+            {Url = url, Method = "GET", Headers = { ["Cache-Control"] = "no-cache" }},
+            CONFIG.AutoTraderHttpTimeoutSeconds
+        )
         if ok and type(response) == "table" and tonumber(response.StatusCode or response.Status) == 200 then
             return response.Body or response.body
         end
     end
-    local ok, body = pcall(function() return game:HttpGet(url) end)
+    local ok, body = boundedGameHttpGet(url, CONFIG.AutoTraderHttpTimeoutSeconds)
     if ok and type(body) == "string" then return body end
     return nil
 end
@@ -7352,6 +7421,7 @@ State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
         diagnostics.lastError = reason
         return false, reason, diagnostics
     end
+    local consecutiveFailures = 0
     for first = 1, #payload, CONFIG.AutoTraderThumbnailBatchSize do
         diagnostics.batches += 1
         local chunk = {}
@@ -7363,14 +7433,15 @@ State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
             diagnostics.lastError = tostring(encoded)
             return diagnostics.completed > 0, tostring(encoded), diagnostics
         end
-        local okRequest, response = pcall(httpRequest, {
+        local okRequest, response = boundedHttpRequest({
             Url = "https://thumbnails.roblox.com/v1/batch",
             Method = "POST",
             Headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
             Body = encoded,
-        })
+        }, CONFIG.AutoTraderHttpTimeoutSeconds)
         if okRequest and type(response) == "table"
             and tonumber(response.StatusCode or response.Status) == 200 then
+            consecutiveFailures = 0
             diagnostics.batchesSucceeded += 1
             local body = response.Body or response.body
             local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body or "") end)
@@ -7402,8 +7473,13 @@ State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
                 diagnostics.lastError = "thumbnail batch JSON decode failed"
             end
         else
+            consecutiveFailures += 1
             diagnostics.lastError = okRequest and ("thumbnail HTTP " .. tostring(response and (response.StatusCode or response.Status)))
                 or ("thumbnail request failed: " .. tostring(response))
+            if consecutiveFailures >= 2 then
+                diagnostics.lastError = tostring(diagnostics.lastError) .. " · stopped after 2 consecutive batch failures"
+                break
+            end
         end
         if first + CONFIG.AutoTraderThumbnailBatchSize <= #payload then task.wait(0.05) end
     end
@@ -7837,6 +7913,8 @@ State.AutoTrader.BeginTeleport = function(reason, sameJob)
         return false
     end
     State.AutoTrader.TeleportInProgress = true
+    State.AutoTrader.TeleportAttemptStartedAt = os.clock()
+    State.AutoTrader.TeleportAttemptOriginJobId = game.JobId
     State.AutoTrader.LastTeleportReason = tostring(reason)
     local teleportData = {svAutoTrader = true, reason = tostring(reason), fromJobId = game.JobId}
     local ok, err = pcall(function()
@@ -7848,6 +7926,8 @@ State.AutoTrader.BeginTeleport = function(reason, sameJob)
     end)
     if not ok then
         State.AutoTrader.TeleportInProgress = false
+        State.AutoTrader.TeleportAttemptStartedAt = 0
+        State.AutoTrader.TeleportAttemptOriginJobId = nil
         State.AutoTrader.LastAnyMovementAt = os.clock()
         State.AutoTrader.Log("teleport_call_failed", {reason = reason, error = tostring(err)})
         return false
@@ -7863,7 +7943,10 @@ State.AutoTrader.AbortServerHop = function(reason)
     State.AutoTrader.ServerHopCurrentCandidate = nil
     State.AutoTrader.ServerHopCurrentDisposition = nil
     State.AutoTrader.ServerHopTeleportStarted = false
+    State.AutoTrader.ServerHopStartedAt = 0
     State.AutoTrader.TeleportInProgress = false
+    State.AutoTrader.TeleportAttemptStartedAt = 0
+    State.AutoTrader.TeleportAttemptOriginJobId = nil
     if reason then
         State.AutoTrader.Log("server_hop_aborted", {reason = tostring(reason)})
     end
@@ -7977,6 +8060,8 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     end
 
     State.AutoTrader.TeleportInProgress = true
+    State.AutoTrader.TeleportAttemptStartedAt = os.clock()
+    State.AutoTrader.TeleportAttemptOriginJobId = game.JobId
     State.AutoTrader.ServerHopAttemptGeneration += 1
     local attemptGeneration = State.AutoTrader.ServerHopAttemptGeneration
     local teleportData = {
@@ -7997,6 +8082,8 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     end)
     if not ok then
         State.AutoTrader.TeleportInProgress = false
+        State.AutoTrader.TeleportAttemptStartedAt = 0
+        State.AutoTrader.TeleportAttemptOriginJobId = nil
         State.AutoTrader.Log("server_hop_candidate_call_failed", {
             jobId = server.id,
             error = tostring(err),
@@ -8027,6 +8114,8 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
         local current = State.AutoTrader.ServerHopCurrentCandidate
         if current and current.id == server.id and game.JobId ~= server.id then
             State.AutoTrader.TeleportInProgress = false
+            State.AutoTrader.TeleportAttemptStartedAt = 0
+            State.AutoTrader.TeleportAttemptOriginJobId = nil
             State.AutoTrader.Log("server_hop_candidate_timeout", {
                 jobId = server.id,
                 seconds = CONFIG.AutoTraderServerTeleportAttemptTimeoutSeconds,
@@ -8048,6 +8137,7 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
     end
     State.AutoTrader.LastServerHopAttemptAt = os.clock()
     State.AutoTrader.ServerHopInProgress = true
+    State.AutoTrader.ServerHopStartedAt = os.clock()
     State.AutoTrader.ServerHopCurrentDisposition = tostring(disposition)
     State.AutoTrader.ServerHopQueueGeneration += 1
     local queueGeneration = State.AutoTrader.ServerHopQueueGeneration
@@ -8134,6 +8224,26 @@ State.AutoTrader.LoadRecentJobs()
 for _, player in ipairs(Players:GetPlayers()) do
     if player ~= LocalPlayer then State.AutoTrader.EnsureServerPlayer(player) end
 end
+connect(LocalPlayer.Idled, function()
+    local handled = false
+    if VirtualUser then
+        handled = pcall(function()
+            VirtualUser:CaptureController()
+            local camera = workspace.CurrentCamera
+            VirtualUser:Button2Down(Vector2.new(0, 0), camera and camera.CFrame or CFrame.new())
+            task.wait(0.08)
+            VirtualUser:Button2Up(Vector2.new(0, 0), camera and camera.CFrame or CFrame.new())
+        end)
+    end
+    if not handled and VirtualInputManager then
+        handled = pcall(function()
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+            task.wait(0.04)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+        end)
+    end
+    State.AutoTrader.Log("anti_idle", {handled = handled})
+end)
 connect(Players.PlayerAdded, function(player)
     if player ~= LocalPlayer then
         State.AutoTrader.EnsureServerPlayer(player)
@@ -8153,6 +8263,11 @@ connect(Players.PlayerRemoving, function(player)
 end)
 connect(LocalPlayer.OnTeleport, function(teleportState)
     if teleportState == Enum.TeleportState.Started then
+        State.AutoTrader.TeleportInProgress = true
+        if State.AutoTrader.TeleportAttemptStartedAt <= 0 then
+            State.AutoTrader.TeleportAttemptStartedAt = os.clock()
+            State.AutoTrader.TeleportAttemptOriginJobId = game.JobId
+        end
         if not State.AutoTrader.TeleportQueued then
             State.AutoTrader.QueueTeleportScript("external_or_late_teleport")
         end
@@ -8166,6 +8281,8 @@ connect(TeleportService.TeleportInitFailed, function(player, result, message, pl
     local failedCandidate = State.AutoTrader.ServerHopCurrentCandidate
     local wasServerHop = State.AutoTrader.ServerHopInProgress and failedCandidate ~= nil
     State.AutoTrader.TeleportInProgress = false
+    State.AutoTrader.TeleportAttemptStartedAt = 0
+    State.AutoTrader.TeleportAttemptOriginJobId = nil
     State.AutoTrader.ServerHopTeleportStarted = false
     State.AutoTrader.LastAnyMovementAt = os.clock()
     State.AutoTrader.Log("teleport_init_failed", {
@@ -8189,6 +8306,13 @@ connect(TeleportService.TeleportInitFailed, function(player, result, message, pl
         end)
     else
         State.AutoTrader.ServerHopInProgress = false
+        if State.AutoTrader.RecoveryTeleportRequired then
+            task.delay(CONFIG.AutoTraderRecoveryRetrySeconds, function()
+                if not Destroyed and State.AutoTrader.RecoveryTeleportRequired then
+                    State.AutoTrader.RequestRecoveryTeleport(State.AutoTrader.RecoveryTeleportReason or "teleport initialization failed")
+                end
+            end)
+        end
     end
 end)
 
@@ -8981,24 +9105,94 @@ State.AutoTrader.IsLocalAccepted = function()
         and accepted.Visible == true
         and tradeGui.Enabled == true
 end
+State.AutoTrader.IsFatalIntegrityReason = function(reason)
+    local text = string.lower(tostring(reason or ""))
+    return text:find("post%-trade inventory", 1) ~= nil
+        or text:find("without a usable pre%-trade audit snapshot", 1) ~= nil
+end
+State.AutoTrader.AbortCurrentTradeBestEffort = function(reason)
+    local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
+    local remote = tradeFolder and tradeFolder:FindFirstChild("DeclineTrade")
+    if (State.CurrentTrade or (isTradeVisible and isTradeVisible()))
+        and remote and remote:IsA("RemoteEvent") then
+        pcall(function() remote:FireServer() end)
+    end
+    State.CurrentTrade = nil
+    if type(State.AutoTrader.ClearTradeRuntime) == "function" then
+        pcall(State.AutoTrader.ClearTradeRuntime)
+    else
+        State.AutoTrader.ManagedPartnerUserId = nil
+        State.AutoTrader.ActionGeneration += 1
+        State.AutoTrader.ActionInFlight = nil
+    end
+    State.AutoTrader.Log("trade_abort_best_effort", {reason = tostring(reason or "recovery")})
+end
+State.AutoTrader.RequestRecoveryTeleport = function(reason)
+    State.AutoTrader.RecoveryTeleportRequired = true
+    State.AutoTrader.RecoveryTeleportReason = tostring(reason or "overnight recovery")
+    if not State.AutoTrader.Preferences.automation
+        or State.AutoTrader.TeleportInProgress
+        or State.AutoTrader.ServerHopInProgress then
+        return false
+    end
+    if os.clock() - (State.AutoTrader.RecoveryTeleportLastAttemptAt or 0) < CONFIG.AutoTraderRecoveryRetrySeconds then
+        return false
+    end
+    State.AutoTrader.RecoveryTeleportLastAttemptAt = os.clock()
+    State.AutoTrader.Status = "RECOVERING · REJOIN"
+    State.AutoTrader.StatusDetail = State.AutoTrader.RecoveryTeleportReason .. " · rejoining a fresh public server so automation can continue."
+    State.AutoTrader.Render()
+    local started = State.AutoTrader.BeginTeleport("overnight_recovery:" .. State.AutoTrader.RecoveryTeleportReason, false)
+    if not started then
+        State.AutoTrader.Log("recovery_teleport_start_failed", {reason = State.AutoTrader.RecoveryTeleportReason})
+    end
+    return started
+end
+State.AutoTrader.RecoverOperationalFreeze = function(reason)
+    if State.AutoTrader.FatalIntegrityStop or not State.AutoTrader.Preferences.automation then return false end
+    if State.AutoTrader.SessionFrozen and reason and State.AutoTrader.SessionFrozen ~= reason then return false end
+    local frozenReason = State.AutoTrader.SessionFrozen or State.AutoTrader.OperationalFreezeReason or tostring(reason or "operational safety stop")
+    State.AutoTrader.AbortCurrentTradeBestEffort(frozenReason)
+    State.AutoTrader.PendingRequest = nil
+    State.AutoTrader.RequestConfirmGeneration += 1
+    State.AutoTrader.SessionFrozen = nil
+    State.AutoTrader.OperationalFreezeAt = 0
+    State.AutoTrader.OperationalFreezeReason = nil
+    State.AutoTrader.NextRequestAt = os.clock() + 0.5
+    State.AutoTrader.Log("operational_freeze_recovered", {reason = frozenReason})
+    return State.AutoTrader.RequestRecoveryTeleport(frozenReason)
+end
 State.AutoTrader.Freeze = function(reason)
     if State.AutoTrader.SessionFrozen then
         return
     end
-    State.AutoTrader.SessionFrozen = tostring(reason or "safety stop")
+    local text = tostring(reason or "safety stop")
+    local fatal = State.AutoTrader.IsFatalIntegrityReason(text)
+    State.AutoTrader.SessionFrozen = text
+    State.AutoTrader.FatalIntegrityStop = fatal
     State.AutoTrader.ActionGeneration += 1
     State.AutoTrader.ActionInFlight = nil
     State.AutoTrader.Desired = nil
-    State.AutoTrader.Status = "FROZEN · SAFETY STOP"
-    State.AutoTrader.StatusDetail = State.AutoTrader.SessionFrozen
-    State.AutoTrader.Log("freeze", {
-        reason = State.AutoTrader.SessionFrozen,
-    })
+    State.AutoTrader.Status = fatal and "FROZEN · INTEGRITY STOP" or "RECOVERING · SAFETY RESET"
+    State.AutoTrader.StatusDetail = fatal
+        and (text .. " Manual review is required because transaction integrity is ambiguous.")
+        or (text .. " The overnight supervisor will abandon this state and rejoin automatically.")
+    State.AutoTrader.Log("freeze", {reason = text, fatal = fatal})
     if State.AutoTrader.RestoreTradeVisuals then
         State.AutoTrader.RestoreTradeVisuals()
     end
     if State.AutoTrader.Render then
         State.AutoTrader.Render()
+    end
+    if not fatal then
+        State.AutoTrader.OperationalFreezeAt = os.clock()
+        State.AutoTrader.OperationalFreezeReason = text
+        task.delay(CONFIG.AutoTraderOperationalRecoveryDelaySeconds, function()
+            if Destroyed or State.AutoTrader.FatalIntegrityStop then return end
+            if State.AutoTrader.SessionFrozen == text then
+                State.AutoTrader.RecoverOperationalFreeze(text)
+            end
+        end)
     end
 end
 State.AutoTrader.GetCurrentLocalEntries = function()
@@ -9647,6 +9841,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
         State.AutoTrader.PostTradeAuditPending = false
         State.AutoTrader.Preferences.automation = false
         State.AutoTrader.SavePreferences()
+        State.AutoTrader.FatalIntegrityStop = true
         State.AutoTrader.SessionFrozen = "Server completed a trade without a usable pre-trade audit snapshot. Auto Trading was disabled."
         State.AutoTrader.Status = "FROZEN · AUDIT MISSING"
         State.AutoTrader.StatusDetail = State.AutoTrader.SessionFrozen
@@ -9727,13 +9922,8 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
         end
         if not fresh then
             State.AutoTrader.PostTradeAuditPending = false
-            State.AutoTrader.Preferences.automation = false
-            State.AutoTrader.SavePreferences()
-            State.AutoTrader.SessionFrozen = "Post-trade audit could not obtain a fresh verified inventory. Auto Trading was disabled."
-            State.AutoTrader.Status = "FROZEN · AUDIT TIMEOUT"
-            State.AutoTrader.StatusDetail = State.AutoTrader.SessionFrozen
             State.AutoTrader.LastAuditDetail = {
-                result = "timeout",
+                result = "timeout_rejoin",
                 reason = freshReason,
                 expected = expected,
                 outgoing = audit.outgoing,
@@ -9744,9 +9934,12 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
             if partner then
                 State.AutoTrader.RecordTargetEvent(partner, "auditFailure")
             end
-            State.AutoTrader.Log("post_trade_audit_timeout", State.AutoTrader.LastAuditDetail)
-            State.AutoTrader.ShowSuccessNotification(partner, completedPlan, "Inventory audit unavailable · Auto Trading disabled")
+            State.AutoTrader.Log("post_trade_audit_timeout_recover", State.AutoTrader.LastAuditDetail)
+            State.AutoTrader.Status = "AUDIT TIMEOUT · RESYNCING"
+            State.AutoTrader.StatusDetail = "Fresh inventory verification timed out; rejoining to establish a clean authoritative inventory baseline instead of stopping overnight."
+            State.AutoTrader.ShowSuccessNotification(partner, completedPlan, "Inventory audit timed out · rejoining to resync")
             State.AutoTrader.Render()
+            State.AutoTrader.RequestRecoveryTeleport("post-trade inventory audit timed out")
             return
         end
         local quantities = fresh.quantities or {}
@@ -9782,6 +9975,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
         if failed then
             State.AutoTrader.Preferences.automation = false
             State.AutoTrader.SavePreferences()
+            State.AutoTrader.FatalIntegrityStop = true
             State.AutoTrader.SessionFrozen = "Post-trade inventory or server-reported receipt differed from the exact expected transaction. Auto Trading was disabled."
             State.AutoTrader.Status = "FROZEN · AUDIT MISMATCH"
             State.AutoTrader.StatusDetail = State.AutoTrader.SessionFrozen
@@ -10180,89 +10374,203 @@ State.AutoTrader.BindIncomingRequestObserver = function()
     end
     if receiving.Visible then task.defer(State.AutoTrader.HandleIncomingRequest) end
 end
+State.AutoTrader.FailPendingRequestAttempt = function(target, generation, reason, detail)
+    local pending = State.AutoTrader.PendingRequest
+    if not pending
+        or (target and pending.userId ~= target.UserId)
+        or (generation and pending.generation ~= generation) then
+        return false
+    end
+    local player = target or Players:GetPlayerByUserId(pending.userId)
+    State.AutoTrader.PendingRequest = nil
+    State.AutoTrader.RequestConfirmGeneration += 1
+    State.AutoTrader.NextRequestAt = os.clock() + 0.15
+    if player then
+        State.AutoTrader.MarkServerPlayerOutcome(player, "trade_unavailable", tostring(reason or "request could not become pending"))
+        State.AutoTrader.SetCooldown(player, "trades off/unavailable", 20)
+    end
+    State.AutoTrader.LastRequestAttempt = {
+        userId = pending.userId,
+        name = pending.name,
+        result = "unavailable",
+        reason = tostring(reason or "request failed"),
+        detail = detail and tostring(detail) or nil,
+        phase = pending.phase,
+        age = os.clock() - (pending.sentAt or os.clock()),
+        at = os.clock(),
+    }
+    State.AutoTrader.Status = "SKIP · TRADES OFF/UNAVAILABLE"
+    State.AutoTrader.StatusDetail = (player and player.Name or pending.name or "That player")
+        .. " never entered MM2's real pending-request state; skipping them for this server visit."
+    State.AutoTrader.Log("request_attempt_unavailable", State.AutoTrader.LastRequestAttempt)
+    State.AutoTrader.Render()
+    return true
+end
 State.AutoTrader.TrySendRequest = function()
-    if Destroyed
-        or not State.AutoTrader.Preferences.automation
-        or State.AutoTrader.SessionFrozen
-        or State.AutoTrader.PendingRequest
-        or type(State.CurrentTrade) == "table"
-        or (isTradeVisible and isTradeVisible())
-        or os.clock() < State.AutoTrader.NextRequestAt then
-        return
+    local function blocked(reason)
+        State.AutoTrader.LastRequestGate = {reason = tostring(reason), at = os.clock()}
+        return false, reason
+    end
+    if Destroyed then return blocked("destroyed") end
+    if not State.AutoTrader.Preferences.automation then return blocked("automation off") end
+    if State.AutoTrader.SessionFrozen then return blocked("session frozen") end
+    if State.AutoTrader.RecoveryTeleportRequired then return blocked("recovery rejoin pending") end
+    if State.AutoTrader.PendingRequest then return blocked("request already pending") end
+    if type(State.CurrentTrade) == "table" then return blocked("trade state active") end
+    if isTradeVisible and isTradeVisible() then return blocked("trade GUI visible") end
+    if os.clock() < State.AutoTrader.NextRequestAt then
+        return blocked("request spacing")
     end
     local _, receiving = State.AutoTrader.GetIncomingRequestUi()
     if receiving and State.AutoTrader.IsGuiShown(receiving) then
         State.AutoTrader.HandleIncomingRequest()
-        return
+        return blocked("incoming request has priority")
     end
     local target = State.AutoTrader.SelectTarget()
-    if not target then return end
+    if not target then return blocked("no eligible target") end
     local friendAllowed, reason = State.AutoTrader.PlayerAllowed(target)
-    if not friendAllowed then return end
+    if not friendAllowed then return blocked(reason or "target not allowed") end
     local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
     local remote = tradeFolder and tradeFolder:FindFirstChild("SendRequest")
     if not remote or not remote:IsA("RemoteFunction") then
         State.AutoTrader.Freeze("Trade.SendRequest RemoteFunction is unavailable.")
-        return
+        return blocked("Trade.SendRequest unavailable")
     end
+
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
     State.AutoTrader.RequestHistory[target.UserId] = os.clock()
     State.AutoTrader.RecordTargetEvent(target, "request")
+    State.AutoTrader.RequestConfirmGeneration += 1
+    local generation = State.AutoTrader.RequestConfirmGeneration
     State.AutoTrader.PendingRequest = {
         userId = target.UserId,
         name = target.Name,
         sentAt = os.clock(),
         phase = "invoking",
         nativeConfirmed = false,
+        invokeFinished = false,
+        nativeWindowExpired = false,
+        generation = generation,
+    }
+    State.AutoTrader.LastRequestGate = nil
+    State.AutoTrader.LastRequestAttempt = {
+        userId = target.UserId,
+        name = target.Name,
+        result = "started",
+        generation = generation,
+        at = os.clock(),
     }
     State.AutoTrader.MarkServerPlayerOutcome(target, "request_attempted", "SendRequest invoked")
     State.AutoTrader.Status = "REQUESTING"
-    State.AutoTrader.StatusDetail = "Attempting a request to " .. target.Name .. "; waiting for MM2's native pending UI before treating it as live."
-    State.AutoTrader.Log("request_send", {userId = target.UserId, name = target.Name})
+    State.AutoTrader.StatusDetail = "Requesting " .. target.Name .. "; verifying MM2's native SendingRequest state independently of the RemoteFunction response."
+    State.AutoTrader.Log("request_send", {userId = target.UserId, name = target.Name, generation = generation})
     State.AutoTrader.Render()
+
+    local function activePending()
+        local pending = State.AutoTrader.PendingRequest
+        if not pending
+            or pending.userId ~= target.UserId
+            or pending.generation ~= generation then
+            return nil
+        end
+        return pending
+    end
+
+    -- Probe the native UI independently. The old implementation did not start
+    -- this timer until InvokeServer returned, so a stalled/odd trades-off response
+    -- could leave the bot stuck on one player forever.
+    task.spawn(function()
+        local deadline = os.clock() + CONFIG.AutoTraderOutgoingNativeConfirmSeconds
+        while not Destroyed and os.clock() < deadline do
+            local pending = activePending()
+            if not pending then return end
+            if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return end
+            if State.AutoTrader.IsNativeOutgoingPending(target) then
+                pending.phase = "pending"
+                pending.nativeConfirmed = true
+                pending.confirmedAt = os.clock()
+                State.AutoTrader.MarkServerPlayerOutcome(target, "request_pending", "native SendingRequest confirmed")
+                State.AutoTrader.LastRequestAttempt = {
+                    userId = target.UserId,
+                    name = target.Name,
+                    result = "native_pending",
+                    generation = generation,
+                    seconds = os.clock() - pending.sentAt,
+                    at = os.clock(),
+                }
+                State.AutoTrader.Status = "REQUEST PENDING"
+                State.AutoTrader.StatusDetail = "MM2 confirmed the native pending request to " .. target.Name .. "."
+                State.AutoTrader.Log("request_native_confirmed", {userId = target.UserId, generation = generation})
+                State.AutoTrader.Render()
+                return
+            end
+            task.wait(0.08)
+        end
+        local pending = activePending()
+        if not pending then return end
+        pending.nativeWindowExpired = true
+        if pending.nativeConfirmed then return end
+        if pending.invokeFinished then
+            State.AutoTrader.FailPendingRequestAttempt(
+                target,
+                generation,
+                "native SendingRequest never appeared",
+                "SendRequest returned but no native pending UI appeared within " .. tostring(CONFIG.AutoTraderOutgoingNativeConfirmSeconds) .. "s"
+            )
+        else
+            pending.phase = "awaiting_native"
+            State.AutoTrader.Status = "REQUEST · VERIFYING"
+            State.AutoTrader.StatusDetail = "MM2 has not shown a pending request for " .. target.Name .. "; waiting only until the hard request-attempt timeout."
+            State.AutoTrader.Render()
+        end
+    end)
+
+    -- Hard watchdog: even if InvokeServer never returns, this attempt cannot pin
+    -- the auto trader forever. A real trade/native pending state cancels this path.
+    task.delay(CONFIG.AutoTraderRequestInvokeTimeoutSeconds, function()
+        if Destroyed then return end
+        local pending = activePending()
+        if not pending or pending.nativeConfirmed then return end
+        if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return end
+        State.AutoTrader.FailPendingRequestAttempt(
+            target,
+            generation,
+            "SendRequest attempt timed out",
+            "No native SendingRequest/trade appeared within " .. tostring(CONFIG.AutoTraderRequestInvokeTimeoutSeconds) .. "s"
+        )
+    end)
+
     task.spawn(function()
         local ok, result = pcall(function() return remote:InvokeServer(target) end)
         if Destroyed then return end
-        local pending = State.AutoTrader.PendingRequest
-        if not pending or pending.userId ~= target.UserId then return end
+        local pending = activePending()
+        if not pending then return end -- late return after watchdog/decline/trade
+        pending.invokeFinished = true
+        pending.invokeOk = ok
+        pending.invokeResult = result
+        -- Once MM2's native pending UI has appeared, that UI is authoritative.
+        -- Ignore any odd/late RemoteFunction return instead of undoing a real request.
+        if pending.nativeConfirmed then return end
         if not ok or result == true then
-            State.AutoTrader.PendingRequest = nil
-            State.AutoTrader.MarkServerPlayerOutcome(target, "trade_unavailable", not ok and "request call failed" or "request unavailable/denied")
-            State.AutoTrader.SetCooldown(target, "trade unavailable", 20)
-            State.AutoTrader.Status = "SKIP · TRADE UNAVAILABLE"
-            State.AutoTrader.StatusDetail = target.Name .. " could not enter MM2's pending-request state; moving on."
-            State.AutoTrader.Log("request_unavailable", {userId = target.UserId, result = result, error = not ok and tostring(result) or nil})
-            State.AutoTrader.Render()
+            State.AutoTrader.FailPendingRequestAttempt(
+                target,
+                generation,
+                not ok and "request call failed" or "request unavailable/denied",
+                not ok and tostring(result) or ("InvokeServer returned " .. tostring(result))
+            )
             return
         end
         pending.phase = "awaiting_native"
-        pending.invokeResult = result
-        State.AutoTrader.RequestConfirmGeneration += 1
-        local generation = State.AutoTrader.RequestConfirmGeneration
-        task.delay(CONFIG.AutoTraderOutgoingNativeConfirmSeconds, function()
-            if Destroyed or generation ~= State.AutoTrader.RequestConfirmGeneration then return end
-            local active = State.AutoTrader.PendingRequest
-            if not active or active.userId ~= target.UserId then return end
-            if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return end
-            if State.AutoTrader.IsNativeOutgoingPending(target) then
-                active.phase = "pending"
-                active.nativeConfirmed = true
-                active.confirmedAt = os.clock()
-                State.AutoTrader.MarkServerPlayerOutcome(target, "request_pending", "native SendingRequest confirmed")
-                State.AutoTrader.Status = "REQUEST PENDING"
-                State.AutoTrader.StatusDetail = "MM2 confirmed the native pending request to " .. target.Name .. "."
-                State.AutoTrader.Log("request_native_confirmed", {userId = target.UserId})
-            else
-                State.AutoTrader.PendingRequest = nil
-                State.AutoTrader.MarkServerPlayerOutcome(target, "trade_unavailable", "native SendingRequest never appeared")
-                State.AutoTrader.SetCooldown(target, "trades off/unavailable", 20)
-                State.AutoTrader.Status = "SKIP · TRADES OFF/UNAVAILABLE"
-                State.AutoTrader.StatusDetail = "No native SendingRequest appeared for " .. target.Name .. "; treating them as unavailable for this server visit."
-                State.AutoTrader.Log("request_native_missing", {userId = target.UserId, wait = CONFIG.AutoTraderOutgoingNativeConfirmSeconds})
-            end
-            State.AutoTrader.Render()
-        end)
+        if pending.nativeWindowExpired then
+            State.AutoTrader.FailPendingRequestAttempt(
+                target,
+                generation,
+                "native SendingRequest never appeared",
+                "SendRequest returned without MM2 entering native pending state"
+            )
+        end
     end)
+    return true, "started"
 end
 State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, otherEntries)
     local partner = State.AutoTrader.GetPlayerFromSide(otherSide)
@@ -10576,6 +10884,13 @@ State.AutoTrader.OnNoTrade = function()
         State.AutoTrader.Render()
         return
     end
+    if State.AutoTrader.RecoveryTeleportRequired then
+        State.AutoTrader.Status = "RECOVERING · REJOIN"
+        State.AutoTrader.StatusDetail = tostring(State.AutoTrader.RecoveryTeleportReason or "A clean-state rejoin is required before trading can continue.")
+        State.AutoTrader.RequestRecoveryTeleport(State.AutoTrader.RecoveryTeleportReason or "pending recovery")
+        State.AutoTrader.Render()
+        return
+    end
     State.AutoTrader.BindIncomingRequestObserver()
     local _, incomingFrame = State.AutoTrader.GetIncomingRequestUi()
     if State.AutoTrader.Preferences.automation and incomingFrame and State.AutoTrader.IsGuiShown(incomingFrame) then
@@ -10607,7 +10922,13 @@ State.AutoTrader.OnNoTrade = function()
         and os.clock() - State.AutoTrader.ServerJoinedAt >= 2.0
         and not State.AutoTrader.ServerHopInProgress
         and not State.AutoTrader.TeleportInProgress then
-        local screen = State.AutoTrader.ScreenCurrentServerAvatars(false)
+        local screen = nil
+        local screenOK, screenResult = pcall(State.AutoTrader.ScreenCurrentServerAvatars, false)
+        if screenOK then
+            screen = screenResult
+        else
+            State.AutoTrader.Log("current_avatar_screen_error", {error = tostring(screenResult)})
+        end
         if screen and screen.fastBot then
             State.AutoTrader.Status = "BOT LOBBY · FAST HOP"
             State.AutoTrader.StatusDetail = string.format(
@@ -10646,7 +10967,14 @@ State.AutoTrader.OnNoTrade = function()
             State.AutoTrader.ServerExhaustedSince = 0
             State.AutoTrader.Status = "AUTO TARGET"
             State.AutoTrader.StatusDetail = "Next eligible: " .. target.Name .. ". Ranked by expected profit/time plus verified inventory quality; one request at a time."
-            State.AutoTrader.TrySendRequest()
+            local started, requestReason = State.AutoTrader.TrySendRequest()
+            if not started and requestReason == "request spacing" then
+                State.AutoTrader.Status = "WAIT · REQUEST SPACING"
+                State.AutoTrader.StatusDetail = "Next eligible: " .. target.Name .. ". Sending as soon as the short anti-spam spacing expires."
+            elseif not started and requestReason and requestReason ~= "request already pending" then
+                State.AutoTrader.Status = "WAIT · REQUEST GATE"
+                State.AutoTrader.StatusDetail = "Next eligible: " .. target.Name .. ". Request is currently blocked by: " .. tostring(requestReason) .. "."
+            end
         else
             local disposition, counts = State.AutoTrader.GetServerDisposition()
             State.AutoTrader.LastServerDisposition = {kind = disposition, counts = counts, at = os.clock()}
@@ -10787,7 +11115,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V10",
+        format = "SV_AUTO_TRADER_SUPPORT_V12",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -10806,7 +11134,16 @@ State.AutoTrader.BuildDebug = function()
             serverHopEnabled = CONFIG.AutoTraderServerHopEnabled,
             movementWatchdogEnabled = CONFIG.AutoTraderMovementWatchdogEnabled,
             outgoingNativeConfirmSeconds = CONFIG.AutoTraderOutgoingNativeConfirmSeconds,
+            requestInvokeTimeoutSeconds = CONFIG.AutoTraderRequestInvokeTimeoutSeconds,
+            httpTimeoutSeconds = CONFIG.AutoTraderHttpTimeoutSeconds,
             incomingResolveSeconds = CONFIG.AutoTraderIncomingResolveSeconds,
+            incomingUnresolvedTimeoutSeconds = CONFIG.AutoTraderIncomingUnresolvedTimeoutSeconds,
+            incomingStuckTimeoutSeconds = CONFIG.AutoTraderIncomingStuckTimeoutSeconds,
+            staleTradeGuiTimeoutSeconds = CONFIG.AutoTraderStaleTradeGuiTimeoutSeconds,
+            absoluteTradeTimeoutSeconds = CONFIG.AutoTraderAbsoluteTradeTimeoutSeconds,
+            serverHopHardTimeoutSeconds = CONFIG.AutoTraderServerHopHardTimeoutSeconds,
+            teleportHardTimeoutSeconds = CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds,
+            noEligibleWorkTimeoutSeconds = CONFIG.AutoTraderNoEligibleWorkTimeoutSeconds,
             botPreviewHardRejectRatio = CONFIG.AutoTraderBotHardRejectRatio,
             botConfirmMinJobs = CONFIG.AutoTraderBotConfirmMinJobs,
             botSuspectMinJobs = CONFIG.AutoTraderBotSuspectMinJobs,
@@ -10840,6 +11177,11 @@ State.AutoTrader.BuildDebug = function()
         status = State.AutoTrader.Status,
         statusDetail = State.AutoTrader.StatusDetail,
         sessionFrozen = State.AutoTrader.SessionFrozen,
+        fatalIntegrityStop = State.AutoTrader.FatalIntegrityStop,
+        operationalFreezeAt = State.AutoTrader.OperationalFreezeAt,
+        operationalFreezeReason = State.AutoTrader.OperationalFreezeReason,
+        recoveryTeleportRequired = State.AutoTrader.RecoveryTeleportRequired,
+        recoveryTeleportReason = State.AutoTrader.RecoveryTeleportReason,
         target = State.AutoTrader.SelectedTarget and {
             name = State.AutoTrader.SelectedTarget.Name,
             userId = State.AutoTrader.SelectedTarget.UserId,
@@ -10866,8 +11208,13 @@ State.AutoTrader.BuildDebug = function()
                     and State.AutoTrader.ServerHopCurrentCandidate.botPreview.score or nil,
             } or nil,
             teleportInProgress = State.AutoTrader.TeleportInProgress,
+            teleportAttemptStartedAt = State.AutoTrader.TeleportAttemptStartedAt,
+            teleportAttemptOriginJobId = State.AutoTrader.TeleportAttemptOriginJobId,
             teleportQueued = State.AutoTrader.TeleportQueued,
             lastTeleportReason = State.AutoTrader.LastTeleportReason,
+            serverHopStartedAt = State.AutoTrader.ServerHopStartedAt,
+            staleTradeGuiSince = State.AutoTrader.StaleTradeGuiSince,
+            noEligibleWorkSince = State.AutoTrader.NoEligibleWorkSince,
             recentJobs = State.AutoTrader.RecentJobs,
             playerStates = State.AutoTrader.ServerPlayers,
             lastAnyMovementAt = State.AutoTrader.LastAnyMovementAt,
@@ -10898,6 +11245,8 @@ State.AutoTrader.BuildDebug = function()
             topBotIconEvidence = botIconSummary,
         },
         pendingRequest = State.AutoTrader.PendingRequest,
+        lastRequestGate = State.AutoTrader.LastRequestGate,
+        lastRequestAttempt = State.AutoTrader.LastRequestAttempt,
         partner = partner and {
             name = partner.Name,
             userId = partner.UserId,
@@ -10954,7 +11303,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V10\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V11\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -11490,7 +11839,14 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                             or not State.CurrentTrade then
                             return
                         end
-                        State.AutoTrader.Freeze("Both-side acceptance did not produce a server completion signal within 2s. No acceptance retry was attempted.")
+                        State.AutoTrader.Log("accept_completion_signal_timeout", {
+                            partner = State.AutoTrader.LastTradePartner and State.AutoTrader.LastTradePartner.Name or nil,
+                            seconds = 2,
+                        })
+                        State.AutoTrader.Status = "ACCEPT UNCERTAIN · RESYNCING"
+                        State.AutoTrader.StatusDetail = "Both sides accepted but the completion signal did not arrive promptly; rejoining to resync instead of remaining stuck."
+                        State.AutoTrader.Render()
+                        State.AutoTrader.RequestRecoveryTeleport("accepted trade completion signal timed out")
                     end)
                 end
                 return
@@ -11606,6 +11962,148 @@ State.AutoTrader.EndIdleTrade = function()
     State.AutoTrader.Render()
     return true
 end
+State.AutoTrader.OvernightSupervisor = function()
+    if Destroyed or not State.AutoTrader.Preferences.automation then return true end
+    local now = os.clock()
+
+    if State.AutoTrader.FatalIntegrityStop then
+        return true
+    end
+
+    if State.AutoTrader.SessionFrozen then
+        if State.AutoTrader.OperationalFreezeAt > 0
+            and now - State.AutoTrader.OperationalFreezeAt >= CONFIG.AutoTraderOperationalRecoveryDelaySeconds then
+            State.AutoTrader.RecoverOperationalFreeze(State.AutoTrader.SessionFrozen)
+        end
+        return true
+    end
+
+    if State.AutoTrader.RecoveryTeleportRequired
+        and not State.AutoTrader.TeleportInProgress
+        and not State.AutoTrader.ServerHopInProgress then
+        State.AutoTrader.RequestRecoveryTeleport(State.AutoTrader.RecoveryTeleportReason or "pending overnight recovery")
+        return true
+    end
+
+    if State.AutoTrader.TeleportInProgress
+        and State.AutoTrader.TeleportAttemptStartedAt > 0
+        and now - State.AutoTrader.TeleportAttemptStartedAt >= CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds then
+        local reason = "teleport did not complete inside the hard overnight deadline"
+        State.AutoTrader.Log("teleport_hard_timeout", {
+            seconds = now - State.AutoTrader.TeleportAttemptStartedAt,
+            lastReason = State.AutoTrader.LastTeleportReason,
+            serverHop = State.AutoTrader.ServerHopInProgress,
+        })
+        if State.AutoTrader.ServerHopInProgress then
+            State.AutoTrader.AbortServerHop(reason)
+        else
+            State.AutoTrader.TeleportInProgress = false
+            State.AutoTrader.TeleportAttemptStartedAt = 0
+            State.AutoTrader.TeleportAttemptOriginJobId = nil
+        end
+        State.AutoTrader.RequestRecoveryTeleport(reason)
+        return true
+    end
+
+    if State.AutoTrader.ServerHopInProgress
+        and State.AutoTrader.ServerHopStartedAt > 0
+        and now - State.AutoTrader.ServerHopStartedAt >= CONFIG.AutoTraderServerHopHardTimeoutSeconds then
+        local reason = "server-hop pipeline exceeded its hard overnight deadline"
+        State.AutoTrader.Log("server_hop_hard_timeout", {
+            seconds = now - State.AutoTrader.ServerHopStartedAt,
+            queueIndex = State.AutoTrader.ServerHopQueueIndex,
+            queueCount = #(State.AutoTrader.ServerHopQueue or {}),
+        })
+        State.AutoTrader.AbortServerHop(reason)
+        State.AutoTrader.RequestRecoveryTeleport(reason)
+        return true
+    end
+
+    local _, receiving, title, username, _, decline = State.AutoTrader.GetIncomingRequestUi()
+    if receiving and State.AutoTrader.IsGuiShown(receiving) then
+        local signature = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
+            .. "|" .. State.AutoTrader.GetTextValue(title)
+        if State.AutoTrader.IncomingRequestFirstSeenSignature ~= signature then
+            State.AutoTrader.IncomingRequestFirstSeenSignature = signature
+            State.AutoTrader.IncomingRequestFirstSeenAt = now
+        end
+        local age = now - (State.AutoTrader.IncomingRequestFirstSeenAt or now)
+        local requester = State.AutoTrader.ResolveIncomingPlayer(State.AutoTrader.GetTextValue(username))
+        if not requester and age >= CONFIG.AutoTraderIncomingUnresolvedTimeoutSeconds then
+            State.AutoTrader.ClickNativeGuiButton(decline, "incoming_unresolved_timeout_decline")
+            State.AutoTrader.Log("incoming_unresolved_timeout", {signature = signature, age = age})
+        end
+        if age >= CONFIG.AutoTraderIncomingStuckTimeoutSeconds then
+            State.AutoTrader.ClickNativeGuiButton(decline, "incoming_stuck_timeout_decline")
+            State.AutoTrader.RequestRecoveryTeleport("incoming request UI stayed stuck for " .. tostring(math.floor(age)) .. "s")
+            return true
+        end
+    else
+        State.AutoTrader.IncomingRequestFirstSeenSignature = nil
+        State.AutoTrader.IncomingRequestFirstSeenAt = 0
+    end
+
+    local tradeVisible = isTradeVisible and isTradeVisible() or false
+    if tradeVisible and not State.CurrentTrade then
+        if State.AutoTrader.StaleTradeGuiSince <= 0 then
+            State.AutoTrader.StaleTradeGuiSince = now
+        elseif now - State.AutoTrader.StaleTradeGuiSince >= CONFIG.AutoTraderStaleTradeGuiTimeoutSeconds then
+            local reason = "TradeGUI remained visible without an authoritative trade state"
+            State.AutoTrader.Log("stale_trade_gui_timeout", {seconds = now - State.AutoTrader.StaleTradeGuiSince})
+            State.AutoTrader.AbortCurrentTradeBestEffort(reason)
+            State.AutoTrader.StaleTradeGuiSince = 0
+            State.AutoTrader.RequestRecoveryTeleport(reason)
+            return true
+        end
+    else
+        State.AutoTrader.StaleTradeGuiSince = 0
+    end
+
+    if State.CurrentTrade
+        and State.AutoTrader.TradeBeganAt > 0
+        and now - State.AutoTrader.TradeBeganAt >= CONFIG.AutoTraderAbsoluteTradeTimeoutSeconds then
+        local partner = State.AutoTrader.LastTradePartner
+        State.AutoTrader.Log("absolute_trade_timeout", {
+            partner = partner and partner.Name or nil,
+            seconds = now - State.AutoTrader.TradeBeganAt,
+        })
+        local ended = State.AutoTrader.EndIdleTrade()
+        if not ended then
+            State.AutoTrader.AbortCurrentTradeBestEffort("absolute trade lifetime exceeded")
+            State.AutoTrader.RequestRecoveryTeleport("absolute trade lifetime exceeded")
+        end
+        return true
+    end
+
+    local incomingVisible = receiving and State.AutoTrader.IsGuiShown(receiving) or false
+    local noBlockingWork = not State.AutoTrader.PendingRequest
+        and not State.CurrentTrade
+        and not State.AutoTrader.PostTradeAuditPending
+        and not State.AutoTrader.ServerHopInProgress
+        and not State.AutoTrader.TeleportInProgress
+        and not incomingVisible
+    if noBlockingWork then
+        local target = State.AutoTrader.SelectTarget()
+        local disposition = State.AutoTrader.GetServerDisposition()
+        if not target and disposition == "ACTIVE" then
+            if State.AutoTrader.NoEligibleWorkSince <= 0 then
+                State.AutoTrader.NoEligibleWorkSince = now
+            elseif now - State.AutoTrader.NoEligibleWorkSince >= CONFIG.AutoTraderNoEligibleWorkTimeoutSeconds then
+                local reason = "server stayed ACTIVE without any eligible request target"
+                State.AutoTrader.Log("no_eligible_work_timeout", {seconds = now - State.AutoTrader.NoEligibleWorkSince})
+                State.AutoTrader.NoEligibleWorkSince = 0
+                State.AutoTrader.RequestRecoveryTeleport(reason)
+                return true
+            end
+        else
+            State.AutoTrader.NoEligibleWorkSince = 0
+        end
+    else
+        State.AutoTrader.NoEligibleWorkSince = 0
+    end
+    return true
+end
+
 State.AutoTrader.Tick = function()
     if Destroyed then
         return
@@ -11636,6 +12134,15 @@ State.AutoTrader.Tick = function()
             and State.AutoTrader.PendingRequest.phase == "pending"
             and os.clock() - (State.AutoTrader.PendingRequest.confirmedAt or State.AutoTrader.PendingRequest.sentAt) >= CONFIG.AutoTraderPendingRequestTimeoutSeconds then
             State.AutoTrader.CancelIgnoredRequest()
+        elseif State.AutoTrader.Preferences.automation
+            and State.AutoTrader.PendingRequest.phase ~= "pending"
+            and os.clock() - (State.AutoTrader.PendingRequest.sentAt or os.clock()) >= CONFIG.AutoTraderRequestInvokeTimeoutSeconds + 0.75 then
+            State.AutoTrader.FailPendingRequestAttempt(
+                target,
+                State.AutoTrader.PendingRequest.generation,
+                "request watchdog recovery",
+                "Pending request never reached native pending/trade state"
+            )
         end
     end
     if State.AutoTrader.Preferences.automation
@@ -11683,6 +12190,11 @@ connect(UI.AutoTraderEnabled.MouseButton1Click, function()
     State.AutoTrader.Preferences.automation = not State.AutoTrader.Preferences.automation
     if State.AutoTrader.Preferences.automation then
         State.AutoTrader.SessionFrozen = nil
+        State.AutoTrader.FatalIntegrityStop = false
+        State.AutoTrader.OperationalFreezeAt = 0
+        State.AutoTrader.OperationalFreezeReason = nil
+        State.AutoTrader.RecoveryTeleportRequired = false
+        State.AutoTrader.RecoveryTeleportReason = nil
         State.AutoTrader.ManualAcceptHold = false
         State.AutoTrader.ActionGeneration += 1
         State.AutoTrader.ActionInFlight = nil
@@ -13101,12 +13613,13 @@ recoverTradeStatus = function()
         or not GetTradeStatus:IsA("RemoteFunction") then
         return false
     end
-    local ok, status, data = pcall(function()
-        return GetTradeStatus:InvokeServer()
+    local ok, packed = runBoundedExternal("GetTradeStatus", CONFIG.AutoTraderRequestInvokeTimeoutSeconds, function()
+        return {GetTradeStatus:InvokeServer()}
     end)
-    if not ok then
+    if not ok or type(packed) ~= "table" then
         return false
     end
+    local status, data = packed[1], packed[2]
     if status == "StartTrade"
         and type(data) == "table"
         and data.Player1
@@ -16170,6 +16683,13 @@ startPeriodic(
     false,
     function()
         return State.AutoTrader.SampleMovement()
+    end
+)
+startPeriodic(
+    1,
+    false,
+    function()
+        return State.AutoTrader.OvernightSupervisor()
     end
 )
 do

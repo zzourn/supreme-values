@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.44-public-auto-trader-v12-overnight-supervisor",
+    version = "18.45-public-auto-trader-v13-executor-liveness",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -82,6 +82,14 @@ local CONFIG = {
     AutoTraderOperationalRecoveryDelaySeconds = 2.5,
     AutoTraderRecoveryRetrySeconds = 4,
     AutoTraderNoEligibleWorkTimeoutSeconds = 45,
+    AutoTraderServerNoProgressTimeoutSeconds = 75,
+    AutoTraderPostTradeAuditSupervisorSeconds = 18,
+    AutoTraderStartupPlayerGuiTimeoutSeconds = 20,
+    AutoTraderExecutorFileTimeoutSeconds = 2.5,
+    AutoTraderExecutorDecompileTimeoutSeconds = 8,
+    AutoTraderRemoteInvokeTimeoutRecoveryCount = 4,
+    AutoTraderBootstrapBotDbMaxIcons = 300,
+    AutoTraderBootstrapBotDbJobsPerIcon = 12,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
     AutoTraderThumbnailBatchSize = 100,
     AutoTraderBotPreviewMinSamples = 5,
@@ -167,13 +175,41 @@ local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
     error("SupremeValues_PC_PublicHelper requires a LocalPlayer.")
 end
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-local httpRequest =
-    (type(request) == "function" and request)
-    or (type(http_request) == "function" and http_request)
-    or (type(syn) == "table" and type(syn.request) == "function" and syn.request)
+local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    or LocalPlayer:WaitForChild("PlayerGui", CONFIG.AutoTraderStartupPlayerGuiTimeoutSeconds)
+if not PlayerGui then
+    error("SupremeValues_PC_PublicHelper could not obtain PlayerGui inside the bounded startup window.")
+end
+local function earlyExecutorEnvironment()
+    local getter = rawget(_G, "getgenv")
+    if type(getter) == "function" then
+        local ok, env = pcall(getter)
+        if ok and type(env) == "table" then return env end
+    end
+    return _G
+end
+local EarlyExecutorEnvironment = earlyExecutorEnvironment()
+local function pickExecutorRequest()
+    local candidates = {}
+    local function add(value)
+        if type(value) == "function" then table.insert(candidates, value) end
+    end
+    pcall(function() add(request) end)
+    pcall(function() add(http_request) end)
+    pcall(function() if type(syn) == "table" then add(syn.request) end end)
+    pcall(function() if type(http) == "table" then add(http.request) end end)
+    pcall(function() if type(fluxus) == "table" then add(fluxus.request) end end)
+    pcall(function() if type(krnl) == "table" then add(krnl.request) end end)
+    for _, name in ipairs({"request", "http_request", "httprequest"}) do add(rawget(EarlyExecutorEnvironment, name)) end
+    for _, tableName in ipairs({"syn", "http", "fluxus", "krnl"}) do
+        local t = rawget(EarlyExecutorEnvironment, tableName)
+        if type(t) == "table" then add(t.request) end
+    end
+    return candidates[1]
+end
+local httpRequest = pickExecutorRequest()
 if type(httpRequest) ~= "function" then
-    warn("[SV Public] No request(options) HTTP function is available.")
+    warn("[SV Public] No compatible request(options) HTTP function is available; game:HttpGet fallbacks will be used where possible.")
 end
 local function runBoundedExternal(label, timeoutSeconds, callback)
     local request = {done = false, ok = false, result = nil}
@@ -1286,7 +1322,20 @@ State.TryGetExecutorGlobal = function(name)
             end
         end
     end
-    return rawget(_G, name)
+    local aliasMap = {
+        readfile = {"read_file"},
+        writefile = {"write_file"},
+        isfile = {"is_file"},
+        setclipboard = {"toclipboard", "set_clipboard"},
+        queue_on_teleport = {"queueonteleport", "queue_on_tp", "queueteleport"},
+    }
+    local directGlobal = rawget(_G, name)
+    if directGlobal ~= nil then return directGlobal end
+    for _, alias in ipairs(aliasMap[name] or {}) do
+        local value = rawget(_G, alias) or rawget(EarlyExecutorEnvironment or {}, alias)
+        if value ~= nil then return value end
+    end
+    return nil
 end
 State.TryDecompileDataModule = function(
     moduleScript
@@ -1315,11 +1364,11 @@ State.TryDecompileDataModule = function(
         return nil,
             "decompile/loadstring unavailable"
     end
-    local okSource, source =
-        pcall(
-            decompileFunction,
-            moduleScript
-        )
+    local okSource, source = runBoundedExternal(
+        "executor decompile",
+        CONFIG.AutoTraderExecutorDecompileTimeoutSeconds,
+        function() return decompileFunction(moduleScript) end
+    )
     if not okSource
         or type(source) ~= "string"
         or source == ""
@@ -6139,6 +6188,7 @@ State.AutoTrader = {
     NotificationSerial = 0,
     PostTradeAuditPending = false,
     PostTradeAuditGeneration = 0,
+    PostTradeAuditStartedAt = 0,
     LastAcceptAudit = nil,
     ServerPlayers = {},
     ServerJoinedAt = os.clock(),
@@ -6181,6 +6231,9 @@ State.AutoTrader = {
     RecoveryTeleportLastAttemptAt = 0,
     StaleTradeGuiSince = 0,
     NoEligibleWorkSince = 0,
+    ServerMeaningfulProgressAt = os.clock(),
+    ServerNoProgressRecoveries = 0,
+    RemoteInvokeTimeoutsThisServer = 0,
     OperationalFreezeAt = 0,
     OperationalFreezeReason = nil,
     FatalIntegrityStop = false,
@@ -6261,14 +6314,16 @@ State.AutoTrader.LoadTargetStats = function()
         local readfileFunction = State.TryGetExecutorGlobal("readfile")
         if type(isfileFunction) == "function"
             and type(readfileFunction) == "function" then
-            local fileOK, exists = pcall(
-                isfileFunction,
-                State.AutoTrader.TargetStatsFile
+            local fileOK, exists = runBoundedExternal(
+                "isfile target stats",
+                CONFIG.AutoTraderExecutorFileTimeoutSeconds,
+                function() return isfileFunction(State.AutoTrader.TargetStatsFile) end
             )
             if fileOK and exists then
-                local readOK, body = pcall(
-                    readfileFunction,
-                    State.AutoTrader.TargetStatsFile
+                local readOK, body = runBoundedExternal(
+                    "readfile target stats",
+                    CONFIG.AutoTraderExecutorFileTimeoutSeconds,
+                    function() return readfileFunction(State.AutoTrader.TargetStatsFile) end
                 )
                 if readOK and type(body) == "string" and body ~= "" then
                     local decodeOK, decoded = pcall(function()
@@ -6310,10 +6365,10 @@ State.AutoTrader.FlushTargetStats = function()
     if not encodeOK or type(encoded) ~= "string" then
         return false
     end
-    return pcall(
-        writefileFunction,
-        State.AutoTrader.TargetStatsFile,
-        encoded
+    return runBoundedExternal(
+        "writefile target stats",
+        CONFIG.AutoTraderExecutorFileTimeoutSeconds,
+        function() return writefileFunction(State.AutoTrader.TargetStatsFile, encoded) end
     )
 end
 State.AutoTrader.LoadTargetStats()
@@ -6920,7 +6975,11 @@ State.AutoTrader.SaveRecentJobs = function()
     local writer = State.TryGetExecutorGlobal("writefile")
     if type(writer) == "function" then
         local ok, body = pcall(function() return HttpService:JSONEncode(State.AutoTrader.RecentJobs) end)
-        if ok then pcall(writer, State.AutoTrader.RecentJobsFile, body) end
+        if ok then
+            runBoundedExternal("writefile recent jobs", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                return writer(State.AutoTrader.RecentJobsFile, body)
+            end)
+        end
     end
 end
 State.AutoTrader.LoadRecentJobs = function()
@@ -6938,9 +6997,13 @@ State.AutoTrader.LoadRecentJobs = function()
     local isfileFunction = State.TryGetExecutorGlobal("isfile")
     local reader = State.TryGetExecutorGlobal("readfile")
     if type(isfileFunction) == "function" and type(reader) == "function" then
-        local okExists, exists = pcall(isfileFunction, State.AutoTrader.RecentJobsFile)
+        local okExists, exists = runBoundedExternal("isfile recent jobs", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+            return isfileFunction(State.AutoTrader.RecentJobsFile)
+        end)
         if okExists and exists then
-            local okRead, body = pcall(reader, State.AutoTrader.RecentJobsFile)
+            local okRead, body = runBoundedExternal("readfile recent jobs", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                return reader(State.AutoTrader.RecentJobsFile)
+            end)
             if okRead and type(body) == "string" then
                 local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
                 if okDecode then merge(decoded) end
@@ -7007,13 +7070,21 @@ end
 State.AutoTrader.LoadBotIconDb = function()
     local loaded = rawget(_G, State.AutoTrader.BotIconDbKey)
         or rawget(ExecutorEnvironment, State.AutoTrader.BotIconDbKey)
+    local bootstrap = State.AutoTrader.TeleportBootstrap
+    if type(loaded) ~= "table" and type(bootstrap) == "table" and type(bootstrap.botDb) == "table" then
+        loaded = bootstrap.botDb
+    end
     if type(loaded) ~= "table" then
         local isfileFunction = State.TryGetExecutorGlobal("isfile")
         local readfileFunction = State.TryGetExecutorGlobal("readfile")
         if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
-            local okExists, exists = pcall(isfileFunction, State.AutoTrader.BotIconDbFile)
+            local okExists, exists = runBoundedExternal("isfile bot db", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                return isfileFunction(State.AutoTrader.BotIconDbFile)
+            end)
             if okExists and exists then
-                local okRead, body = pcall(readfileFunction, State.AutoTrader.BotIconDbFile)
+                local okRead, body = runBoundedExternal("readfile bot db", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                    return readfileFunction(State.AutoTrader.BotIconDbFile)
+                end)
                 if okRead and type(body) == "string" and body ~= "" then
                     local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
                     if okDecode and type(decoded) == "table" then loaded = decoded end
@@ -7021,9 +7092,13 @@ State.AutoTrader.LoadBotIconDb = function()
             end
             -- One-time migration path from v9's full-CDN-path database.
             if type(loaded) ~= "table" then
-                local okOldExists, oldExists = pcall(isfileFunction, "SV_AutoTrader_BotIcons_v1.json")
+                local okOldExists, oldExists = runBoundedExternal("isfile legacy bot db", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                    return isfileFunction("SV_AutoTrader_BotIcons_v1.json")
+                end)
                 if okOldExists and oldExists then
-                    local okRead, body = pcall(readfileFunction, "SV_AutoTrader_BotIcons_v1.json")
+                    local okRead, body = runBoundedExternal("readfile legacy bot db", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                        return readfileFunction("SV_AutoTrader_BotIcons_v1.json")
+                    end)
                     if okRead and type(body) == "string" and body ~= "" then
                         local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
                         if okDecode and type(decoded) == "table" then loaded = decoded end
@@ -7093,7 +7168,9 @@ State.AutoTrader.FlushBotIconDb = function()
     if type(writer) ~= "function" then return false end
     local okEncode, body = pcall(function() return HttpService:JSONEncode(State.AutoTrader.BotIconDb) end)
     if not okEncode then return false end
-    return pcall(writer, State.AutoTrader.BotIconDbFile, body)
+    return runBoundedExternal("writefile bot db", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+        return writer(State.AutoTrader.BotIconDbFile, body)
+    end)
 end
 State.AutoTrader.SaveBotIconDb = function(immediate)
     rawset(_G, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
@@ -7184,15 +7261,63 @@ end
 State.AutoTrader.LoadBotIconDb()
 
 State.AutoTrader.GetQueueOnTeleport = function()
-    local direct = State.TryGetExecutorGlobal("queue_on_teleport") or State.TryGetExecutorGlobal("queueonteleport")
-    if type(direct) == "function" then return direct end
-    local synTable = State.TryGetExecutorGlobal("syn")
-    if type(synTable) == "table" and type(synTable.queue_on_teleport) == "function" then return synTable.queue_on_teleport end
-    local fluxusTable = State.TryGetExecutorGlobal("fluxus")
-    if type(fluxusTable) == "table" and type(fluxusTable.queue_on_teleport) == "function" then return fluxusTable.queue_on_teleport end
+    for _, name in ipairs({"queue_on_teleport", "queueonteleport", "queue_on_tp", "queueteleport"}) do
+        local direct = State.TryGetExecutorGlobal(name)
+        if type(direct) == "function" then return direct end
+    end
+    for _, tableName in ipairs({"syn", "fluxus", "krnl"}) do
+        local t = State.TryGetExecutorGlobal(tableName)
+        if type(t) == "table" then
+            for _, key in ipairs({"queue_on_teleport", "queueonteleport", "queue_on_tp"}) do
+                if type(t[key]) == "function" then return t[key] end
+            end
+        end
+    end
     return nil
 end
-State.AutoTrader.BuildTeleportBootstrapCode = function(reason)
+State.AutoTrader.BuildCompactTeleportBotDb = function()
+    local rows = {}
+    for fingerprint, record in pairs(State.AutoTrader.BotIconDb.icons or {}) do
+        table.insert(rows, {fingerprint = fingerprint, record = record})
+    end
+    table.sort(rows, function(a, b)
+        local ar, br = a.record or {}, b.record or {}
+        local as = (tonumber(ar.botEvidence) or 0) + (tonumber(ar.humanEvidence) or 0)
+        local bs = (tonumber(br.botEvidence) or 0) + (tonumber(br.humanEvidence) or 0)
+        if as ~= bs then return as > bs end
+        return (tonumber(ar.lastSeen) or 0) > (tonumber(br.lastSeen) or 0)
+    end)
+    local icons = {}
+    local function compactJobs(source)
+        local jobs = {}
+        for jobId, stamp in pairs(type(source) == "table" and source or {}) do
+            table.insert(jobs, {id = jobId, stamp = tonumber(stamp) or 0})
+        end
+        table.sort(jobs, function(a, b) return a.stamp > b.stamp end)
+        local out = {}
+        for index, row in ipairs(jobs) do
+            if index > CONFIG.AutoTraderBootstrapBotDbJobsPerIcon then break end
+            out[row.id] = row.stamp
+        end
+        return out
+    end
+    for index, row in ipairs(rows) do
+        if index > CONFIG.AutoTraderBootstrapBotDbMaxIcons then break end
+        local r = row.record or {}
+        icons[row.fingerprint] = {
+            botEvidence = tonumber(r.botEvidence) or 0,
+            humanEvidence = tonumber(r.humanEvidence) or 0,
+            botPlayerSightings = tonumber(r.botPlayerSightings) or 0,
+            humanPlayerSightings = tonumber(r.humanPlayerSightings) or 0,
+            firstSeen = tonumber(r.firstSeen) or 0,
+            lastSeen = tonumber(r.lastSeen) or 0,
+            botJobs = compactJobs(r.botJobs),
+            humanJobs = compactJobs(r.humanJobs),
+        }
+    end
+    return {version = 2, icons = icons}
+end
+State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
     local payload = {
         reason = tostring(reason or "teleport"),
         preferences = {
@@ -7205,6 +7330,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason)
             reserves = State.AutoTrader.Preferences.reserves,
         },
         recentJobs = State.AutoTrader.RecentJobs,
+        botDb = includeBotDb == false and nil or State.AutoTrader.BuildCompactTeleportBotDb(),
     }
     local ok, encoded = pcall(function() return HttpService:JSONEncode(payload) end)
     if not ok then return nil, tostring(encoded) end
@@ -7219,7 +7345,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason)
         "task.wait(1)",
         "local U=" .. quotedUrl,
         "local function F() local R={d=false,o=false,b=nil}; task.spawn(function() local o,b=pcall(function() return game:HttpGet(U) end); R.o=o; R.b=b; R.d=true end); local x=os.clock()+10; while not R.d and os.clock()<x do task.wait(.1) end; if R.d and R.o and type(R.b)=='string' and #R.b>1000 then return R.b end end",
-        "while true do local b=F(); if b then local f,e=loadstring(b); if f then local o=pcall(f); if o then break end end end; task.wait(3) end",
+        "while true do local b=F(); if b then local f,e=loadstring(b); if f then local R={d=false,o=false}; task.spawn(function() R.o=pcall(f); R.d=true end); local x=os.clock()+35; while not R.d and os.clock()<x do task.wait(.2) end; if R.d and R.o then break end end end; task.wait(3) end",
     }, ";")
 end
 State.AutoTrader.QueueTeleportScript = function(reason)
@@ -7237,15 +7363,33 @@ State.AutoTrader.QueueTeleportScript = function(reason)
         State.AutoTrader.FlushTargetStats()
         return true
     end)
-    local code, buildError = State.AutoTrader.BuildTeleportBootstrapCode(reason)
+    local code, buildError = State.AutoTrader.BuildTeleportBootstrapCode(reason, true)
     if not code then return false, buildError end
     local ok, err = runBoundedExternal("queue_on_teleport", 2.5, function()
         return queueFunction(code)
     end)
+    local compactFallback = false
+    if not ok then
+        local minimalCode, minimalError = State.AutoTrader.BuildTeleportBootstrapCode(reason, false)
+        if minimalCode then
+            local retryOK, retryErr = runBoundedExternal("queue_on_teleport minimal fallback", 2.5, function()
+                return queueFunction(minimalCode)
+            end)
+            if retryOK then
+                ok = true
+                err = nil
+                compactFallback = true
+            else
+                err = tostring(err) .. " | minimal fallback: " .. tostring(retryErr)
+            end
+        else
+            err = tostring(err) .. " | minimal bootstrap build: " .. tostring(minimalError)
+        end
+    end
     if ok then
         State.AutoTrader.TeleportQueued = true
         State.AutoTrader.LastTeleportReason = tostring(reason or "teleport")
-        State.AutoTrader.Log("teleport_script_queued", {reason = reason})
+        State.AutoTrader.Log("teleport_script_queued", {reason = reason, minimalFallback = compactFallback})
         return true
     end
     return false, tostring(err)
@@ -9839,6 +9983,7 @@ end
 State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, completedPlan, tradeSeconds)
     if not audit then
         State.AutoTrader.PostTradeAuditPending = false
+        State.AutoTrader.PostTradeAuditStartedAt = 0
         State.AutoTrader.Preferences.automation = false
         State.AutoTrader.SavePreferences()
         State.AutoTrader.FatalIntegrityStop = true
@@ -9852,6 +9997,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
         return
     end
     State.AutoTrader.PostTradeAuditPending = true
+    State.AutoTrader.PostTradeAuditStartedAt = os.clock()
     State.AutoTrader.PostTradeAuditGeneration += 1
     local generation = State.AutoTrader.PostTradeAuditGeneration
     local expected = {}
@@ -9922,6 +10068,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
         end
         if not fresh then
             State.AutoTrader.PostTradeAuditPending = false
+            State.AutoTrader.PostTradeAuditStartedAt = 0
             State.AutoTrader.LastAuditDetail = {
                 result = "timeout_rejoin",
                 reason = freshReason,
@@ -9958,6 +10105,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
             end
         end
         State.AutoTrader.PostTradeAuditPending = false
+        State.AutoTrader.PostTradeAuditStartedAt = 0
         local failed = #serverMismatches > 0 or #inventoryMismatches > 0
         State.AutoTrader.LastAuditDetail = {
             result = failed and "failed" or "passed",
@@ -10000,6 +10148,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
                 State.AutoTrader.MarkServerPlayerOutcome(partner, "traded", "post-trade audit passed")
             end
             State.AutoTrader.AuditedTradesThisServer += 1
+            State.AutoTrader.ServerMeaningfulProgressAt = os.clock()
             State.AutoTrader.Status = "TRADE COMPLETE · VERIFIED"
             State.AutoTrader.StatusDetail = "Server receipt and fresh incoming/outgoing inventory deltas both matched the exact automated trade."
             State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
@@ -11115,11 +11264,18 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V12",
+        format = "SV_AUTO_TRADER_SUPPORT_V13",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
         supportInstruction = "Paste this entire block into ChatGPT when asking about Auto Trader behavior.",
+        executorCompatibility = {
+            requestAvailable = type(httpRequest) == "function",
+            queueOnTeleportAvailable = type(State.AutoTrader.GetQueueOnTeleport()) == "function",
+            readfileAvailable = type(State.TryGetExecutorGlobal("readfile")) == "function",
+            writefileAvailable = type(State.TryGetExecutorGlobal("writefile")) == "function",
+            isfileAvailable = type(State.TryGetExecutorGlobal("isfile")) == "function",
+        },
         preferences = {
             automation = State.AutoTrader.Preferences.automation,
             ignoreFriends = State.AutoTrader.Preferences.ignoreFriends,
@@ -11215,6 +11371,10 @@ State.AutoTrader.BuildDebug = function()
             serverHopStartedAt = State.AutoTrader.ServerHopStartedAt,
             staleTradeGuiSince = State.AutoTrader.StaleTradeGuiSince,
             noEligibleWorkSince = State.AutoTrader.NoEligibleWorkSince,
+            serverMeaningfulProgressAt = State.AutoTrader.ServerMeaningfulProgressAt,
+            serverNoProgressRecoveries = State.AutoTrader.ServerNoProgressRecoveries,
+            postTradeAuditStartedAt = State.AutoTrader.PostTradeAuditStartedAt,
+            remoteInvokeTimeoutsThisServer = State.AutoTrader.RemoteInvokeTimeoutsThisServer,
             recentJobs = State.AutoTrader.RecentJobs,
             playerStates = State.AutoTrader.ServerPlayers,
             lastAnyMovementAt = State.AutoTrader.LastAnyMovementAt,
@@ -11303,7 +11463,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V11\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V13\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -11867,6 +12027,7 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                     plan = completedPlan,
                 })
                 State.AutoTrader.PostTradeAuditPending = true
+                State.AutoTrader.PostTradeAuditStartedAt = os.clock()
                 State.AutoTrader.RestoreTradeVisuals()
                 State.AutoTrader.ClearTradeRuntime()
                 State.AutoTrader.Status = "TRADE COMPLETED"
@@ -11985,6 +12146,26 @@ State.AutoTrader.OvernightSupervisor = function()
         return true
     end
 
+    if State.AutoTrader.PostTradeAuditPending then
+        if State.AutoTrader.PostTradeAuditStartedAt <= 0 then
+            State.AutoTrader.PostTradeAuditStartedAt = now
+        elseif now - State.AutoTrader.PostTradeAuditStartedAt >= CONFIG.AutoTraderPostTradeAuditSupervisorSeconds then
+            local age = now - State.AutoTrader.PostTradeAuditStartedAt
+            State.AutoTrader.PostTradeAuditGeneration += 1
+            State.AutoTrader.PostTradeAuditPending = false
+            State.AutoTrader.PostTradeAuditStartedAt = 0
+            State.AutoTrader.LastAuditDetail = {result = "outer_watchdog_rejoin", age = age}
+            State.AutoTrader.Log("post_trade_audit_outer_watchdog", {seconds = age})
+            State.AutoTrader.Status = "AUDIT WATCHDOG · RESYNCING"
+            State.AutoTrader.StatusDetail = "The post-trade audit state outlived its independent deadline; rejoining before any more trades."
+            State.AutoTrader.Render()
+            State.AutoTrader.RequestRecoveryTeleport("post-trade audit outer watchdog expired")
+            return true
+        end
+    else
+        State.AutoTrader.PostTradeAuditStartedAt = 0
+    end
+
     if State.AutoTrader.TeleportInProgress
         and State.AutoTrader.TeleportAttemptStartedAt > 0
         and now - State.AutoTrader.TeleportAttemptStartedAt >= CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds then
@@ -12100,6 +12281,31 @@ State.AutoTrader.OvernightSupervisor = function()
         end
     else
         State.AutoTrader.NoEligibleWorkSince = 0
+    end
+
+    -- Whole-server liveness deadline. PlayerAdded does intentionally NOT reset
+    -- this clock, so a churny bot lobby cannot keep WAITING_FOR_DISCOVERY alive forever.
+    if noBlockingWork then
+        local targetNow = State.AutoTrader.SelectTarget()
+        if not targetNow then
+            local baseline = math.max(State.AutoTrader.ServerJoinedAt or now, State.AutoTrader.ServerMeaningfulProgressAt or 0)
+            if now - baseline >= CONFIG.AutoTraderServerNoProgressTimeoutSeconds then
+                State.AutoTrader.ServerNoProgressRecoveries += 1
+                State.AutoTrader.FastBotHopActive = true
+                State.AutoTrader.FastBotHopReason = "EXHAUSTED_NO_PROGRESS"
+                State.AutoTrader.Log("server_no_progress_timeout", {
+                    seconds = now - baseline,
+                    recoveries = State.AutoTrader.ServerNoProgressRecoveries,
+                    disposition = State.AutoTrader.GetServerDisposition(),
+                })
+                State.AutoTrader.Status = "SERVER IDLE · FORCED HOP"
+                State.AutoTrader.StatusDetail = "No actionable trading progress occurred inside the whole-server deadline; hopping even if new unresolved players keep joining."
+                State.AutoTrader.Render()
+                State.AutoTrader.ServerMeaningfulProgressAt = now
+                State.AutoTrader.TryServerHop("EXHAUSTED_NO_PROGRESS", select(2, State.AutoTrader.GetServerDisposition()))
+                return true
+            end
+        end
     end
     return true
 end
@@ -16276,6 +16482,19 @@ State.Profile.FetchRemoteTotalForPlayer = function(player, force)
         if remoteState.inFlightByUserId[userId] == request then
             remoteState.inFlightByUserId[userId] = nil
         end
+        if State.AutoTrader then
+            State.AutoTrader.RemoteInvokeTimeoutsThisServer = (State.AutoTrader.RemoteInvokeTimeoutsThisServer or 0) + 1
+            if State.AutoTrader.RemoteInvokeTimeoutsThisServer >= CONFIG.AutoTraderRemoteInvokeTimeoutRecoveryCount
+                and State.AutoTrader.Preferences and State.AutoTrader.Preferences.automation
+                and not State.AutoTrader.TeleportInProgress
+                and not State.AutoTrader.ServerHopInProgress then
+                task.defer(function()
+                    if not Destroyed and State.AutoTrader.RemoteInvokeTimeoutsThisServer >= CONFIG.AutoTraderRemoteInvokeTimeoutRecoveryCount then
+                        State.AutoTrader.RequestRecoveryTeleport("too many timed-out GetFullInventory invocations on this executor/server")
+                    end
+                end)
+            end
+        end
         local failures =
             (remoteState.failureCountByUserId[userId] or 0) + 1
         remoteState.retryAfterByUserId[userId] =
@@ -16724,4 +16943,6 @@ do
         end
     )
 end
-warn("[SV Public] Supreme Values PC Public Helper loaded.")
+rawset(_G, "__SV_AUTO_TRADER_V13_READY", true)
+rawset(ExecutorEnvironment, "__SV_AUTO_TRADER_V13_READY", true)
+warn("[SV Public] Supreme Values PC Public Helper v13 loaded.")

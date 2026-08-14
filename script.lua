@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.45-public-auto-trader-v13-executor-liveness",
+    version = "18.46-public-auto-trader-v14-executor-http-startup-fix",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -240,6 +240,89 @@ local function boundedGameHttpGet(url, timeoutSeconds)
     return runBoundedExternal("game:HttpGet", timeoutSeconds or 7.5, function()
         return game:HttpGet(url)
     end)
+end
+local function normalizeHttpResponse(response)
+    if type(response) == "string" then
+        return {
+            Success = true,
+            StatusCode = 200,
+            StatusMessage = "OK",
+            Body = response,
+            Headers = {},
+        }
+    end
+    if type(response) ~= "table" then
+        return nil
+    end
+    local statusCode = tonumber(
+        response.StatusCode
+        or response.statusCode
+        or response.Status
+        or response.status
+        or response.status_code
+    )
+    local success = response.Success
+    if success == nil then success = response.success end
+    if success == nil and statusCode then
+        success = statusCode >= 200 and statusCode < 400
+    end
+    local body = response.Body
+        or response.body
+        or response.ResponseBody
+        or response.responseBody
+        or response.response_body
+    local headers = response.Headers or response.headers or {}
+    return {
+        Success = success == true,
+        StatusCode = statusCode,
+        StatusMessage = response.StatusMessage
+            or response.statusMessage
+            or response.status_message
+            or response.Message
+            or response.message,
+        Body = body,
+        Headers = type(headers) == "table" and headers or {},
+    }
+end
+local function fetchStaticTextCompat(url, headers, timeoutSeconds)
+    local requestError = nil
+    if type(httpRequest) == "function" then
+        local ok, rawResponse = boundedHttpRequest({
+            Url = url,
+            URL = url,
+            Method = "GET",
+            Headers = headers or {},
+        }, timeoutSeconds or 7.5)
+        if ok then
+            local normalized = normalizeHttpResponse(rawResponse)
+            if normalized and (normalized.StatusCode == 304 or normalized.Success) then
+                return true, normalized, "request"
+            end
+            if normalized then
+                requestError = "HTTP " .. tostring(normalized.StatusCode or "?")
+            else
+                requestError = "request returned an unsupported response shape"
+            end
+        else
+            requestError = tostring(rawResponse)
+        end
+    else
+        requestError = "request(options) unavailable"
+    end
+
+    local okGet, body = boundedGameHttpGet(url, timeoutSeconds or 7.5)
+    if okGet and type(body) == "string" and body ~= "" then
+        return true, {
+            Success = true,
+            StatusCode = 200,
+            StatusMessage = "OK",
+            Body = body,
+            Headers = {},
+        }, "game:HttpGet"
+    end
+    return false, tostring(requestError or "request failed")
+        .. "; game:HttpGet fallback: "
+        .. tostring(body), nil
 end
 local GLOBAL_KEY = "__SUPREME_VALUES_PC_PUBLIC_HELPER"
 do
@@ -944,9 +1027,6 @@ local function mappingEntryCount(imageLinks, itemLinks)
     return count
 end
 local function loadLinkedImages()
-    if type(httpRequest) ~= "function" then
-        return false, "request(options) is unavailable.", false
-    end
     local headers = {
         ["Accept"] = "application/json",
         ["Cache-Control"] = "no-cache",
@@ -954,16 +1034,13 @@ local function loadLinkedImages()
     if HttpState.linkedETag then
         headers["If-None-Match"] = HttpState.linkedETag
     end
-    local ok, response = boundedHttpRequest({
-        Url = CONFIG.LinkedImagesUrl,
-        Method = "GET",
-        Headers = headers,
-    }, CONFIG.AutoTraderHttpTimeoutSeconds)
+    local ok, response = fetchStaticTextCompat(
+        CONFIG.LinkedImagesUrl,
+        headers,
+        CONFIG.AutoTraderHttpTimeoutSeconds
+    )
     if not ok then
         return false, tostring(response), false
-    end
-    if type(response) ~= "table" then
-        return false, "Invalid linked-images response.", false
     end
     if tonumber(response.StatusCode) == 304 then
         return true, nil, false
@@ -1039,9 +1116,6 @@ local function validateSupremeCandidate(decoded, candidateCatalog)
     return true
 end
 local function fetchSupremeDatabase()
-    if type(httpRequest) ~= "function" then
-        return false, "The custom request(options) function is not available.", false
-    end
     local headers = {
         ["Accept"] = "application/json",
         ["Cache-Control"] = "no-cache",
@@ -1049,16 +1123,13 @@ local function fetchSupremeDatabase()
     if HttpState.supremeETag then
         headers["If-None-Match"] = HttpState.supremeETag
     end
-    local requestOK, response = boundedHttpRequest({
-        Url = CONFIG.JsonUrl,
-        Method = "GET",
-        Headers = headers,
-    }, CONFIG.AutoTraderHttpTimeoutSeconds)
+    local requestOK, response = fetchStaticTextCompat(
+        CONFIG.JsonUrl,
+        headers,
+        CONFIG.AutoTraderHttpTimeoutSeconds
+    )
     if not requestOK then
         return false, "HTTP error: " .. tostring(response), false
-    end
-    if type(response) ~= "table" then
-        return false, "request(options) returned something other than a response table.", false
     end
     if tonumber(response.StatusCode) == 304 then
         if SupremeDatabase then
@@ -11264,7 +11335,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V13",
+        format = "SV_AUTO_TRADER_SUPPORT_V14",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -11275,6 +11346,12 @@ State.AutoTrader.BuildDebug = function()
             readfileAvailable = type(State.TryGetExecutorGlobal("readfile")) == "function",
             writefileAvailable = type(State.TryGetExecutorGlobal("writefile")) == "function",
             isfileAvailable = type(State.TryGetExecutorGlobal("isfile")) == "function",
+            scriptInstanceAvailable = (function()
+                local value = nil
+                pcall(function() value = script end)
+                return typeof(value) == "Instance"
+            end)(),
+            staticHttpFallbackEnabled = true,
         },
         preferences = {
             automation = State.AutoTrader.Preferences.automation,
@@ -11463,7 +11540,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V13\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V14\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -16768,13 +16845,24 @@ local function startPeriodic(baseSeconds, backoff, callback)
 end
 State.QueueNativeDatabaseWarmup()
 rawset(_G, GLOBAL_KEY, Controller)
-connect(script.Destroying, function()
-    Controller.Destroy()
-end)
+do
+    -- Executor-injected chunks do not consistently expose a Script object.
+    -- Never let an absent/non-Instance `script` abort startup before the
+    -- value database and periodic refresh loops are launched.
+    local scriptObject = nil
+    pcall(function() scriptObject = script end)
+    if typeof(scriptObject) == "Instance" then
+        pcall(function()
+            connect(scriptObject.Destroying, function()
+                Controller.Destroy()
+            end)
+        end)
+    end
+end
 task.spawn(function()
-    pcall(reconnectGuiWatchers)
-    pcall(State.Profile.Bind)
-    pcall(updatePublicUiScale)
+    -- Load the value/mapping databases before optional GUI binding. Some
+    -- executors expose injected Script/GUI state differently; a bad UI
+    -- binding must never strand the catalog at "Loading...".
     local initOK, initError =
         pcall(function()
             local databaseOK, databaseError =
@@ -16787,10 +16875,18 @@ task.spawn(function()
             if not linksOK and linksError then
                 warn("[SV Public] linked_images.json was not loaded:", linksError)
             end
+            if not databaseOK and databaseError then
+                warn("[SV Public] Initial value database unavailable:", databaseError)
+            end
+
+            -- These are cosmetic/binding concerns and are intentionally
+            -- isolated after the foundational database work.
+            pcall(reconnectGuiWatchers)
+            pcall(State.Profile.Bind)
+            pcall(updatePublicUiScale)
+
             if databaseOK then
                 refreshResolvedViews(true)
-            elseif databaseError then
-                warn("[SV Public] Initial value database unavailable:", databaseError)
             end
             if linksChanged and SupremeDatabase then
                 refreshResolvedViews(false)
@@ -16943,6 +17039,6 @@ do
         end
     )
 end
-rawset(_G, "__SV_AUTO_TRADER_V13_READY", true)
-rawset(ExecutorEnvironment, "__SV_AUTO_TRADER_V13_READY", true)
-warn("[SV Public] Supreme Values PC Public Helper v13 loaded.")
+rawset(_G, "__SV_AUTO_TRADER_V14_READY", true)
+rawset(ExecutorEnvironment, "__SV_AUTO_TRADER_V14_READY", true)
+warn("[SV Public] Supreme Values PC Public Helper v14 loaded.")

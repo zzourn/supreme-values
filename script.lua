@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.47-public-auto-trader-v15-profit-throughput",
+    version = "18.48-public-auto-trader-v16-opportunity-learning",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -51,6 +51,17 @@ local CONFIG = {
     AutoTraderNegotiationFinalSeconds = 11.0,
     AutoTraderTargetOpportunityFloor = 0.014,
     AutoTraderEconomicSkipGraceSeconds = 12,
+    -- Stay-vs-hop economics. The learned hop benchmark is intentionally
+    -- discounted because teleport/discovery has real overhead and uncertainty.
+    AutoTraderHopOpportunityDefault = 0.020,
+    AutoTraderHopOpportunityRetentionFactor = 0.82,
+    AutoTraderHopOpportunityMax = 0.12,
+    AutoTraderMixedLobbyProbeSeconds = 6.5,
+    -- Per-player bot risk is a ranking penalty, not a blanket server verdict.
+    -- This lets a valuable real player in a bot-heavy lobby remain tradable.
+    AutoTraderConfirmedBotTargetMultiplier = 0.14,
+    AutoTraderSuspectBotTargetMultiplier = 0.34,
+    AutoTraderUnknownBotRiskPenalty = 0.55,
 
     AutoTraderBeamWidth = 3200,
     AutoTraderExactStateLimit = 10000,
@@ -6302,6 +6313,8 @@ State.AutoTrader = {
     CurrentServerAvatarScreenJobId = nil,
     FastBotHopActive = false,
     FastBotHopReason = nil,
+    PlayerBotRiskByUserId = {},
+    LastOpportunityDecision = nil,
     AuditedTradesThisServer = 0,
     TeleportQueued = false,
     TeleportInProgress = false,
@@ -6492,6 +6505,7 @@ State.AutoTrader.GetPlayerStats = function(player)
             incomingAccepted = 0,
             responses = 0,
             declines = 0,
+            tradeDeclines = 0,
             ignored = 0,
             trades = 0,
             successes = 0,
@@ -6507,6 +6521,7 @@ State.AutoTrader.GetPlayerStats = function(player)
     State.AutoTrader.TargetStats[player.UserId] = nil
     State.AutoTrader.TargetStats[key] = stats
     stats.auditFailures = tonumber(stats.auditFailures) or 0
+    stats.tradeDeclines = tonumber(stats.tradeDeclines) or 0
     stats.lastDecayUnix = tonumber(stats.lastDecayUnix) or os.time()
     stats.lastEventUnix = tonumber(stats.lastEventUnix) or os.time()
     local nowUnix = os.time()
@@ -6519,6 +6534,7 @@ State.AutoTrader.GetPlayerStats = function(player)
             "incomingAccepted",
             "responses",
             "declines",
+            "tradeDeclines",
             "ignored",
             "trades",
             "successes",
@@ -6533,6 +6549,182 @@ State.AutoTrader.GetPlayerStats = function(player)
     end
     return stats
 end
+-- Generalized learning lives inside the existing target-stats persistence file so
+-- it survives teleports/executor restarts without adding another fragile file.
+State.AutoTrader.GetStrategyStats = function()
+    local root = State.AutoTrader.TargetStats.__strategy_v1
+    if type(root) ~= "table" then
+        root = {version = 1, global = {}, bands = {}, marginStages = {}}
+        State.AutoTrader.TargetStats.__strategy_v1 = root
+    end
+    root.version = 1
+    root.global = type(root.global) == "table" and root.global or {}
+    root.bands = type(root.bands) == "table" and root.bands or {}
+    root.marginStages = type(root.marginStages) == "table" and root.marginStages or {}
+    return root
+end
+State.AutoTrader.GetValueBand = function(total)
+    total = math.max(0, tonumber(total) or 0)
+    if total < 100 then return "lt100" end
+    if total < 500 then return "100_499" end
+    if total < 2000 then return "500_1999" end
+    return "2000_plus"
+end
+State.AutoTrader.NormalizeStrategyBucket = function(bucket)
+    bucket = type(bucket) == "table" and bucket or {}
+    for _, field in ipairs({
+        "requests", "responses", "trades", "successes", "declines",
+        "tradeDeclines", "ignored", "idle", "terminalOutcomes", "totalProfit",
+        "totalResponseSeconds", "totalTradeSeconds", "terminalSeconds",
+    }) do
+        bucket[field] = math.max(0, tonumber(bucket[field]) or 0)
+    end
+    bucket.lastEventUnix = tonumber(bucket.lastEventUnix) or 0
+    return bucket
+end
+State.AutoTrader.GetStrategyBucket = function(total, create)
+    local root = State.AutoTrader.GetStrategyStats()
+    local key = State.AutoTrader.GetValueBand(total)
+    local bucket = root.bands[key]
+    if type(bucket) ~= "table" and create ~= false then
+        bucket = {}
+        root.bands[key] = bucket
+    end
+    return bucket and State.AutoTrader.NormalizeStrategyBucket(bucket) or nil, key
+end
+State.AutoTrader.GetStrategyPriors = function(total)
+    local root = State.AutoTrader.GetStrategyStats()
+    local global = State.AutoTrader.NormalizeStrategyBucket(root.global)
+    root.global = global
+    local band = State.AutoTrader.GetStrategyBucket(total, false)
+    band = band and State.AutoTrader.NormalizeStrategyBucket(band) or nil
+    local function empirical(bucket, num, den, fallback)
+        if not bucket then return fallback end
+        local denominator = math.max(0, tonumber(bucket[den]) or 0)
+        local numerator = math.max(0, tonumber(bucket[num]) or 0)
+        local priorStrength = 6
+        return clamp((numerator + fallback * priorStrength) / (denominator + priorStrength), 0.01, 0.99)
+    end
+    local globalResponse = empirical(global, "responses", "requests", 0.62)
+    local globalTrade = empirical(global, "trades", "responses", 0.52)
+    local globalSuccess = empirical(global, "successes", "trades", 0.27)
+    local bandWeight = band and clamp((band.requests or 0) / 14, 0, 0.72) or 0
+    local response = globalResponse
+    local trade = globalTrade
+    local success = globalSuccess
+    if band then
+        response = response * (1 - bandWeight) + empirical(band, "responses", "requests", response) * bandWeight
+        trade = trade * (1 - bandWeight) + empirical(band, "trades", "responses", trade) * bandWeight
+        success = success * (1 - bandWeight) + empirical(band, "successes", "trades", success) * bandWeight
+    end
+    local function blendedAverage(fieldTotal, fieldCount, fallback)
+        local gCount = tonumber(global[fieldCount]) or 0
+        local g = gCount > 0 and (tonumber(global[fieldTotal]) or 0) / gCount or fallback
+        if band then
+            local bCount = tonumber(band[fieldCount]) or 0
+            if bCount > 0 then
+                local b = (tonumber(band[fieldTotal]) or 0) / bCount
+                return g * (1 - bandWeight) + b * bandWeight
+            end
+        end
+        return g
+    end
+    local avgResponse = blendedAverage("totalResponseSeconds", "responses", 5)
+    local avgTrade = blendedAverage("totalTradeSeconds", "successes", 16)
+    local avgProfit = nil
+    local gSuccess = tonumber(global.successes) or 0
+    if gSuccess > 0 then avgProfit = (tonumber(global.totalProfit) or 0) / gSuccess end
+    if band and (tonumber(band.successes) or 0) > 0 then
+        local b = (tonumber(band.totalProfit) or 0) / math.max(1, tonumber(band.successes) or 0)
+        avgProfit = avgProfit and (avgProfit * (1 - bandWeight) + b * bandWeight) or b
+    end
+    return {
+        responseRate = clamp(response, 0.08, 0.96),
+        tradeRate = clamp(trade, 0.08, 0.92),
+        successRate = clamp(success, 0.05, 0.80),
+        avgResponse = clamp(avgResponse, 1.5, 12),
+        avgTrade = clamp(avgTrade, 4, 40),
+        avgProfit = avgProfit and math.max(0, avgProfit) or nil,
+        band = State.AutoTrader.GetValueBand(total),
+        bandSamples = band and (tonumber(band.requests) or 0) or 0,
+        globalSamples = tonumber(global.requests) or 0,
+    }
+end
+State.AutoTrader.GetHopOpportunityRate = function()
+    local root = State.AutoTrader.GetStrategyStats()
+    local global = State.AutoTrader.NormalizeStrategyBucket(root.global)
+    root.global = global
+    local outcomes = tonumber(global.terminalOutcomes) or 0
+    local seconds = tonumber(global.terminalSeconds) or 0
+    local learned = nil
+    if outcomes >= 5 and seconds >= 30 then
+        learned = (tonumber(global.totalProfit) or 0) / math.max(1, seconds)
+    end
+    local weight = learned and clamp(outcomes / 24, 0, 0.82) or 0
+    local blended = CONFIG.AutoTraderHopOpportunityDefault * (1 - weight)
+        + math.min(CONFIG.AutoTraderHopOpportunityMax, math.max(0, learned or 0)) * weight
+    return math.max(CONFIG.AutoTraderTargetOpportunityFloor, math.min(CONFIG.AutoTraderHopOpportunityMax, blended))
+end
+State.AutoTrader.RecordStrategyEvent = function(player, kind, data)
+    data = data or {}
+    local total = tonumber(data.verifiedTotal)
+    if total == nil and player then
+        local value, verified = State.AutoTrader.GetVerifiedPlayerValue(player)
+        if verified then total = tonumber(value) end
+    end
+    total = math.max(0, total or 0)
+    local root = State.AutoTrader.GetStrategyStats()
+    root.global = State.AutoTrader.NormalizeStrategyBucket(root.global)
+    local band = State.AutoTrader.GetStrategyBucket(total, true)
+    local buckets = {root.global, band}
+    for _, bucket in ipairs(buckets) do
+        if kind == "request" then bucket.requests += 1
+        elseif kind == "response" then
+            bucket.responses += 1
+            local seconds = tonumber(data.seconds)
+            if seconds and seconds >= 0 then bucket.totalResponseSeconds += seconds end
+        elseif kind == "trade" then bucket.trades += 1
+        elseif kind == "success" then
+            bucket.successes += 1
+            bucket.totalProfit += math.max(0, tonumber(data.profit) or 0)
+            local seconds = tonumber(data.seconds)
+            if seconds and seconds >= 0 then bucket.totalTradeSeconds += seconds end
+            bucket.terminalOutcomes += 1
+            bucket.terminalSeconds += math.max(1, tonumber(data.totalSeconds) or seconds or 12)
+        elseif kind == "decline" then
+            bucket.declines += 1
+            bucket.terminalOutcomes += 1
+            bucket.terminalSeconds += math.max(1, tonumber(data.seconds) or 5)
+        elseif kind == "tradeDecline" then
+            bucket.tradeDeclines += 1
+            bucket.terminalOutcomes += 1
+            bucket.terminalSeconds += math.max(1, tonumber(data.seconds) or 10)
+        elseif kind == "ignored" then
+            bucket.ignored += 1
+            bucket.terminalOutcomes += 1
+            bucket.terminalSeconds += math.max(1, tonumber(data.seconds) or CONFIG.AutoTraderPendingRequestTimeoutSeconds)
+        elseif kind == "idle" then
+            bucket.idle += 1
+            bucket.terminalOutcomes += 1
+            bucket.terminalSeconds += math.max(1, tonumber(data.seconds) or CONFIG.AutoTraderTradeIdleTimeoutSeconds)
+        end
+        bucket.lastEventUnix = os.time()
+    end
+    local stage = tonumber(data.negotiationStage)
+    if stage and stage >= 1 and stage <= 4 and (kind == "success" or kind == "tradeDecline" or kind == "idle") then
+        local key = tostring(math.floor(stage))
+        local m = type(root.marginStages[key]) == "table" and root.marginStages[key] or {}
+        m.shownOutcomes = math.max(0, tonumber(m.shownOutcomes) or 0) + 1
+        m.successes = math.max(0, tonumber(m.successes) or 0) + (kind == "success" and 1 or 0)
+        m.declines = math.max(0, tonumber(m.declines) or 0) + (kind ~= "success" and 1 or 0)
+        m.totalProfit = math.max(0, tonumber(m.totalProfit) or 0) + (kind == "success" and math.max(0, tonumber(data.profit) or 0) or 0)
+        m.totalSeconds = math.max(0, tonumber(m.totalSeconds) or 0) + math.max(1, tonumber(data.seconds) or 1)
+        m.lastMargin = tonumber(data.negotiationMargin)
+        m.lastEventUnix = os.time()
+        root.marginStages[key] = m
+    end
+end
+
 State.AutoTrader.RecordTargetEvent = function(player, kind, data)
     if not player then
         return
@@ -6554,6 +6746,8 @@ State.AutoTrader.RecordTargetEvent = function(player, kind, data)
         end
     elseif kind == "decline" then
         stats.declines += 1
+    elseif kind == "tradeDecline" then
+        stats.tradeDeclines = (tonumber(stats.tradeDeclines) or 0) + 1
     elseif kind == "ignored" then
         stats.ignored += 1
     elseif kind == "trade" then
@@ -6569,6 +6763,13 @@ State.AutoTrader.RecordTargetEvent = function(player, kind, data)
         stats.auditFailures += 1
     end
     stats.lastEventUnix = os.time()
+    State.AutoTrader.RecordStrategyEvent(player, kind, data)
+    if State.AutoTrader.LearnHumanFingerprintForPlayer then
+        if kind == "incomingRequest" then State.AutoTrader.LearnHumanFingerprintForPlayer(player, 0.90, "incoming_request")
+        elseif kind == "response" then State.AutoTrader.LearnHumanFingerprintForPlayer(player, 0.75, "response")
+        elseif kind == "trade" then State.AutoTrader.LearnHumanFingerprintForPlayer(player, 1.15, "trade")
+        elseif kind == "success" then State.AutoTrader.LearnHumanFingerprintForPlayer(player, 1.75, "audited_success") end
+    end
     State.AutoTrader.SaveTargetStats()
 end
 State.AutoTrader.GetTargetProfile = function(player)
@@ -6715,19 +6916,19 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
     local trades = math.max(0, tonumber(stats.trades) or 0)
     local successes = math.max(0, tonumber(stats.successes) or 0)
 
-    -- Hierarchical-ish priors: response, trade-start given a response, then
-    -- audited success given a started trade. These are deliberately smoothed so
-    -- one stranger is not permanently condemned after one unlucky interaction.
-    local responseRate = clamp((responses + 2.2) / (requests + 3.2), 0.08, 0.96)
-    local tradeRate = clamp((trades + 1.4) / (responses + 2.8), 0.08, 0.92)
-    local successRate = clamp((successes + 0.9) / (trades + 3.2), 0.05, 0.80)
+    -- Per-user observations are blended with generalized value-band learning.
+    -- That lets every stranger teach the bot something useful about future strangers.
+    local priors = State.AutoTrader.GetStrategyPriors(total)
+    local responseRate = clamp((responses + priors.responseRate * 3.2) / (requests + 3.2), 0.08, 0.96)
+    local tradeRate = clamp((trades + priors.tradeRate * 2.8) / (responses + 2.8), 0.08, 0.92)
+    local successRate = clamp((successes + priors.successRate * 3.2) / (trades + 3.2), 0.05, 0.80)
 
     local avgResponse = responses > 0
         and ((tonumber(stats.totalResponseSeconds) or 0) / responses)
-        or 5
+        or priors.avgResponse
     local avgTrade = successes > 0
         and ((tonumber(stats.totalTradeSeconds) or 0) / successes)
-        or 16
+        or priors.avgTrade
     local expectedSeconds = math.max(4, avgResponse + avgTrade)
 
     local profile = State.AutoTrader.GetTargetProfile(player)
@@ -6742,9 +6943,19 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
     -- separation between medium and large inventories while still preventing a
     -- single huge inventory from dominating every decision.
     local priorProfit = math.max(1, math.min(150, math.sqrt(total) * 2.0))
-    local learnedProfit = successes > 0
-        and math.max(1, (tonumber(stats.totalProfit) or 0) / successes)
-        or priorProfit
+    local generalizedWeight = priors.avgProfit and clamp(
+        ((tonumber(priors.bandSamples) or 0) + (tonumber(priors.globalSamples) or 0) * 0.15) / 18,
+        0,
+        0.65
+    ) or 0
+    local generalizedProfit = priorProfit * (1 - generalizedWeight)
+        + math.max(1, tonumber(priors.avgProfit) or priorProfit) * generalizedWeight
+    local learnedProfit = generalizedProfit
+    if successes > 0 then
+        local userProfit = math.max(1, (tonumber(stats.totalProfit) or 0) / successes)
+        local userWeight = clamp(successes / 4, 0, 0.80)
+        learnedProfit = generalizedProfit * (1 - userWeight) + userProfit * userWeight
+    end
     local expectedProfit = learnedProfit * compositionMultiplier * denominationMultiplier
 
     local freshBonus = requests < 0.25 and 1.08 or 1
@@ -6752,8 +6963,21 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
     local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.45)
     local declinePenalty = 1 / (1 + (tonumber(stats.declines) or 0) * 0.10)
 
-    -- Score is expected audited Supreme-value gain per second, with only a tiny
-    -- tie-breaking preference for larger inventories.
+    local botRisk, botInfo = 0, nil
+    if State.AutoTrader.GetPlayerBotRisk then
+        botRisk, botInfo = State.AutoTrader.GetPlayerBotRisk(player)
+    end
+    local botMultiplier = 1
+    if botInfo and botInfo.class == "confirmed_bot" then
+        botMultiplier = CONFIG.AutoTraderConfirmedBotTargetMultiplier
+    elseif botInfo and botInfo.class == "suspect_bot" then
+        botMultiplier = CONFIG.AutoTraderSuspectBotTargetMultiplier
+    else
+        botMultiplier = clamp(1 - math.max(0, botRisk or 0) * CONFIG.AutoTraderUnknownBotRiskPenalty, 0.42, 1)
+    end
+
+    -- Score is expected audited Supreme-value gain per second. Bot association is
+    -- a per-player opportunity penalty, never a blanket mixed-server human label.
     return (
         expectedProfit
         * responseRate
@@ -6763,6 +6987,7 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
         * incomingBonus
         * auditPenalty
         * declinePenalty
+        * botMultiplier
         / expectedSeconds
     ) + math.log(total + 1) * 0.00008
 end
@@ -7663,6 +7888,44 @@ State.AutoTrader.ResolveCurrentPlayerFingerprints = function()
     return completed > 0, result, completed > 0 and nil or "current-player headshot lookup returned no completed thumbnails"
 end
 
+State.AutoTrader.AddSoftHumanIconEvidence = function(fingerprint, amount, playerSightings)
+    local record = State.AutoTrader.GetBotIconRecord(fingerprint, true)
+    if not record then return false end
+    amount = math.max(0, tonumber(amount) or 0)
+    record.humanEvidence = (tonumber(record.humanEvidence) or 0) + amount
+    record.humanPlayerSightings = (tonumber(record.humanPlayerSightings) or 0) + math.max(0, tonumber(playerSightings) or 1)
+    record.lastSeen = os.time()
+    return true
+end
+State.AutoTrader.LearnHumanFingerprintForPlayer = function(player, strength, reason)
+    if not player then return false end
+    local screen = State.AutoTrader.CurrentServerAvatarScreen
+    local fingerprint = screen and screen.jobId == game.JobId
+        and screen.fingerprintByUserId and screen.fingerprintByUserId[player.UserId] or nil
+    if not fingerprint then return false end
+    State.AutoTrader.AddBotIconEvidence(fingerprint, "human", math.max(0.25, tonumber(strength) or 1), game.JobId, 1)
+    State.AutoTrader.SaveBotIconDb(false)
+    State.AutoTrader.Log("human_hash_behavior_evidence", {
+        userId = player.UserId, name = player.Name, fingerprint = fingerprint,
+        strength = strength, reason = reason,
+    })
+    return true
+end
+State.AutoTrader.GetPlayerBotRisk = function(player)
+    if not player then return 0, nil end
+    local screen = State.AutoTrader.CurrentServerAvatarScreen
+    local info = screen and screen.jobId == game.JobId and screen.botByUserId
+        and screen.botByUserId[player.UserId] or nil
+    if not info then return 0, nil end
+    local risk = tonumber(info.risk) or 0
+    local stats = State.AutoTrader.GetPlayerStats(player)
+    -- Actual behavior is stronger evidence than a shared/default avatar appearance.
+    if (tonumber(stats.successes) or 0) > 0 then risk *= 0.12
+    elseif (tonumber(stats.trades) or 0) > 0 then risk *= 0.32
+    elseif (tonumber(stats.responses) or 0) > 0 then risk *= 0.55 end
+    return clamp(risk, 0, 1), info
+end
+
 State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
     local diagnostics = {
         servers = #(servers or {}), tokens = 0, batches = 0, batchesSucceeded = 0,
@@ -7983,13 +8246,22 @@ State.AutoTrader.LearnCurrentServerBotIcons = function(counts)
                 local value, valueVerified = State.AutoTrader.GetVerifiedPlayerValue(player)
                 local fingerprint = current.fingerprintByUserId[player.UserId]
                 if valueVerified and value and value > 0 and fingerprint then
-                    State.AutoTrader.AddBotIconEvidence(fingerprint, "human", 1.0, game.JobId, 1)
+                    local stats = State.AutoTrader.GetPlayerStats(player)
+                    if (tonumber(stats.successes) or 0) > 0
+                        or (tonumber(stats.trades) or 0) > 0
+                        or (tonumber(stats.responses) or 0) > 0 then
+                        State.AutoTrader.AddBotIconEvidence(fingerprint, "human", 1.25, game.JobId, 1)
+                    else
+                        -- Positive inventory is only weak human evidence. It must not
+                        -- wash a bot hash merely because a farm account owns an item.
+                        State.AutoTrader.AddSoftHumanIconEvidence(fingerprint, 0.20, 1)
+                    end
                     humanLearned += 1
                 end
             end
         end
         if humanLearned > 0 then
-            learning.action = "learn_human_positive_players"
+            learning.action = "learn_human_positive_players_soft_behavior_strong"
             learning.humanFingerprintsLearned = humanLearned
         elseif (State.AutoTrader.AuditedTradesThisServer or 0) > 0 then
             learning.action = "human_trade_seen_no_partner_hash"
@@ -8046,17 +8318,38 @@ State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     local fastBot = preview.sample >= CONFIG.AutoTraderBotPreviewMinSamples
         and (preview.confirmedRatio >= CONFIG.AutoTraderBotFastRejectConfirmedRatio
             or preview.suspectRatio >= CONFIG.AutoTraderBotFastRejectSuspectRatio)
+    local botByUserId = {}
+    for userId, fingerprint in pairs(current.fingerprintByUserId or {}) do
+        local class, confidence, record = State.AutoTrader.GetBotIconClass(fingerprint)
+        local botJobs = record and State.AutoTrader.BotIconJobCount(record.botJobs) or 0
+        local humanJobs = record and State.AutoTrader.BotIconJobCount(record.humanJobs) or 0
+        local risk = 0
+        if class == "confirmed_bot" then risk = 0.96
+        elseif class == "suspect_bot" then risk = 0.82
+        elseif botJobs >= 2 then risk = math.min(0.62, 0.30 + botJobs * 0.09) * confidence
+        elseif botJobs == 1 then risk = 0.18 * confidence end
+        botByUserId[userId] = {
+            fingerprint = fingerprint, class = class, confidence = confidence,
+            botJobs = botJobs, humanJobs = humanJobs, risk = clamp(risk, 0, 1),
+        }
+    end
     local result = {
         jobId = game.JobId, ok = true, sample = preview.sample,
         confirmedRatio = preview.confirmedRatio, suspectRatio = preview.suspectRatio,
         topTwoRatio = preview.topTwoRatio, uniqueFingerprints = preview.uniqueFingerprints,
         structuralReject = preview.structuralReject, hardReject = preview.hardReject,
         fastBot = fastBot, at = os.clock(), frequencies = preview.frequencies,
+        fingerprintByUserId = current.fingerprintByUserId,
+        botByUserId = botByUserId,
     }
+    State.AutoTrader.PlayerBotRiskByUserId = botByUserId
     State.AutoTrader.CurrentServerAvatarScreen = result
     if fastBot then
         State.AutoTrader.FastBotHopActive = true
         State.AutoTrader.FastBotHopReason = "EXHAUSTED_BOT_HASH_PREVIEW"
+    elseif State.AutoTrader.FastBotHopReason == "EXHAUSTED_BOT_HASH_PREVIEW" then
+        State.AutoTrader.FastBotHopActive = false
+        State.AutoTrader.FastBotHopReason = nil
     end
     State.AutoTrader.Log("current_server_avatar_screen", result)
     return result
@@ -8231,6 +8524,12 @@ State.AutoTrader.ServerHopStillAllowed = function()
     local _, liveIncoming = State.AutoTrader.GetIncomingRequestUi()
     local exhausted = string.sub(tostring(currentDisposition), 1, 9) == "EXHAUSTED"
     local fastBot = State.AutoTrader.FastBotHopActive == true
+    if fastBot and currentDisposition == "ACTIVE" and State.AutoTrader.SelectTarget then
+        local retainTarget = State.AutoTrader.SelectTarget()
+        if retainTarget then
+            return false, "new profitable mixed-lobby target: " .. tostring(retainTarget.Name)
+        end
+    end
     local noWork = not State.AutoTrader.PendingRequest
         and not State.CurrentTrade
         and not State.AutoTrader.PostTradeAuditPending
@@ -8631,6 +8930,15 @@ State.AutoTrader.SelectTarget = function()
     local bestTotal = 0
     local now = os.clock()
     local canEconomicSkip = now - (State.AutoTrader.ServerJoinedAt or now) >= CONFIG.AutoTraderEconomicSkipGraceSeconds
+    local hopRate = State.AutoTrader.GetHopOpportunityRate()
+    local opportunityFloor = math.max(
+        CONFIG.AutoTraderTargetOpportunityFloor,
+        hopRate * CONFIG.AutoTraderHopOpportunityRetentionFactor
+    )
+    State.AutoTrader.LastOpportunityDecision = {
+        at = now, hopOpportunityRate = hopRate, retentionFloor = opportunityFloor,
+        bestScore = nil, bestName = nil, bestUserId = nil,
+    }
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and player.Parent then
             local serverEntry = State.AutoTrader.EnsureServerPlayer(player)
@@ -8645,13 +8953,13 @@ State.AutoTrader.SelectTarget = function()
                         if verified and total and total > 0 then
                             local score = State.AutoTrader.GetTargetScore(player, total)
                             local economicPath = State.AutoTrader.TargetHasEconomicPath(total)
-                            if canEconomicSkip and (not economicPath or score < CONFIG.AutoTraderTargetOpportunityFloor) then
+                            if canEconomicSkip and (not economicPath or score < opportunityFloor) then
                                 State.AutoTrader.MarkServerPlayerOutcome(
                                     player,
                                     "economic_skip",
                                     not economicPath
                                         and "known inventory cannot support even the cheapest safe local denomination"
-                                        or ("expected value/second below server-retention floor: " .. tostring(score))
+                                        or ("expected value/second below learned stay-vs-hop floor: " .. tostring(score) .. " < " .. tostring(opportunityFloor))
                                 )
                                 State.AutoTrader.Log("target_economic_skip", {
                                     userId = player.UserId,
@@ -8659,6 +8967,9 @@ State.AutoTrader.SelectTarget = function()
                                     verifiedTotal = total,
                                     score = score,
                                     economicPath = economicPath,
+                                    botRisk = State.AutoTrader.GetPlayerBotRisk and select(1, State.AutoTrader.GetPlayerBotRisk(player)) or 0,
+                                    hopOpportunityRate = hopRate,
+                                    retentionFloor = opportunityFloor,
                                 })
                             elseif economicPath and (
                                 not best
@@ -8678,6 +8989,11 @@ State.AutoTrader.SelectTarget = function()
     end
     State.AutoTrader.SelectedTarget = best
     State.AutoTrader.SelectedTargetScore = bestScore
+    if State.AutoTrader.LastOpportunityDecision then
+        State.AutoTrader.LastOpportunityDecision.bestScore = best and bestScore or nil
+        State.AutoTrader.LastOpportunityDecision.bestName = best and best.Name or nil
+        State.AutoTrader.LastOpportunityDecision.bestUserId = best and best.UserId or nil
+    end
     State.AutoTrader.SelectedTargetValue = bestTotal
     State.AutoTrader.SelectedTargetProfile = best and State.AutoTrader.GetTargetProfile(best) or nil
     return best
@@ -10346,6 +10662,8 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
                 State.AutoTrader.RecordTargetEvent(partner, "success", {
                     profit = completedPlan and completedPlan.win or 0,
                     seconds = tradeSeconds,
+                    negotiationStage = completedPlan and completedPlan.negotiationStage or nil,
+                    negotiationMargin = completedPlan and completedPlan.negotiationMargin or nil,
                 })
                 State.AutoTrader.MarkServerPlayerOutcome(partner, "traded", "post-trade audit passed")
             end
@@ -11321,16 +11639,44 @@ State.AutoTrader.OnNoTrade = function()
             State.AutoTrader.Log("current_avatar_screen_error", {error = tostring(screenResult)})
         end
         if screen and screen.fastBot then
-            State.AutoTrader.Status = "BOT LOBBY · FAST HOP"
-            State.AutoTrader.StatusDetail = string.format(
-                "Known bot-associated avatar ratio is too high (confirmed %.0f%% / suspect %.0f%%); leaving without waiting for full inventory discovery.",
-                (screen.confirmedRatio or 0) * 100,
-                (screen.suspectRatio or 0) * 100
-            )
-            State.AutoTrader.Render()
-            State.AutoTrader.FastBotHopReason = "EXHAUSTED_BOT_HASH_PREVIEW"
-            State.AutoTrader.TryServerHop("EXHAUSTED_BOT_HASH_PREVIEW", select(2, State.AutoTrader.GetServerDisposition()))
-            return
+            local mixedTarget = State.AutoTrader.SelectTarget()
+            local mixedDisposition, mixedCounts = State.AutoTrader.GetServerDisposition()
+            local serverAge = os.clock() - (State.AutoTrader.ServerJoinedAt or os.clock())
+            if mixedTarget then
+                -- Bot-heavy is not synonymous with worthless. Keep the server long
+                -- enough to work verified high-EV humans, while per-player bot risk
+                -- keeps the farm accounts at the bottom of the target queue.
+                State.AutoTrader.FastBotHopActive = false
+                State.AutoTrader.FastBotHopReason = nil
+                State.AutoTrader.Log("mixed_bot_lobby_retained_for_human", {
+                    target = mixedTarget.Name, userId = mixedTarget.UserId,
+                    score = State.AutoTrader.SelectedTargetScore,
+                    confirmedRatio = screen.confirmedRatio, suspectRatio = screen.suspectRatio,
+                })
+            elseif (tonumber(mixedCounts.unknown) or 0) > 0
+                and serverAge < CONFIG.AutoTraderMixedLobbyProbeSeconds then
+                State.AutoTrader.FastBotHopActive = false
+                State.AutoTrader.FastBotHopReason = nil
+                State.AutoTrader.Status = "BOT-HEAVY · CHECKING HUMANS"
+                State.AutoTrader.StatusDetail = string.format(
+                    "Bot-associated avatars are common here, but unresolved players get %.1fs to prove a profitable human opportunity before hopping.",
+                    math.max(0, CONFIG.AutoTraderMixedLobbyProbeSeconds - serverAge)
+                )
+                State.AutoTrader.Render()
+                return
+            else
+                State.AutoTrader.Status = "BOT LOBBY · FAST HOP"
+                State.AutoTrader.StatusDetail = string.format(
+                    "Known bot-associated avatar ratio is high (confirmed %.0f%% / suspect %.0f%%) and no worthwhile human target remains; hopping.",
+                    (screen.confirmedRatio or 0) * 100,
+                    (screen.suspectRatio or 0) * 100
+                )
+                State.AutoTrader.Render()
+                State.AutoTrader.FastBotHopActive = true
+                State.AutoTrader.FastBotHopReason = "EXHAUSTED_BOT_HASH_PREVIEW"
+                State.AutoTrader.TryServerHop("EXHAUSTED_BOT_HASH_PREVIEW", mixedCounts)
+                return
+            end
         end
         local dispositionNow, countsNow = State.AutoTrader.GetServerDisposition()
         local inventoryBot, inventoryBotInfo = State.AutoTrader.ShouldFastRejectInventoryBotLobby(countsNow)
@@ -11449,6 +11795,8 @@ State.AutoTrader.BuildDebug = function()
                     resolvedUnits = info.resolvedUnits,
                 } or nil,
                 score = score,
+                botRisk = State.AutoTrader.GetPlayerBotRisk and select(1, State.AutoTrader.GetPlayerBotRisk(player)) or 0,
+                botInfo = State.AutoTrader.GetPlayerBotRisk and select(2, State.AutoTrader.GetPlayerBotRisk(player)) or nil,
                 profile = profile,
                 stats = rawStats,
                 friend = State.AutoTrader.FriendCache[player.UserId],
@@ -11476,9 +11824,10 @@ State.AutoTrader.BuildDebug = function()
         end
     end
     local persistentStatsCount = 0
-    for _ in pairs(State.AutoTrader.TargetStats or {}) do
-        persistentStatsCount += 1
+    for key in pairs(State.AutoTrader.TargetStats or {}) do
+        if tostring(key) ~= "__strategy_v1" then persistentStatsCount += 1 end
     end
+    local strategyStats = State.AutoTrader.GetStrategyStats()
     local botIconSummary = {}
     for fingerprint, record in pairs(State.AutoTrader.BotIconDb.icons or {}) do
         local class, confidence = State.AutoTrader.GetBotIconClass(fingerprint)
@@ -11506,7 +11855,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V15",
+        format = "SV_AUTO_TRADER_SUPPORT_V16",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -11550,6 +11899,9 @@ State.AutoTrader.BuildDebug = function()
             noEligibleWorkTimeoutSeconds = CONFIG.AutoTraderNoEligibleWorkTimeoutSeconds,
             targetOpportunityFloor = CONFIG.AutoTraderTargetOpportunityFloor,
             economicSkipGraceSeconds = CONFIG.AutoTraderEconomicSkipGraceSeconds,
+            learnedHopOpportunityRate = State.AutoTrader.GetHopOpportunityRate(),
+            hopOpportunityRetentionFactor = CONFIG.AutoTraderHopOpportunityRetentionFactor,
+            mixedLobbyProbeSeconds = CONFIG.AutoTraderMixedLobbyProbeSeconds,
             negotiationMargins = {
                 CONFIG.AutoTraderNegotiationStage1Margin,
                 CONFIG.AutoTraderNegotiationStage2Margin,
@@ -11578,7 +11930,7 @@ State.AutoTrader.BuildDebug = function()
             maxStabilityDrop = CONFIG.AutoTraderMaxStabilityDrop,
         },
         solverConfig = {
-            objective = "maximize audited Supreme-value gain/hour subject to hard safety floors",
+            objective = "maximize learned audited Supreme-value gain/hour with mixed-lobby per-player bot risk and stay-vs-hop opportunity cost",
             maxOfferSlots = CONFIG.MaxOfferSlots,
             exactStateLimit = CONFIG.AutoTraderExactStateLimit,
             beamWidth = CONFIG.AutoTraderBeamWidth,
@@ -11595,6 +11947,13 @@ State.AutoTrader.BuildDebug = function()
         status = State.AutoTrader.Status,
         statusDetail = State.AutoTrader.StatusDetail,
         negotiation = State.AutoTrader.LastNegotiation,
+        opportunityDecision = State.AutoTrader.LastOpportunityDecision,
+        strategyLearning = {
+            global = strategyStats.global,
+            bands = strategyStats.bands,
+            marginStages = strategyStats.marginStages,
+            hopOpportunityRate = State.AutoTrader.GetHopOpportunityRate(),
+        },
         anchorAttractiveness = State.AutoTrader.LastAnchorAttractiveness,
         sessionFrozen = State.AutoTrader.SessionFrozen,
         fatalIntegrityStop = State.AutoTrader.FatalIntegrityStop,
@@ -11727,7 +12086,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V15\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V16\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -12146,8 +12505,9 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
             local pending = State.AutoTrader.PendingRequest
             local player = pending and Players:GetPlayerByUserId(pending.userId) or nil
             if player then
-                State.AutoTrader.RecordTargetEvent(player, "response", {seconds = pending and (os.clock() - pending.sentAt) or nil})
-                State.AutoTrader.RecordTargetEvent(player, "decline")
+                local responseSeconds = pending and (os.clock() - pending.sentAt) or nil
+                State.AutoTrader.RecordTargetEvent(player, "response", {seconds = responseSeconds})
+                State.AutoTrader.RecordTargetEvent(player, "decline", {seconds = responseSeconds})
                 State.AutoTrader.MarkServerPlayerOutcome(player, "declined", "request declined")
                 State.AutoTrader.SetCooldown(player, "request declined")
             end
@@ -12220,6 +12580,12 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
             local partner = State.AutoTrader.LastTradePartner
             local localDecline = os.clock() - (State.AutoTrader.LocalDeclineAt or 0) <= 0.8
             if partner and not localDecline then
+                local negotiation = State.AutoTrader.LastNegotiation
+                State.AutoTrader.RecordTargetEvent(partner, "tradeDecline", {
+                    seconds = State.AutoTrader.TradeBeganAt > 0 and (os.clock() - State.AutoTrader.TradeBeganAt) or nil,
+                    negotiationStage = negotiation and negotiation.stage or nil,
+                    negotiationMargin = negotiation and negotiation.margin or nil,
+                })
                 State.AutoTrader.MarkServerPlayerOutcome(partner, "trade_declined", "active trade declined")
                 State.AutoTrader.SetCooldown(partner, "active trade declined")
             elseif partner and localDecline then
@@ -12331,7 +12697,7 @@ State.AutoTrader.CancelIgnoredRequest = function()
     end
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
     if player then
-        State.AutoTrader.RecordTargetEvent(player, "ignored")
+        State.AutoTrader.RecordTargetEvent(player, "ignored", {seconds = pending and (os.clock() - pending.sentAt) or CONFIG.AutoTraderPendingRequestTimeoutSeconds})
         State.AutoTrader.MarkServerPlayerOutcome(player, "no_response", "request timed out")
         State.AutoTrader.SetCooldown(player, "request ignored", 75)
     end
@@ -12366,6 +12732,12 @@ State.AutoTrader.EndIdleTrade = function()
         return false
     end
     if partner then
+        local negotiation = State.AutoTrader.LastNegotiation
+        State.AutoTrader.RecordTargetEvent(partner, "idle", {
+            seconds = State.AutoTrader.TradeBeganAt > 0 and (os.clock() - State.AutoTrader.TradeBeganAt) or CONFIG.AutoTraderTradeIdleTimeoutSeconds,
+            negotiationStage = negotiation and negotiation.stage or nil,
+            negotiationMargin = negotiation and negotiation.margin or nil,
+        })
         State.AutoTrader.MarkServerPlayerOutcome(partner, "idle", "trade idle/no response")
         State.AutoTrader.SetCooldown(partner, "trade idle/no response", CONFIG.AutoTraderCooldownSeconds)
     end
@@ -12382,7 +12754,7 @@ State.AutoTrader.EndIdleTrade = function()
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
     State.AutoTrader.Status = "COOLDOWN · IDLE TRADE"
     State.AutoTrader.StatusDetail = partner
-        and (partner.Name .. " made no trade progress for about 35s; trade ended and player cooled down.")
+        and (partner.Name .. " made no trade progress inside the bounded trade-idle window; trade ended and player cooled down.")
         or "Idle trade ended automatically."
     State.AutoTrader.Render()
     return true

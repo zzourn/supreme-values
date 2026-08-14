@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.46-public-auto-trader-v14-executor-http-startup-fix",
+    version = "18.47-public-auto-trader-v15-profit-throughput",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -39,8 +39,19 @@ local CONFIG = {
     AutoTraderPostTradeAuditTimeoutSeconds = 8,
     AutoTraderPendingRequestTimeoutSeconds = 12,
     AutoTraderFirstOfferTimeoutSeconds = 18,
-    AutoTraderTradeIdleTimeoutSeconds = 35,
+    AutoTraderTradeIdleTimeoutSeconds = 26,
     AutoTraderAnchorMaxValue = 100,
+    -- Profit-throughput optimizer. The dynamic minimum win remains the hard
+    -- safety floor; these margins are negotiation targets above that floor.
+    AutoTraderNegotiationStage1Margin = 0.18,
+    AutoTraderNegotiationStage2Margin = 0.11,
+    AutoTraderNegotiationStage3Margin = 0.06,
+    AutoTraderNegotiationStage2Seconds = 3.5,
+    AutoTraderNegotiationStage3Seconds = 7.0,
+    AutoTraderNegotiationFinalSeconds = 11.0,
+    AutoTraderTargetOpportunityFloor = 0.014,
+    AutoTraderEconomicSkipGraceSeconds = 12,
+
     AutoTraderBeamWidth = 3200,
     AutoTraderExactStateLimit = 10000,
     AutoTraderExactQuantityLimit = 80,
@@ -6699,35 +6710,83 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
         return -math.huge
     end
     local stats = State.AutoTrader.GetPlayerStats(player)
-    local responseRate = ((tonumber(stats.responses) or 0) + 1.5)
-        / ((tonumber(stats.requests) or 0) + 2)
-    local successRate = ((tonumber(stats.successes) or 0) + 0.8)
-        / ((tonumber(stats.trades) or 0) + 2)
-    local avgResponse = (tonumber(stats.responses) or 0) > 0
-        and ((tonumber(stats.totalResponseSeconds) or 0) / stats.responses)
+    local requests = math.max(0, tonumber(stats.requests) or 0)
+    local responses = math.max(0, tonumber(stats.responses) or 0)
+    local trades = math.max(0, tonumber(stats.trades) or 0)
+    local successes = math.max(0, tonumber(stats.successes) or 0)
+
+    -- Hierarchical-ish priors: response, trade-start given a response, then
+    -- audited success given a started trade. These are deliberately smoothed so
+    -- one stranger is not permanently condemned after one unlucky interaction.
+    local responseRate = clamp((responses + 2.2) / (requests + 3.2), 0.08, 0.96)
+    local tradeRate = clamp((trades + 1.4) / (responses + 2.8), 0.08, 0.92)
+    local successRate = clamp((successes + 0.9) / (trades + 3.2), 0.05, 0.80)
+
+    local avgResponse = responses > 0
+        and ((tonumber(stats.totalResponseSeconds) or 0) / responses)
         or 5
-    local avgTrade = (tonumber(stats.successes) or 0) > 0
-        and ((tonumber(stats.totalTradeSeconds) or 0) / stats.successes)
-        or 18
-    local expectedSeconds = math.max(3, avgResponse + avgTrade)
-    local expectedProfit = (tonumber(stats.successes) or 0) > 0
-        and math.max(1, (tonumber(stats.totalProfit) or 0) / stats.successes)
-        or math.max(1, math.min(20, math.sqrt(total) * 0.65))
-    local freshBonus = (tonumber(stats.requests) or 0) < 0.25 and 1.15 or 1
-    local incomingBonus = 1 + math.min(0.25, (tonumber(stats.incomingRequests) or 0) * 0.04)
+    local avgTrade = successes > 0
+        and ((tonumber(stats.totalTradeSeconds) or 0) / successes)
+        or 16
+    local expectedSeconds = math.max(4, avgResponse + avgTrade)
+
     local profile = State.AutoTrader.GetTargetProfile(player)
     local compositionMultiplier = profile and profile.multiplier or 0.70
-    local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.35)
+    local usefulTypes = profile and math.max(0, tonumber(profile.usefulTypes) or 0) or 0
+    local distinctNumeric = profile and math.max(0, tonumber(profile.distinctNumeric) or 0) or 0
+    local denominationMultiplier = 0.82
+        + clamp(usefulTypes / 8, 0, 1) * 0.24
+        + clamp(distinctNumeric / 12, 0, 1) * 0.10
+
+    -- Unlike v14's sqrt(total) estimate capped at 20, this keeps meaningful
+    -- separation between medium and large inventories while still preventing a
+    -- single huge inventory from dominating every decision.
+    local priorProfit = math.max(1, math.min(150, math.sqrt(total) * 2.0))
+    local learnedProfit = successes > 0
+        and math.max(1, (tonumber(stats.totalProfit) or 0) / successes)
+        or priorProfit
+    local expectedProfit = learnedProfit * compositionMultiplier * denominationMultiplier
+
+    local freshBonus = requests < 0.25 and 1.08 or 1
+    local incomingBonus = 1 + math.min(0.20, (tonumber(stats.incomingRequests) or 0) * 0.035)
+    local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.45)
+    local declinePenalty = 1 / (1 + (tonumber(stats.declines) or 0) * 0.10)
+
+    -- Score is expected audited Supreme-value gain per second, with only a tiny
+    -- tie-breaking preference for larger inventories.
     return (
         expectedProfit
         * responseRate
+        * tradeRate
         * successRate
         * freshBonus
         * incomingBonus
-        * compositionMultiplier
         * auditPenalty
+        * declinePenalty
         / expectedSeconds
-    ) + math.sqrt(total) * 0.0005
+    ) + math.log(total + 1) * 0.00008
+end
+
+State.AutoTrader.GetMinimumTradableUnitValue = function()
+    local tradable = State.AutoTrader.GetTradableInventory()
+    if type(tradable) ~= "table" then return nil end
+    local minimum = nil
+    for _, entry in ipairs(tradable) do
+        local value = tonumber(entry.unitValue)
+        if value and value > 0 and (tonumber(entry.maxQuantity) or 0) > 0 then
+            minimum = not minimum and value or math.min(minimum, value)
+        end
+    end
+    return minimum
+end
+
+State.AutoTrader.TargetHasEconomicPath = function(verifiedTotal)
+    local total = tonumber(verifiedTotal) or 0
+    if total <= 0 then return false end
+    local minimumLocal = State.AutoTrader.GetMinimumTradableUnitValue()
+    if not minimumLocal then return true end -- don't skip merely because local inventory is refreshing
+    local conservativeMinWin = math.max(State.AutoTrader.GetMinimumWin(), total * CONFIG.AutoTraderMinWinPercent)
+    return total - conservativeMinWin >= minimumLocal - 0.000001
 end
 State.AutoTrader.GetReserve = function(itemType, itemId)
     local key = State.Mapping.MakeItemKey(itemType, itemId)
@@ -6910,6 +6969,7 @@ State.AutoTrader.IsTerminalServerOutcome = function(outcome)
         or outcome == "trade_unavailable"
         or outcome == "trade_declined"
         or outcome == "idle"
+        or outcome == "economic_skip"
 end
 State.AutoTrader.GetServerPlayerClassification = function(player)
     local state = State.AutoTrader.EnsureServerPlayer(player)
@@ -8570,6 +8630,7 @@ State.AutoTrader.SelectTarget = function()
     local bestScore = -math.huge
     local bestTotal = 0
     local now = os.clock()
+    local canEconomicSkip = now - (State.AutoTrader.ServerJoinedAt or now) >= CONFIG.AutoTraderEconomicSkipGraceSeconds
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and player.Parent then
             local serverEntry = State.AutoTrader.EnsureServerPlayer(player)
@@ -8583,10 +8644,28 @@ State.AutoTrader.SelectTarget = function()
                         local total, verified = State.AutoTrader.GetVerifiedPlayerValue(player)
                         if verified and total and total > 0 then
                             local score = State.AutoTrader.GetTargetScore(player, total)
-                            if not best
+                            local economicPath = State.AutoTrader.TargetHasEconomicPath(total)
+                            if canEconomicSkip and (not economicPath or score < CONFIG.AutoTraderTargetOpportunityFloor) then
+                                State.AutoTrader.MarkServerPlayerOutcome(
+                                    player,
+                                    "economic_skip",
+                                    not economicPath
+                                        and "known inventory cannot support even the cheapest safe local denomination"
+                                        or ("expected value/second below server-retention floor: " .. tostring(score))
+                                )
+                                State.AutoTrader.Log("target_economic_skip", {
+                                    userId = player.UserId,
+                                    name = player.Name,
+                                    verifiedTotal = total,
+                                    score = score,
+                                    economicPath = economicPath,
+                                })
+                            elseif economicPath and (
+                                not best
                                 or score > bestScore + 0.000001
                                 or (math.abs(score - bestScore) <= 0.000001 and total > bestTotal)
-                                or (math.abs(score - bestScore) <= 0.000001 and total == bestTotal and player.UserId < best.UserId) then
+                                or (math.abs(score - bestScore) <= 0.000001 and total == bestTotal and player.UserId < best.UserId)
+                            ) then
                                 best = player
                                 bestScore = score
                                 bestTotal = total
@@ -8784,31 +8863,36 @@ State.AutoTrader.GetTradableInventory = function()
 end
 State.AutoTrader.GetAnchor = function(entries)
     local best = nil
+    local bestScore = -math.huge
     for _, entry in ipairs(entries or {}) do
         if entry.unitValue
             and entry.unitValue > 0
             and entry.unitValue <= CONFIG.AutoTraderAnchorMaxValue
             and entry.maxQuantity > 0 then
+            local data = entry.record and entry.record.data or {}
             local duplicate = entry.maxQuantity >= 2 and 1 or 0
-            if not best then
+            local demand = tonumber(entry.demand) or tonumber(data.demand) or 0
+            local flip = data.flippability and (FLIP_SCORE[data.flippability] or 0) or 0
+            local stability = data.stability and (STABILITY_SCORE[data.stability] or 0) or 0
+            local risk = 0
+            if data.stability == "Receding" then risk += 3.5 end
+            if data.stability == "Underpaid For" then risk += 2.0 end
+            if data.stability == "Untradable" then risk += 100 end
+            local costPenalty = math.log((tonumber(entry.unitValue) or 0) + 1) * 1.35
+            local score = demand * 2.4
+                + flip * 1.35
+                + stability * 0.65
+                + (State.AutoTrader.Preferences.preferDuplicates and duplicate * 3.0 or duplicate * 1.0)
+                - costPenalty
+                - risk
+            if not best or score > bestScore + 0.000001
+                or (math.abs(score - bestScore) <= 0.000001 and entry.unitValue < best.unitValue) then
                 best = entry
-            else
-                local bestDuplicate = best.maxQuantity >= 2 and 1 or 0
-                if State.AutoTrader.Preferences.preferDuplicates
-                    and duplicate ~= bestDuplicate then
-                    if duplicate > bestDuplicate then
-                        best = entry
-                    end
-                elseif entry.demand ~= best.demand then
-                    if entry.demand > best.demand then
-                        best = entry
-                    end
-                elseif entry.unitValue > best.unitValue then
-                    best = entry
-                end
+                bestScore = score
             end
         end
     end
+    State.AutoTrader.LastAnchorAttractiveness = best and bestScore or nil
     return best
 end
 State.AutoTrader.OfferHash = function(entries)
@@ -9008,15 +9092,49 @@ State.AutoTrader.QuantityOptions = function(maxQuantity, unitValue, lower, upper
     table.sort(result)
     return result
 end
-State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation)
+State.AutoTrader.GetNegotiationStage = function(otherSummary)
+    local stableFor = math.max(0, os.clock() - (State.AutoTrader.OtherStableSince or os.clock()))
+    local margin, stage, nextAt
+    if stableFor < CONFIG.AutoTraderNegotiationStage2Seconds then
+        margin, stage, nextAt = CONFIG.AutoTraderNegotiationStage1Margin, 1, CONFIG.AutoTraderNegotiationStage2Seconds
+    elseif stableFor < CONFIG.AutoTraderNegotiationStage3Seconds then
+        margin, stage, nextAt = CONFIG.AutoTraderNegotiationStage2Margin, 2, CONFIG.AutoTraderNegotiationStage3Seconds
+    elseif stableFor < CONFIG.AutoTraderNegotiationFinalSeconds then
+        margin, stage, nextAt = CONFIG.AutoTraderNegotiationStage3Margin, 3, CONFIG.AutoTraderNegotiationFinalSeconds
+    else
+        margin, stage, nextAt = 0, 4, nil
+    end
+    local hardMin = State.AutoTrader.GetEffectiveMinimumWin(otherSummary)
+    local known = math.max(0, tonumber(otherSummary and otherSummary.knownFloor) or 0)
+    local targetProfit = math.max(hardMin, known * margin)
+    return {
+        stage = stage,
+        margin = margin,
+        stableFor = stableFor,
+        nextAt = nextAt,
+        nextIn = nextAt and math.max(0, nextAt - stableFor) or nil,
+        targetProfit = targetProfit,
+        final = stage >= 4,
+    }
+end
+
+State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation, negotiation)
     local minWin, minInfo = State.AutoTrader.GetEffectiveMinimumWin(otherSummary)
     local upper = otherSummary.knownFloor - minWin
+    negotiation = negotiation or State.AutoTrader.GetNegotiationStage(otherSummary)
+    local targetProfit = math.max(minWin, tonumber(negotiation.targetProfit) or minWin)
+    local targetUpper = math.max(0, math.min(upper, otherSummary.knownFloor - targetProfit))
     local diagnostics = {
         receiveKnownFloor = otherSummary.knownFloor,
         unknownCount = otherSummary.unknownCount,
         minimumWin = minWin,
         minimumWinInfo = minInfo,
         upper = upper,
+        targetUpper = targetUpper,
+        targetProfit = targetProfit,
+        negotiationStage = negotiation.stage,
+        negotiationMargin = negotiation.margin,
+        proactiveAccept = negotiation.final == true,
         candidateCount = 0,
         peakStates = 1,
         pruned = false,
@@ -9120,8 +9238,11 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation)
             if #nextStates > CONFIG.AutoTraderExactStateLimit then
                 diagnostics.pruned = true
                 table.sort(nextStates, function(a, b)
-                    local aDistance = upper - a.total
-                    local bDistance = upper - b.total
+                    local aPreferred = a.total <= targetUpper + 0.000001
+                    local bPreferred = b.total <= targetUpper + 0.000001
+                    if aPreferred ~= bPreferred then return aPreferred end
+                    local aDistance = math.abs(targetUpper - a.total)
+                    local bDistance = math.abs(targetUpper - b.total)
                     if math.abs(aDistance - bDistance) > 0.000001 then
                         return aDistance < bDistance
                     end
@@ -9144,8 +9265,13 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation)
         end
     end
     table.sort(states, function(a, b)
-        if math.abs(a.total - b.total) > 0.000001 then
-            return a.total > b.total
+        local aPreferred = a.total <= targetUpper + 0.000001
+        local bPreferred = b.total <= targetUpper + 0.000001
+        if aPreferred ~= bPreferred then return aPreferred end
+        local aDistance = math.abs(targetUpper - a.total)
+        local bDistance = math.abs(targetUpper - b.total)
+        if math.abs(aDistance - bDistance) > 0.000001 then
+            return aDistance < bDistance
         end
         if a.slots ~= b.slots then
             return a.slots < b.slots
@@ -9186,6 +9312,11 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation)
     end
     best.minWin = minWin
     best.minimumWinInfo = minInfo
+    best.targetProfit = targetProfit
+    best.targetUpper = targetUpper
+    best.negotiationStage = negotiation.stage
+    best.negotiationMargin = negotiation.margin
+    best.proactiveAccept = negotiation.final == true
     best.receiveTotal = otherSummary.knownFloor
     best.unknownCount = otherSummary.unknownCount
     best.win = otherSummary.knownFloor - best.total
@@ -10289,11 +10420,18 @@ State.AutoTrader.ReconcileDesired = function(localEntries, desired, context)
         State.AutoTrader.Status = "WAIT · KNOWN VALUE"
         State.AutoTrader.StatusDetail = "Their offer has no numeric known value yet; your automated offer is empty."
     else
-        State.AutoTrader.Status = "OFFER READY · AUTO ACCEPT"
-        State.AutoTrader.StatusDetail = "Exact verified plan is present. Running the final acceptance gate."
+        local proactive = State.AutoTrader.Plan and State.AutoTrader.Plan.proactiveAccept == true
+        if proactive or State.AutoTrader.OtherAcceptedAt > 0 then
+            State.AutoTrader.Status = "OFFER READY · AUTO ACCEPT"
+            State.AutoTrader.StatusDetail = "Exact verified plan is present. Running the final acceptance gate."
+        else
+            State.AutoTrader.Status = "NEGOTIATING · HOLDING MARGIN"
+            State.AutoTrader.StatusDetail = "Higher-profit offer is ready. Waiting briefly for them to accept before conceding toward the hard safety floor."
+        end
     end
     State.AutoTrader.Render()
-    if context and context.kind == "plan" then
+    if context and context.kind == "plan"
+        and (State.AutoTrader.OtherAcceptedAt > 0 or (State.AutoTrader.Plan and State.AutoTrader.Plan.proactiveAccept == true)) then
         State.AutoTrader.TryAutoAccept()
     end
 end
@@ -10966,6 +11104,22 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         State.AutoTrader.Render()
         return
     end
+    local negotiation = State.AutoTrader.GetNegotiationStage(otherSummary)
+    State.AutoTrader.LastNegotiation = negotiation
+    local scheduleKey = otherHash .. "|stage:" .. tostring(negotiation.stage)
+    if negotiation.nextIn and State.AutoTrader.LastNegotiationScheduleKey ~= scheduleKey then
+        State.AutoTrader.LastNegotiationScheduleKey = scheduleKey
+        local expectedHash = otherHash
+        local expectedStage = negotiation.stage
+        task.delay(negotiation.nextIn + 0.06, function()
+            if Destroyed or not State.CurrentTrade or State.AutoTrader.LastOtherHash ~= expectedHash then return end
+            local current = State.AutoTrader.GetNegotiationStage(State.AutoTrader.OtherSummary or otherSummary)
+            if current.stage ~= expectedStage then
+                State.AutoTrader.LastCalculationSignature = nil
+                scheduleTradeRefresh(0)
+            end
+        end)
+    end
     local mappingRevision = State.Mapping.Revision
     local inventoryStamp = inventorySnapshot and inventorySnapshot.lastSuccess or nil
     local calculationSignature = otherHash
@@ -10983,6 +11137,7 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         .. tostring(State.AutoTrader.ReserveTypeCount())
         .. "|"
         .. tostring(State.AutoTrader.Preferences.unknownTheirZero)
+        .. "|neg:" .. tostring(negotiation.stage)
     if State.AutoTrader.LastCalculationSignature == calculationSignature and State.AutoTrader.Plan then
         if State.AutoTrader.Preferences.automation and State.AutoTrader.Desired then
             local context = State.AutoTrader.BuildActionContext("plan", otherHash, inventorySnapshot, partner)
@@ -10998,10 +11153,12 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     local expectedDatabase = SupremeDatabase
     local expectedPartnerUserId = partner.UserId
     State.AutoTrader.Status = "CALCULATING"
-    State.AutoTrader.StatusDetail = "Finding the highest-value market-safe offer that preserves the dynamic minimum win after reserves."
+    State.AutoTrader.StatusDetail = "Optimizing expected value/hour: targeting negotiation stage "
+        .. tostring(negotiation.stage)
+        .. " while preserving the same hard dynamic minimum-win and market-quality floors."
     State.AutoTrader.Render()
     task.spawn(function()
-        local plan, reason, diagnostics = State.AutoTrader.FindPlan(otherSummary, tradable, generation)
+        local plan, reason, diagnostics = State.AutoTrader.FindPlan(otherSummary, tradable, generation, negotiation)
         if Destroyed or generation ~= State.AutoTrader.PlanGeneration then
             return
         end
@@ -11049,13 +11206,21 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             and "PLAN VERIFIED"
             or "SHADOW READY"
         State.AutoTrader.StatusDetail = State.AutoTrader.Preferences.automation
-            and "Plan passed dynamic-profit and market-quality validation; reconciling one verified mutation at a time, then auto-accepting after the cooldown."
+            and (plan.proactiveAccept
+                and "Final concession stage: exact safe plan is being reconciled and may auto-accept after the cooldown."
+                or ("Holding a higher-profit negotiation stage (target margin "
+                    .. formatPercent((plan.negotiationMargin or 0) * 100, false)
+                    .. "). The bot will concede only if the same offer remains on the table."))
             or "Plan passed dynamic-profit and market-quality validation. Auto Trading is currently off."
         State.AutoTrader.Log("plan_ready", {
             receiveKnownFloor = plan.receiveTotal,
             unknownCount = plan.unknownCount,
             give = plan.total,
             win = plan.win,
+            targetProfit = plan.targetProfit,
+            negotiationStage = plan.negotiationStage,
+            negotiationMargin = plan.negotiationMargin,
+            proactiveAccept = plan.proactiveAccept,
             items = plan.items,
         })
         State.AutoTrader.Render()
@@ -11066,6 +11231,10 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     end)
 end
 State.AutoTrader.ClearTradeRuntime = function()
+    -- Do not rely on a secondary TradeGUI-disabled event to clear the authoritative
+    -- state. Some executors miss that signal, which previously left REQUEST GATE
+    -- stuck on "trade state active" after a decline.
+    State.CurrentTrade = nil
     State.AutoTrader.PlanGeneration += 1
     State.AutoTrader.ActionGeneration += 1
     State.AutoTrader.ActionInFlight = nil
@@ -11075,6 +11244,8 @@ State.AutoTrader.ClearTradeRuntime = function()
     State.AutoTrader.LastOtherHash = nil
     State.AutoTrader.LastCalculationSignature = nil
     State.AutoTrader.OtherStableSince = 0
+    State.AutoTrader.LastNegotiation = nil
+    State.AutoTrader.LastNegotiationScheduleKey = nil
     State.AutoTrader.Plan = nil
     State.AutoTrader.Safety = nil
     State.AutoTrader.Anchor = nil
@@ -11186,7 +11357,7 @@ State.AutoTrader.OnNoTrade = function()
         elseif target then
             State.AutoTrader.ServerExhaustedSince = 0
             State.AutoTrader.Status = "AUTO TARGET"
-            State.AutoTrader.StatusDetail = "Next eligible: " .. target.Name .. ". Ranked by expected profit/time plus verified inventory quality; one request at a time."
+            State.AutoTrader.StatusDetail = "Next eligible: " .. target.Name .. ". Ranked by estimated audited Supreme-value gain per second, response/trade probability, and usable inventory composition."
             local started, requestReason = State.AutoTrader.TrySendRequest()
             if not started and requestReason == "request spacing" then
                 State.AutoTrader.Status = "WAIT · REQUEST SPACING"
@@ -11335,7 +11506,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V14",
+        format = "SV_AUTO_TRADER_SUPPORT_V15",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -11377,6 +11548,19 @@ State.AutoTrader.BuildDebug = function()
             serverHopHardTimeoutSeconds = CONFIG.AutoTraderServerHopHardTimeoutSeconds,
             teleportHardTimeoutSeconds = CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds,
             noEligibleWorkTimeoutSeconds = CONFIG.AutoTraderNoEligibleWorkTimeoutSeconds,
+            targetOpportunityFloor = CONFIG.AutoTraderTargetOpportunityFloor,
+            economicSkipGraceSeconds = CONFIG.AutoTraderEconomicSkipGraceSeconds,
+            negotiationMargins = {
+                CONFIG.AutoTraderNegotiationStage1Margin,
+                CONFIG.AutoTraderNegotiationStage2Margin,
+                CONFIG.AutoTraderNegotiationStage3Margin,
+                0,
+            },
+            negotiationStageSeconds = {
+                CONFIG.AutoTraderNegotiationStage2Seconds,
+                CONFIG.AutoTraderNegotiationStage3Seconds,
+                CONFIG.AutoTraderNegotiationFinalSeconds,
+            },
             botPreviewHardRejectRatio = CONFIG.AutoTraderBotHardRejectRatio,
             botConfirmMinJobs = CONFIG.AutoTraderBotConfirmMinJobs,
             botSuspectMinJobs = CONFIG.AutoTraderBotSuspectMinJobs,
@@ -11394,6 +11578,7 @@ State.AutoTrader.BuildDebug = function()
             maxStabilityDrop = CONFIG.AutoTraderMaxStabilityDrop,
         },
         solverConfig = {
+            objective = "maximize audited Supreme-value gain/hour subject to hard safety floors",
             maxOfferSlots = CONFIG.MaxOfferSlots,
             exactStateLimit = CONFIG.AutoTraderExactStateLimit,
             beamWidth = CONFIG.AutoTraderBeamWidth,
@@ -11409,6 +11594,8 @@ State.AutoTrader.BuildDebug = function()
         },
         status = State.AutoTrader.Status,
         statusDetail = State.AutoTrader.StatusDetail,
+        negotiation = State.AutoTrader.LastNegotiation,
+        anchorAttractiveness = State.AutoTrader.LastAnchorAttractiveness,
         sessionFrozen = State.AutoTrader.SessionFrozen,
         fatalIntegrityStop = State.AutoTrader.FatalIntegrityStop,
         operationalFreezeAt = State.AutoTrader.OperationalFreezeAt,
@@ -11540,7 +11727,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V14\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V15\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()

@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.65.1-public-auto-trader-v33-bootstrap-compat",
+    version = "18.65.3-public-auto-trader-v33-startup-performance",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -230,7 +230,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V33",
-    distributionNormalizedSha256 = "ba43cc1ffd91fb754b6572511b7d2baab761f6352bfc5d17904f315189a0a48b",
+    distributionNormalizedSha256 = "edca284cb5e2b69fa6123da5dd931fc000deb0ff1f39a6fb80055166a8d39fd6",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -378,12 +378,27 @@ HARDEN.sha256K = {
     0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
 }
-local function sha256Hex(message)
-    -- v32: process at most four source bytes per string.byte call. v31 expanded
-    -- the entire ~900 KB script as return values, which overflows some executors.
-    if type(message) ~= "string" or type(bit32) ~= "table" then return nil end
+local function sha256Hex(message, cooperative)
+    -- Large Supreme payloads are hashed cooperatively so pure-Luau SHA does not
+    -- monopolize the VM for many seconds. Small integrity checks stay synchronous.
+    if type(message) ~= "string" or type(bit32) ~= "table" then return nil, 0, 0 end
+    local startedAt = os.clock()
+    local yieldEnabled = cooperative == true and #message >= 1048576 and RunService ~= nil
+    local yieldStartedAt = startedAt
+    local blocksSinceYield = 0
+    local yieldCount = 0
     local band, bxor, bnot, rshift, rrotate = bit32.band, bit32.bxor, bit32.bnot, bit32.rshift, bit32.rrotate
     local h0,h1,h2,h3,h4,h5,h6,h7 = 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+    local function maybeYield()
+        if not yieldEnabled then return end
+        blocksSinceYield += 1
+        if blocksSinceYield >= 64 and os.clock() - yieldStartedAt >= 0.003 then
+            blocksSinceYield = 0
+            yieldCount += 1
+            RunService.Heartbeat:Wait()
+            yieldStartedAt = os.clock()
+        end
+    end
     local function processBlock(source, offset)
         local w = {}
         for i = 0, 15 do
@@ -408,12 +423,13 @@ local function sha256Hex(message)
             h,g,f,e,d,c,b,a = g,f,e,band(d + t1, 0xffffffff),c,b,a,band(t1 + t2, 0xffffffff)
         end
         h0,h1,h2,h3,h4,h5,h6,h7 = band(h0+a,0xffffffff),band(h1+b,0xffffffff),band(h2+c,0xffffffff),band(h3+d,0xffffffff),band(h4+e,0xffffffff),band(h5+f,0xffffffff),band(h6+g,0xffffffff),band(h7+h,0xffffffff)
+        maybeYield()
         return true
     end
     local byteLength = #message
     local fullBytes = byteLength - (byteLength % 64)
     for offset = 1, fullBytes, 64 do
-        if not processBlock(message, offset) then return nil end
+        if not processBlock(message, offset) then return nil, yieldCount, (os.clock() - startedAt) * 1000 end
     end
     local bitLength = byteLength * 8
     local high = math.floor(bitLength / 4294967296)
@@ -427,9 +443,9 @@ local function sha256Hex(message)
     local tail = string.sub(message, fullBytes + 1) .. string.char(0x80)
     tail = tail .. string.rep("\0", (56 - (#tail % 64)) % 64) .. u32be(high) .. u32be(low)
     for offset = 1, #tail, 64 do
-        if not processBlock(tail, offset) then return nil end
+        if not processBlock(tail, offset) then return nil, yieldCount, (os.clock() - startedAt) * 1000 end
     end
-    return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", h0,h1,h2,h3,h4,h5,h6,h7)
+    return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", h0,h1,h2,h3,h4,h5,h6,h7), yieldCount, (os.clock() - startedAt) * 1000
 end
 local function normalizeDistributionSourceForHash(source)
     if type(source) ~= "string" then return nil end
@@ -909,7 +925,9 @@ local HttpState = {
     requestCount = 0, gameHttpGetCount = 0, notModifiedCount = 0, fullDownloadCount = 0,
     downloadedBytes = 0, errorCount = 0,
 }
-HARDEN.supremeLkgFile = "SV_AutoTrader_SupremeValues_LKG_v1.json"
+HARDEN.supremeLkgFile = "SV_AutoTrader_SupremeValues_LKG_v2.body"
+HARDEN.supremeLkgMetaFile = "SV_AutoTrader_SupremeValues_LKG_v2.meta.json"
+HARDEN.supremeLkgLegacyFile = "SV_AutoTrader_SupremeValues_LKG_v1.json"
 HARDEN.mappingsLkgFile = "SV_AutoTrader_LinkedImages_LKG_v1.json"
 State.Mapping = {
     ItemLinks = {},
@@ -1406,37 +1424,48 @@ local function validateSupremeCandidate(decoded, candidateCatalog, candidateDiag
     if metadataCount and metadataCount > 0 and candidateCount < math.floor(metadataCount * 0.80) then return false, "The candidate database indexed fewer items than its metadata claims." end
     return true
 end
-local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix)
-    if type(body) ~= "string" or body == "" then return false, "empty Supreme Values body", false end
-    if #body > CONFIG.SupremeJsonMaxBytes then return false, "Supreme Values JSON exceeded the configured body-size limit", false end
+local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix, verifiedDigest)
+    if type(body) ~= "string" or body == "" then return false, "empty Supreme Values body", false, nil end
+    if #body > CONFIG.SupremeJsonMaxBytes then return false, "Supreme Values JSON exceeded the configured body-size limit", false, nil end
     if LastSupremeBody == body and SupremeDatabase then
         LastDatabaseLoad = os.time(); HARDEN.lastDatabaseVerifiedAt = tonumber(verifiedAtUnix) or HARDEN.lastDatabaseVerifiedAt or 0; DatabaseStatus = "Ready"; HARDEN.lastDatabaseSource = sourceLabel or HARDEN.lastDatabaseSource; HttpState.supremeUnchanged += 1
-        return true, nil, false
+        return true, nil, false, HARDEN.supremeDataHash
     end
     local decodeOK, decoded = pcall(function() return HttpService:JSONDecode(body) end)
-    if not decodeOK then return false, "JSON decode failed: " .. tostring(decoded), false end
+    if not decodeOK then return false, "JSON decode failed: " .. tostring(decoded), false, nil end
     local indexOK, candidateExact, candidateCanonical, candidateCatalog, candidateFast, candidateDiagnostics = pcall(buildSupremeIndex, decoded)
-    if not indexOK then return false, "The candidate database could not be indexed; keeping last-known-good values.", false end
+    if not indexOK then return false, "The candidate database could not be indexed; keeping last-known-good values.", false, nil end
     local valid, validationError = validateSupremeCandidate(decoded, candidateCatalog, candidateDiagnostics)
-    if not valid then return false, validationError, false end
+    if not valid then return false, validationError, false, nil end
+    local digest = type(verifiedDigest) == "string" and verifiedDigest or nil
+    if not digest then
+        local hashYields, hashMilliseconds
+        digest, hashYields, hashMilliseconds = sha256Hex(body, true)
+        HARDEN.lastSupremeHashYields = tonumber(hashYields) or 0
+        HARDEN.lastSupremeHashMilliseconds = tonumber(hashMilliseconds) or 0
+    else
+        HARDEN.lastSupremeHashYields = 0
+        HARDEN.lastSupremeHashMilliseconds = 0
+    end
+    if not digest then return false, "SHA-256 unavailable for Supreme Values body", false, nil end
     SupremeDatabase = decoded
     IndexExact, IndexCanonical, Catalog = candidateExact, candidateCanonical, candidateCatalog
     HARDEN.supremeFastIndex, HARDEN.supremeIndexDiagnostics = candidateFast, candidateDiagnostics
     LastSupremeBody = body
     HARDEN.supremeDataRevision += 1
-    HARDEN.supremeDataHash = sha256Hex(body) or tostring(#body)
+    HARDEN.supremeDataHash = digest
     LastDatabaseLoad = os.time()
     HARDEN.lastDatabaseVerifiedAt = tonumber(verifiedAtUnix) or os.time()
     HARDEN.lastDatabaseSource = sourceLabel or "live"
     DatabaseStatus = "Ready"
-    return true, nil, true
+    return true, nil, true, digest
 end
 local function fetchSupremeDatabase()
     local function tryDiskLkg(liveError)
         if SupremeDatabase then return false, liveError, false end
         local cached = HARDEN.readLkgEnvelope and HARDEN.readLkgEnvelope(HARDEN.supremeLkgFile) or nil
         if cached and type(cached.body) == "string" then
-            local loaded, err, changed = loadSupremeFromBody(cached.body, "disk_lkg", cached.savedAtUnix)
+            local loaded, err, changed = loadSupremeFromBody(cached.body, "disk_lkg", cached.savedAtUnix, cached.sha256)
             if loaded then return loaded, err, changed end
             return false, tostring(liveError) .. "; disk LKG rejected: " .. tostring(err), false
         end
@@ -1476,12 +1505,19 @@ local function fetchSupremeDatabase()
     HttpState.downloadedBytes += #body
     local candidateETag = getResponseHeader(response, "etag")
     local candidateLastModified = getResponseHeader(response, "last-modified")
-    local loaded, err, changed = loadSupremeFromBody(body, "live_" .. tostring(source or "http"), os.time())
+    local loaded, err, changed, digest = loadSupremeFromBody(body, "live_" .. tostring(source or "http"), os.time())
     if not loaded then return tryDiskLkg(err) end
     -- Commit validators only after the exact body they describe passed all trust gates.
     HttpState.supremeETag = candidateETag
     HttpState.supremeLastModified = candidateLastModified
-    if changed and HARDEN.writeLkgEnvelope then HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body) end
+    if changed and HARDEN.writeLkgEnvelope then
+        task.spawn(function()
+            if not Destroyed then
+                local okWrite, writeErr = HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body, digest)
+                if not okWrite then warn("[SV Public] Supreme LKG write failed:", writeErr) end
+            end
+        end)
+    end
     return true, err, changed
 end
 local function ensureSupremeDatabase(force)
@@ -6893,29 +6929,78 @@ HARDEN.atomicWriteTextFileBestEffort = function(fileName, body)
     return true
 end
 HARDEN.readLkgEnvelope = function(fileName)
-    local function validate(decoded)
+    local function saneSavedAt(value)
+        local now = os.time()
+        local savedAt = tonumber(value)
+        if not savedAt or savedAt < 946684800 or savedAt > now + 300 then return nil end
+        return math.min(savedAt, now)
+    end
+    local function validateV1(decoded, cooperativeHash)
         if type(decoded) ~= "table" or tonumber(decoded.version) ~= 1 or type(decoded.body) ~= "string" then
             return nil, "invalid LKG envelope"
         end
-        local now = os.time()
-        local savedAt = tonumber(decoded.savedAtUnix)
-        if not savedAt or savedAt < 946684800 or savedAt > now + 300 then
-            return nil, "LKG savedAtUnix is invalid or implausibly in the future"
-        end
-        local digest = sha256Hex(decoded.body)
-        if type(decoded.sha256) ~= "string" or not digest
-            or string.lower(digest) ~= string.lower(decoded.sha256) then
+        local savedAt = saneSavedAt(decoded.savedAtUnix)
+        if not savedAt then return nil, "LKG savedAtUnix is invalid or implausibly in the future" end
+        local digest = sha256Hex(decoded.body, cooperativeHash == true)
+        if type(decoded.sha256) ~= "string" or not digest or string.lower(digest) ~= string.lower(decoded.sha256) then
             return nil, "LKG body hash mismatch"
         end
-        decoded.savedAtUnix = math.min(savedAt, now)
+        decoded.savedAtUnix = savedAt
+        decoded.sha256 = digest
         return decoded
     end
+    if fileName == HARDEN.supremeLkgFile then
+        local readfileFunction = State.TryGetExecutorGlobal("readfile")
+        local isfileFunction = State.TryGetExecutorGlobal("isfile")
+        local function readExact(name)
+            if type(readfileFunction) ~= "function" or type(isfileFunction) ~= "function" then return nil end
+            local okExists, exists = waitForExternalWithDeadline("isfile " .. name, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return isfileFunction(name) end)
+            if not okExists or not exists then return nil end
+            local okRead, value = waitForExternalWithDeadline("readfile " .. name, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(name) end)
+            return okRead and type(value) == "string" and value or nil
+        end
+        local function decodeMeta(text)
+            if type(text) ~= "string" then return nil end
+            local ok, decoded = pcall(function() return HttpService:JSONDecode(text) end)
+            return ok and type(decoded) == "table" and decoded or nil
+        end
+        local bodyPrimary = readExact(HARDEN.supremeLkgFile)
+        local bodyBackup = readExact(HARDEN.supremeLkgFile .. ".bak")
+        local metaPrimary = decodeMeta(readExact(HARDEN.supremeLkgMetaFile))
+        local metaBackup = decodeMeta(readExact(HARDEN.supremeLkgMetaFile .. ".bak"))
+        local metas = {metaPrimary, metaBackup}
+        local bodies = {bodyPrimary, bodyBackup}
+        for _, body in pairs(bodies) do
+            if type(body) == "string" and body ~= "" then
+                local digest, hashYields, hashMilliseconds = sha256Hex(body, true)
+                HARDEN.lastSupremeLkgHashYields = tonumber(hashYields) or 0
+                HARDEN.lastSupremeLkgHashMilliseconds = tonumber(hashMilliseconds) or 0
+                if digest then
+                    for _, meta in pairs(metas) do
+                        local savedAt = meta and tonumber(meta.version) == 2 and saneSavedAt(meta.savedAtUnix) or nil
+                        if savedAt and type(meta.sha256) == "string" and string.lower(meta.sha256) == string.lower(digest) then
+                            notePersistence(fileName, true, "read_verified_raw_lkg")
+                            return {version=2, savedAtUnix=savedAt, sha256=digest, body=body, controllerVersion=meta.controllerVersion}
+                        end
+                    end
+                end
+            end
+        end
+        -- One-release migration path: accept the old giant JSON envelope when v2 is absent.
+        local legacy = HARDEN.readJsonFileBestEffort(HARDEN.supremeLkgLegacyFile)
+        local validLegacy, legacyError = validateV1(legacy, true)
+        if validLegacy then
+            notePersistence(fileName, true, "read_verified_legacy_lkg")
+            return validLegacy
+        end
+        return nil, legacyError or "no valid Supreme Values LKG"
+    end
     local decoded, readError, source = HARDEN.readJsonFileBestEffort(fileName)
-    local valid, validationError = validate(decoded)
+    local valid, validationError = validateV1(decoded, false)
     if valid then return valid end
     if source == "primary" then
         local backup = HARDEN.readJsonFileBestEffort(fileName .. ".bak")
-        valid = validate(backup)
+        valid = validateV1(backup, false)
         if valid then
             notePersistence(fileName, true, "read_verified_backup")
             return valid
@@ -6923,10 +7008,23 @@ HARDEN.readLkgEnvelope = function(fileName)
     end
     return nil, validationError or readError or "invalid LKG envelope"
 end
-HARDEN.writeLkgEnvelope = function(fileName, body)
+HARDEN.writeLkgEnvelope = function(fileName, body, knownDigest)
     if type(body) ~= "string" then return false, "invalid LKG body" end
-    local digest = sha256Hex(body)
+    local digest = type(knownDigest) == "string" and knownDigest or nil
+    if not digest then digest = sha256Hex(body, fileName == HARDEN.supremeLkgFile) end
     if not digest then return false, "SHA-256 unavailable for LKG write" end
+    if fileName == HARDEN.supremeLkgFile then
+        -- Store the huge Supreme JSON as raw bytes and keep only tiny integrity metadata in JSON.
+        -- Body first, metadata second: metadata is the commit point, and the reader can pair backups
+        -- by digest if a shutdown interrupts between the two writes.
+        local bodyOK, bodyErr = HARDEN.atomicWriteTextFileBestEffort(HARDEN.supremeLkgFile, body)
+        if not bodyOK then return false, bodyErr end
+        local okMeta, encodedMeta = pcall(function() return HttpService:JSONEncode({
+            version = 2, savedAtUnix = os.time(), sha256 = digest, controllerVersion = CONTROLLER_VERSION,
+        }) end)
+        if not okMeta then return false, encodedMeta end
+        return HARDEN.atomicWriteTextFileBestEffort(HARDEN.supremeLkgMetaFile, encodedMeta)
+    end
     local ok, encoded = pcall(function() return HttpService:JSONEncode({
         version = 1, savedAtUnix = os.time(), sha256 = digest, body = body, controllerVersion = CONTROLLER_VERSION,
     }) end)
@@ -7153,7 +7251,7 @@ local function compactDebugValue(value, depth, seen)
     seen[value] = nil
     return out
 end
-local function supportJsonValue(value, depth, seen)
+HARDEN.supportJsonValue = function(value, depth, seen)
     depth = depth or 0
     seen = seen or {}
     local kind = typeof(value)
@@ -7177,7 +7275,7 @@ local function supportJsonValue(value, depth, seen)
     for k,v in pairs(value) do
         count += 1
         if count > 200 then out.__truncated = true; break end
-        out[tostring(k)] = supportJsonValue(v, depth + 1, seen)
+        out[tostring(k)] = HARDEN.supportJsonValue(v, depth + 1, seen)
     end
     seen[value] = nil
     return out
@@ -14459,6 +14557,12 @@ State.AutoTrader.BuildDebug = function()
             mappingSource = HARDEN.lastMappingSource,
             mappingDiagnostics = HARDEN.mappingDiagnostics,
             supremeLkgFile = HARDEN.supremeLkgFile,
+            supremeLkgMetaFile = HARDEN.supremeLkgMetaFile,
+            supremeLkgLegacyFile = HARDEN.supremeLkgLegacyFile,
+            supremeHashMilliseconds = HARDEN.lastSupremeHashMilliseconds,
+            supremeHashYields = HARDEN.lastSupremeHashYields,
+            supremeLkgHashMilliseconds = HARDEN.lastSupremeLkgHashMilliseconds,
+            supremeLkgHashYields = HARDEN.lastSupremeLkgHashYields,
             mappingsLkgFile = HARDEN.mappingsLkgFile,
             http = HttpState,
         },
@@ -14690,7 +14794,7 @@ State.AutoTrader.BuildDebug = function()
         },
         recentLog = State.AutoTrader.DebugLog,
     }
-    local safePayload = supportJsonValue(payload)
+    local safePayload = HARDEN.supportJsonValue(payload)
     local ok, encoded = pcall(function()
         return HttpService:JSONEncode(safePayload)
     end)

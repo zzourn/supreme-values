@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.63-public-auto-trader-v31-audit-hardening",
+    version = "18.65-public-auto-trader-v33-unattended-hardening",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -13,7 +13,11 @@ local CONFIG = {
     ProfileRefreshSeconds = 5,
     TradeRefreshSeconds = 2,
     RemoteTimeoutSeconds = 5,
-    RemoteJsonMaxBytes = 6 * 1024 * 1024,
+    -- v32: separate caps by payload class. The real Supreme database is larger than
+    -- the original 6 MiB v31 guess; schema/catalog validation remains the trust gate.
+    SupremeJsonMaxBytes = 32 * 1024 * 1024,
+    LinkedImagesJsonMaxBytes = 8 * 1024 * 1024,
+    ServerListJsonMaxBytes = 8 * 1024 * 1024,
     DecisionDataMaxAgeSeconds = 1800,
     RemoteStaleSeconds = 24,
     MinimumCatalogItems = 200,
@@ -225,8 +229,8 @@ local CONFIG = {
 }
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
-    supportFormat = "SV_AUTO_TRADER_SUPPORT_V31",
-    distributionNormalizedSha256 = "8fac117523447b02d7f77be9a977508eff9db01a0adc68491298cd436a8d648c",
+    supportFormat = "SV_AUTO_TRADER_SUPPORT_V33",
+    distributionNormalizedSha256 = "ae33ba8848119ef494aad9d3ea7f0529203926ed956870a906f5437394c671df",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -252,10 +256,10 @@ local function validateConfigRelationships()
     need(CONFIG.AutoTraderBootstrapHttpAttemptTimeoutSeconds > 0 and CONFIG.AutoTraderBootstrapExecutionTimeoutSeconds > 0, "bootstrap operation timeouts must be positive")
     if #errors > 0 then error("Invalid Supreme Values configuration: " .. table.concat(errors, "; ")) end
 end
-validateConfigRelationships()
 if not CONFIG.Enabled then
     return
 end
+validateConfigRelationships()
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
@@ -375,22 +379,18 @@ HARDEN.sha256K = {
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
 }
 local function sha256Hex(message)
+    -- v32: process at most four source bytes per string.byte call. v31 expanded
+    -- the entire ~900 KB script as return values, which overflows some executors.
     if type(message) ~= "string" or type(bit32) ~= "table" then return nil end
     local band, bxor, bnot, rshift, rrotate = bit32.band, bit32.bxor, bit32.bnot, bit32.rshift, bit32.rrotate
-    local bytes = {string.byte(message, 1, #message)}
-    local bitLength = #bytes * 8
-    bytes[#bytes + 1] = 0x80
-    while #bytes % 64 ~= 56 do bytes[#bytes + 1] = 0 end
-    local high = math.floor(bitLength / 4294967296)
-    local low = bitLength % 4294967296
-    for shift = 24, 0, -8 do bytes[#bytes + 1] = band(rshift(high, shift), 0xff) end
-    for shift = 24, 0, -8 do bytes[#bytes + 1] = band(rshift(low, shift), 0xff) end
     local h0,h1,h2,h3,h4,h5,h6,h7 = 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
-    for chunk = 1, #bytes, 64 do
+    local function processBlock(source, offset)
         local w = {}
         for i = 0, 15 do
-            local j = chunk + i * 4
-            w[i] = bytes[j] * 16777216 + bytes[j + 1] * 65536 + bytes[j + 2] * 256 + bytes[j + 3]
+            local j = offset + i * 4
+            local b1,b2,b3,b4 = string.byte(source, j, j + 3)
+            if b4 == nil then return false end
+            w[i] = b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
         end
         for i = 16, 63 do
             local s0 = bxor(rrotate(w[i - 15], 7), rrotate(w[i - 15], 18), rshift(w[i - 15], 3))
@@ -408,6 +408,26 @@ local function sha256Hex(message)
             h,g,f,e,d,c,b,a = g,f,e,band(d + t1, 0xffffffff),c,b,a,band(t1 + t2, 0xffffffff)
         end
         h0,h1,h2,h3,h4,h5,h6,h7 = band(h0+a,0xffffffff),band(h1+b,0xffffffff),band(h2+c,0xffffffff),band(h3+d,0xffffffff),band(h4+e,0xffffffff),band(h5+f,0xffffffff),band(h6+g,0xffffffff),band(h7+h,0xffffffff)
+        return true
+    end
+    local byteLength = #message
+    local fullBytes = byteLength - (byteLength % 64)
+    for offset = 1, fullBytes, 64 do
+        if not processBlock(message, offset) then return nil end
+    end
+    local bitLength = byteLength * 8
+    local high = math.floor(bitLength / 4294967296)
+    local low = bitLength % 4294967296
+    local function u32be(value)
+        return string.char(
+            band(rshift(value, 24), 0xff), band(rshift(value, 16), 0xff),
+            band(rshift(value, 8), 0xff), band(value, 0xff)
+        )
+    end
+    local tail = string.sub(message, fullBytes + 1) .. string.char(0x80)
+    tail = tail .. string.rep("\0", (56 - (#tail % 64)) % 64) .. u32be(high) .. u32be(low)
+    for offset = 1, #tail, 64 do
+        if not processBlock(tail, offset) then return nil end
     end
     return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", h0,h1,h2,h3,h4,h5,h6,h7)
 end
@@ -1254,7 +1274,7 @@ local function mappingEntryCount(imageLinks, itemLinks)
 end
 HARDEN.mappingDiagnostics = {badCategory = 0, badAssetId = 0, missingName = 0, missingCategory = 0, malformed = 0}
 local function loadLinkedImagesFromBody(body, sourceLabel, verifiedAtUnix)
-    if type(body) ~= "string" or body == "" or #body > CONFIG.RemoteJsonMaxBytes then
+    if type(body) ~= "string" or body == "" or #body > CONFIG.LinkedImagesJsonMaxBytes then
         return false, "linked_images body missing/too large", false
     end
     if LastLinkedImagesBody == body then
@@ -1294,37 +1314,53 @@ local function loadLinkedImagesFromBody(body, sourceLabel, verifiedAtUnix)
     return true, nil, true
 end
 local function loadLinkedImages()
+    local function tryDiskLkg(liveError)
+        if mappingEntryCount(LinkedImages, State.Mapping.ItemLinks) > 0 then
+            return false, liveError, false
+        end
+        local cached = HARDEN.readLkgEnvelope and HARDEN.readLkgEnvelope(HARDEN.mappingsLkgFile) or nil
+        if cached and type(cached.body) == "string" then
+            local loaded, err, changed = loadLinkedImagesFromBody(cached.body, "disk_lkg", cached.savedAtUnix)
+            if loaded then return loaded, err, changed end
+            return false, tostring(liveError) .. "; disk LKG rejected: " .. tostring(err), false
+        end
+        return false, liveError, false
+    end
+
     local headers = {["Accept"] = "application/json", ["Cache-Control"] = "no-cache"}
     if HttpState.linkedETag then headers["If-None-Match"] = HttpState.linkedETag
     elseif HttpState.linkedLastModified then headers["If-Modified-Since"] = HttpState.linkedLastModified end
     local ok, response, source = fetchStaticTextCompat(CONFIG.LinkedImagesUrl, headers, CONFIG.AutoTraderHttpTimeoutSeconds)
     if not ok then
         HttpState.errorCount += 1
-        if mappingEntryCount(LinkedImages, State.Mapping.ItemLinks) == 0 then
-            local cached = HARDEN.readLkgEnvelope and HARDEN.readLkgEnvelope(HARDEN.mappingsLkgFile) or nil
-            if cached and type(cached.body) == "string" then return loadLinkedImagesFromBody(cached.body, "disk_lkg", cached.savedAtUnix) end
-        end
-        return false, tostring(response), false
+        return tryDiskLkg(tostring(response))
     end
     if source == "request" then HttpState.requestCount += 1 elseif source == "game:HttpGet" then HttpState.gameHttpGetCount += 1 end
     if tonumber(response.StatusCode) == 304 then
         HttpState.notModifiedCount += 1
-        HttpState.linkedUnchanged += 1
-        HARDEN.lastMappingLoad = os.time()
-        HARDEN.lastMappingVerifiedAt = os.time()
-        return true, nil, false
+        if mappingEntryCount(LinkedImages, State.Mapping.ItemLinks) > 0 then
+            HttpState.linkedUnchanged += 1
+            HARDEN.lastMappingLoad = os.time()
+            HARDEN.lastMappingVerifiedAt = os.time()
+            return true, nil, false
+        end
+        return tryDiskLkg("HTTP 304 received before an accepted mapping load")
     end
-    if tonumber(response.StatusCode) == 404 then return false, "linked_images.json returned HTTP 404; keeping last-known-good mappings.", false end
-    if response.Success ~= true then return false, "HTTP " .. tostring(response.StatusCode or "?"), false end
+    if tonumber(response.StatusCode) == 404 then return tryDiskLkg("linked_images.json returned HTTP 404; keeping last-known-good mappings.") end
+    if response.Success ~= true then return tryDiskLkg("HTTP " .. tostring(response.StatusCode or "?")) end
     local body = response.Body or ""
-    if #body > CONFIG.RemoteJsonMaxBytes then return false, "linked_images.json exceeded the configured body-size limit", false end
+    if #body > CONFIG.LinkedImagesJsonMaxBytes then return tryDiskLkg("linked_images.json exceeded the configured body-size limit") end
     HttpState.fullDownloadCount += 1
     HttpState.downloadedBytes += #body
-    HttpState.linkedETag = getResponseHeader(response, "etag") or HttpState.linkedETag
-    HttpState.linkedLastModified = getResponseHeader(response, "last-modified") or HttpState.linkedLastModified
+    local candidateETag = getResponseHeader(response, "etag")
+    local candidateLastModified = getResponseHeader(response, "last-modified")
     local loaded, err, changed = loadLinkedImagesFromBody(body, "live_" .. tostring(source or "http"), os.time())
-    if loaded and changed and HARDEN.writeLkgEnvelope then HARDEN.writeLkgEnvelope(HARDEN.mappingsLkgFile, body) end
-    return loaded, err, changed
+    if not loaded then return tryDiskLkg(err) end
+    -- Validators belong to the accepted body, never merely to a received candidate.
+    HttpState.linkedETag = candidateETag
+    HttpState.linkedLastModified = candidateLastModified
+    if changed and HARDEN.writeLkgEnvelope then HARDEN.writeLkgEnvelope(HARDEN.mappingsLkgFile, body) end
+    return true, err, changed
 end
 local function validateSupremeCandidate(decoded, candidateCatalog, candidateDiagnostics)
     if type(decoded) ~= "table" or type(decoded._metadata) ~= "table" then return false, "The JSON is not the expected Supreme Values database." end
@@ -1372,7 +1408,7 @@ local function validateSupremeCandidate(decoded, candidateCatalog, candidateDiag
 end
 local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix)
     if type(body) ~= "string" or body == "" then return false, "empty Supreme Values body", false end
-    if #body > CONFIG.RemoteJsonMaxBytes then return false, "Supreme Values JSON exceeded the configured body-size limit", false end
+    if #body > CONFIG.SupremeJsonMaxBytes then return false, "Supreme Values JSON exceeded the configured body-size limit", false end
     if LastSupremeBody == body and SupremeDatabase then
         LastDatabaseLoad = os.time(); HARDEN.lastDatabaseVerifiedAt = tonumber(verifiedAtUnix) or HARDEN.lastDatabaseVerifiedAt or 0; DatabaseStatus = "Ready"; HARDEN.lastDatabaseSource = sourceLabel or HARDEN.lastDatabaseSource; HttpState.supremeUnchanged += 1
         return true, nil, false
@@ -1396,36 +1432,57 @@ local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix)
     return true, nil, true
 end
 local function fetchSupremeDatabase()
+    local function tryDiskLkg(liveError)
+        if SupremeDatabase then return false, liveError, false end
+        local cached = HARDEN.readLkgEnvelope and HARDEN.readLkgEnvelope(HARDEN.supremeLkgFile) or nil
+        if cached and type(cached.body) == "string" then
+            local loaded, err, changed = loadSupremeFromBody(cached.body, "disk_lkg", cached.savedAtUnix)
+            if loaded then return loaded, err, changed end
+            return false, tostring(liveError) .. "; disk LKG rejected: " .. tostring(err), false
+        end
+        return false, liveError, false
+    end
+
     local headers = {["Accept"] = "application/json", ["Cache-Control"] = "no-cache"}
     if HttpState.supremeETag then headers["If-None-Match"] = HttpState.supremeETag
     elseif HttpState.supremeLastModified then headers["If-Modified-Since"] = HttpState.supremeLastModified end
     local requestOK, response, source = fetchStaticTextCompat(CONFIG.JsonUrl, headers, CONFIG.AutoTraderHttpTimeoutSeconds)
     if not requestOK then
         HttpState.errorCount += 1
-        if not SupremeDatabase then
-            local cached = HARDEN.readLkgEnvelope and HARDEN.readLkgEnvelope(HARDEN.supremeLkgFile) or nil
-            if cached and type(cached.body) == "string" then return loadSupremeFromBody(cached.body, "disk_lkg", cached.savedAtUnix) end
-        end
-        return false, "HTTP error: " .. tostring(response), false
+        return tryDiskLkg("HTTP error: " .. tostring(response))
     end
     if source == "request" then HttpState.requestCount += 1 elseif source == "game:HttpGet" then HttpState.gameHttpGetCount += 1 end
     if tonumber(response.StatusCode) == 304 then
-        HttpState.notModifiedCount += 1; HttpState.supremeUnchanged += 1
-        if SupremeDatabase then LastDatabaseLoad = os.time(); HARDEN.lastDatabaseVerifiedAt = os.time(); DatabaseStatus = "Ready"; return true, nil, false end
-        local cached = HARDEN.readLkgEnvelope and HARDEN.readLkgEnvelope(HARDEN.supremeLkgFile) or nil
-        if cached and type(cached.body) == "string" then return loadSupremeFromBody(cached.body, "disk_lkg", cached.savedAtUnix) end
-        DatabaseStatus = "Unavailable"; return false, "HTTP 304 received before an initial database load.", false
+        HttpState.notModifiedCount += 1
+        if SupremeDatabase then
+            HttpState.supremeUnchanged += 1
+            LastDatabaseLoad = os.time()
+            HARDEN.lastDatabaseVerifiedAt = os.time()
+            DatabaseStatus = "Ready"
+            return true, nil, false
+        end
+        local loaded, err, changed = tryDiskLkg("HTTP 304 received before an initial database load.")
+        if loaded then return loaded, err, changed end
+        DatabaseStatus = "Unavailable"
+        return false, err, false
     end
-    if response.Success ~= true then return false, string.format("HTTP %s %s", tostring(response.StatusCode or "?"), tostring(response.StatusMessage or "request failed")), false end
+    if response.Success ~= true then
+        return tryDiskLkg(string.format("HTTP %s %s", tostring(response.StatusCode or "?"), tostring(response.StatusMessage or "request failed")))
+    end
     local body = response.Body
-    if type(body) ~= "string" or body == "" then return false, "GitHub returned an empty response body; keeping last-known-good values.", false end
-    if #body > CONFIG.RemoteJsonMaxBytes then return false, "Supreme Values JSON exceeded the configured body-size limit", false end
-    HttpState.fullDownloadCount += 1; HttpState.downloadedBytes += #body
-    HttpState.supremeETag = getResponseHeader(response, "etag") or HttpState.supremeETag
-    HttpState.supremeLastModified = getResponseHeader(response, "last-modified") or HttpState.supremeLastModified
+    if type(body) ~= "string" or body == "" then return tryDiskLkg("GitHub returned an empty response body; keeping last-known-good values.") end
+    if #body > CONFIG.SupremeJsonMaxBytes then return tryDiskLkg("Supreme Values JSON exceeded the configured body-size limit") end
+    HttpState.fullDownloadCount += 1
+    HttpState.downloadedBytes += #body
+    local candidateETag = getResponseHeader(response, "etag")
+    local candidateLastModified = getResponseHeader(response, "last-modified")
     local loaded, err, changed = loadSupremeFromBody(body, "live_" .. tostring(source or "http"), os.time())
-    if loaded and changed and HARDEN.writeLkgEnvelope then HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body) end
-    return loaded, err, changed
+    if not loaded then return tryDiskLkg(err) end
+    -- Commit validators only after the exact body they describe passed all trust gates.
+    HttpState.supremeETag = candidateETag
+    HttpState.supremeLastModified = candidateLastModified
+    if changed and HARDEN.writeLkgEnvelope then HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body) end
+    return true, err, changed
 end
 local function ensureSupremeDatabase(force)
     if not force
@@ -6755,68 +6812,102 @@ HARDEN.readJsonFileBestEffort = function(fileName)
     end
     return nil, err or "invalid JSON persistence document", source
 end
+HARDEN.fileWriteState = HARDEN.fileWriteState or {nextSerial = 0, byFile = {}}
 HARDEN.atomicWriteTextFileBestEffort = function(fileName, body)
     local writefileFunction = State.TryGetExecutorGlobal("writefile")
     local readfileFunction = State.TryGetExecutorGlobal("readfile")
     local isfileFunction = State.TryGetExecutorGlobal("isfile")
     local delfileFunction = State.TryGetExecutorGlobal("delfile")
-    local renamefileFunction = State.TryGetExecutorGlobal("renamefile")
     if type(writefileFunction) ~= "function" or type(body) ~= "string" then
         notePersistence(fileName, false, "write", "writefile unavailable")
         return false, "writefile unavailable"
     end
+
+    local existingLock = HARDEN.fileWriteState.byFile[fileName]
+    if existingLock and existingLock.busy then
+        return false, existingLock.uncertain and "previous file write is still unresolved" or "file write already in progress"
+    end
+    HARDEN.fileWriteState.nextSerial += 1
+    local serial = HARDEN.fileWriteState.nextSerial
+    local lock = {busy = true, uncertain = false, serial = serial, startedAt = os.clock()}
+    HARDEN.fileWriteState.byFile[fileName] = lock
+    local function release()
+        if HARDEN.fileWriteState.byFile[fileName] == lock then HARDEN.fileWriteState.byFile[fileName] = nil end
+        lock.busy = false
+    end
+    local function holdUntilResolved(request)
+        lock.uncertain = true
+        if request then
+            task.spawn(function()
+                while not request.done and not Destroyed do task.wait(0.1) end
+                release()
+            end)
+        end
+    end
+    local function fail(reason, request)
+        notePersistence(fileName, false, "write", reason)
+        if request and request.timedOut and not request.done then holdUntilResolved(request) else release() end
+        return false, reason
+    end
+
     local oldBody = nil
     if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
-        local okExists, exists = waitForExternalWithDeadline("isfile " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return isfileFunction(fileName) end)
+        local okExists, exists, existsRequest = waitForExternalWithDeadline("isfile " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return isfileFunction(fileName) end)
+        if not okExists and existsRequest and existsRequest.timedOut then return fail(tostring(exists), existsRequest) end
         if okExists and exists then
-            local okOld, prior = waitForExternalWithDeadline("readfile " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(fileName) end)
+            local okOld, prior, readRequest = waitForExternalWithDeadline("readfile " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(fileName) end)
+            if not okOld and readRequest and readRequest.timedOut then return fail(tostring(prior), readRequest) end
             if okOld and type(prior) == "string" then oldBody = prior end
         end
     end
     if oldBody then
-        waitForExternalWithDeadline("writefile backup " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return writefileFunction(fileName .. ".bak", oldBody) end)
+        local okBackup, backupErr, backupRequest = waitForExternalWithDeadline("writefile backup " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return writefileFunction(fileName .. ".bak", oldBody) end)
+        if not okBackup and backupRequest and backupRequest.timedOut then return fail(tostring(backupErr), backupRequest) end
     end
-    local tempName = fileName .. ".tmp"
-    local okTemp, tempErr = waitForExternalWithDeadline("writefile temp " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return writefileFunction(tempName, body) end)
-    if not okTemp then notePersistence(fileName, false, "write", tempErr); return false, tempErr end
+
+    local tempName = fileName .. ".tmp." .. tostring(serial)
+    local okTemp, tempErr, tempRequest = waitForExternalWithDeadline("writefile temp " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return writefileFunction(tempName, body) end)
+    if not okTemp then return fail(tostring(tempErr), tempRequest) end
     if type(readfileFunction) == "function" then
-        local okVerify, verifyBody = waitForExternalWithDeadline("verify temp " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(tempName) end)
-        if not okVerify or verifyBody ~= body then
-            notePersistence(fileName, false, "write", "temporary file verification failed")
-            return false, "temporary file verification failed"
-        end
+        local okVerify, verifyBody, verifyRequest = waitForExternalWithDeadline("verify temp " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(tempName) end)
+        if not okVerify then return fail(tostring(verifyBody), verifyRequest) end
+        if verifyBody ~= body then return fail("temporary file verification failed") end
     end
-    local okFinal, finalErr
-    if type(renamefileFunction) == "function" then
-        if type(delfileFunction) == "function" and type(isfileFunction) == "function" then
-            local okExists, exists = waitForExternalWithDeadline("isfile final " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return isfileFunction(fileName) end)
-            if okExists and exists then waitForExternalWithDeadline("delete old " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return delfileFunction(fileName) end) end
-        end
-        okFinal, finalErr = waitForExternalWithDeadline("rename temp " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return renamefileFunction(tempName, fileName) end)
-    else
-        okFinal, finalErr = waitForExternalWithDeadline("writefile final " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return writefileFunction(fileName, body) end)
+
+    -- Direct replacement is safer across executor APIs than delete-then-rename: a timed-out
+    -- delete could otherwise execute late and remove the newly committed file. Never retry a
+    -- timed-out final write; keep this filename locked until the underlying callback resolves.
+    local okFinal, finalErr, finalRequest = waitForExternalWithDeadline("writefile final " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return writefileFunction(fileName, body) end)
+    if not okFinal then return fail(tostring(finalErr), finalRequest) end
+    if type(readfileFunction) == "function" then
+        local okVerify, verifyBody, verifyRequest = waitForExternalWithDeadline("verify final " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(fileName) end)
+        if not okVerify then return fail(tostring(verifyBody), verifyRequest) end
+        if verifyBody ~= body then return fail("final file verification failed") end
     end
-    if okFinal and type(readfileFunction) == "function" then
-        local okVerify, verifyBody = waitForExternalWithDeadline("verify final " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(fileName) end)
-        okFinal = okVerify and verifyBody == body
-        if not okFinal then finalErr = "final file verification failed" end
+    if type(delfileFunction) == "function" and not HARDEN.tempCleanupDisabled then
+        local okDelete, _, deleteRequest = waitForExternalWithDeadline("delete temp " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return delfileFunction(tempName) end)
+        if not okDelete and deleteRequest and deleteRequest.timedOut then HARDEN.tempCleanupDisabled = true end
     end
-    if type(delfileFunction) == "function" then
-        waitForExternalWithDeadline("delete temp " .. fileName, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return delfileFunction(tempName) end)
-    end
-    notePersistence(fileName, okFinal, "write", finalErr)
-    return okFinal, finalErr
+    notePersistence(fileName, true, "write")
+    release()
+    return true
 end
 HARDEN.readLkgEnvelope = function(fileName)
     local function validate(decoded)
         if type(decoded) ~= "table" or tonumber(decoded.version) ~= 1 or type(decoded.body) ~= "string" then
             return nil, "invalid LKG envelope"
         end
+        local now = os.time()
+        local savedAt = tonumber(decoded.savedAtUnix)
+        if not savedAt or savedAt < 946684800 or savedAt > now + 300 then
+            return nil, "LKG savedAtUnix is invalid or implausibly in the future"
+        end
         local digest = sha256Hex(decoded.body)
         if type(decoded.sha256) ~= "string" or not digest
             or string.lower(digest) ~= string.lower(decoded.sha256) then
             return nil, "LKG body hash mismatch"
         end
+        decoded.savedAtUnix = math.min(savedAt, now)
         return decoded
     end
     local decoded, readError, source = HARDEN.readJsonFileBestEffort(fileName)
@@ -6834,8 +6925,10 @@ HARDEN.readLkgEnvelope = function(fileName)
 end
 HARDEN.writeLkgEnvelope = function(fileName, body)
     if type(body) ~= "string" then return false, "invalid LKG body" end
+    local digest = sha256Hex(body)
+    if not digest then return false, "SHA-256 unavailable for LKG write" end
     local ok, encoded = pcall(function() return HttpService:JSONEncode({
-        version = 1, savedAtUnix = os.time(), sha256 = sha256Hex(body), body = body, controllerVersion = CONTROLLER_VERSION,
+        version = 1, savedAtUnix = os.time(), sha256 = digest, body = body, controllerVersion = CONTROLLER_VERSION,
     }) end)
     if not ok then return false, encoded end
     return HARDEN.atomicWriteTextFileBestEffort(fileName, encoded)
@@ -7060,16 +7153,54 @@ local function compactDebugValue(value, depth, seen)
     seen[value] = nil
     return out
 end
+local function supportJsonValue(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+    local kind = typeof(value)
+    if kind == "nil" or kind == "boolean" then return value end
+    if kind == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then return tostring(value) end
+        return value
+    end
+    if kind == "string" then return #value > 5000 and (string.sub(value, 1, 5000) .. "…") or value end
+    if kind == "Instance" then
+        local name, className = "?", "Instance"
+        pcall(function() name = value.Name end)
+        pcall(function() className = value.ClassName end)
+        return {__type = "Instance", class = tostring(className), name = tostring(name)}
+    end
+    if kind ~= "table" then return tostring(value) end
+    if seen[value] then return "<cycle>" end
+    if depth >= 8 then return "<depth-limit>" end
+    seen[value] = true
+    local out, count = {}, 0
+    for k,v in pairs(value) do
+        count += 1
+        if count > 200 then out.__truncated = true; break end
+        out[tostring(k)] = supportJsonValue(v, depth + 1, seen)
+    end
+    seen[value] = nil
+    return out
+end
 State.AutoTrader.DebugLogBuffer = {}
+State.AutoTrader.DiskLogFlushInFlight = false
 State.AutoTrader.FlushDiskDebugLog = function()
-    if #State.AutoTrader.DebugLogBuffer == 0 then return true end
+    local waitDeadline = os.clock() + CONFIG.AutoTraderExecutorFileTimeoutSeconds
+    while State.AutoTrader.DiskLogFlushInFlight and os.clock() < waitDeadline do task.wait(0.03) end
+    if State.AutoTrader.DiskLogFlushInFlight then return false, "debug log flush already in progress" end
+    if #State.AutoTrader.DebugLogBuffer == 0 then State.AutoTrader.DiskLogPending = 0; return true end
+    State.AutoTrader.DiskLogFlushInFlight = true
+    local snapshotCount = #State.AutoTrader.DebugLogBuffer
     local lines = {}
-    for _, event in ipairs(State.AutoTrader.DebugLogBuffer) do
+    for index = 1, snapshotCount do
+        local event = State.AutoTrader.DebugLogBuffer[index]
         local ok, encoded = pcall(function() return HttpService:JSONEncode(event) end)
         if ok and type(encoded) == "string" then table.insert(lines, encoded) end
     end
-    table.clear(State.AutoTrader.DebugLogBuffer)
-    if #lines == 0 then return true end
+    if #lines == 0 then
+        State.AutoTrader.DiskLogFlushInFlight = false
+        return false, "no debug events could be encoded"
+    end
     local existing = HARDEN.readTextFileBestEffort(State.AutoTrader.DebugLogFile)
     if type(existing) ~= "string" then
         local ok, header = pcall(function() return HttpService:JSONEncode({
@@ -7087,7 +7218,13 @@ State.AutoTrader.FlushDiskDebugLog = function()
         local ok, header = pcall(function() return HttpService:JSONEncode({type="header", controllerVersion=CONTROLLER_VERSION, jobId=game.JobId, rotatedAtUnix=os.time()}) end)
         if ok then nextBody = header .. "\n" .. nextBody end
     end
-    return HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.DebugLogFile, nextBody)
+    local okWrite, writeErr = HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.DebugLogFile, nextBody)
+    if okWrite then
+        for _ = 1, math.min(snapshotCount, #State.AutoTrader.DebugLogBuffer) do table.remove(State.AutoTrader.DebugLogBuffer, 1) end
+    end
+    State.AutoTrader.DiskLogPending = #State.AutoTrader.DebugLogBuffer
+    State.AutoTrader.DiskLogFlushInFlight = false
+    return okWrite, writeErr
 end
 State.AutoTrader.Log = function(kind, data)
     State.AutoTrader.DebugSequence += 1
@@ -7103,7 +7240,7 @@ State.AutoTrader.Log = function(kind, data)
     while #log > 120 do table.remove(log, 1) end
     table.insert(State.AutoTrader.DebugLogBuffer, event)
     State.AutoTrader.DiskLogPending = #State.AutoTrader.DebugLogBuffer
-    if #State.AutoTrader.DebugLogBuffer >= CONFIG.AutoTraderDiskLogFlushEveryEvents then
+    if #State.AutoTrader.DebugLogBuffer >= CONFIG.AutoTraderDiskLogFlushEveryEvents and not State.AutoTrader.DiskLogFlushInFlight then
         task.defer(function()
             if not Destroyed then
                 local ok, err = State.AutoTrader.FlushDiskDebugLog()
@@ -7123,16 +7260,30 @@ State.AutoTrader.GetMinimumWin = function()
 end
 State.AutoTrader.RunSelfTests = function()
     local tests = {}
-    local function check(name, condition, detail)
-        table.insert(tests, {name=name, ok=condition == true, detail=condition and nil or tostring(detail or "failed")})
+    local function record(name, ok, detail)
+        table.insert(tests, {name=name, ok=ok == true, detail=ok and nil or tostring(detail or "failed")})
     end
-    check("sha256-known-vector", sha256Hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 implementation mismatch")
-    local prefs = normalizePreferences({automation="false",ignoreFriends=1,winPreset=999,reserves={['Weapons|Knife']=2.9,['Bad|Thing']=7,['Pets|']=4,['Pets|Dog']=-1},panelPosition={xs=9,ys=-3,xo=99999,yo=-99999}})
-    check("preference-booleans", type(prefs.automation)=="boolean" and type(prefs.ignoreFriends)=="boolean", "non-boolean preferences survived normalization")
-    check("preference-preset", prefs.winPreset==4, "win preset was not clamped")
-    check("preference-reserves", prefs.reserves['Weapons|Knife']==2 and prefs.reserves['Bad|Thing']==nil and prefs.reserves['Pets|']==nil and prefs.reserves['Pets|Dog']==nil, "reserve normalization mismatch")
-    check("preference-panel", prefs.panelPosition and prefs.panelPosition.xs==1 and prefs.panelPosition.ys==0 and prefs.panelPosition.xo==2000 and prefs.panelPosition.yo==-2000, "panel clamp mismatch")
-    do
+    local function run(name, callback)
+        local ok, passed, detail = pcall(callback)
+        if not ok then record(name, false, "self-test error: " .. tostring(passed))
+        else record(name, passed == true, detail) end
+    end
+
+    run("sha256-known-vector", function()
+        return sha256Hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 implementation mismatch"
+    end)
+    run("sha256-large-message", function()
+        return sha256Hex(string.rep("v32-sha-block-test|", 8192)) == "65ac5f87ceb19a7558a8de73a27d71829e50c8b1e503d2175ec1a206998660b2", "large-message SHA-256 mismatch"
+    end)
+    run("preference-normalization", function()
+        local prefs = normalizePreferences({automation="false",ignoreFriends=1,winPreset=999,reserves={['Weapons|Knife']=2.9,['Bad|Thing']=7,['Pets|']=4,['Pets|Dog']=-1},panelPosition={xs=9,ys=-3,xo=99999,yo=-99999}})
+        local ok = type(prefs.automation)=="boolean" and type(prefs.ignoreFriends)=="boolean"
+            and prefs.winPreset==4
+            and prefs.reserves['Weapons|Knife']==2 and prefs.reserves['Bad|Thing']==nil and prefs.reserves['Pets|']==nil and prefs.reserves['Pets|Dog']==nil
+            and prefs.panelPosition and prefs.panelPosition.xs==1 and prefs.panelPosition.ys==0 and prefs.panelPosition.xo==2000 and prefs.panelPosition.yo==-2000
+        return ok, "preference normalization mismatch"
+    end)
+    run("player-presence-generation", function()
         local userId = -2147483001
         local first = {UserId=userId, Name="__SV_PRESENCE_SELFTEST_A"}
         local second = {UserId=userId, Name="__SV_PRESENCE_SELFTEST_B"}
@@ -7140,44 +7291,50 @@ State.AutoTrader.RunSelfTests = function()
         if a then a.outcome="declined"; a.outcomeAt=os.clock() end
         State.AutoTrader.EndServerPlayerPresence(first)
         local b = State.AutoTrader.EnsureServerPlayer(second)
-        check("player-presence-generation", b and b.presenceGeneration==2 and b.outcome==nil and b.present==true, "same-UserId rejoin retained stale per-presence state")
+        local passed = b and b.presenceGeneration==2 and b.outcome==nil and b.present==true
         State.AutoTrader.ServerPlayers[userId]=nil; State.AutoTrader.Cooldowns[userId]=nil; State.AutoTrader.RequestHistory[userId]=nil; State.AutoTrader.MovementSamples[userId]=nil
-    end
-    do
+        return passed, "same-UserId rejoin retained stale per-presence state"
+    end)
+    run("planner-market-pareto", function()
         local generation = State.AutoTrader.PlanGeneration
         local incoming = {knownFloor=20,totalValue=20,unknownCount=0,demand=5,demandCoverage=1,flip=nil,flipCoverage=0,stability=nil,stabilityCoverage=0,stabilityShares={}}
         local high = {key="selftest-high",itemId="selftest-high",itemType="Weapons",name="high-market",unitValue=10,maxQuantity=1,quantity=1,demand=10,reserve=0,record={name="high-market",data={value=10,demand=10}}}
         local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=10,maxQuantity=1,quantity=1,demand=4,reserve=0,record={name="safe-market",data={value=10,demand=4}}}
-        local plan = State.AutoTrader.FindPlan({high,safe}, incoming, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
-        check("planner-market-pareto", plan and plan.items and plan.items[1] and plan.items[1].name=="safe-market", "equal-value market-safe planner state was lost during dominance pruning")
-    end
-    local indexChecked, indexFailures = 0, 0
+        local plan = State.AutoTrader.FindPlan(incoming, {high,safe}, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
+        return plan and plan.items and plan.items[1] and plan.items[1].name=="safe-market", "equal-value market-safe planner state was lost during dominance pruning"
+    end)
     if SupremeDatabase and #Catalog > 0 then
-        for i=1,math.min(40,#Catalog) do
-            local record=Catalog[i]
-            local resolved=getSupremeRecord(record.category, record.key, record.name, record.data and record.data.year or nil)
-            indexChecked += 1
-            if resolved ~= record then indexFailures += 1 end
+        run("supreme-index-roundtrip", function()
+            local indexChecked, indexFailures = 0, 0
+            for i=1,math.min(40,#Catalog) do
+                local record=Catalog[i]
+                local resolved=getSupremeRecord(record.category, record.name, record.key, record.data and record.data.year or nil)
+                indexChecked += 1
+                if resolved ~= record then indexFailures += 1 end
+            end
+            return indexFailures==0, tostring(indexFailures).."/"..tostring(indexChecked).." sampled records did not round-trip"
+        end)
+    end
+    run("linked-mapping-shape", function()
+        local mappingChecked, mappingFailures = 0, 0
+        for _, link in pairs(State.Mapping.ItemLinks or {}) do
+            if mappingChecked >= 50 then break end
+            mappingChecked += 1
+            if type(link)~="table" or type(link.name)~="string" or type(link.category)~="string" then mappingFailures += 1 end
         end
-        check("supreme-index-roundtrip", indexFailures==0, tostring(indexFailures).."/"..tostring(indexChecked).." sampled records did not round-trip")
-    end
-    local mappingChecked, mappingFailures = 0, 0
-    for _, link in pairs(State.Mapping.ItemLinks or {}) do
-        if mappingChecked >= 50 then break end
-        mappingChecked += 1
-        if type(link)~="table" or type(link.name)~="string" or type(link.category)~="string" then mappingFailures += 1 end
-    end
-    for _, link in pairs(LinkedImages or {}) do
-        if mappingChecked >= 100 then break end
-        mappingChecked += 1
-        if type(link)~="table" or type(link.name)~="string" or type(link.category)~="string" then mappingFailures += 1 end
-    end
-    if mappingChecked > 0 then check("linked-mapping-shape", mappingFailures==0, tostring(mappingFailures).." malformed sampled mappings") end
+        for _, link in pairs(LinkedImages or {}) do
+            if mappingChecked >= 100 then break end
+            mappingChecked += 1
+            if type(link)~="table" or type(link.name)~="string" or type(link.category)~="string" then mappingFailures += 1 end
+        end
+        return mappingChecked == 0 or mappingFailures==0, tostring(mappingFailures).." malformed sampled mappings"
+    end)
+
     local passed = 0
     for _, row in ipairs(tests) do if row.ok then passed += 1 end end
     local result = {passed=passed, total=#tests, ok=passed==#tests, tests=tests, atUnix=os.time(), controllerVersion=CONTROLLER_VERSION}
     State.AutoTrader.SelfTest=result
-    State.AutoTrader.Log("self_test", {passed=passed,total=#tests,ok=result.ok})
+    State.AutoTrader.Log("self_test", {passed=passed,total=#tests,ok=result.ok,tests=tests})
     return result
 end
 State.AutoTrader.GetPlayerStats = function(player)
@@ -7857,6 +8014,7 @@ State.AutoTrader.GetFriendStatus = function(player)
 end
 State.AutoTrader.EnsureServerPlayer = function(player)
     if not player or player == LocalPlayer then return nil end
+    if typeof(player) == "Instance" and player:IsA("Player") and player.Parent ~= Players then return nil end
     local entry = State.AutoTrader.ServerPlayers[player.UserId]
     local newPresence = not entry or entry.present ~= true or entry.playerInstance ~= player
     if not entry then
@@ -8623,7 +8781,24 @@ State.AutoTrader.RefreshTeleportScriptLkg = function()
 end
 HARDEN.bootstrapShaCode = [[
 local K={0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2}
-local function S(m)local b={string.byte(m,1,#m)};local L=#b*8;b[#b+1]=128;while #b%64~=56 do b[#b+1]=0 end;local hi=math.floor(L/4294967296);local lo=L%4294967296;for sh=24,0,-8 do b[#b+1]=bit32.band(bit32.rshift(hi,sh),255) end;for sh=24,0,-8 do b[#b+1]=bit32.band(bit32.rshift(lo,sh),255) end;local h0,h1,h2,h3,h4,h5,h6,h7=0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19;for c=1,#b,64 do local w={};for i=0,15 do local j=c+i*4;w[i]=b[j]*16777216+b[j+1]*65536+b[j+2]*256+b[j+3] end;for i=16,63 do local a=bit32.bxor(bit32.rrotate(w[i-15],7),bit32.rrotate(w[i-15],18),bit32.rshift(w[i-15],3));local z=bit32.bxor(bit32.rrotate(w[i-2],17),bit32.rrotate(w[i-2],19),bit32.rshift(w[i-2],10));w[i]=bit32.band(w[i-16]+a+w[i-7]+z,0xffffffff) end;local a,b1,c1,d,e,f,g,h=h0,h1,h2,h3,h4,h5,h6,h7;for i=0,63 do local s1=bit32.bxor(bit32.rrotate(e,6),bit32.rrotate(e,11),bit32.rrotate(e,25));local ch=bit32.bxor(bit32.band(e,f),bit32.band(bit32.bnot(e),g));local t1=bit32.band(h+s1+ch+K[i+1]+w[i],0xffffffff);local s0=bit32.bxor(bit32.rrotate(a,2),bit32.rrotate(a,13),bit32.rrotate(a,22));local maj=bit32.bxor(bit32.band(a,b1),bit32.band(a,c1),bit32.band(b1,c1));local t2=bit32.band(s0+maj,0xffffffff);h,g,f,e,d,c1,b1,a=g,f,e,bit32.band(d+t1,0xffffffff),c1,b1,a,bit32.band(t1+t2,0xffffffff) end;h0,h1,h2,h3,h4,h5,h6,h7=bit32.band(h0+a,0xffffffff),bit32.band(h1+b1,0xffffffff),bit32.band(h2+c1,0xffffffff),bit32.band(h3+d,0xffffffff),bit32.band(h4+e,0xffffffff),bit32.band(h5+f,0xffffffff),bit32.band(h6+g,0xffffffff),bit32.band(h7+h,0xffffffff) end;return string.format('%08x%08x%08x%08x%08x%08x%08x%08x',h0,h1,h2,h3,h4,h5,h6,h7) end
+local function S(m)
+ if type(m)~='string' or type(bit32)~='table' then return nil end
+ local B,X,N,R,Q=bit32.band,bit32.bxor,bit32.bnot,bit32.rshift,bit32.rrotate
+ local h0,h1,h2,h3,h4,h5,h6,h7=0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+ local function P(s,o)
+  local w={}
+  for i=0,15 do local j=o+i*4;local a,b,c,d=string.byte(s,j,j+3);if d==nil then return false end;w[i]=a*16777216+b*65536+c*256+d end
+  for i=16,63 do local a=X(Q(w[i-15],7),Q(w[i-15],18),R(w[i-15],3));local z=X(Q(w[i-2],17),Q(w[i-2],19),R(w[i-2],10));w[i]=B(w[i-16]+a+w[i-7]+z,0xffffffff) end
+  local a,b,c,d,e,f,g,h=h0,h1,h2,h3,h4,h5,h6,h7
+  for i=0,63 do local s1=X(Q(e,6),Q(e,11),Q(e,25));local ch=X(B(e,f),B(N(e),g));local t1=B(h+s1+ch+K[i+1]+w[i],0xffffffff);local s0=X(Q(a,2),Q(a,13),Q(a,22));local maj=X(B(a,b),B(a,c),B(b,c));local t2=B(s0+maj,0xffffffff);h,g,f,e,d,c,b,a=g,f,e,B(d+t1,0xffffffff),c,b,a,B(t1+t2,0xffffffff) end
+  h0,h1,h2,h3,h4,h5,h6,h7=B(h0+a,0xffffffff),B(h1+b,0xffffffff),B(h2+c,0xffffffff),B(h3+d,0xffffffff),B(h4+e,0xffffffff),B(h5+f,0xffffffff),B(h6+g,0xffffffff),B(h7+h,0xffffffff);return true
+ end
+ local n=#m;local q=n-(n%64);for o=1,q,64 do if not P(m,o) then return nil end end
+ local L=n*8;local hi=math.floor(L/4294967296);local lo=L%4294967296
+ local function U(v)return string.char(B(R(v,24),255),B(R(v,16),255),B(R(v,8),255),B(v,255))end
+ local t=string.sub(m,q+1)..string.char(128);t=t..string.rep('\0',(56-(#t%64))%64)..U(hi)..U(lo);for o=1,#t,64 do if not P(t,o) then return nil end end
+ return string.format('%08x%08x%08x%08x%08x%08x%08x%08x',h0,h1,h2,h3,h4,h5,h6,h7)
+end
 ]]
 State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
     State.AutoTrader.TeleportBootstrapSerial += 1
@@ -8751,7 +8926,7 @@ State.AutoTrader.InspectServerListBody = function(body)
         return nil, summary
     end
     summary.bodyBytes = #body
-    if #body > CONFIG.RemoteJsonMaxBytes then
+    if #body > CONFIG.ServerListJsonMaxBytes then
         summary.decodeError = "body exceeded configured maximum"
         return nil, summary
     end
@@ -11332,13 +11507,34 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
     local plannerStartedAt = os.clock()
     local gcBefore = nil
     pcall(function() gcBefore = collectgarbage("count") end)
+    local function invalidPlannerInput(reason)
+        return nil, reason, {
+            invalidInput = true,
+            plannerMilliseconds = (os.clock() - plannerStartedAt) * 1000,
+            receiveKnownFloor = tonumber(otherSummary and otherSummary.knownFloor),
+            inventoryEntryCount = type(inventoryEntries) == "table" and #inventoryEntries or nil,
+        }
+    end
+    if type(otherSummary) ~= "table" then
+        return invalidPlannerInput("their offer summary is unavailable")
+    end
+    local knownFloor = tonumber(otherSummary.knownFloor)
+    if knownFloor == nil or knownFloor < 0 then
+        return invalidPlannerInput("their offer summary does not have a numeric known-floor value yet")
+    end
+    if type(inventoryEntries) ~= "table" then
+        return invalidPlannerInput("local tradable inventory entries are unavailable")
+    end
     local minWin, minInfo = State.AutoTrader.GetEffectiveMinimumWin(otherSummary)
-    local upper = otherSummary.knownFloor - minWin
+    minWin = tonumber(minWin)
+    if minWin == nil then return invalidPlannerInput("dynamic minimum win is unavailable") end
+    local upper = knownFloor - minWin
     negotiation = negotiation or State.AutoTrader.GetNegotiationStage(otherSummary)
+    if type(negotiation) ~= "table" then return invalidPlannerInput("negotiation state is unavailable") end
     local targetProfit = math.max(minWin, tonumber(negotiation.targetProfit) or minWin)
-    local targetUpper = math.max(0, math.min(upper, otherSummary.knownFloor - targetProfit))
+    local targetUpper = math.max(0, math.min(upper, knownFloor - targetProfit))
     local diagnostics = {
-        receiveKnownFloor=otherSummary.knownFloor, unknownCount=otherSummary.unknownCount,
+        receiveKnownFloor=knownFloor, unknownCount=tonumber(otherSummary.unknownCount) or 0,
         minimumWin=minWin, minimumWinInfo=minInfo, upper=upper, targetUpper=targetUpper,
         targetProfit=targetProfit, negotiationStage=negotiation.stage, negotiationMargin=negotiation.margin,
         proactiveAccept=negotiation.final==true, candidateCount=0, peakStates=1, pruned=false,
@@ -11511,120 +11707,86 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
     State.AutoTrader.LastMarketGate=bestMarket
     return best,nil,diagnostics
 end
-State.AutoTrader.ValidatePlan = function(
-    plan,
-    expectedOtherHash,
-    expectedMappingRevision,
-    expectedInventoryStamp,
-    expectedDatabaseRevision,
-    expectedDatabaseHash,
-    expectedPartnerUserId
-)
-    local checks = {}
+State.AutoTrader.ValidatePlan = function(plan, context)
+    context = type(context) == "table" and context or {}
+    local expectedOtherHash = context.otherHash
+    local expectedMappingRevision = context.mappingRevision
+    local expectedInventoryStamp = context.inventoryStamp
+    local expectedDatabaseRevision = context.databaseRevision
+    local expectedDatabaseHash = context.databaseHash
+    local expectedGameDataRevision = context.gameDataRevision
+    local expectedPartnerUserId = context.partnerUserId
+    local checks = {context = {
+        mappingRevision = expectedMappingRevision,
+        databaseRevision = expectedDatabaseRevision,
+        databaseHash = expectedDatabaseHash,
+        gameDataRevision = expectedGameDataRevision,
+        partnerUserId = expectedPartnerUserId,
+    }}
     local function fail(reason)
         checks.ok = false
         checks.reason = reason
         return false, checks
     end
-    if not plan or type(plan.items) ~= "table" then
-        return fail("missing plan")
-    end
-    if State.Mapping.Revision ~= expectedMappingRevision then
-        return fail("mapping revision changed")
-    end
-    if HARDEN.supremeDataRevision ~= expectedDatabaseRevision or HARDEN.supremeDataHash ~= expectedDatabaseHash then
+    if not plan or type(plan.items) ~= "table" then return fail("missing plan") end
+    if expectedMappingRevision == nil or State.Mapping.Revision ~= expectedMappingRevision then return fail("mapping revision changed") end
+    if expectedDatabaseRevision == nil or expectedDatabaseHash == nil
+        or HARDEN.supremeDataRevision ~= expectedDatabaseRevision or HARDEN.supremeDataHash ~= expectedDatabaseHash then
         return fail("Supreme database revision/hash changed")
     end
+    if expectedGameDataRevision == nil or State.GameDataRevision ~= expectedGameDataRevision then return fail("game item-data revision changed") end
     local remoteState = State.Profile.remoteTotals
-    if not remoteState
-        or remoteState.lastSuccessByUserId[LocalPlayer.UserId] ~= expectedInventoryStamp then
-        return fail("local inventory snapshot changed")
-    end
-    if type(State.CurrentTrade) ~= "table" then
-        return fail("trade state disappeared")
-    end
+    if not remoteState or remoteState.lastSuccessByUserId[LocalPlayer.UserId] ~= expectedInventoryStamp then return fail("local inventory snapshot changed") end
+    if type(State.CurrentTrade) ~= "table" then return fail("trade state disappeared") end
     local _, currentOtherSide = getTradeSides(State.CurrentTrade)
-    if not currentOtherSide then
-        return fail("current trade partner is unavailable")
-    end
+    if not currentOtherSide then return fail("current trade partner is unavailable") end
     local currentPartner = State.AutoTrader.GetPlayerFromSide(currentOtherSide)
-    if expectedPartnerUserId
-        and (not currentPartner or currentPartner.UserId ~= expectedPartnerUserId) then
-        return fail("trade partner changed")
-    end
+    if expectedPartnerUserId and (not currentPartner or currentPartner.UserId ~= expectedPartnerUserId) then return fail("trade partner changed") end
     local currentOtherEntries = resolveTradeOffer(currentOtherSide)
     local currentHash = State.AutoTrader.OfferHash(currentOtherEntries)
-    if currentHash ~= expectedOtherHash then
-        return fail("their offer changed")
-    end
-    if State.AutoTrader.LastOtherHash ~= expectedOtherHash
-        or os.clock() - State.AutoTrader.OtherStableSince < CONFIG.AutoTraderStableSeconds then
-        return fail("their offer is not stable")
-    end
+    if currentHash ~= expectedOtherHash then return fail("their offer changed") end
+    if State.AutoTrader.LastOtherHash ~= expectedOtherHash or os.clock() - State.AutoTrader.OtherStableSince < CONFIG.AutoTraderStableSeconds then return fail("their offer is not stable") end
     local otherSummary = State.AutoTrader.SummarizeOther(currentOtherEntries)
-    if otherSummary.slotCount == 0 then
-        return fail("their offer disappeared")
-    end
-    if not State.AutoTrader.Preferences.unknownTheirZero
-        and otherSummary.unknownCount > 0 then
-        return fail("their offer contains unknown value data")
-    end
+    if otherSummary.slotCount == 0 then return fail("their offer disappeared") end
+    if not State.AutoTrader.Preferences.unknownTheirZero and otherSummary.unknownCount > 0 then return fail("their offer contains unknown value data") end
     local tradable, inventoryReason = State.AutoTrader.GetTradableInventory()
-    if not tradable then
-        return fail(tostring(inventoryReason or "tradable inventory unavailable"))
-    end
+    if not tradable then return fail(tostring(inventoryReason or "tradable inventory unavailable")) end
     local allowed = {}
-    for _, entry in ipairs(tradable) do
-        allowed[entry.key] = entry
-    end
-    local recomputed = 0
-    local slots = 0
+    for _, entry in ipairs(tradable) do allowed[entry.key] = entry end
+    local recomputed, slots = 0, 0
+    local validatedItems = {}
     for _, item in ipairs(plan.items) do
         slots += 1
         local source = allowed[item.key]
-        if not source then
-            return fail("plan contains an unavailable or reserved item")
-        end
+        if not source then return fail("plan contains an unavailable or reserved item") end
         local quantity = math.floor(tonumber(item.quantity) or 0)
-        if quantity < 1 or quantity > source.maxQuantity then
-            return fail("plan violates a reserve or owned quantity")
-        end
-        if not source.unitValue or source.unitValue <= 0 then
-            return fail("plan contains a nonnumeric local item")
-        end
+        if quantity < 1 or quantity > source.maxQuantity then return fail("plan violates a reserve or owned quantity") end
+        if not source.unitValue or source.unitValue <= 0 then return fail("plan contains a nonnumeric local item") end
         recomputed += source.unitValue * quantity
+        table.insert(validatedItems, {
+            key = source.key, itemId = source.itemId, itemType = source.itemType, name = source.name,
+            quantity = quantity, unitValue = source.unitValue, record = source.record,
+            demand = source.demand, reserve = source.reserve,
+        })
     end
-    if slots < 1 or slots > CONFIG.MaxOfferSlots then
-        return fail("plan violates the slot cap")
-    end
-    if math.abs(recomputed - plan.total) > 0.001 then
-        return fail("plan total does not recompute")
-    end
+    if slots < 1 or slots > CONFIG.MaxOfferSlots then return fail("plan violates the slot cap") end
+    if math.abs(recomputed - plan.total) > 0.001 then return fail("plan total does not recompute") end
     local minWin, minInfo = State.AutoTrader.GetEffectiveMinimumWin(otherSummary)
     local profit = otherSummary.knownFloor - recomputed
     if profit < minWin - 0.001 then
-        checks.minimumWin = minWin
-        checks.minimumWinInfo = minInfo
+        checks.minimumWin = minWin; checks.minimumWinInfo = minInfo
         return fail("profit is below the dynamic minimum win")
     end
-    local marketOK, market = State.AutoTrader.EvaluateMarketGate(plan, otherSummary)
+    -- Re-evaluate market quality from the currently resolved inventory records, not stale planner records.
+    local marketOK, market = State.AutoTrader.EvaluateMarketGate({items=validatedItems,total=recomputed}, otherSummary)
     checks.marketGate = market
     State.AutoTrader.LastMarketGate = market
-    if not marketOK then
-        return fail(
-            "market-quality gate failed: "
-            .. table.concat(market.failures or {}, "; ")
-        )
-    end
+    if not marketOK then return fail("market-quality gate failed: " .. table.concat(market.failures or {}, "; ")) end
     checks.ok = true
     checks.reason = "independent safety validation passed"
-    checks.profit = profit
-    checks.minimumWin = minWin
-    checks.minimumWinInfo = minInfo
-    checks.give = recomputed
-    checks.receiveKnownFloor = otherSummary.knownFloor
-    checks.unknownCount = otherSummary.unknownCount
-    checks.slots = slots
+    checks.profit = profit; checks.minimumWin = minWin; checks.minimumWinInfo = minInfo
+    checks.give = recomputed; checks.receiveKnownFloor = otherSummary.knownFloor; checks.unknownCount = otherSummary.unknownCount; checks.slots = slots
+    checks.validatedItems = validatedItems
     return true, checks
 end
 State.AutoTrader.IsLocalAccepted = function()
@@ -12231,14 +12393,16 @@ State.AutoTrader.ValidateAutoAccept = function()
     end
     local remoteState = State.Profile.remoteTotals
     local inventoryStamp = remoteState and remoteState.lastSuccessByUserId[LocalPlayer.UserId] or nil
-    local safe, safety = State.AutoTrader.ValidatePlan(
-        plan,
-        otherHash,
-        State.Mapping.Revision,
-        inventoryStamp,
-        SupremeDatabase,
-        partner.UserId
-    )
+    local planned = type(plan.validationContext) == "table" and plan.validationContext or {}
+    local safe, safety = State.AutoTrader.ValidatePlan(plan, {
+        otherHash = otherHash,
+        mappingRevision = planned.mappingRevision or State.Mapping.Revision,
+        inventoryStamp = inventoryStamp,
+        databaseRevision = planned.databaseRevision or HARDEN.supremeDataRevision,
+        databaseHash = planned.databaseHash or HARDEN.supremeDataHash,
+        gameDataRevision = planned.gameDataRevision or State.GameDataRevision,
+        partnerUserId = partner.UserId,
+    })
     if not safe then
         return false, tostring(safety and safety.reason or "independent plan validation failed")
     end
@@ -13741,7 +13905,11 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         .. "|"
         .. tostring(inventoryStamp)
         .. "|"
-        .. tostring(SupremeDatabase)
+        .. tostring(HARDEN.supremeDataRevision)
+        .. "|"
+        .. tostring(HARDEN.supremeDataHash)
+        .. "|game:"
+        .. tostring(State.GameDataRevision)
         .. "|"
         .. tostring(State.AutoTrader.Preferences.winPreset)
         .. "|"
@@ -13765,6 +13933,7 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     local generation = State.AutoTrader.PlanGeneration
     local expectedDatabaseRevision = HARDEN.supremeDataRevision
     local expectedDatabaseHash = HARDEN.supremeDataHash
+    local expectedGameDataRevision = State.GameDataRevision
     local expectedPartnerUserId = partner.UserId
     State.AutoTrader.Status = "CALCULATING"
     State.AutoTrader.StatusDetail = "Optimizing expected value/hour: targeting negotiation stage "
@@ -13790,15 +13959,16 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             State.AutoTrader.Render()
             return
         end
-        local safe, safety = State.AutoTrader.ValidatePlan(
-            plan,
-            otherHash,
-            mappingRevision,
-            inventoryStamp,
-            expectedDatabaseRevision,
-            expectedDatabaseHash,
-            expectedPartnerUserId
-        )
+        local validationContext = {
+            otherHash = otherHash,
+            mappingRevision = mappingRevision,
+            inventoryStamp = inventoryStamp,
+            databaseRevision = expectedDatabaseRevision,
+            databaseHash = expectedDatabaseHash,
+            gameDataRevision = expectedGameDataRevision,
+            partnerUserId = expectedPartnerUserId,
+        }
+        local safe, safety = State.AutoTrader.ValidatePlan(plan, validationContext)
         if Destroyed or generation ~= State.AutoTrader.PlanGeneration then
             return
         end
@@ -13812,6 +13982,13 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             State.AutoTrader.Render()
             return
         end
+        plan.validationContext = {
+            mappingRevision = mappingRevision,
+            databaseRevision = expectedDatabaseRevision,
+            databaseHash = expectedDatabaseHash,
+            gameDataRevision = expectedGameDataRevision,
+            partnerUserId = expectedPartnerUserId,
+        }
         State.AutoTrader.Plan = plan
         State.AutoTrader.Desired = {
             items = plan.items,
@@ -14513,8 +14690,9 @@ State.AutoTrader.BuildDebug = function()
         },
         recentLog = State.AutoTrader.DebugLog,
     }
+    local safePayload = supportJsonValue(payload)
     local ok, encoded = pcall(function()
-        return HttpService:JSONEncode(payload)
+        return HttpService:JSONEncode(safePayload)
     end)
     if not ok then
         return nil, tostring(encoded)

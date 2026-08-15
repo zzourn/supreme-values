@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.66.0-public-auto-trader-v34-consolidated-reliability",
+    version = "18.68.1-public-auto-trader-v36-frozen-architecture-release",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -24,6 +24,15 @@ local CONFIG = {
     TradeHelperDefault = true,
     ShouldTradeScore = 8,
     MaxOfferSlots = 4,
+    -- v35: contact eligibility is planner feasibility, not stay-vs-hop EV.
+    -- Equal/non-loss denomination trades are allowed only when they improve portfolio
+    -- flexibility while preserving meaningful high-value anchor strength.
+    AutoTraderOpportunityFrontierLimit = 700,
+    AutoTraderOpportunityMaxResolvedTypes = 32,
+    AutoTraderLiquidityMinScore = 1.25,
+    AutoTraderLiquidityAnchorMinValue = 25,
+    AutoTraderLiquidityAnchorRetention = 0.50,
+    AutoTraderQueueProjectionLimit = 8,
     ValueBadgeOnInventory = true,
     ValueBadgeOnTrade = true,
     ValueBadgeOnProfile = true,
@@ -66,8 +75,9 @@ local CONFIG = {
     AutoTraderFirstOfferTimeoutSeconds = 18,
     AutoTraderTradeIdleTimeoutSeconds = 26,
     AutoTraderAnchorMaxValue = 100,
-    -- Profit-throughput optimizer. The dynamic minimum win remains the hard
-    -- safety floor; these margins are negotiation targets above that floor.
+    -- Value-win negotiation targets. The dynamic minimum remains the normal
+    -- value-win safety floor; strategic liquidity may relax only to zero loss after
+    -- anchor/coverage validation.
     AutoTraderNegotiationStage1Margin = 0.18,
     AutoTraderNegotiationStage2Margin = 0.11,
     AutoTraderNegotiationStage3Margin = 0.06,
@@ -76,8 +86,8 @@ local CONFIG = {
     AutoTraderNegotiationFinalSeconds = 11.0,
     AutoTraderTargetOpportunityFloor = 0.014,
     AutoTraderEconomicSkipGraceSeconds = 12,
-    -- Stay-vs-hop economics. The learned hop benchmark is intentionally
-    -- discounted because teleport/discovery has real overhead and uncertainty.
+    -- Hop economics are retained as ordering/telemetry. They no longer veto a
+    -- human whose resolved inventory proves a useful trade.
     AutoTraderHopOpportunityDefault = 0.020,
     AutoTraderHopOpportunityRetentionFactor = 0.82,
     AutoTraderHopOpportunityMax = 0.12,
@@ -245,8 +255,8 @@ local CONFIG = {
 }
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
-    supportFormat = "SV_AUTO_TRADER_SUPPORT_V34",
-    distributionNormalizedSha256 = "a064c12654d89f3adc80ff9747d4b4056690da83c9023db14863c8387de9e165",
+    supportFormat = "SV_AUTO_TRADER_SUPPORT_V36",
+    distributionNormalizedSha256 = "dec686097fa3e9bdc29707885e7322ceaf4f6c5c87c20ea6873f1e9ec17ec72c",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -1657,31 +1667,27 @@ State.RebuildGameDataAliasIndex = function(
                 end
             end
         end
-        for internalId, record in pairs(
-            bucket
-        ) do
-            if type(record) == "table" then
-                addAlias(
-                    internalId,
-                    record
-                )
-                for _, field in ipairs({
-                    "DataID",
-                    "DataId",
-                    "ItemID",
-                    "ItemId",
-                    "ID",
-                    "Id",
-                    "InternalID",
-                    "InternalId",
-                }) do
-                    addAlias(
-                        record[field],
-                        record
-                    )
+        local visited = setmetatable({}, {__mode = "k"})
+        local function walk(node, depth)
+            if type(node) ~= "table" or depth > 7 or visited[node] then return end
+            visited[node] = true
+            for internalId, record in pairs(node) do
+                if type(record) == "table" then
+                    local looksRecord = record.ItemName ~= nil or record.DisplayName ~= nil or record.Name ~= nil
+                        or record.Image ~= nil or record.Icon ~= nil or record.Rarity ~= nil or record.Tier ~= nil
+                        or record.Chroma ~= nil or record.DataID ~= nil or record.DataId ~= nil
+                        or record.ItemID ~= nil or record.ItemId ~= nil
+                    if looksRecord then
+                        addAlias(internalId, record)
+                        for _, field in ipairs({
+                            "DataID", "DataId", "ItemID", "ItemId", "ID", "Id", "InternalID", "InternalId",
+                        }) do addAlias(record[field], record) end
+                    end
+                    walk(record, depth + 1)
                 end
             end
         end
+        walk(bucket, 0)
     end
     indexBucket(
         "Weapons",
@@ -2178,6 +2184,80 @@ local function getGameDisplayName(
     end
     return fallback
 end
+State.DetectItemVariant = function(source)
+    local function normalizedVariant(value)
+        local n = normalize(value or "")
+        if n == "chroma" or n:find("chroma", 1, true) then
+            return "Chroma"
+        end
+        return nil
+    end
+    if type(source) == "table" then
+        if source.Chroma == true or source.IsChroma == true or source.isChroma == true then
+            return "Chroma"
+        end
+        for _, field in ipairs({"Variant", "variant", "Modifier", "modifier", "Prefix", "prefix", "Special", "special", "Rarity", "rarity", "Tier", "tier", "Type", "type"}) do
+            local variant = normalizedVariant(source[field])
+            if variant then return variant end
+        end
+        if normalize(source.Chroma) == "true" then return "Chroma" end
+        return nil
+    end
+    local okInstance, isInstance = pcall(function() return typeof(source) == "Instance" end)
+    if okInstance and isInstance and source then
+        for _, attribute in ipairs({"Variant", "Chroma", "IsChroma", "Rarity", "Tier", "Type"}) do
+            local ok, value = pcall(function() return source:GetAttribute(attribute) end)
+            if ok then
+                if (attribute == "Chroma" or attribute == "IsChroma") and value == true then return "Chroma" end
+                local variant = normalizedVariant(value)
+                if variant then return variant end
+            end
+        end
+        local objects = {source}
+        local okDesc, descendants = pcall(function() return source:GetDescendants() end)
+        if okDesc and type(descendants) == "table" then
+            for _, descendant in ipairs(descendants) do table.insert(objects, descendant) end
+        end
+        for _, object in ipairs(objects) do
+            local okText, text = pcall(function()
+                if object:IsA("TextLabel") or object:IsA("TextButton") then return object.Text end
+                return nil
+            end)
+            if okText and normalizedVariant(text) == "Chroma" then return "Chroma" end
+            local okName, name = pcall(function() return object.Name end)
+            if okName and normalizedVariant(name) == "Chroma" then return "Chroma" end
+        end
+    end
+    return nil
+end
+State.ComposeVariantDisplayName = function(baseName, variant)
+    local base = trim(tostring(baseName or ""))
+    if base == "" then return base end
+    if variant == "Chroma" and not normalize(base):find("chroma", 1, true) then
+        return "Chroma " .. base
+    end
+    return base
+end
+State.BuildInventoryIdentityHint = function(node, parentKey)
+    local hint = {}
+    hint.variant = State.DetectItemVariant(node)
+    if type(node) == "table" then
+        hint.year = tonumber(node.Year or node.year or node.ReleaseYear or node.releaseYear)
+        hint.event = node.Event or node.event or node.Holiday or node.holiday or node.Season or node.season or node.Origin or node.origin
+    end
+    local ancestryPath = tostring(parentKey or "")
+    local parent = normalize(ancestryPath)
+    if ancestryPath ~= "" then hint.ancestryPath = ancestryPath end
+    if not hint.variant and parent:find("chroma", 1, true) then hint.variant = "Chroma" end
+    if not hint.event then
+        if parent:find("halloween", 1, true) then hint.event = "Halloween"
+        elseif parent:find("christmas", 1, true) or parent:find("xmas", 1, true) then hint.event = "Christmas"
+        elseif parent:find("holiday", 1, true) or parent:find("season", 1, true) then hint.event = ancestryPath end
+    end
+    if hint.variant or hint.year or hint.event or hint.ancestryPath then return hint end
+    return nil
+end
+
 State.GetNativeIdentityEvidence = function(
     gameData,
     itemId
@@ -2391,7 +2471,7 @@ State.GetNativeIdentityEvidence = function(
             or gameData.Icon
             or gameData.icon
         evidence.chroma =
-            gameData.Chroma
+            State.DetectItemVariant(gameData) == "Chroma"
     end
     if #evidence.years == 1 then
         evidence.year =
@@ -3026,68 +3106,40 @@ local function rebuildGameResolverIndexes()
         local bucketName = pair[1]
         local bucket = pair[2]
         if type(bucket) == "table" then
-            for internalId, gameData in pairs(bucket) do
-                if type(gameData) == "table" then
-                    local displayName =
-                        getGameDisplayName(gameData, tostring(internalId))
-                    local entry = {
-                        id = tostring(internalId),
-                        data = gameData,
-                        bucket = bucketName,
-                        displayName = displayName,
-                    }
-                    addGameIndex(
-                        GameNameIndex,
-                        normalize(displayName),
-                        entry
-                    )
-                    addGameIndex(
-                        GameCanonicalIndex,
-                        canonicalName(displayName),
-                        entry
-                    )
-                    addGameIndex(
-                        GameNameIndex,
-                        normalize(tostring(internalId)),
-                        entry
-                    )
-                    addGameIndex(
-                        GameCanonicalIndex,
-                        canonicalName(tostring(internalId)),
-                        entry
-                    )
-                    local rawImage =
-                        gameData.Image
-                        or gameData.image
-                        or gameData.Icon
-                        or gameData.icon
-                    local rawImageKey =
-                        State.NormalizeGameImageKey(
-                            rawImage
-                        )
-                    if rawImageKey then
-                        addGameIndex(
-                            State.GameResolverRawImageIndex,
-                            rawImageKey,
-                            entry
-                        )
-                    end
-                    local imageIds = {}
-                    collectGameImageIds(
-                        gameData,
-                        imageIds,
-                        {},
-                        0
-                    )
-                    for imageId in pairs(imageIds) do
-                        addGameIndex(
-                            GameIconIndex,
-                            imageId,
-                            entry
-                        )
+            local visited = setmetatable({}, {__mode = "k"})
+            local function walk(node, depth)
+                if type(node) ~= "table" or depth > 7 or visited[node] then return end
+                visited[node] = true
+                for internalId, gameData in pairs(node) do
+                    if type(gameData) == "table" then
+                        local looksRecord = gameData.ItemName ~= nil or gameData.DisplayName ~= nil or gameData.Name ~= nil
+                            or gameData.Image ~= nil or gameData.Icon ~= nil or gameData.Rarity ~= nil or gameData.Tier ~= nil
+                            or gameData.Chroma ~= nil or gameData.DataID ~= nil or gameData.DataId ~= nil
+                            or gameData.ItemID ~= nil or gameData.ItemId ~= nil
+                        if looksRecord then
+                            local displayName = getGameDisplayName(gameData, tostring(internalId))
+                            local entry = {id=tostring(internalId), data=gameData, bucket=bucketName, displayName=displayName}
+                            addGameIndex(GameNameIndex, normalize(displayName), entry)
+                            addGameIndex(GameCanonicalIndex, canonicalName(displayName), entry)
+                            addGameIndex(GameNameIndex, normalize(tostring(internalId)), entry)
+                            addGameIndex(GameCanonicalIndex, canonicalName(tostring(internalId)), entry)
+                            local variantName = State.ComposeVariantDisplayName(displayName, State.DetectItemVariant(gameData))
+                            if variantName ~= displayName then
+                                addGameIndex(GameNameIndex, normalize(variantName), entry)
+                                addGameIndex(GameCanonicalIndex, canonicalName(variantName), entry)
+                            end
+                            local rawImage = gameData.Image or gameData.image or gameData.Icon or gameData.icon
+                            local rawImageKey = State.NormalizeGameImageKey(rawImage)
+                            if rawImageKey then addGameIndex(State.GameResolverRawImageIndex, rawImageKey, entry) end
+                            local imageIds = {}
+                            collectGameImageIds(gameData, imageIds, {}, 0)
+                            for imageId in pairs(imageIds) do addGameIndex(GameIconIndex, imageId, entry) end
+                        end
+                        walk(gameData, depth + 1)
                     end
                 end
             end
+            walk(bucket, 0)
         end
     end
 end
@@ -3897,7 +3949,7 @@ local function gatherCandidatesByNames(searchNames)
     end
     return candidates
 end
-local function resolveGameItem(itemId, itemType, displayName)
+local function resolveGameItem(itemId, itemType, displayName, identityHint)
     if not SupremeDatabase then
         return nil, "NO_DATABASE", {
             trusted = false,
@@ -3916,6 +3968,11 @@ local function resolveGameItem(itemId, itemType, displayName)
             gameData,
             displayName or itemId
         )
+    identityHint = type(identityHint) == "table" and identityHint or nil
+    local hintedVariant = identityHint and identityHint.variant or nil
+    local hintedYear = identityHint and tonumber(identityHint.year) or nil
+    local hintedEvent = identityHint and identityHint.event or nil
+    local variantDisplay = State.ComposeVariantDisplayName(gameDisplay, hintedVariant or State.DetectItemVariant(gameData))
     local nativeEvidence =
         State.GetNativeIdentityEvidence(
             gameData,
@@ -3979,6 +4036,9 @@ local function resolveGameItem(itemId, itemType, displayName)
             nativeEvidence.year
             or ""
         )
+        .. "\0variant=" .. tostring(hintedVariant or State.DetectItemVariant(gameData) or "")
+        .. "\0hintyear=" .. tostring(hintedYear or "")
+        .. "\0hintevent=" .. tostring(hintedEvent or "")
         .. "\0maprev="
         .. tostring(State.Mapping.Revision)
         .. "\0gamedbrev="
@@ -4011,6 +4071,7 @@ local function resolveGameItem(itemId, itemType, displayName)
             itemType,
             gameData
         )
+    if hintedVariant == "Chroma" then preferredCategory = "chromas" end
     local internalBase,
         internalKind,
         internalYear,
@@ -4035,21 +4096,18 @@ local function resolveGameItem(itemId, itemType, displayName)
     local expectedYear = nil
     if not yearConflict then
         expectedYear =
-            internalYear
+            hintedYear
+            or internalYear
             or nativeYear
     end
     local expectedEvent =
-        nativeEvidence.event
+        hintedEvent
+        or nativeEvidence.event
     local chromaExpected = nil
-    if type(gameData) == "table" then
-        if gameData.Chroma == true
-            or normalize(
-                gameData.Rarity
-            ) == "chroma" then
-            chromaExpected = true
-        elseif gameData.Chroma == false then
-            chromaExpected = false
-        end
+    if hintedVariant == "Chroma" or State.DetectItemVariant(gameData) == "Chroma" then
+        chromaExpected = true
+    elseif type(gameData) == "table" and gameData.Chroma == false then
+        chromaExpected = false
     end
     local searchNames = {}
     local directSearchNames = {}
@@ -4097,6 +4155,10 @@ local function resolveGameItem(itemId, itemType, displayName)
             value
         )
     end
+    addSearchName(
+        variantDisplay,
+        hintedVariant ~= nil
+    )
     addSearchName(
         gameDisplay,
         true
@@ -4776,6 +4838,7 @@ local function summarizeResolvedOffer(entries)
                 itemType = entry.itemType,
                 quantity = quantity,
                 unitValue = unitValue,
+                variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
             }
             table.insert(summary.entries, resolvedEntry)
             table.insert(summary.items, {
@@ -5385,11 +5448,14 @@ local function parseOfferEntry(rawEntry)
     if itemId == nil then
         return nil
     end
+    local identityHint = State.BuildInventoryIdentityHint(rawEntry, nil)
     return {
         itemId = tostring(itemId),
         itemType = tostring(itemType),
         quantity = math.max(1, tonumber(quantity) or 1),
         raw = rawEntry,
+        identityHint = identityHint,
+        variant = identityHint and identityHint.variant or nil,
     }
 end
 local function resolveTradeOffer(side)
@@ -5412,7 +5478,8 @@ local function resolveTradeOffer(side)
                     resolveGameItem(
                         parsed.itemId,
                         parsed.itemType,
-                        displayName
+                        State.ComposeVariantDisplayName(displayName, parsed.identityHint and parsed.identityHint.variant),
+                        parsed.identityHint
                     )
                 )
             table.insert(result, parsed)
@@ -5428,6 +5495,8 @@ local function cloneOfferEntries(entries)
             itemType = entry.itemType,
             quantity = entry.quantity,
             record = entry.record,
+            variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
+            identityHint = entry.identityHint,
         })
     end
     return copy
@@ -5439,13 +5508,13 @@ local function normalizeTradeItemType(itemType)
     end
     return "weapons"
 end
-local function offerKey(itemId, itemType)
-    return normalizeTradeItemType(itemType) .. "\0" .. tostring(itemId)
+local function offerKey(itemId, itemType, variant)
+    return normalizeTradeItemType(itemType) .. "\0" .. tostring(itemId) .. "\0" .. tostring(variant or "")
 end
-local function findOfferEntry(entries, itemId, itemType)
-    local wanted = offerKey(itemId, itemType)
+local function findOfferEntry(entries, itemId, itemType, variant)
+    local wanted = offerKey(itemId, itemType, variant)
     for index, entry in ipairs(entries) do
-        if offerKey(entry.itemId, entry.itemType) == wanted then
+        if offerKey(entry.itemId, entry.itemType, entry.variant or (entry.identityHint and entry.identityHint.variant)) == wanted then
             return entry, index
         end
     end
@@ -5894,6 +5963,8 @@ local function tradeCardIsInsideOffers(frame)
 end
 local function classifyTradeCard(frame, preferredType)
     local displayName = getLooseCardDisplayName(frame)
+    local variantHint = State.DetectItemVariant(frame)
+    if variantHint then displayName = State.ComposeVariantDisplayName(displayName, variantHint) end
     local iconAssetId = getCardIconAssetId(frame)
     if preferredType then
         local id =
@@ -5903,7 +5974,7 @@ local function classifyTradeCard(frame, preferredType)
                 iconAssetId
             )
         if id then
-            return preferredType, id, displayName, iconAssetId
+            return preferredType, id, displayName, iconAssetId, variantHint
         end
     end
     local weaponId =
@@ -5919,15 +5990,15 @@ local function classifyTradeCard(frame, preferredType)
             iconAssetId
         )
     if weaponId and not petId then
-        return "Weapons", weaponId, displayName, iconAssetId
+        return "Weapons", weaponId, displayName, iconAssetId, variantHint
     end
     if petId and not weaponId then
-        return "Pets", petId, displayName, iconAssetId
+        return "Pets", petId, displayName, iconAssetId, variantHint
     end
     if preferredType then
-        return preferredType, nil, displayName, iconAssetId
+        return preferredType, nil, displayName, iconAssetId, variantHint
     end
-    return nil, nil, displayName, iconAssetId
+    return nil, nil, displayName, iconAssetId, variantHint
 end
 local function removeCardDecoration(frame)
     if not frame then
@@ -6113,6 +6184,12 @@ local function decorateCard(frame, options)
         or State.GetCardRawImageKey(
             frame
         )
+    local variantHint = options.variant or State.DetectItemVariant(frame)
+    local identityHint = variantHint and {variant = variantHint} or nil
+    if variantHint then
+        displayName = State.ComposeVariantDisplayName(displayName or itemId, variantHint)
+        if not rarityHint and variantHint == "Chroma" then rarityHint = "Chroma" end
+    end
     local directGameData =
         itemId
         and select(
@@ -6219,7 +6296,8 @@ local function decorateCard(frame, options)
             resolveGameItem(
                 itemId or displayName,
                 itemType,
-                displayName
+                displayName,
+                identityHint
             )
         if nativeRecord then
             record = nativeRecord
@@ -6262,7 +6340,8 @@ local function decorateCard(frame, options)
             resolveGameItem(
                 itemId or displayName,
                 itemType,
-                displayName
+                displayName,
+                identityHint
             )
         record = fallbackRecord
         resolutionMeta =
@@ -6285,6 +6364,7 @@ local function decorateCard(frame, options)
         itemType = itemType,
         displayName = displayName,
         gameRarity = rarityHint,
+        variant = variantHint,
         rawImageKey = rawImageKey,
         gameDatabaseSource =
             State.GameDatabaseSource,
@@ -6384,6 +6464,8 @@ local function decorateCard(frame, options)
         itemType = itemType,
         record = record,
         displayName = displayName,
+        variant = variantHint,
+        identityHint = identityHint,
         showValue =
             options.showValue,
         showInfo =
@@ -6753,6 +6835,12 @@ State.AutoTrader = {
     ManualBotConfirmRosterKey = nil,
     PlayerBotRiskByUserId = {},
     LastOpportunityDecision = nil,
+    OpportunityCache = {},
+    LastTradeQueue = {},
+    LastTradeQueueSignature = "",
+    LastQueueProjection = nil,
+    QueueProjectionCache = nil,
+    LastLocalInventoryDiagnostics = nil,
     AuditedTradesThisServer = 0,
     TeleportQueued = false,
     TeleportQueueOutcome = nil,
@@ -7416,6 +7504,7 @@ State.AutoTrader.IsSessionHistoryEvent = function(kind)
         or kind:find("freeze", 1, true) ~= nil
         or kind:find("fatal", 1, true) ~= nil
         or kind:find("server_hop", 1, true) ~= nil
+        or kind:find("trade_queue", 1, true) ~= nil
 end
 State.AutoTrader.RecordSessionEvent = function(event)
     if type(event) ~= "table" or not State.AutoTrader.IsSessionHistoryEvent(event.kind) then return false end
@@ -7473,6 +7562,20 @@ State.AutoTrader.BuildSessionHistoryRecord = function(checkpointReason)
         recovery = {count=State.AutoTrader.AutomaticRecoveryCount,lastReason=State.AutoTrader.LastRecoveryReason},
         serverScan = {selected=scan.selected,queueCount=scan.queueCount,safeCandidateCount=scan.safeCandidateCount,
             trustedCandidateCount=scan.trustedCandidateCount,unknownCandidateCount=scan.unknownCandidateCount},
+        tradeQueue = (function()
+            local rows = {}
+            for index, row in ipairs(State.AutoTrader.LastTradeQueue or {}) do
+                if index > 8 then break end
+                local opportunity = row.opportunity
+                table.insert(rows, {position=index,name=row.player and row.player.Name or nil,userId=row.player and row.player.UserId or nil,
+                    kind=opportunity and opportunity.kind or nil,giveTotal=opportunity and opportunity.giveTotal or nil,
+                    receiveTotal=opportunity and opportunity.receiveTotal or nil,win=opportunity and opportunity.win or nil,
+                    give=opportunity and State.AutoTrader.FormatOpportunityItems and State.AutoTrader.FormatOpportunityItems(opportunity.giveItems) or nil,
+                    receive=opportunity and State.AutoTrader.FormatOpportunityItems and State.AutoTrader.FormatOpportunityItems(opportunity.receiveItems) or nil})
+            end
+            return {length=#(State.AutoTrader.LastTradeQueue or {}),rows=rows,projection=State.AutoTrader.LastQueueProjection}
+        end)(),
+        localInventoryDiagnostics = State.AutoTrader.LastLocalInventoryDiagnostics,
         recentEvents = table.clone(State.AutoTrader.SessionEventHistory),
     })
 end
@@ -7577,6 +7680,23 @@ State.AutoTrader.RunSelfTests = function()
         local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=10,maxQuantity=1,quantity=1,demand=4,reserve=0,record={name="safe-market",data={value=10,demand=4}}}
         local plan = State.AutoTrader.FindPlan(incoming, {high,safe}, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
         return plan and plan.items and plan.items[1] and plan.items[1].name=="safe-market", "equal-value market-safe planner state was lost during dominance pruning"
+    end)
+    run("portfolio-liquidity", function()
+        local six = {key="selftest-six",itemId="selftest-six",itemType="Weapons",name="Six",unitValue=6,quantity=1,maxQuantity=1,record={name="Six",data={value=6,demand=5}}}
+        local three = {key="selftest-three",itemId="selftest-three",itemType="Weapons",name="Three",unitValue=3,quantity=2,maxQuantity=2,record={name="Three",data={value=3,demand=5}}}
+        local split = State.AutoTrader.EvaluatePortfolioDelta({six}, {{key=six.key,itemId=six.itemId,itemType=six.itemType,name=six.name,unitValue=6,quantity=1,record=six.record}}, {{key=three.key,itemId=three.itemId,itemType=three.itemType,name=three.name,unitValue=3,quantity=2,record=three.record}})
+        local hundred = {key="selftest-hundred",itemId="selftest-hundred",itemType="Weapons",name="Hundred",unitValue=100,quantity=1,maxQuantity=1,record={name="Hundred",data={value=100,demand=5}}}
+        local quarter = {key="selftest-quarter",itemId="selftest-quarter",itemType="Weapons",name="Quarter",unitValue=25,quantity=4,maxQuantity=4,record={name="Quarter",data={value=25,demand=5}}}
+        local overSplit = State.AutoTrader.EvaluatePortfolioDelta({hundred}, {{key=hundred.key,itemId=hundred.itemId,itemType=hundred.itemType,name=hundred.name,unitValue=100,quantity=1,record=hundred.record}}, {{key=quarter.key,itemId=quarter.itemId,itemType=quarter.itemType,name=quarter.name,unitValue=25,quantity=4,record=quarter.record}})
+        return split.ok == true and overSplit.ok == false,
+            "liquidity policy must allow 6→3+3 but preserve a sole 100-value anchor from 25×4 liquidation"
+    end)
+    run("variant-identity", function()
+        local hint = State.BuildInventoryIdentityHint({Chroma=true,Year=2018}, "Halloween")
+        return State.DetectItemVariant({Chroma=true}) == "Chroma"
+            and State.ComposeVariantDisplayName("Boneblade", "Chroma") == "Chroma Boneblade"
+            and hint and hint.variant == "Chroma" and hint.year == 2018,
+            "separate Chroma variant/event identity was not preserved independently from the base item title"
     end)
     if SupremeDatabase and #Catalog > 0 then
         run("supreme-index-roundtrip", function()
@@ -8323,6 +8443,13 @@ State.AutoTrader.EnsureServerPlayer = function(player)
         entry.lastDiscoveryRetryAt = 0
         entry.lastVerifiedTotal = nil
         entry.lastVerifiedAt = 0
+        entry.contactState = "NOT_CONTACTED"
+        entry.contactStateAt = entry.joinedAt
+        entry.contactReason = nil
+        entry.transportDeferredUntil = 0
+        entry.incomingInspectionDone = false
+        entry.feasibilityState = nil
+        entry.feasibilitySignature = nil
         State.AutoTrader.Cooldowns[player.UserId] = nil
         State.AutoTrader.RequestHistory[player.UserId] = nil
         State.AutoTrader.ServerExhaustedSince = 0
@@ -8720,22 +8847,69 @@ State.AutoTrader.NormalizeBotIconDb = function(value)
     value.version = 5
     return value
 end
+State.AutoTrader.BotTrustStageFile = "SV_AutoTrader_BotHashes_v36.pending.json"
+State.AutoTrader.BotTrustMarkerFile = "SV_AutoTrader_BotHashes_v36.trusted.json"
+State.AutoTrader.BotTrustBodyMatchesMarker = function(body, decoded, marker)
+    if type(decoded) ~= "table" or type(body) ~= "string" then return false, "invalid body" end
+    local revision = tonumber(decoded.trustedRevision) or 0
+    if revision <= 0 then return true, "legacy_trusted" end
+    if type(marker) ~= "table" then return false, "missing trusted marker" end
+    if tonumber(marker.revision) ~= revision then return false, "trusted marker revision mismatch" end
+    local digest = sha256Hex(body)
+    if not digest or marker.sha256 ~= digest then return false, "trusted marker hash mismatch" end
+    return true, "marker_verified"
+end
+State.AutoTrader.ReadTrustedBotDbFromDisk = function()
+    local body, bodyErr, bodySource = HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile)
+    local marker = HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile)
+    local decoded = nil
+    if type(body) == "string" then
+        local okDecode, value = pcall(function() return HttpService:JSONDecode(body) end)
+        if okDecode and type(value) == "table" then decoded = value end
+    end
+    local trusted, trustReason = State.AutoTrader.BotTrustBodyMatchesMarker(body, decoded, marker)
+    if trusted then
+        return decoded, {source=bodySource or "primary", reason=trustReason, trustedRevision=tonumber(decoded.trustedRevision) or 0}
+    end
+    -- If a crash/timeout wrote a newer primary but never committed its marker,
+    -- atomicWrite left the previously trusted body in .bak. The current (old)
+    -- marker should still authenticate that backup. Staging is never consulted.
+    local backupBody = HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile .. ".bak")
+    local backupDecoded = nil
+    if type(backupBody) == "string" then
+        local okBackup, value = pcall(function() return HttpService:JSONDecode(backupBody) end)
+        if okBackup and type(value) == "table" then backupDecoded = value end
+    end
+    local backupTrusted, backupReason = State.AutoTrader.BotTrustBodyMatchesMarker(backupBody, backupDecoded, marker)
+    if not backupTrusted then
+        local backupMarker = HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile .. ".bak")
+        backupTrusted, backupReason = State.AutoTrader.BotTrustBodyMatchesMarker(backupBody, backupDecoded, backupMarker)
+    end
+    if backupTrusted then
+        return backupDecoded, {source="trusted_backup", reason=backupReason, primaryRejected=trustReason, trustedRevision=tonumber(backupDecoded.trustedRevision) or 0}
+    end
+    return nil, {source="none", reason="no authoritatively trusted bot DB", primaryRejected=trustReason, backupRejected=backupReason, readError=bodyErr}
+end
 State.AutoTrader.LoadBotIconDb = function()
     local loaded = rawget(_G, State.AutoTrader.BotIconDbKey)
         or rawget(ExecutorEnvironment, State.AutoTrader.BotIconDbKey)
     local bootstrap = State.AutoTrader.TeleportBootstrap
-    if type(loaded) ~= "table" and type(bootstrap) == "table" and type(bootstrap.botDb) == "table" then
+    local loadMeta = nil
+    if type(loaded) == "table" then
+        loadMeta = {source="trusted_runtime", reason="already promoted in this executor", trustedRevision=tonumber(loaded.trustedRevision) or 0}
+    elseif type(bootstrap) == "table" and type(bootstrap.botDb) == "table" then
         loaded = bootstrap.botDb
-    end
-    if type(loaded) ~= "table" then
-        local decoded = HARDEN.readJsonFileBestEffort(State.AutoTrader.BotIconDbFile)
-        if type(decoded) == "table" then loaded = decoded end
-        -- One-time migration path from v9's full-CDN-path database.
+        loadMeta = {source="trusted_teleport_bootstrap", reason="carried from previously promoted live DB", trustedRevision=tonumber(loaded.trustedRevision) or 0}
+    else
+        loaded, loadMeta = State.AutoTrader.ReadTrustedBotDbFromDisk()
+        -- One-time migration path from v9's full-CDN-path database. Legacy DBs
+        -- predate trustedRevision and are accepted as legacy input only.
         if type(loaded) ~= "table" then
             local legacy = HARDEN.readJsonFileBestEffort("SV_AutoTrader_BotIcons_v1.json")
-            if type(legacy) == "table" then loaded = legacy end
+            if type(legacy) == "table" then loaded = legacy; loadMeta = {source="legacy_v9", reason="legacy migration"} end
         end
     end
+    State.AutoTrader.BotTrustLoad = loadMeta or {source="empty", reason="no bot DB available"}
     State.AutoTrader.BotIconDb = State.AutoTrader.NormalizeBotIconDb(loaded)
     rawset(_G, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
     rawset(ExecutorEnvironment, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
@@ -10348,6 +10522,144 @@ State.AutoTrader.SampleGoldBotCertification = function()
     return true
 end
 
+
+-- v36: crash-safe trusted bot evidence promotion. This block must execute BEFORE
+-- destination teleport data is imported below; staging artifacts are deliberately
+-- outside every trusted loader/global/bootstrap channel.
+do
+    State.AutoTrader.BotTrustStageFile = "SV_AutoTrader_BotHashes_v36.pending.json"
+    State.AutoTrader.BotTrustMarkerFile = "SV_AutoTrader_BotHashes_v36.trusted.json"
+    State.AutoTrader.BotIconDbPending = nil
+    State.AutoTrader.BotTrustCommitSerial = tonumber(State.AutoTrader.BotTrustCommitSerial) or 0
+    State.AutoTrader.ClonePlainTable = function(value, seen)
+        if type(value) ~= "table" then return value end
+        seen = seen or {}
+        if seen[value] then return seen[value] end
+        local out = {}
+        seen[value] = out
+        for k, v in pairs(value) do out[State.AutoTrader.ClonePlainTable(k, seen)] = State.AutoTrader.ClonePlainTable(v, seen) end
+        return out
+    end
+    State.AutoTrader.ApplyBotEvidenceToDb = function(db, kind, fingerprint, jobId, playerSightings, sampleUserId, sampleName)
+        fingerprint = State.AutoTrader.ExtractAvatarHeadshotHash(fingerprint) or fingerprint
+        if type(fingerprint) ~= "string" or not fingerprint:match("^[0-9a-fA-F]+$") or #fingerprint ~= 32 then return false end
+        fingerprint = string.lower(fingerprint)
+        db.icons = type(db.icons) == "table" and db.icons or {}
+        local record = db.icons[fingerprint]
+        if type(record) ~= "table" then
+            record = {botEvidence=0,humanEvidence=0,botJobs={},humanJobs={},botPlayerSightings=0,humanPlayerSightings=0,goldBotJobs={},goldBotSightings=0,strictGoldBotJobs={},strictGoldBotSightings=0,manualGoldBotJobs={},manualGoldBotSightings=0,firstSeen=os.time(),lastSeen=os.time()}
+            db.icons[fingerprint] = record
+        end
+        record.strictGoldBotJobs = type(record.strictGoldBotJobs) == "table" and record.strictGoldBotJobs or {}
+        record.manualGoldBotJobs = type(record.manualGoldBotJobs) == "table" and record.manualGoldBotJobs or {}
+        record.strictGoldBotSightings = tonumber(record.strictGoldBotSightings) or 0
+        record.manualGoldBotSightings = tonumber(record.manualGoldBotSightings) or 0
+        local jobs = kind == "manual" and record.manualGoldBotJobs or record.strictGoldBotJobs
+        local source = tostring(jobId or "")
+        local newJob = source ~= "" and jobs[source] == nil
+        if source ~= "" then jobs[source] = os.time() end
+        local sightings = math.max(1, tonumber(playerSightings) or 1)
+        if kind == "manual" then
+            if newJob then record.manualGoldBotSightings += sightings end
+        elseif newJob then
+            record.strictGoldBotSightings += sightings
+        end
+        if not record.sampleUserId then record.sampleUserId = tonumber(sampleUserId) end
+        if (not record.sampleName or record.sampleName == "") and type(sampleName) == "string" then record.sampleName = sampleName end
+        record.lastSeen = os.time()
+        return true
+    end
+    State.AutoTrader.CommitTrustedBotDbCandidate = function(candidate, provenance)
+        if type(candidate) ~= "table" or type(candidate.icons) ~= "table" then return false, "invalid candidate bot DB" end
+        State.AutoTrader.BotTrustCommitSerial += 1
+        candidate.version = 5
+        candidate.trustedRevision = (tonumber(State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.trustedRevision) or 0) + 1
+        candidate.writtenByVersion = CONTROLLER_VERSION
+        candidate.lastTrustedCommitUnix = os.time()
+        local okBody, body = pcall(function() return HttpService:JSONEncode(candidate) end)
+        if not okBody then return false, "candidate JSON encode failed: " .. tostring(body) end
+        local digest = sha256Hex(body)
+        if not digest then return false, "candidate SHA failed" end
+        local envelope = {schema=1,kind="untrusted_staging_only",revision=candidate.trustedRevision,sha256=digest,body=body,provenance=provenance,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()}
+        local okEnvelope, envelopeBody = pcall(function() return HttpService:JSONEncode(envelope) end)
+        if not okEnvelope then return false, "staging envelope encode failed" end
+        State.AutoTrader.BotIconDbPending = {revision=candidate.trustedRevision,sha256=digest,provenance=provenance,stage="writing_staging",at=os.clock()}
+        local okStage, stageErr = HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustStageFile, envelopeBody)
+        if not okStage then State.AutoTrader.BotIconDbPending.stage="staging_write_failed"; return false, "staging write failed: " .. tostring(stageErr) end
+        local staged = HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustStageFile)
+        if type(staged) ~= "table" or staged.sha256 ~= digest or staged.body ~= body then State.AutoTrader.BotIconDbPending.stage="staging_verify_failed"; return false, "staging read-back verification failed" end
+        State.AutoTrader.BotIconDbPending.stage = "writing_trusted_primary"
+        local okTrusted, trustedErr = HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotIconDbFile, body)
+        if not okTrusted then State.AutoTrader.BotIconDbPending.stage="trusted_write_uncertain"; return false, "trusted primary write failed/uncertain: " .. tostring(trustedErr) end
+        local trustedBody = HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile)
+        if type(trustedBody) ~= "string" or sha256Hex(trustedBody) ~= digest then State.AutoTrader.BotIconDbPending.stage="trusted_readback_failed"; return false, "trusted primary read-back verification failed" end
+        local markerBody = HttpService:JSONEncode({schema=1,revision=candidate.trustedRevision,sha256=digest,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()})
+        State.AutoTrader.BotIconDbPending.stage = "writing_trusted_marker"
+        local okMarker, markerErr = HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustMarkerFile, markerBody)
+        if not okMarker then State.AutoTrader.BotIconDbPending.stage="marker_write_uncertain"; return false, "trusted marker write failed/uncertain: " .. tostring(markerErr) end
+        local marker = HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile)
+        if type(marker) ~= "table" or tonumber(marker.revision) ~= tonumber(candidate.trustedRevision) or marker.sha256 ~= digest then State.AutoTrader.BotIconDbPending.stage="marker_readback_failed"; return false, "trusted marker read-back verification failed" end
+        State.AutoTrader.BotIconDb = candidate
+        rawset(_G, State.AutoTrader.BotIconDbKey, candidate)
+        rawset(ExecutorEnvironment, State.AutoTrader.BotIconDbKey, candidate)
+        State.AutoTrader.BotIconDbPending = {revision=candidate.trustedRevision,sha256=digest,provenance=provenance,stage="PROMOTED_TRUSTED",at=os.clock(),promotedAtUnix=os.time()}
+        State.AutoTrader.Log("bot_trust_promoted", State.AutoTrader.BotIconDbPending)
+        return true
+    end
+    State.AutoTrader.SaveBotIconDb = function(immediate)
+        State.AutoTrader.BotIconDbSaveGeneration += 1
+        local generation = State.AutoTrader.BotIconDbSaveGeneration
+        local function saveTrusted()
+            State.AutoTrader.PruneBotIconDb()
+            local candidate = State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb)
+            local okBody, body = pcall(function() return HttpService:JSONEncode(candidate) end)
+            if not okBody then return false, tostring(body) end
+            local digest = sha256Hex(body)
+            local ok, err = HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotIconDbFile, body)
+            if not ok then return false, err end
+            local readback = HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile)
+            if type(readback) ~= "string" or not digest or sha256Hex(readback) ~= digest then return false, "trusted bot DB read-back mismatch" end
+            if (tonumber(candidate.trustedRevision) or 0) > 0 then
+                local markerBody = HttpService:JSONEncode({schema=1,revision=candidate.trustedRevision,sha256=digest,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()})
+                local okMarker, markerErr = HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustMarkerFile, markerBody)
+                if not okMarker then return false, "trusted bot marker write failed/uncertain: " .. tostring(markerErr) end
+                local marker = HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile)
+                if type(marker) ~= "table" or tonumber(marker.revision) ~= tonumber(candidate.trustedRevision) or marker.sha256 ~= digest then return false, "trusted bot marker read-back mismatch" end
+            end
+            rawset(_G, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+            rawset(ExecutorEnvironment, State.AutoTrader.BotIconDbKey, State.AutoTrader.BotIconDb)
+            return true
+        end
+        if immediate then return saveTrusted() end
+        task.delay(0.75, function() if not Destroyed and generation == State.AutoTrader.BotIconDbSaveGeneration then saveTrusted() end end)
+        return true
+    end
+    State.AutoTrader.FlushBotIconDb = function() return State.AutoTrader.SaveBotIconDb(true) end
+    State.AutoTrader.ImportStrictGoldTeleportCommit = function(payload)
+        if type(payload) ~= "table" or tonumber(payload.version) ~= 3 then return false, "invalid strict payload" end
+        local sourceJobId = payload.sourceJobId
+        if type(sourceJobId) ~= "string" or sourceJobId == "" or sourceJobId == game.JobId then return false, "invalid source JobId" end
+        if math.max(0, tonumber(payload.certifiedPlayers) or 0) < CONFIG.AutoTraderGoldMinRemotePlayers or type(payload.fingerprints) ~= "table" or #payload.fingerprints == 0 or #payload.fingerprints > 50 then return false, "invalid strict payload membership" end
+        local candidate = State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb)
+        local learned = 0
+        for _, row in ipairs(payload.fingerprints) do
+            if type(row) ~= "table" then return false, "malformed fingerprint row" end
+            if State.AutoTrader.ApplyBotEvidenceToDb(candidate, "strict", row.fingerprint, sourceJobId, math.max(1, math.min(20, math.floor(tonumber(row.count) or 1))), tonumber(row.sampleUserId), row.sampleName) then learned += 1 else return false, "invalid strict fingerprint" end
+        end
+        local saved, err = State.AutoTrader.CommitTrustedBotDbCandidate(candidate, {source="strict_gold_departure_commit",sourceJobId=sourceJobId,certifiedPlayers=payload.certifiedPlayers})
+        if not saved then
+            State.AutoTrader.Status = "BOT CERTIFY · SAVE FAILED"
+            State.AutoTrader.StatusDetail = "Strict bot evidence remains UNTRUSTED because persistence did not verify: " .. tostring(err)
+            State.AutoTrader.Log("strict_bot_commit_failed", {reason=err,hashesPrepared=learned})
+            State.AutoTrader.Render()
+            return false, err
+        end
+        State.AutoTrader.LastBotLearning = {jobId=sourceJobId,importedIntoJobId=game.JobId,action="strict_gold_departure_commit_imported",source="trusted_persistence_verified",certifiedPlayers=payload.certifiedPlayers,hashesLearned=learned,atUnix=os.time()}
+        State.AutoTrader.Log("strict_gold_departure_commit_imported", State.AutoTrader.LastBotLearning)
+        return true
+    end
+end
+
 do
     -- The strict evidence belongs to the server we just left. Import it only now,
     -- after an actual teleport delivered the validated candidate payload.
@@ -10960,6 +11272,12 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     end
     State.AutoTrader.Render()
 
+    if State.AutoTrader.ServerHopEscapeEpoch and State.AutoTrader.IsServerHopEscapeEpochCurrent
+        and not State.AutoTrader.IsServerHopEscapeEpochCurrent() then
+        State.AutoTrader.AbortServerHop("automated bot escape was revoked before teleport bootstrap queue")
+        State.AutoTrader.Log("bot_escape_hop_revoked_before_queue", {epoch=State.AutoTrader.ServerHopEscapeEpoch, reason=State.AutoTrader.FastBotHopReason})
+        return false
+    end
     local queued, queueError = State.AutoTrader.QueueTeleportScript(
         "server_hop:" .. tostring(State.AutoTrader.ServerHopCurrentDisposition)
     )
@@ -10976,6 +11294,15 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     State.AutoTrader.TeleportAttemptOriginJobId = game.JobId
     State.AutoTrader.ServerHopAttemptGeneration += 1
     local attemptGeneration = State.AutoTrader.ServerHopAttemptGeneration
+    if State.AutoTrader.ServerHopEscapeEpoch and State.AutoTrader.IsServerHopEscapeEpochCurrent
+        and not State.AutoTrader.IsServerHopEscapeEpochCurrent() then
+        State.AutoTrader.TeleportInProgress = false
+        State.AutoTrader.TeleportAttemptStartedAt = 0
+        State.AutoTrader.TeleportAttemptOriginJobId = nil
+        State.AutoTrader.AbortServerHop("automated bot escape was revoked before TeleportToPlaceInstance")
+        State.AutoTrader.Log("bot_escape_hop_revoked_before_teleport", {epoch=State.AutoTrader.ServerHopEscapeEpoch, reason=State.AutoTrader.FastBotHopReason})
+        return false
+    end
     local teleportData = {
         svAutoTrader = true,
         reason = "server_hop",
@@ -11303,6 +11630,442 @@ State.AutoTrader.ReconcilePlayerActivityOutcome = function(player, entry)
     end
 end
 
+State.AutoTrader.GetPortfolioMetrics = function(entries)
+    local totalValue, unitCount, distinctValues, minValue, maxValue = 0, 0, {}, math.huge, 0
+    local values = {}
+    for _, entry in ipairs(entries or {}) do
+        local value = tonumber(entry.unitValue) or (entry.record and entry.record.data and numericValue(entry.record.data))
+        local quantity = math.max(0, math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0))
+        if value and value > 0 and quantity > 0 then
+            totalValue += value * quantity
+            unitCount += quantity
+            distinctValues[string.format("%.3f", value)] = true
+            minValue = math.min(minValue, value)
+            maxValue = math.max(maxValue, value)
+            table.insert(values, {value=value, quantity=quantity})
+        end
+    end
+    local distinctCount = 0
+    for _ in pairs(distinctValues) do distinctCount += 1 end
+    if minValue == math.huge then minValue = 0 end
+    local anchorThreshold = math.max(CONFIG.AutoTraderLiquidityAnchorMinValue, totalValue * 0.12)
+    local anchorValue, anchorCount = 0, 0
+    for _, row in ipairs(values) do
+        if row.value >= anchorThreshold then
+            anchorValue += row.value * row.quantity
+            anchorCount += row.quantity
+        end
+    end
+    local bands = {2,3,5,8,10,15,20,30,50,75,100,150,250,500,1000,2500}
+    local coverage = 0
+    for _, band in ipairs(bands) do
+        if minValue > 0 and minValue <= band then coverage += 1 end
+    end
+    return {
+        totalValue=totalValue, unitCount=unitCount, distinctValues=distinctCount,
+        minValue=minValue, maxValue=maxValue, anchorThreshold=anchorThreshold,
+        anchorValue=anchorValue, anchorCount=anchorCount, coverage=coverage,
+    }
+end
+State.AutoTrader.SimulatePortfolioExchange = function(baseEntries, giveItems, receiveItems)
+    local byKey = {}
+    local function keyFor(entry)
+        return State.Mapping.MakeItemKey(entry.itemType, entry.itemId)
+            .. "|variant:" .. tostring(entry.variant or (entry.identityHint and entry.identityHint.variant) or "")
+    end
+    local function add(entry, quantity)
+        local value = tonumber(entry.unitValue) or (entry.record and entry.record.data and numericValue(entry.record.data))
+        if not value or value <= 0 then return end
+        local key = keyFor(entry)
+        local row = byKey[key]
+        if not row then
+            row = {
+                key=entry.key or State.Mapping.MakeItemKey(entry.itemType, entry.itemId), itemId=entry.itemId,
+                itemType=entry.itemType, name=entry.name or (entry.record and entry.record.name) or entry.itemId,
+                record=entry.record, unitValue=value, demand=entry.demand, variant=entry.variant,
+                identityHint=entry.identityHint, quantity=0, maxQuantity=0,
+            }
+            byKey[key] = row
+        end
+        row.quantity += quantity
+        row.maxQuantity = row.quantity
+    end
+    for _, entry in ipairs(baseEntries or {}) do
+        add(entry, math.max(0, math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0)))
+    end
+    for _, entry in ipairs(giveItems or {}) do add(entry, -math.max(1, math.floor(tonumber(entry.quantity) or 1))) end
+    for _, entry in ipairs(receiveItems or {}) do add(entry, math.max(1, math.floor(tonumber(entry.quantity) or 1))) end
+    local result = {}
+    for _, row in pairs(byKey) do
+        if row.quantity > 0 then row.maxQuantity=row.quantity; table.insert(result,row) end
+    end
+    return result
+end
+State.AutoTrader.EvaluatePortfolioDelta = function(baseEntries, giveItems, receiveItems)
+    local before = State.AutoTrader.GetPortfolioMetrics(baseEntries)
+    local afterEntries = State.AutoTrader.SimulatePortfolioExchange(baseEntries, giveItems, receiveItems)
+    local after = State.AutoTrader.GetPortfolioMetrics(afterEntries)
+    local anchorOK = true
+    local anchorReason = nil
+    if before.maxValue >= before.anchorThreshold and before.maxValue > 0 then
+        if after.maxValue + 0.000001 < before.maxValue * CONFIG.AutoTraderLiquidityAnchorRetention then
+            anchorOK = false
+            anchorReason = "would liquidate too much one-slot anchor strength"
+        elseif before.anchorValue > 0 and after.anchorValue + 0.000001 < before.anchorValue * 0.45 then
+            anchorOK = false
+            anchorReason = "would liquidate too much high-value anchor inventory"
+        end
+    end
+    local minImprovement = 0
+    if before.minValue > 0 and after.minValue > 0 and after.minValue < before.minValue then
+        minImprovement = math.min(4, math.log(before.minValue / after.minValue) / math.log(2)) * 2.0
+    end
+    local coverageGain = math.max(0, after.coverage - before.coverage) * 0.35
+    local pieceGain = clamp(after.unitCount - before.unitCount, -4, 4) * 0.25
+    local distinctGain = clamp(after.distinctValues - before.distinctValues, -4, 4) * 0.35
+    local anchorBonus = (after.maxValue >= before.maxValue * 0.85) and 0.35 or 0
+    local score = minImprovement + coverageGain + pieceGain + distinctGain + anchorBonus
+    local ok = anchorOK and score >= CONFIG.AutoTraderLiquidityMinScore
+    return {
+        ok=ok, score=score, before=before, after=after, anchorOK=anchorOK, anchorReason=anchorReason,
+        minImprovement=minImprovement, coverageGain=coverageGain, pieceGain=pieceGain, distinctGain=distinctGain,
+        reason=ok and ("portfolio reach improves: minimum usable denomination " .. formatCompact(before.minValue) .. " → " .. formatCompact(after.minValue)
+            .. ", coverage " .. tostring(before.coverage) .. " → " .. tostring(after.coverage))
+            or (anchorReason or "portfolio flexibility improvement is too small"),
+        simulatedEntries=afterEntries,
+    }
+end
+State.AutoTrader.BuildOpportunityFrontier = function(entries, cap)
+    cap = math.max(0, tonumber(cap) or 0)
+    if cap <= 0 then return {} end
+    local candidates = {}
+    for _, entry in ipairs(entries or {}) do
+        local value = tonumber(entry.unitValue) or (entry.record and entry.record.data and numericValue(entry.record.data))
+        local maximum = math.max(0, math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0))
+        if value and value > 0 and maximum > 0 and value <= cap + 0.000001 then
+            local copy = {}
+            for key, field in pairs(entry) do copy[key]=field end
+            copy.unitValue=value; copy.maxQuantity=maximum
+            table.insert(candidates, copy)
+        end
+    end
+    table.sort(candidates, function(a,b) return a.unitValue < b.unitValue end)
+    if #candidates > CONFIG.AutoTraderOpportunityMaxResolvedTypes then
+        local kept, seen = {}, {}
+        local half = math.floor(CONFIG.AutoTraderOpportunityMaxResolvedTypes / 2)
+        for i=1,half do if candidates[i] then table.insert(kept,candidates[i]); seen[candidates[i]]=true end end
+        for i=#candidates,math.max(1,#candidates-half+1),-1 do if candidates[i] and not seen[candidates[i]] then table.insert(kept,candidates[i]) end end
+        candidates=kept
+    end
+    local states = {{total=0,slots=0,items={}}}
+    for _, entry in ipairs(candidates) do
+        local maximum = math.min(entry.maxQuantity, math.max(0, math.floor(cap / entry.unitValue + 0.000001)))
+        local optionSet = {}
+        local function addOption(q) q=math.floor(tonumber(q) or 0); if q>=1 and q<=maximum then optionSet[q]=true end end
+        if maximum <= 8 then for q=1,maximum do addOption(q) end
+        else addOption(1);addOption(2);addOption(3);addOption(4);addOption(math.floor(maximum/2));addOption(math.floor(maximum*0.75));addOption(maximum) end
+        local nextByKey = {}
+        local function consider(state)
+            local bucket=math.floor(state.total*10+0.5)
+            local key=tostring(bucket).."|"..tostring(state.slots)
+            local existing=nextByKey[key]
+            if not existing or #state.items > #existing.items then nextByKey[key]=state end
+        end
+        for _, state in ipairs(states) do
+            consider(state)
+            if state.slots < CONFIG.MaxOfferSlots then
+                for q in pairs(optionSet) do
+                    local total=state.total+entry.unitValue*q
+                    if total<=cap+0.000001 then
+                        local items={}
+                        for i,item in ipairs(state.items) do items[i]=item end
+                        local item={}
+                        for k,v in pairs(entry) do item[k]=v end
+                        item.quantity=q
+                        table.insert(items,item)
+                        consider({total=total,slots=state.slots+1,items=items})
+                    end
+                end
+            end
+        end
+        local nextStates={}
+        for _, state in pairs(nextByKey) do table.insert(nextStates,state) end
+        table.sort(nextStates,function(a,b) return a.total<b.total end)
+        if #nextStates>CONFIG.AutoTraderOpportunityFrontierLimit then
+            local sampled={}
+            local limit=CONFIG.AutoTraderOpportunityFrontierLimit
+            for i=1,limit do
+                local index=math.floor((i-1)*(#nextStates-1)/math.max(1,limit-1)+1.5)
+                table.insert(sampled,nextStates[math.min(#nextStates,index)])
+            end
+            nextStates=sampled
+        end
+        states=nextStates
+    end
+    local result={}
+    for _,state in ipairs(states) do if state.slots>0 and state.total>0 then table.insert(result,state) end end
+    table.sort(result,function(a,b) return a.total<b.total end)
+    return result
+end
+State.AutoTrader.GetResolvedRemoteOpportunityEntries = function(player)
+    if not player then return {}, nil end
+    local allHints=State.Profile.remoteCardHintsByUserId[player.UserId]
+    local byKey={}
+    for _, sectionName in ipairs({"Weapons","Pets"}) do
+        for _, hint in ipairs(type(allHints)=="table" and type(allHints[sectionName])=="table" and allHints[sectionName] or {}) do
+            local record=hint.record
+            local value=record and record.data and numericValue(record.data) or nil
+            if value and value>0 then
+                local variant=hint.variant or (hint.identityHint and hint.identityHint.variant) or (record.category=="chromas" and "Chroma" or nil)
+                local key=State.Mapping.MakeItemKey(hint.itemType or sectionName,hint.itemId).."|variant:"..tostring(variant or "")
+                local row=byKey[key]
+                if not row then
+                    row={key=State.Mapping.MakeItemKey(hint.itemType or sectionName,hint.itemId),itemId=hint.itemId,itemType=hint.itemType or sectionName,
+                        name=record.name,record=record,unitValue=value,demand=tonumberSafe(record.data.demand) or 0,quantity=0,maxQuantity=0,
+                        variant=variant,identityHint=hint.identityHint}
+                    byKey[key]=row
+                end
+                local q=math.max(1,math.floor(tonumber(hint.quantity) or 1)); row.quantity+=q; row.maxQuantity=row.quantity
+            end
+        end
+    end
+    local entries={}
+    for _,row in pairs(byKey) do table.insert(entries,row) end
+    table.sort(entries,function(a,b) if a.unitValue~=b.unitValue then return a.unitValue<b.unitValue end return tostring(a.name)<tostring(b.name) end)
+    return entries, State.AutoTrader.GetTargetProfile(player)
+end
+State.AutoTrader.GetReserveSignature = function()
+    local parts={}
+    for key,value in pairs(State.AutoTrader.Preferences.reserves or {}) do if tonumber(value) and tonumber(value)>0 then table.insert(parts,tostring(key).."="..tostring(math.floor(tonumber(value)))) end end
+    table.sort(parts); return table.concat(parts,";")
+end
+State.AutoTrader.BuildPreTradeOpportunity = function(player, localOverride, noCache)
+    if not player or player==LocalPlayer or not player.Parent then return nil,"player unavailable" end
+    local remoteState=State.Profile.remoteTotals
+    local remoteStamp=remoteState and remoteState.lastSuccessByUserId[player.UserId] or nil
+    if not remoteStamp then return nil,"inventory unresolved" end
+    local localEntries, inventoryReason, localInventory
+    if type(localOverride)=="table" then localEntries=localOverride
+    else
+        if type(State.AutoTrader.GetTradableInventory)~="function" then return nil,"local planner not ready" end
+        localEntries,inventoryReason,localInventory=State.AutoTrader.GetTradableInventory()
+    end
+    if not localEntries or #localEntries==0 then return nil,tostring(inventoryReason or "no tradable numeric local inventory") end
+    local localStamp=(localInventory and localInventory.lastSuccess) or (State.AutoTrader.InventoryCache and State.AutoTrader.InventoryCache.lastSuccess) or 0
+    local cacheKey=tostring(remoteStamp).."|"..tostring(localStamp).."|"..tostring(State.Mapping.Revision).."|"..tostring(HARDEN.supremeDataRevision).."|"..tostring(HARDEN.supremeDataHash).."|"..State.AutoTrader.GetReserveSignature()
+    if not noCache then
+        local cached=State.AutoTrader.OpportunityCache[player.UserId]
+        if cached and cached.key==cacheKey then return cached.opportunity,cached.reason end
+    end
+    local remoteEntries,profile=State.AutoTrader.GetResolvedRemoteOpportunityEntries(player)
+    if #remoteEntries==0 then
+        local reason=(profile and ((profile.unresolvedUnits or 0)>0 or (profile.nonNumericUnits or 0)>0)) and "no proven trade from currently resolved inventory" or "no resolved numeric inventory"
+        if not noCache then State.AutoTrader.OpportunityCache[player.UserId]={key=cacheKey,opportunity=nil,reason=reason} end
+        return nil,reason
+    end
+    local remoteKnownTotal=0
+    for _,e in ipairs(remoteEntries) do remoteKnownTotal+=e.unitValue*e.maxQuantity end
+    local receiveFrontier=State.AutoTrader.BuildOpportunityFrontier(remoteEntries,remoteKnownTotal)
+    local giveFrontier=State.AutoTrader.BuildOpportunityFrontier(localEntries,remoteKnownTotal)
+    if #giveFrontier==0 or #receiveFrontier==0 then
+        local reason="no legal ≤4-slot exchange can be built from resolved numeric items"
+        if not noCache then State.AutoTrader.OpportunityCache[player.UserId]={key=cacheKey,opportunity=nil,reason=reason} end
+        return nil,reason
+    end
+    local bestProfit=nil
+    for _,receive in ipairs(receiveFrontier) do
+        local receiveSummary=summarizeResolvedOffer(receive.items)
+        local minWin=State.AutoTrader.GetEffectiveMinimumWin(receiveSummary)
+        local limit=receive.total-minWin
+        if limit>0 then
+            local checked=0
+            for gi=#giveFrontier,1,-1 do
+                local give=giveFrontier[gi]
+                if give.total<=limit+0.000001 then
+                    checked+=1
+                    local marketOK,market=State.AutoTrader.EvaluateMarketGate({items=give.items,total=give.total},receiveSummary)
+                    if marketOK then
+                        local delta=State.AutoTrader.EvaluatePortfolioDelta(localEntries,give.items,receive.items)
+                        if delta.anchorOK then
+                            local win=receive.total-give.total
+                            local candidate={kind="profit",giveItems=give.items,receiveItems=receive.items,giveTotal=give.total,receiveTotal=receive.total,win=win,minWin=minWin,marketGate=market,portfolioDelta=delta,
+                                reason="resolved inventory proves a safe value-winning exchange ("..formatCompact(give.total).." → "..formatCompact(receive.total)..", +"..formatCompact(win)..") while preserving high-value anchor strength"}
+                            if not bestProfit or win<bestProfit.win-0.000001 or (math.abs(win-bestProfit.win)<=0.000001 and receive.total>bestProfit.receiveTotal) then bestProfit=candidate end
+                            break
+                        end
+                    end
+                    if checked>=40 then break end
+                end
+            end
+        end
+    end
+    local bestLiquidity=nil
+    if not bestProfit then
+        for _,receive in ipairs(receiveFrontier) do
+            local receiveSummary=summarizeResolvedOffer(receive.items)
+            local checked=0
+            for gi=#giveFrontier,1,-1 do
+                local give=giveFrontier[gi]
+                if give.total<=receive.total+0.000001 then
+                    local gap=receive.total-give.total
+                    if gap<=math.max(0.5,receive.total*0.03)+0.000001 then
+                        checked+=1
+                        local marketOK,market=State.AutoTrader.EvaluateMarketGate({items=give.items,total=give.total},receiveSummary)
+                        if marketOK then
+                            local delta=State.AutoTrader.EvaluatePortfolioDelta(localEntries,give.items,receive.items)
+                            if delta.ok then
+                                local candidate={kind="liquidity",strategicKind="liquidity",giveItems=give.items,receiveItems=receive.items,giveTotal=give.total,receiveTotal=receive.total,win=gap,minWin=0,marketGate=market,portfolioDelta=delta,
+                                    reason="resolved inventory proves a non-loss denomination upgrade: "..delta.reason}
+                                if not bestLiquidity or delta.score>bestLiquidity.portfolioDelta.score+0.000001 or (math.abs(delta.score-bestLiquidity.portfolioDelta.score)<=0.000001 and receive.total>bestLiquidity.receiveTotal) then bestLiquidity=candidate end
+                            end
+                        end
+                        if checked>=40 then break end
+                    elseif give.total<receive.total-math.max(0.5,receive.total*0.03) then break end
+                end
+            end
+        end
+    end
+    local opportunity=bestProfit or bestLiquidity
+    if opportunity then
+        local knownTotal=profile and tonumber(profile.total) or remoteKnownTotal
+        local ev=State.AutoTrader.GetTargetScore(player,math.max(knownTotal or 0,opportunity.receiveTotal))
+        opportunity.expectedRate=ev
+        opportunity.queueScore=(opportunity.kind=="profit" and 2000000 or 1000000)+(tonumber(ev) or 0)*10000+(opportunity.kind=="profit" and opportunity.win*100 or (opportunity.portfolioDelta and opportunity.portfolioDelta.score or 0)*1000)+opportunity.receiveTotal
+        opportunity.remoteKnownTotal=remoteKnownTotal
+        opportunity.partial=profile and profile.partial==true or false
+        opportunity.unresolvedUnits=profile and profile.unresolvedUnits or 0
+        opportunity.nonNumericUnits=profile and profile.nonNumericUnits or 0
+    end
+    local reason=opportunity and opportunity.reason or "planner found no safe value win or anchor-preserving non-loss liquidity improvement"
+    if not noCache then State.AutoTrader.OpportunityCache[player.UserId]={key=cacheKey,opportunity=opportunity,reason=reason} end
+    return opportunity,reason
+end
+
+State.AutoTrader.FormatOpportunityItems = function(items)
+    local parts = {}
+    for _, item in ipairs(items or {}) do
+        local quantity = math.max(1, math.floor(tonumber(item.quantity) or 1))
+        local name = tostring(item.name or (item.record and item.record.name) or item.itemId or "?")
+        local variant = item.variant or (item.identityHint and item.identityHint.variant)
+        if variant == "Chroma" and not normalize(name):find("chroma", 1, true) then
+            name = "Chroma " .. name
+        end
+        local value = tonumber(item.unitValue) or (item.record and item.record.data and numericValue(item.record.data))
+        table.insert(parts, (quantity > 1 and (tostring(quantity) .. "× ") or "") .. name .. (value and (" [" .. formatCompact(value) .. "]") or ""))
+    end
+    return #parts > 0 and table.concat(parts, " + ") or "—"
+end
+State.AutoTrader.BuildQueueProjection = function(snapshot)
+    snapshot = snapshot or State.AutoTrader.LastEligibilitySnapshot
+    local queue = snapshot and snapshot.queue or {}
+    local first = queue and queue[1] or nil
+    if not first or not first.player or not first.opportunity then
+        State.AutoTrader.LastQueueProjection = nil
+        return nil
+    end
+    local inventory = State.AutoTrader.GetTradableInventory and select(1, State.AutoTrader.GetTradableInventory()) or nil
+    if type(inventory) ~= "table" or #inventory == 0 then
+        State.AutoTrader.LastQueueProjection = nil
+        return nil
+    end
+    local opportunity = first.opportunity
+    local cacheKey = tostring(first.player.UserId) .. "|" .. tostring(State.AutoTrader.InventoryCacheStamp or 0)
+        .. "|" .. tostring(opportunity.kind) .. "|" .. tostring(opportunity.giveTotal) .. "|" .. tostring(opportunity.receiveTotal)
+        .. "|" .. tostring(#queue)
+    local cached = State.AutoTrader.QueueProjectionCache
+    if cached and cached.key == cacheKey and os.clock() - (cached.at or 0) < 2 then
+        State.AutoTrader.LastQueueProjection = cached.projection
+        return cached.projection
+    end
+    local simulated = State.AutoTrader.SimulatePortfolioExchange(inventory, opportunity.giveItems, opportunity.receiveItems)
+    local projectedRows = {}
+    local beforeSet = {}
+    for _, row in ipairs(queue) do if row.player then beforeSet[row.player.UserId] = true end end
+    local newlyUnlocked = {}
+    local lostFeasibility = {}
+    for _, row in ipairs(snapshot.rows or {}) do
+        local player = row.player
+        if player and player ~= first.player and player.Parent
+            and row.state ~= "terminal" and row.state ~= "friend" and row.state ~= "active_trade" and row.state ~= "active_request"
+            and row.state ~= "discovery_pending" and row.state ~= "unresolvable" and row.state ~= "zero" then
+            local projectedOpportunity = State.AutoTrader.BuildPreTradeOpportunity(player, simulated, true)
+            if projectedOpportunity then
+                table.insert(projectedRows, {
+                    player = player,
+                    verifiedTotal = row.verifiedTotal,
+                    score = row.score,
+                    queueScore = projectedOpportunity.queueScore,
+                    opportunity = projectedOpportunity,
+                })
+                if not beforeSet[player.UserId] then table.insert(newlyUnlocked, player.Name) end
+            elseif beforeSet[player.UserId] then
+                table.insert(lostFeasibility, player.Name)
+            end
+        end
+    end
+    table.sort(projectedRows, function(a, b)
+        local aq = tonumber(a.queueScore or a.score) or -math.huge
+        local bq = tonumber(b.queueScore or b.score) or -math.huge
+        if aq ~= bq then return aq > bq end
+        return (tonumber(a.verifiedTotal) or 0) > (tonumber(b.verifiedTotal) or 0)
+    end)
+    local projectedNames = {}
+    for i, row in ipairs(projectedRows) do
+        if i > CONFIG.AutoTraderQueueProjectionLimit then break end
+        table.insert(projectedNames, row.player.Name)
+    end
+    local projection = {
+        at = os.clock(),
+        basedOnUserId = first.player.UserId,
+        basedOnName = first.player.Name,
+        kind = opportunity.kind,
+        modeledGive = State.AutoTrader.FormatOpportunityItems(opportunity.giveItems),
+        modeledReceive = State.AutoTrader.FormatOpportunityItems(opportunity.receiveItems),
+        giveTotal = opportunity.giveTotal,
+        receiveTotal = opportunity.receiveTotal,
+        beforeMetrics = State.AutoTrader.GetPortfolioMetrics(inventory),
+        afterMetrics = State.AutoTrader.GetPortfolioMetrics(simulated),
+        projectedOrder = projectedNames,
+        projectedRows = projectedRows,
+        newlyUnlocked = newlyUnlocked,
+        lostFeasibility = lostFeasibility,
+        disclaimer = "Projection assumes the representative modeled exchange succeeds; the queue is rebuilt from audited real inventory after any completed trade.",
+    }
+    State.AutoTrader.QueueProjectionCache = {key = cacheKey, at = os.clock(), projection = projection}
+    State.AutoTrader.LastQueueProjection = projection
+    return projection
+end
+State.AutoTrader.FindLiquidityPlan = function(otherSummary, inventoryEntries, generation, negotiation)
+    if type(otherSummary)~="table" or (tonumber(otherSummary.knownFloor) or 0)<=0 then return nil,"their resolved offer has no numeric value",{strategicLiquidity=true} end
+    if (tonumber(otherSummary.unknownCount) or 0)>0 then return nil,"strategic liquidity requires a fully resolved incoming offer",{strategicLiquidity=true} end
+    local receiveItems=otherSummary.entries or {}
+    if #receiveItems<2 then return nil,"strategic liquidity requires the incoming side to improve denomination structure",{strategicLiquidity=true} end
+    local frontier=State.AutoTrader.BuildOpportunityFrontier(inventoryEntries,otherSummary.knownFloor)
+    local best=nil
+    for i=#frontier,1,-1 do
+        if generation and generation~=State.AutoTrader.PlanGeneration then return nil,"superseded",{strategicLiquidity=true} end
+        local give=frontier[i]
+        if give.total<=otherSummary.knownFloor+0.000001 then
+            local gap=otherSummary.knownFloor-give.total
+            if gap<=math.max(0.5,otherSummary.knownFloor*0.03)+0.000001 then
+                local marketOK,market=State.AutoTrader.EvaluateMarketGate({items=give.items,total=give.total},otherSummary)
+                if marketOK then
+                    local delta=State.AutoTrader.EvaluatePortfolioDelta(inventoryEntries,give.items,receiveItems)
+                    if delta.ok then
+                        best={items=give.items,total=give.total,receiveTotal=otherSummary.knownFloor,unknownCount=0,win=gap,minWin=0,
+                            minimumWinInfo={strategicLiquidity=true,effective=0},targetProfit=0,targetUpper=otherSummary.knownFloor,
+                            negotiationStage=negotiation and negotiation.stage or 4,negotiationMargin=0,proactiveAccept=(not negotiation) or negotiation.final==true,
+                            marketGate=market,strategicKind="liquidity",portfolioDelta=delta}
+                        State.AutoTrader.LastMarketGate=market
+                        return best,nil,{strategicLiquidity=true,portfolioDelta=delta,give=give.total,receive=otherSummary.knownFloor}
+                    end
+                end
+            elseif give.total<otherSummary.knownFloor-math.max(0.5,otherSummary.knownFloor*0.03) then break end
+        end
+    end
+    return nil,"no anchor-preserving non-loss liquidity plan exists for their current offer",{strategicLiquidity=true}
+end
+
 State.AutoTrader.BuildEligibilityContext = function()
     local now = os.clock()
     local hopRate = State.AutoTrader.GetHopOpportunityRate()
@@ -11387,28 +12150,19 @@ State.AutoTrader.EvaluatePlayerEligibility = function(player, context)
     end
 
     local score = State.AutoTrader.GetTargetScore(player, total)
-    local economicPath = State.AutoTrader.TargetHasEconomicPath(total)
-    if context.canEconomicSkip and (not economicPath or score < context.opportunityFloor) then
+    local opportunity, opportunityReason = State.AutoTrader.BuildPreTradeOpportunity(player)
+    if not opportunity then
         return {
-            state = "economic_hop_preferred", player = player, entry = entry, actionable = false,
-            verifiedTotal = total, score = score, economicPath = economicPath,
-            reason = not economicPath
-                and "known inventory cannot support even the cheapest safe local denomination"
-                or ("expected value/second below stay-vs-hop floor: " .. tostring(score) .. " < " .. tostring(context.opportunityFloor)),
-        }
-    end
-
-    if not economicPath then
-        return {
-            state = "no_economic_path", player = player, entry = entry, actionable = false,
+            state = "no_feasible_trade", player = player, entry = entry, actionable = false,
             verifiedTotal = total, score = score, economicPath = false,
-            reason = "known inventory cannot support a safe local denomination",
+            reason = opportunityReason or "planner cannot prove a worthwhile trade from resolved inventory",
         }
     end
-
     return {
         state = "actionable", player = player, entry = entry, actionable = true,
         verifiedTotal = total, score = score, economicPath = true,
+        opportunity = opportunity, queueScore = opportunity.queueScore,
+        reason = opportunity.reason,
     }
 end
 
@@ -11419,7 +12173,7 @@ State.AutoTrader.BuildEligibilitySnapshot = function()
         friend = 0, exhausted = 0, active = 0,
         verifiedPositive = 0, verifiedZero = 0, verifiedCount = 0,
         actionable = 0, economicHopPreferred = 0, retryLater = 0,
-        friendPending = 0, discoveryPending = 0, noEconomicPath = 0,
+        friendPending = 0, discoveryPending = 0, noEconomicPath = 0, noFeasibleTrade = 0,
     }
     local rows = {}
     local best, bestScore, bestTotal = nil, -math.huge, 0
@@ -11437,7 +12191,7 @@ State.AutoTrader.BuildEligibilitySnapshot = function()
             if row.state == "actionable" then
                 counts.actionable += 1
                 counts.valued += 1
-                local score = tonumber(row.score) or -math.huge
+                local score = tonumber(row.queueScore or (row.opportunity and row.opportunity.queueScore) or row.score) or -math.huge
                 local total = tonumber(row.verifiedTotal) or 0
                 if not best
                     or score > bestScore + 0.000001
@@ -11445,6 +12199,9 @@ State.AutoTrader.BuildEligibilitySnapshot = function()
                     or (math.abs(score - bestScore) <= 0.000001 and total == bestTotal and player.UserId < best.UserId) then
                     best, bestScore, bestTotal = player, score, total
                 end
+            elseif row.state == "no_feasible_trade" then
+                counts.noFeasibleTrade += 1
+                counts.valued += 1
             elseif row.state == "economic_hop_preferred" then
                 counts.economicHopPreferred += 1
                 counts.valued += 1
@@ -11478,10 +12235,40 @@ State.AutoTrader.BuildEligibilitySnapshot = function()
             end
         end
     end
+    local queue = {}
+    for _, row in ipairs(rows) do if row.state == "actionable" then table.insert(queue,row) end end
+    table.sort(queue,function(a,b)
+        local aq=tonumber(a.queueScore or (a.opportunity and a.opportunity.queueScore) or a.score) or -math.huge
+        local bq=tonumber(b.queueScore or (b.opportunity and b.opportunity.queueScore) or b.score) or -math.huge
+        if aq~=bq then return aq>bq end
+        return (tonumber(a.verifiedTotal) or 0)>(tonumber(b.verifiedTotal) or 0)
+    end)
+    local queueParts = {}
+    local queueEventRows = {}
+    for index, row in ipairs(queue) do
+        local opportunity = row.opportunity
+        table.insert(queueParts, tostring(row.player and row.player.UserId or "?") .. ":" .. tostring(opportunity and opportunity.kind or "?")
+            .. ":" .. tostring(opportunity and opportunity.giveTotal or "?") .. ">" .. tostring(opportunity and opportunity.receiveTotal or "?"))
+        if index <= 8 then
+            table.insert(queueEventRows, {
+                position=index, name=row.player and row.player.Name or nil, userId=row.player and row.player.UserId or nil,
+                kind=opportunity and opportunity.kind or nil, give=opportunity and opportunity.giveTotal or nil,
+                receive=opportunity and opportunity.receiveTotal or nil, win=opportunity and opportunity.win or nil,
+            })
+        end
+    end
+    local queueSignature = table.concat(queueParts, "|")
+    if queueSignature ~= State.AutoTrader.LastTradeQueueSignature then
+        State.AutoTrader.LastTradeQueueSignature = queueSignature
+        State.AutoTrader.QueueProjectionCache = nil
+        State.AutoTrader.Log("trade_queue_changed", {length=#queue, rows=queueEventRows})
+    end
+    State.AutoTrader.LastTradeQueue = queue
     local snapshot = {
         at = context.now,
         context = context,
         rows = rows,
+        queue = queue,
         counts = counts,
         best = best,
         bestScore = best and bestScore or nil,
@@ -11502,7 +12289,7 @@ State.AutoTrader.GetServerDisposition = function()
         friend = 0, exhausted = 0, active = 0,
         verifiedPositive = 0, verifiedZero = 0, verifiedCount = 0,
         actionable = 0, economicHopPreferred = 0, retryLater = 0,
-        friendPending = 0, discoveryPending = 0, noEconomicPath = 0,
+        friendPending = 0, discoveryPending = 0, noEconomicPath = 0, noFeasibleTrade = 0,
     }
     if not State.AutoTrader.Preferences.automation then return "OFF", counts end
     if State.AutoTrader.SessionFrozen then return "FROZEN", counts end
@@ -11522,6 +12309,7 @@ State.AutoTrader.GetServerDisposition = function()
         counts.earliestRetry = snapshot.earliestRetry
         return "WAITING_FOR_RETRY", counts
     end
+    if counts.noFeasibleTrade > 0 then return "EXHAUSTED_NO_FEASIBLE_TRADES", counts end
     if counts.economicHopPreferred > 0 then return "EXHAUSTED_ECONOMIC_HOP_PREFERRED", counts end
     if counts.noEconomicPath > 0 then return "EXHAUSTED_NO_ECONOMIC_PATH", counts end
     if counts.retryLater > 0 then
@@ -11542,7 +12330,10 @@ State.AutoTrader.SelectTarget = function()
         at = context.now,
         hopOpportunityRate = context.hopOpportunityRate,
         retentionFloor = context.opportunityFloor,
-        bestScore = snapshot.bestScore,
+        bestScore = snapshot.queue and snapshot.queue[1] and snapshot.queue[1].score or nil,
+        bestQueueScore = snapshot.bestScore,
+        queueLength = #(snapshot.queue or {}),
+        queue = snapshot.queue,
         bestName = best and best.Name or nil,
         bestUserId = best and best.UserId or nil,
         bestEconomicName = snapshot.bestEconomic and snapshot.bestEconomic.Name or nil,
@@ -11554,12 +12345,13 @@ State.AutoTrader.SelectTarget = function()
         earliestRetry = snapshot.earliestRetry,
     }
     State.AutoTrader.SelectedTarget = best
-    State.AutoTrader.SelectedTargetScore = snapshot.bestScore or -math.huge
+    State.AutoTrader.SelectedTargetScore = -math.huge
+    for _, row in ipairs(snapshot.queue or {}) do if row.player == best then State.AutoTrader.SelectedTargetScore = tonumber(row.score) or -math.huge; break end end
     State.AutoTrader.SelectedTargetValue = snapshot.bestTotal or 0
     State.AutoTrader.SelectedTargetProfile = best and State.AutoTrader.GetTargetProfile(best) or nil
     State.AutoTrader.LastDecisionEvent = {
         at=context.now, kind=best and "target" or "no_target", userId=best and best.UserId or nil,
-        name=best and best.Name or nil, score=snapshot.bestScore, counts=snapshot.counts,
+        name=best and best.Name or nil, score=State.AutoTrader.SelectedTargetScore, queueScore=snapshot.bestScore, counts=snapshot.counts,
         hopOpportunityRate=context.hopOpportunityRate, retentionFloor=context.opportunityFloor,
     }
     return best
@@ -11600,7 +12392,9 @@ State.AutoTrader.GetLocalInventory = function(force)
                 local itemType = tostring(hint.itemType or "Weapons")
                 local itemId = tostring(hint.itemId or "")
                 if itemId ~= "" then
-                    local key = State.Mapping.MakeItemKey(itemType, itemId)
+                    local baseKey = State.Mapping.MakeItemKey(itemType, itemId)
+                    local variant = hint.variant or (hint.identityHint and hint.identityHint.variant)
+                    local key = baseKey .. "|variant:" .. tostring(variant or "")
                     local quantity = math.max(1, tonumber(hint.quantity) or 1)
                     local existing = byKey[key]
                     if existing then
@@ -11613,6 +12407,7 @@ State.AutoTrader.GetLocalInventory = function(force)
                     else
                         existing = {
                             key = key,
+                            reserveKey = baseKey,
                             itemId = itemId,
                             itemType = itemType,
                             quantity = quantity,
@@ -11621,6 +12416,9 @@ State.AutoTrader.GetLocalInventory = function(force)
                             unitValue = unitValue,
                             demand = tonumberSafe(record.data.demand) or 0,
                             resolutionMeta = hint.resolutionMeta,
+                            variant = variant,
+                            identityHint = hint.identityHint,
+                            nativeKey = itemId,
                         }
                         byKey[key] = existing
                     end
@@ -11641,6 +12439,30 @@ State.AutoTrader.GetLocalInventory = function(force)
         end
         return normalize(a.name) < normalize(b.name)
     end)
+    local unresolvedLocal = {}
+    local nonNumericLocal = {}
+    local function collectLocalDiagnostics(section)
+        for _, miss in ipairs(section and section.unresolvedAll or {}) do
+            if #unresolvedLocal < 40 then
+                table.insert(unresolvedLocal, {
+                    itemId=miss.itemId, itemType=miss.itemType, quantity=miss.quantity, reason=miss.reason,
+                    suggested=miss.suggested, variant=miss.variant or (miss.identityHint and miss.identityHint.variant),
+                    resolutionMeta=miss.resolutionMeta,
+                })
+            end
+        end
+        for _, hint in ipairs(section and section.cardHints or {}) do
+            if hint.record and not (hint.record.data and numericValue(hint.record.data)) and #nonNumericLocal < 20 then
+                table.insert(nonNumericLocal, {itemId=hint.itemId,itemType=hint.itemType,quantity=hint.quantity,name=hint.record.name,variant=hint.variant})
+            end
+        end
+    end
+    collectLocalDiagnostics(calculated.weapons)
+    collectLocalDiagnostics(calculated.pets)
+    State.AutoTrader.LastLocalInventoryDiagnostics = {
+        at=os.clock(), stamp=lastSuccess, resolvedTypes=#entries, partial=calculated.partial==true,
+        unresolved=unresolvedLocal, nonNumeric=nonNumericLocal,
+    }
     State.AutoTrader.InventoryCache = {
         entries = entries,
         raw = raw,
@@ -11675,11 +12497,11 @@ State.AutoTrader.GetLocalAuditSnapshot = function(force)
     end
     local quantities = {}
     local evidence = {}
-    local function add(itemType, itemId, quantity, resolved, record)
+    local function add(itemType, itemId, quantity, resolved, record, variant)
         if itemId == nil then
             return
         end
-        local key = State.Mapping.MakeItemKey(itemType, itemId)
+        local key = State.Mapping.MakeItemKey(itemType, itemId) .. "|variant:" .. tostring(variant or "")
         quantity = math.max(1, math.floor(tonumber(quantity) or 1))
         quantities[key] = (quantities[key] or 0) + quantity
         evidence[key] = evidence[key] or {
@@ -11688,6 +12510,7 @@ State.AutoTrader.GetLocalAuditSnapshot = function(force)
             itemId = tostring(itemId),
             resolved = resolved == true,
             name = record and record.name or tostring(itemId),
+            variant = variant,
         }
     end
     local function ingest(section, itemType)
@@ -11697,7 +12520,8 @@ State.AutoTrader.GetLocalAuditSnapshot = function(force)
                 hint.itemId,
                 hint.quantity,
                 true,
-                hint.record
+                hint.record,
+                hint.variant or (hint.identityHint and hint.identityHint.variant)
             )
         end
         for _, miss in ipairs(section and section.unresolvedAll or {}) do
@@ -11706,7 +12530,8 @@ State.AutoTrader.GetLocalAuditSnapshot = function(force)
                 miss.itemId,
                 miss.quantity,
                 false,
-                nil
+                nil,
+                miss.variant or (miss.identityHint and miss.identityHint.variant)
             )
         end
     end
@@ -11784,6 +12609,8 @@ State.AutoTrader.OfferHash = function(entries)
             normalizeTradeItemType(entry.itemType)
             .. "|"
             .. tostring(entry.itemId)
+            .. "|variant:"
+            .. tostring(entry.variant or (entry.identityHint and entry.identityHint.variant) or "")
             .. "|"
             .. tostring(math.max(1, tonumber(entry.quantity) or 1))
         )
@@ -11791,10 +12618,12 @@ State.AutoTrader.OfferHash = function(entries)
     table.sort(parts)
     return table.concat(parts, ";")
 end
-State.AutoTrader.GetOfferQuantity = function(entries, itemType, itemId)
-    local wanted = State.Mapping.MakeItemKey(itemType, itemId)
+State.AutoTrader.GetOfferQuantity = function(entries, itemType, itemId, variant)
+    local wanted = State.Mapping.MakeItemKey(itemType, itemId) .. "|variant:" .. tostring(variant or "")
     for _, entry in ipairs(entries or {}) do
-        if State.Mapping.MakeItemKey(entry.itemType, entry.itemId) == wanted then
+        local entryKey = State.Mapping.MakeItemKey(entry.itemType, entry.itemId)
+            .. "|variant:" .. tostring(entry.variant or (entry.identityHint and entry.identityHint.variant) or "")
+        if entryKey == wanted then
             return math.max(0, math.floor(tonumber(entry.quantity) or 0))
         end
     end
@@ -12035,7 +12864,7 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
         minimumWin=minWin, minimumWinInfo=minInfo, upper=upper, targetUpper=targetUpper,
         targetProfit=targetProfit, negotiationStage=negotiation.stage, negotiationMargin=negotiation.margin,
         proactiveAccept=negotiation.final==true, candidateCount=0, peakStates=1, pruned=false,
-        quantityPruned=false, marketRejected=0, marketRejectSamples={}, exactQuantityLimit=CONFIG.AutoTraderExactQuantityLimit,
+        quantityPruned=false, marketRejected=0, anchorRejected=0, marketRejectSamples={}, exactQuantityLimit=CONFIG.AutoTraderExactQuantityLimit,
         exactStateLimit=CONFIG.AutoTraderExactStateLimit, beamWidth=CONFIG.AutoTraderBeamWidth,
         bucketFrontier=CONFIG.AutoTraderPlannerBucketFrontier, theoreticalQuantities=0, sampledQuantities=0,
         expansions=0, dominanceDiscarded=0, frontierCapped=0, beamDiscarded=0, yieldCount=0,
@@ -12149,7 +12978,8 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
                             diagnostics.expansions+=1
                             local weighted=candidate.unitValue*quantity
                             local demand,flip,stability=metricData(candidate)
-                            local item={key=candidate.key,itemId=candidate.itemId,itemType=candidate.itemType,name=candidate.name,quantity=quantity,unitValue=candidate.unitValue,record=candidate.record,demand=candidate.demand,reserve=candidate.reserve}
+                            local item={key=candidate.key,itemId=candidate.itemId,itemType=candidate.itemType,name=candidate.name,quantity=quantity,unitValue=candidate.unitValue,record=candidate.record,demand=candidate.demand,reserve=candidate.reserve,
+                                variant=candidate.variant,identityHint=candidate.identityHint}
                             consider({
                                 total=total,slots=state.slots+1,
                                 demandScore=state.demandScore+candidate.demand*candidate.unitValue*quantity,
@@ -12179,14 +13009,22 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
         maybeYield()
     end
     table.sort(states,stateSort)
-    local best,bestMarket=nil,nil
+    local best,bestMarket,bestPortfolioDelta=nil,nil,nil
     for _,state in ipairs(states) do
         if state.slots>0 and state.total<=upper+0.000001 then
             state.items=reconstructItems(state)
             local marketOK,market=State.AutoTrader.EvaluateMarketGate(state,otherSummary)
-            if marketOK then best,bestMarket=state,market; break end
-            diagnostics.marketRejected+=1
-            if #diagnostics.marketRejectSamples<5 then table.insert(diagnostics.marketRejectSamples,{total=state.total,failures=market.failures}) end
+            if marketOK then
+                local portfolioDelta=State.AutoTrader.EvaluatePortfolioDelta(inventoryEntries,state.items,otherSummary.entries or {})
+                if portfolioDelta.anchorOK then
+                    best,bestMarket,bestPortfolioDelta=state,market,portfolioDelta
+                    break
+                end
+                diagnostics.anchorRejected+=1
+            else
+                diagnostics.marketRejected+=1
+                if #diagnostics.marketRejectSamples<5 then table.insert(diagnostics.marketRejectSamples,{total=state.total,failures=market.failures}) end
+            end
         end
         maybeYield()
     end
@@ -12194,10 +13032,12 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
     diagnostics.solverMode=(diagnostics.pruned and "pareto-frontier+adaptive-beam" or "pareto-frontier-dp") .. (diagnostics.quantityPruned and "+sampled-quantity" or "+exact-quantity")
     finishDiagnostics()
     if not best then
-        if diagnostics.marketRejected>0 then return nil,"market-quality gate rejected every candidate combination",diagnostics end
+        if diagnostics.anchorRejected>0 and diagnostics.marketRejected==0 then return nil,"every value-winning combination would liquidate too much high-value anchor strength",diagnostics end
+        if diagnostics.marketRejected>0 then return nil,"market-quality or anchor-preservation gates rejected every candidate combination",diagnostics end
         return nil,"no numeric local combination can preserve the dynamic minimum win",diagnostics
     end
     best.parent=nil; best.addedItem=nil
+    best.portfolioDelta=bestPortfolioDelta
     best.minWin=minWin; best.minimumWinInfo=minInfo; best.targetProfit=targetProfit; best.targetUpper=targetUpper
     best.negotiationStage=negotiation.stage; best.negotiationMargin=negotiation.margin; best.proactiveAccept=negotiation.final==true
     best.receiveTotal=otherSummary.knownFloor; best.unknownCount=otherSummary.unknownCount; best.win=otherSummary.knownFloor-best.total; best.marketGate=bestMarket
@@ -12263,14 +13103,23 @@ State.AutoTrader.ValidatePlan = function(plan, context)
         table.insert(validatedItems, {
             key = source.key, itemId = source.itemId, itemType = source.itemType, name = source.name,
             quantity = quantity, unitValue = source.unitValue, record = source.record,
-            demand = source.demand, reserve = source.reserve,
+            demand = source.demand, reserve = source.reserve, variant = source.variant, identityHint = source.identityHint,
         })
     end
     if slots < 1 or slots > CONFIG.MaxOfferSlots then return fail("plan violates the slot cap") end
     if math.abs(recomputed - plan.total) > 0.001 then return fail("plan total does not recompute") end
     local minWin, minInfo = State.AutoTrader.GetEffectiveMinimumWin(otherSummary)
     local profit = otherSummary.knownFloor - recomputed
-    if profit < minWin - 0.001 then
+    local portfolioDelta = State.AutoTrader.EvaluatePortfolioDelta(tradable, validatedItems, otherSummary.entries or {})
+    checks.portfolioDelta = portfolioDelta
+    if not portfolioDelta.anchorOK then return fail("trade would liquidate too much high-value anchor strength: " .. tostring(portfolioDelta.anchorReason or "anchor preservation failed")) end
+    if plan.strategicKind == "liquidity" then
+        if profit < -0.001 then return fail("strategic liquidity trade would lose Supreme value") end
+        if otherSummary.unknownCount > 0 then return fail("strategic liquidity trade requires a fully resolved incoming offer") end
+        if not portfolioDelta.ok then return fail("strategic liquidity validation failed: " .. tostring(portfolioDelta.reason)) end
+        minWin = 0
+        minInfo = {strategicLiquidity=true,effective=0,portfolioDelta=portfolioDelta}
+    elseif profit < minWin - 0.001 then
         checks.minimumWin = minWin; checks.minimumWinInfo = minInfo
         return fail("profit is below the dynamic minimum win")
     end
@@ -12410,7 +13259,8 @@ State.AutoTrader.ObserveAction = function(localEntries)
         local currentQuantity = State.AutoTrader.GetOfferQuantity(
             localEntries,
             action.itemType,
-            action.itemId
+            action.itemId,
+            action.variant
         )
         local passed = action.kind == "add"
             and currentQuantity > action.beforeQuantity
@@ -12549,7 +13399,8 @@ State.AutoTrader.FireMutation = function(kind, item, context, localEntries)
         State.AutoTrader.Freeze("Offer changed between action planning and mutation precheck.")
         return false
     end
-    local beforeQuantity = State.AutoTrader.GetOfferQuantity(beforeEntries, item.itemType, item.itemId)
+    local itemVariant = item.variant or (item.identityHint and item.identityHint.variant)
+    local beforeQuantity = State.AutoTrader.GetOfferQuantity(beforeEntries, item.itemType, item.itemId, itemVariant)
     if kind == "add" then
         local tradable, inventoryReason = State.AutoTrader.GetTradableInventory()
         if not tradable then
@@ -12557,7 +13408,7 @@ State.AutoTrader.FireMutation = function(kind, item, context, localEntries)
             return false
         end
         local allowed = nil
-        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId)
+        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(itemVariant or "")
         for _, candidate in ipairs(tradable) do
             if candidate.key == key then
                 allowed = candidate
@@ -12578,6 +13429,7 @@ State.AutoTrader.FireMutation = function(kind, item, context, localEntries)
         kind = kind,
         itemId = item.itemId,
         itemType = item.itemType,
+        variant = itemVariant,
         beforeHash = beforeHash,
         beforeQuantity = beforeQuantity,
         startedAt = os.clock(),
@@ -12610,7 +13462,7 @@ State.AutoTrader.FireMutation = function(kind, item, context, localEntries)
             return
         end
         local currentEntries = State.AutoTrader.GetCurrentLocalEntries() or {}
-        local currentQuantity = State.AutoTrader.GetOfferQuantity(currentEntries, item.itemType, item.itemId)
+        local currentQuantity = State.AutoTrader.GetOfferQuantity(currentEntries, item.itemType, item.itemId, itemVariant)
         local passed = kind == "add"
             and currentQuantity > beforeQuantity
             or kind == "remove"
@@ -12963,14 +13815,14 @@ State.AutoTrader.CaptureAcceptAudit = function(info)
         end
     end
     for _, item in ipairs(info.plan.items or {}) do
-        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId)
+        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(item.variant or (item.identityHint and item.identityHint.variant) or "")
         local quantity = math.max(1, math.floor(tonumber(item.quantity) or 1))
         touchExpected(key)
         expected[key] -= quantity
         outgoing[key] = (outgoing[key] or 0) + quantity
     end
     for _, item in ipairs(info.otherEntries or {}) do
-        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId)
+        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(item.variant or (item.identityHint and item.identityHint.variant) or "")
         local quantity = math.max(1, math.floor(tonumber(item.quantity) or 1))
         touchExpected(key)
         expected[key] += quantity
@@ -13154,7 +14006,8 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
             local itemType = item.ItemType or item.Type or item[3] or "Weapons"
             local quantity = math.max(1, math.floor(tonumber(item[2] or item.Amount or item.Quantity) or 1))
             if itemId ~= nil then
-                local key = State.Mapping.MakeItemKey(itemType, itemId)
+                local hint = State.BuildInventoryIdentityHint(item, nil)
+                local key = State.Mapping.MakeItemKey(itemType, itemId) .. "|variant:" .. tostring(hint and hint.variant or "")
                 serverIncoming[key] = (serverIncoming[key] or 0) + quantity
             end
         end
@@ -13354,6 +14207,12 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
                 and "The completion event was missed, but repeated fresh inventory deltas matched the exact owned transaction."
                 or "Server receipt and repeated fresh incoming/outgoing inventory deltas matched the exact automated trade."
             State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
+            if partner and State.AutoTrader.LastQueueProjection and State.AutoTrader.LastQueueProjection.basedOnUserId == partner.UserId then
+                State.AutoTrader.ProjectionAwaitingActual = State.AutoTrader.LastQueueProjection
+            end
+            State.AutoTrader.SelectedTarget = nil
+            State.AutoTrader.QueueProjectionCache = nil
+            State.AutoTrader.OpportunityCache = {}
             State.AutoTrader.Log("post_trade_audit_passed", State.AutoTrader.LastAuditDetail)
             State.AutoTrader.ShowSuccessNotification(partner, completedPlan, "Full incoming + outgoing audit ✓")
         end
@@ -13455,14 +14314,15 @@ State.AutoTrader.ReconcileDesired = function(localEntries, desired, context)
     local desiredMap = {}
     local desiredItems = desired and desired.items or {}
     for _, item in ipairs(desiredItems) do
-        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId)
+        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(item.variant or (item.identityHint and item.identityHint.variant) or "")
         desiredMap[key] = {
             quantity = math.max(1, math.floor(tonumber(item.quantity) or 1)),
             item = item,
         }
     end
     for _, current in ipairs(localEntries or {}) do
-        local key = State.Mapping.MakeItemKey(current.itemType, current.itemId)
+        local currentVariant = current.variant or (current.identityHint and current.identityHint.variant)
+        local key = State.Mapping.MakeItemKey(current.itemType, current.itemId) .. "|variant:" .. tostring(currentVariant or "")
         local wanted = desiredMap[key]
         local currentQuantity = math.max(1, math.floor(tonumber(current.quantity) or 1))
         local wantedQuantity = wanted and wanted.quantity or 0
@@ -13471,12 +14331,14 @@ State.AutoTrader.ReconcileDesired = function(localEntries, desired, context)
                 itemId = current.itemId,
                 itemType = current.itemType,
                 name = current.record and current.record.name or current.itemId,
+                variant = currentVariant,
+                identityHint = current.identityHint,
             }, context, localEntries)
             return
         end
     end
     for _, item in ipairs(desiredItems) do
-        local currentQuantity = State.AutoTrader.GetOfferQuantity(localEntries, item.itemType, item.itemId)
+        local currentQuantity = State.AutoTrader.GetOfferQuantity(localEntries, item.itemType, item.itemId, item.variant or (item.identityHint and item.identityHint.variant))
         local wantedQuantity = math.max(1, math.floor(tonumber(item.quantity) or 1))
         if currentQuantity < wantedQuantity then
             State.AutoTrader.FireMutation("add", item, context, localEntries)
@@ -13974,8 +14836,8 @@ State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signa
         for round = 1, CONFIG.AutoTraderIncomingActionMaxRounds do
             for _, mode in ipairs(modes) do
                 if Destroyed or generation ~= State.AutoTrader.IncomingRequestActionGeneration then return end
-                if decision == "accept" and (State.CurrentTrade or (isTradeVisible and isTradeVisible())) then
-                    State.AutoTrader.AcknowledgeIncomingTradeStart(player, "trade_visible_before_click")
+                if decision == "accept" and State.AutoTrader.IsAuthoritativeTradeWithPlayer and State.AutoTrader.IsAuthoritativeTradeWithPlayer(player) then
+                    State.AutoTrader.AcknowledgeIncomingTradeStart(player, "authoritative_trade_before_click")
                     return
                 end
                 local _, liveReceiving, liveTitle, liveUsername, liveAccept, liveDecline = State.AutoTrader.GetIncomingRequestUi()
@@ -14001,8 +14863,8 @@ State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signa
                 local deadline = os.clock() + CONFIG.AutoTraderIncomingActionAckSeconds
                 while not Destroyed and generation == State.AutoTrader.IncomingRequestActionGeneration and os.clock() < deadline do
                     if decision == "accept" then
-                        if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then
-                            State.AutoTrader.AcknowledgeIncomingTradeStart(player, "trade_visible_after_click")
+                        if State.AutoTrader.IsAuthoritativeTradeWithPlayer and State.AutoTrader.IsAuthoritativeTradeWithPlayer(player) then
+                            State.AutoTrader.AcknowledgeIncomingTradeStart(player, "authoritative_trade_after_click")
                             return
                         end
                     else
@@ -14037,8 +14899,8 @@ State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signa
         if decision == "accept" then
             local graceDeadline = os.clock() + CONFIG.AutoTraderIncomingActionAckSeconds
             while os.clock() < graceDeadline do
-                if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then
-                    State.AutoTrader.AcknowledgeIncomingTradeStart(player, "trade_visible_final_grace")
+                if State.AutoTrader.IsAuthoritativeTradeWithPlayer and State.AutoTrader.IsAuthoritativeTradeWithPlayer(player) then
+                    State.AutoTrader.AcknowledgeIncomingTradeStart(player, "authoritative_trade_final_grace")
                     return
                 end
                 task.wait(0.06)
@@ -14192,7 +15054,7 @@ State.AutoTrader.FailPendingRequestAttempt = function(target, generation, reason
         transportConsecutive = State.AutoTrader.TradeTransport.outgoingUnacknowledgedConsecutive,
         recoveryAfterCleanup = pending.recoveryAfterCleanup == true,
     }
-    local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(pending.failureReason, "trade_unavailable", false)
+    local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(pending.failureReason, "transport_deferred", false)
     if not started then
         State.AutoTrader.Log("request_failure_cancel_failed", {reason = cancelReason, pending = pending})
         State.AutoTrader.RequestRecoveryTeleport("failed outgoing request could not be canceled cleanly")
@@ -14249,8 +15111,9 @@ State.AutoTrader.TrySendRequest = function()
     end
 
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
-    State.AutoTrader.RequestHistory[target.UserId] = os.clock()
-    State.AutoTrader.RecordTargetEvent(target, "request")
+    if State.AutoTrader.SetContactState then
+        State.AutoTrader.SetContactState(target, "TRANSPORT_ATTEMPTING", "local SendRequest invocation started; awaiting correlated MM2 acknowledgement")
+    end
     State.AutoTrader.RequestConfirmGeneration += 1
     local generation = State.AutoTrader.RequestConfirmGeneration
     State.AutoTrader.PendingRequest = {
@@ -14274,7 +15137,7 @@ State.AutoTrader.TrySendRequest = function()
         generation = generation,
         at = os.clock(),
     }
-    State.AutoTrader.MarkServerPlayerOutcome(target, "request_attempted", "SendRequest invoked")
+    State.AutoTrader.Log("request_transport_attempt_started", {userId=target.UserId,name=target.Name,generation=generation})
     State.AutoTrader.Status = "REQUEST · ATTEMPTING"
     State.AutoTrader.StatusDetail = "Attempting a request to " .. target.Name .. "; this is NOT counted as sent until MM2's native SendingRequest/trade state acknowledges it."
     State.AutoTrader.Log("request_send", {userId = target.UserId, name = target.Name, generation = generation, correlationId = State.AutoTrader.PendingRequest.correlationId})
@@ -14510,6 +15373,9 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
                 record = State.AutoTrader.Anchor.record,
                 demand = State.AutoTrader.Anchor.demand,
             }
+            if State.AutoTrader.CopyPlannerItemIdentity then
+                State.AutoTrader.CopyPlannerItemIdentity(State.AutoTrader.Anchor, anchorItem)
+            end
             State.AutoTrader.Desired = {
                 items = {anchorItem},
                 kind = "anchor",
@@ -14644,6 +15510,15 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     State.AutoTrader.Render()
     task.spawn(function()
         local plan, reason, diagnostics = State.AutoTrader.FindPlan(otherSummary, tradable, generation, negotiation)
+        if not plan then
+            local liquidityPlan, liquidityReason, liquidityDiagnostics = State.AutoTrader.FindLiquidityPlan(otherSummary, tradable, generation, negotiation)
+            if liquidityPlan then
+                plan, reason, diagnostics = liquidityPlan, nil, liquidityDiagnostics
+            else
+                diagnostics = {valuePlanner=diagnostics, liquidityPlanner=liquidityDiagnostics}
+                reason = tostring(reason or "value plan unavailable") .. "; liquidity: " .. tostring(liquidityReason or "unavailable")
+            end
+        end
         if Destroyed or generation ~= State.AutoTrader.PlanGeneration then
             return
         end
@@ -14700,12 +15575,14 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             and "PLAN VERIFIED"
             or "SHADOW READY"
         State.AutoTrader.StatusDetail = State.AutoTrader.Preferences.automation
-            and (plan.proactiveAccept
+            and (plan.strategicKind == "liquidity"
+                and ("Strategic non-loss split is verified: " .. tostring(plan.portfolioDelta and plan.portfolioDelta.reason or "portfolio flexibility improves") .. ".")
+                or (plan.proactiveAccept
                 and "Final concession stage: exact safe plan is being reconciled and may auto-accept after the cooldown."
                 or ("Holding a higher-profit negotiation stage (target margin "
                     .. formatPercent((plan.negotiationMargin or 0) * 100, false)
-                    .. "). The bot will concede only if the same offer remains on the table."))
-            or "Plan passed dynamic-profit and market-quality validation. Auto Trading is currently off."
+                    .. "). The bot will concede only if the same offer remains on the table.")))
+            or "Plan passed value/portfolio and market-quality validation. Auto Trading is currently off."
         State.AutoTrader.Log("plan_ready", {
             receiveKnownFloor = plan.receiveTotal,
             unknownCount = plan.unknownCount,
@@ -14716,6 +15593,8 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             negotiationMargin = plan.negotiationMargin,
             proactiveAccept = plan.proactiveAccept,
             items = plan.items,
+            strategicKind = plan.strategicKind,
+            portfolioDelta = plan.portfolioDelta,
         })
         State.AutoTrader.Render()
         if State.AutoTrader.Preferences.automation then
@@ -14848,8 +15727,8 @@ State.AutoTrader.OnNoTrade = function()
             return
         end
     end
-    -- v21: current-server bot evidence cannot cause a hop. Only ordinary
-    -- target/discovery/exhaustion/liveness logic below decides when to leave.
+    -- v35: current-server bot escape is handled above. In a regular/human server,
+    -- planner feasibility decides who enters the one-attempt queue; EV only orders it.
     local target = State.AutoTrader.SelectTarget()
     if State.AutoTrader.Preferences.automation then
         if State.AutoTrader.SessionFrozen then
@@ -14857,8 +15736,11 @@ State.AutoTrader.OnNoTrade = function()
             State.AutoTrader.StatusDetail = State.AutoTrader.SessionFrozen
         elseif target then
             State.AutoTrader.ServerExhaustedSince = 0
-            State.AutoTrader.Status = "AUTO TARGET"
-            State.AutoTrader.StatusDetail = "Next eligible: " .. target.Name .. ". Ranked by estimated audited Supreme-value gain per second, response/trade probability, and usable inventory composition."
+            State.AutoTrader.Status = "QUEUE Q1"
+            local queuedOpportunity = State.AutoTrader.LastTradeQueue and State.AutoTrader.LastTradeQueue[1] and State.AutoTrader.LastTradeQueue[1].opportunity
+            State.AutoTrader.StatusDetail = "Trying " .. target.Name .. " once because resolved inventory proves "
+                .. (queuedOpportunity and queuedOpportunity.kind == "liquidity" and "an anchor-preserving non-loss liquidity improvement" or "a safe value-winning trade")
+                .. ". Queue order uses response/profit history, but EV never vetoes a proven trade."
             local started, requestReason = State.AutoTrader.TrySendRequest()
             if not started and requestReason == "request spacing" then
                 State.AutoTrader.Status = "WAIT · REQUEST SPACING"
@@ -14874,15 +15756,19 @@ State.AutoTrader.OnNoTrade = function()
                 State.AutoTrader.ServerExhaustedSince = 0
                 State.AutoTrader.KickServerDiscovery()
                 State.AutoTrader.Status = "WAIT · DISCOVERY"
-                State.AutoTrader.StatusDetail = "No actionable target yet; " .. tostring(counts.discoveryPending or counts.unknown or 0) .. " player inventory/inventories are still inside the bounded discovery window."
+                State.AutoTrader.StatusDetail = "No proven trade queued yet; " .. tostring(counts.discoveryPending or counts.unknown or 0) .. " player inventory/inventories are still inside the bounded discovery window. Unknown inventory alone will not trigger a request."
             elseif disposition == "WAITING_FOR_FRIEND_STATUS" then
                 State.AutoTrader.ServerExhaustedSince = 0
                 State.AutoTrader.Status = "WAIT · FRIEND CHECK"
-                State.AutoTrader.StatusDetail = "No actionable target yet; waiting briefly for " .. tostring(counts.friendPending or 0) .. " friend-status lookup(s)."
+                State.AutoTrader.StatusDetail = "No proven trade queued yet; waiting briefly for " .. tostring(counts.friendPending or 0) .. " friend-status lookup(s)."
             elseif disposition == "WAITING_FOR_RETRY" then
                 State.AutoTrader.ServerExhaustedSince = 0
                 State.AutoTrader.Status = "WAIT · RETRY"
-                State.AutoTrader.StatusDetail = "No target is actionable this instant; the earliest clean retry opens in about " .. formatNumber(counts.earliestRetry or 0) .. "s."
+                State.AutoTrader.StatusDetail = "No new queue target is available this instant; the earliest clean retry opens in about " .. formatNumber(counts.earliestRetry or 0) .. "s."
+            elseif disposition == "WAITING_FOR_DEEP_SEARCH" then
+                State.AutoTrader.ServerExhaustedSince = 0
+                State.AutoTrader.Status = "WAIT · FEASIBILITY SEARCH"
+                State.AutoTrader.StatusDetail = tostring(counts.deepSearchPending or 0) .. " inconclusive player search(es) are using their one bounded deeper pass. They are not contacted unless a real witness is found."
             elseif string.sub(disposition, 1, 9) == "EXHAUSTED" then
                 if State.AutoTrader.ServerExhaustedSince <= 0 then
                     State.AutoTrader.ServerExhaustedSince = os.clock()
@@ -14904,7 +15790,7 @@ State.AutoTrader.OnNoTrade = function()
     else
         State.AutoTrader.Status = target and "SHADOW TARGET" or "AUTO OFF"
         State.AutoTrader.StatusDetail = target
-            and ("Would consider " .. target.Name .. " using response history + inventory-quality ranking. Auto Trading is OFF.")
+            and ("Would queue " .. target.Name .. " because the planner proves a useful exchange; response history only determines order. Auto Trading is OFF.")
             or "Auto Trading is OFF. Planner can still analyze manual trades."
     end
     State.AutoTrader.Render()
@@ -14925,6 +15811,28 @@ State.AutoTrader.BuildDebug = function()
     end
     local inventory = State.AutoTrader.GetLocalInventory(false)
     local auditSnapshot = State.AutoTrader.GetLocalAuditSnapshot(false)
+    local queueProjection = State.AutoTrader.BuildQueueProjection(State.AutoTrader.LastEligibilitySnapshot)
+    local tradeQueueSupport = {}
+    for index, row in ipairs(State.AutoTrader.LastTradeQueue or {}) do
+        if index > 12 then break end
+        local opportunity = row.opportunity
+        table.insert(tradeQueueSupport, {
+            position = index,
+            name = row.player and row.player.Name or nil,
+            userId = row.player and row.player.UserId or nil,
+            verifiedTotal = row.verifiedTotal,
+            orderingEv = row.score,
+            queueScore = row.queueScore or (opportunity and opportunity.queueScore),
+            kind = opportunity and opportunity.kind or nil,
+            giveTotal = opportunity and opportunity.giveTotal or nil,
+            receiveTotal = opportunity and opportunity.receiveTotal or nil,
+            win = opportunity and opportunity.win or nil,
+            give = opportunity and State.AutoTrader.FormatOpportunityItems(opportunity.giveItems) or nil,
+            receive = opportunity and State.AutoTrader.FormatOpportunityItems(opportunity.receiveItems) or nil,
+            reason = opportunity and opportunity.reason or row.reason,
+            portfolioDelta = opportunity and opportunity.portfolioDelta or nil,
+        })
+    end
     local reserveList = {}
     if inventory then
         for _, entry in ipairs(inventory.entries) do
@@ -14981,6 +15889,17 @@ State.AutoTrader.BuildDebug = function()
                     score = eligibility.score,
                     verifiedTotal = eligibility.verifiedTotal,
                     economicPath = eligibility.economicPath,
+                    queueScore = eligibility.queueScore,
+                    opportunity = eligibility.opportunity and {
+                        kind = eligibility.opportunity.kind,
+                        giveTotal = eligibility.opportunity.giveTotal,
+                        receiveTotal = eligibility.opportunity.receiveTotal,
+                        win = eligibility.opportunity.win,
+                        give = State.AutoTrader.FormatOpportunityItems(eligibility.opportunity.giveItems),
+                        receive = State.AutoTrader.FormatOpportunityItems(eligibility.opportunity.receiveItems),
+                        reason = eligibility.opportunity.reason,
+                        portfolioDelta = eligibility.opportunity.portfolioDelta,
+                    } or nil,
                 },
             })
         end
@@ -15152,7 +16071,7 @@ State.AutoTrader.BuildDebug = function()
             maxStabilityDrop = CONFIG.AutoTraderMaxStabilityDrop,
         },
         solverConfig = {
-            objective = "maximize learned audited Supreme-value gain/hour while aggressively escaping bot-heavy servers; incomplete bot evidence never trains permanent hashes",
+            objective = "planner-first: try every human once when resolved inventory proves a safe value win or anchor-preserving non-loss liquidity improvement; EV only orders; aggressively escape bot-heavy servers",
             maxOfferSlots = CONFIG.MaxOfferSlots,
             exactStateLimit = CONFIG.AutoTraderExactStateLimit,
             beamWidth = CONFIG.AutoTraderBeamWidth,
@@ -15228,7 +16147,13 @@ State.AutoTrader.BuildDebug = function()
             bestScore = State.AutoTrader.LastEligibilitySnapshot.bestScore,
             bestEconomicName = State.AutoTrader.LastEligibilitySnapshot.bestEconomic and State.AutoTrader.LastEligibilitySnapshot.bestEconomic.Name or nil,
             bestEconomicScore = State.AutoTrader.LastEligibilitySnapshot.bestEconomicScore,
+            queueLength = #(State.AutoTrader.LastEligibilitySnapshot.queue or {}),
+            philosophy = "resolved inventory must prove a safe value win or anchor-preserving non-loss liquidity improvement; unknown inventory alone never triggers a request; EV only orders feasible humans",
         } or nil,
+        tradeQueue = tradeQueueSupport,
+        queueProjection = queueProjection,
+        localInventoryDiagnostics = State.AutoTrader.LastLocalInventoryDiagnostics,
+        localResolverPolicy = "nested holiday/event buckets + separate Chroma variant evidence are resolved independently from the base item title; normal/chroma identities remain distinct in planner and audit keys",
         replayFixture = State.AutoTrader.LastReplayFixture,
         selfTest = State.AutoTrader.SelfTest,
         pendingAutoTransaction = State.AutoTrader.PendingAutoTransaction and {
@@ -15798,10 +16723,10 @@ UI.AutoTraderServerDecision.TextYAlignment = Enum.TextYAlignment.Top
 UI.AutoTraderServerDecision.ZIndex = 1456
 
 UI.AutoTraderOpportunityCard = uiCard(UI.AutoTraderHomeContent, UDim2.new(0.5, 4, 0, 200), UDim2.new(0.5, -4, 0, 128), true)
-uiSectionTitle(UI.AutoTraderOpportunityCard, "IS IT WORTH STAYING?", 6)
+uiSectionTitle(UI.AutoTraderOpportunityCard, "QUEUE / SEARCH STATE", 6)
 UI.AutoTraderOpportunityBest = uiValueLabel(UI.AutoTraderOpportunityCard, "Best target: —", 26, 11, THEME.green, Enum.Font.ArialBold)
-UI.AutoTraderOpportunityRates = uiValueLabel(UI.AutoTraderOpportunityCard, "Target EV: —   Hop EV: —", 49)
-UI.AutoTraderOpportunityFloor = uiValueLabel(UI.AutoTraderOpportunityCard, "Stay floor: —", 69)
+UI.AutoTraderOpportunityRates = uiValueLabel(UI.AutoTraderOpportunityCard, "Feasible: —   Inconclusive: —", 49)
+UI.AutoTraderOpportunityFloor = uiValueLabel(UI.AutoTraderOpportunityCard, "Deep search: —", 69)
 UI.AutoTraderOpportunityDecision = makeLabel(UI.AutoTraderOpportunityCard, "Waiting for verified opportunities.", 10, THEME.faint, Enum.Font.Arial)
 UI.AutoTraderOpportunityDecision.Position = UDim2.fromOffset(10, 89)
 UI.AutoTraderOpportunityDecision.Size = UDim2.new(1, -20, 0, 34)
@@ -15855,7 +16780,7 @@ UI.AutoTraderStatsNote = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 97
 uiSectionTitle(UI.AutoTraderStatsNote, "WHAT THESE NUMBERS MEAN", 6)
 UI.AutoTraderStatsNoteText = makeLabel(
     UI.AutoTraderStatsNote,
-    "Session profit/hour is wall-clock since startup. Learned rates are persisted, decayed observations across strangers; they influence opportunity ranking but never bypass exact trade safety checks.",
+    "Session profit/hour is wall-clock since startup. Learned response/profit rates only ORDER people whose resolved inventory already proves a useful trade; they never veto a feasible human and never bypass exact trade safety.",
     9,
     THEME.faint,
     Enum.Font.Arial
@@ -15926,26 +16851,34 @@ UI.AutoTraderPlayerHeader.Size = UDim2.new(1, -8, 0, 22)
 UI.AutoTraderPlayerHeader.ZIndex = 1454
 UI.AutoTraderPlayerHint = makeLabel(
     playersPage,
-    "Ranked by trading economics only. Bot-avatar labels are shown for diagnosis but never change current-server target EV.",
+    "Planner-first queue: a human enters only when resolved inventory proves a safe value win or an anchor-preserving non-loss liquidity improvement. EV/history order proven opportunities; they never veto one.",
     9,
     THEME.faint,
     Enum.Font.Arial
 )
 UI.AutoTraderPlayerHint.Position = UDim2.fromOffset(4, 24)
-UI.AutoTraderPlayerHint.Size = UDim2.new(1, -8, 0, 20)
+UI.AutoTraderPlayerHint.Size = UDim2.new(1, -8, 0, 34)
 UI.AutoTraderPlayerHint.TextWrapped = true
 UI.AutoTraderPlayerHint.ZIndex = 1454
-UI.AutoTraderPlayerDetail = uiCard(playersPage, UDim2.fromOffset(0, 50), UDim2.new(1, 0, 0, 82), true)
+UI.AutoTraderPlayerDetail = uiCard(playersPage, UDim2.fromOffset(0, 64), UDim2.new(1, 0, 0, 102), true)
 uiSectionTitle(UI.AutoTraderPlayerDetail, "NEXT / SELECTED PLAYER", 6)
-UI.AutoTraderPlayerDetailText = makeLabel(UI.AutoTraderPlayerDetail, "No ranked target yet.", 10, THEME.muted, Enum.Font.Arial)
+UI.AutoTraderPlayerDetailText = makeLabel(UI.AutoTraderPlayerDetail, "No proven trade queued yet.", 10, THEME.muted, Enum.Font.Arial)
 UI.AutoTraderPlayerDetailText.Position = UDim2.fromOffset(10, 25)
-UI.AutoTraderPlayerDetailText.Size = UDim2.new(1, -20, 0, 50)
+UI.AutoTraderPlayerDetailText.Size = UDim2.new(1, -20, 0, 70)
 UI.AutoTraderPlayerDetailText.TextWrapped = true
 UI.AutoTraderPlayerDetailText.TextYAlignment = Enum.TextYAlignment.Top
 UI.AutoTraderPlayerDetailText.ZIndex = 1456
+UI.AutoTraderQueueProjectionCard = uiCard(playersPage, UDim2.fromOffset(0, 174), UDim2.new(1, 0, 0, 92), false)
+uiSectionTitle(UI.AutoTraderQueueProjectionCard, "IF THE NEXT MODELED TRADE SUCCEEDS", 6)
+UI.AutoTraderQueueProjection = makeLabel(UI.AutoTraderQueueProjectionCard, "No projection yet.", 9, THEME.muted, Enum.Font.Arial)
+UI.AutoTraderQueueProjection.Position = UDim2.fromOffset(10, 25)
+UI.AutoTraderQueueProjection.Size = UDim2.new(1, -20, 0, 60)
+UI.AutoTraderQueueProjection.TextWrapped = true
+UI.AutoTraderQueueProjection.TextYAlignment = Enum.TextYAlignment.Top
+UI.AutoTraderQueueProjection.ZIndex = 1456
 UI.AutoTraderPlayerScroll = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(0, 140),
-    Size = UDim2.new(1, 0, 1, -140),
+    Position = UDim2.fromOffset(0, 274),
+    Size = UDim2.new(1, 0, 1, -274),
     BackgroundColor3 = AERO.recessed,
     BorderSizePixel = 0,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
@@ -16248,6 +17181,14 @@ State.AutoTrader.UpdateControls = function()
         UI.AutoTraderProfit.Text = "Base Win: +" .. formatNumber(minWin) .. " · Dynamic ≥ " .. formatPercent(CONFIG.AutoTraderMinWinPercent * 100, false)
     end
     UI.AutoTraderReserveCount.Text = tostring(State.AutoTrader.ReserveTypeCount()) .. " reserves"
+    if UI.AutoTraderReserveTitle then
+        local diagnostics = State.AutoTrader.LastLocalInventoryDiagnostics
+        local unresolvedCount = diagnostics and #(diagnostics.unresolved or {}) or 0
+        UI.AutoTraderReserveTitle.Text = diagnostics
+            and ("INVENTORY RESERVES · resolver " .. tostring(diagnostics.resolvedTypes or 0) .. " valued / " .. tostring(unresolvedCount) .. " unresolved")
+            or "INVENTORY RESERVES · resolver waiting"
+        UI.AutoTraderReserveTitle.TextColor3 = unresolvedCount > 0 and THEME.yellow or Color3.fromRGB(37, 83, 111)
+    end
 end
 
 State.AutoTrader.RebuildReserveList = function()
@@ -16262,7 +17203,7 @@ State.AutoTrader.RebuildReserveList = function()
     local search = normalize(State.AutoTrader.ProtectedSearch or "")
     local shown = 0
     for _, entry in ipairs(inventory.entries) do
-        local searchable = normalize(entry.name .. " " .. entry.itemId .. " " .. entry.itemType)
+        local searchable = normalize(entry.name .. " " .. tostring(entry.variant or "") .. " " .. entry.itemId .. " " .. entry.itemType)
         if search == "" or searchable:find(search, 1, true) then
             shown += 1
             local reserve = State.AutoTrader.GetReserve(entry.itemType, entry.itemId)
@@ -16278,7 +17219,21 @@ State.AutoTrader.RebuildReserveList = function()
             plus.MouseButton1Click:Connect(function() if not Destroyed then State.AutoTrader.SetReserve(rowEntry.itemType, rowEntry.itemId, rowReserve + 1, rowEntry.quantity) end end)
         end
     end
-    if shown == 0 then
+    local diagnostics = State.AutoTrader.LastLocalInventoryDiagnostics
+    local unresolved = diagnostics and diagnostics.unresolved or {}
+    if #unresolved > 0 and search == "" then
+        local warningTitle = makeLabel(UI.AutoTraderReserveContent, "VALUE RESOLVER WARNINGS · these owned items are excluded until identity/value is trusted", 10, THEME.yellow, Enum.Font.ArialBold)
+        warningTitle.Size = UDim2.new(1, 0, 0, 28); warningTitle.TextWrapped = true; warningTitle.ZIndex = 1453
+        for index, miss in ipairs(unresolved) do
+            if index > 12 then break end
+            local display = State.ComposeVariantDisplayName(tostring(miss.itemId or "?"), miss.variant)
+            local reasonText = tostring(miss.reason or "unresolved")
+            if miss.suggested then reasonText = reasonText .. " · suggested " .. tostring(miss.suggested) end
+            local warning = makeLabel(UI.AutoTraderReserveContent, "! " .. display .. " · " .. tostring(miss.itemType or "?") .. " · " .. reasonText, 9, THEME.yellow, Enum.Font.Arial)
+            warning.Size = UDim2.new(1, 0, 0, 34); warning.TextWrapped = true; warning.TextYAlignment = Enum.TextYAlignment.Top; warning.ZIndex = 1453
+        end
+    end
+    if shown == 0 and #unresolved == 0 then
         local label = makeLabel(UI.AutoTraderReserveContent, "No matching resolved numeric inventory items.", 10, THEME.faint, Enum.Font.Arial)
         label.Size = UDim2.new(1, 0, 0, 28); label.ZIndex = 1453
     end
@@ -16317,11 +17272,15 @@ end
 State.AutoTrader.RebuildPlayerDashboard = function()
     if not UI.AutoTraderPlayerContent then return end
     clearDynamic(UI.AutoTraderPlayerContent)
+    local snapshot = State.AutoTrader.BuildEligibilitySnapshot()
     local rows = {}
-    local context = State.AutoTrader.BuildEligibilityContext()
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Parent then
-            local eligibility = State.AutoTrader.EvaluatePlayerEligibility(player, context)
+    local queuePosition = {}
+    for index, queued in ipairs(snapshot.queue or {}) do
+        if queued.player then queuePosition[queued.player.UserId] = index end
+    end
+    for _, eligibility in ipairs(snapshot.rows or {}) do
+        local player = eligibility.player
+        if player and player.Parent then
             local total = eligibility.verifiedTotal
             if total == nil then
                 local verifiedTotal, verified = State.AutoTrader.GetVerifiedPlayerValue(player)
@@ -16332,67 +17291,114 @@ State.AutoTrader.RebuildPlayerDashboard = function()
             local risk, botInfo = State.AutoTrader.GetPlayerBotRisk(player)
             table.insert(rows, {
                 player = player, eligibility = eligibility, total = total, score = score,
+                queueScore = eligibility.queueScore or (eligibility.opportunity and eligibility.opportunity.queueScore),
+                queuePosition = queuePosition[player.UserId],
                 risk = risk or 0, botInfo = botInfo,
             })
         end
     end
     local priority = {
-        actionable = 1, active_request = 2, active_trade = 2,
-        retry_later = 3, economic_hop_preferred = 4, friend_pending = 5,
-        discovery_pending = 5, no_economic_path = 6, terminal = 7,
-        friend = 8, unresolvable = 9, zero = 10, ineligible = 11,
+        actionable = 1, active_request = 2, active_trade = 2, transport_deferred = 3,
+        retry_later = 4, friend_pending = 5, discovery_pending = 5, search_inconclusive = 6,
+        proven_impossible = 7, terminal = 8, friend = 9, unresolvable = 10, zero = 11, ineligible = 12,
     }
     table.sort(rows, function(a, b)
         local ap = priority[a.eligibility.state] or 50
         local bp = priority[b.eligibility.state] or 50
         if ap ~= bp then return ap < bp end
+        if a.eligibility.state == "actionable" and b.eligibility.state == "actionable" then
+            return (a.queuePosition or 999) < (b.queuePosition or 999)
+        end
         local as, bs = tonumber(a.score) or -math.huge, tonumber(b.score) or -math.huge
         if as ~= bs then return as > bs end
         return (tonumber(a.total) or 0) > (tonumber(b.total) or 0)
     end)
     local stateLabels = {
-        actionable = "READY", active_request = "REQUEST", active_trade = "TRADING",
-        retry_later = "RETRY", economic_hop_preferred = "HOP BETTER",
-        friend_pending = "FRIEND ?", discovery_pending = "DISCOVERY",
-        no_economic_path = "NO PATH", terminal = "DONE", friend = "FRIEND",
-        unresolvable = "UNRESOLVED", zero = "ZERO", ineligible = "INELIGIBLE",
+        actionable = "QUEUED", active_request = "REQUEST ACK", active_trade = "TRADING",
+        transport_deferred = "TRANSPORT", retry_later = "RETRY",
+        friend_pending = "FRIEND ?", discovery_pending = "DISCOVERY", search_inconclusive = "INCONCLUSIVE",
+        proven_impossible = "IMPOSSIBLE", terminal = "DONE", friend = "FRIEND", unresolvable = "UNRESOLVED",
+        zero = "ZERO", ineligible = "INELIGIBLE",
     }
+    UI.AutoTraderPlayerHeader.Text = "TRADE QUEUE · " .. tostring(#(snapshot.queue or {})) .. " PROVEN OPPORTUNIT" .. (#(snapshot.queue or {}) == 1 and "Y" or "IES")
     for index, info in ipairs(rows) do
         local p = info.player
         local eligibility = info.eligibility
-        local row = makeButton(UI.AutoTraderPlayerContent, "", UDim2.new(1, 0, 0, 48), THEME.panel2)
+        local opportunity = eligibility.opportunity
+        local row = makeButton(UI.AutoTraderPlayerContent, "", UDim2.new(1, 0, 0, 54), THEME.panel2)
         row.LayoutOrder = index; row.ZIndex = 1454
         aeroStroke(row, THEME.border, 0.5)
         aeroGradient(row, AERO.cardAltTop, AERO.cardAltBottom, 90)
+        local prefix = info.queuePosition and ("Q" .. tostring(info.queuePosition) .. " · ") or ""
         local nameColor = eligibility.state == "actionable" and THEME.green
             or (p == State.AutoTrader.SelectedTarget and THEME.green or THEME.text)
-        local name = makeLabel(row, tostring(index) .. ". " .. p.Name, 10, nameColor, Enum.Font.ArialBold)
-        name.Position = UDim2.fromOffset(8, 3); name.Size = UDim2.new(0.34, -8, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
-        local value = makeLabel(row, "Value " .. (info.total ~= nil and formatCompact(info.total) or "?"), 10, THEME.muted, Enum.Font.Arial)
-        value.Position = UDim2.new(0.34, 2, 0, 3); value.Size = UDim2.new(0.18, -4, 0, 18); value.ZIndex = 1455
-        local ev = makeLabel(row, "EV " .. rateText(info.score), 10, info.score and THEME.green or THEME.faint, Enum.Font.Arial)
-        ev.Position = UDim2.new(0.52, 2, 0, 3); ev.Size = UDim2.new(0.18, -4, 0, 18); ev.ZIndex = 1455
+        local name = makeLabel(row, prefix .. p.Name, 10, nameColor, Enum.Font.ArialBold)
+        name.Position = UDim2.fromOffset(8, 3); name.Size = UDim2.new(0.32, -8, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
+        local value = makeLabel(row, "Inv " .. (info.total ~= nil and formatCompact(info.total) or "?"), 10, THEME.muted, Enum.Font.Arial)
+        value.Position = UDim2.new(0.32, 2, 0, 3); value.Size = UDim2.new(0.16, -4, 0, 18); value.ZIndex = 1455
+        local modeledText, modeledColor = "—", THEME.faint
+        if opportunity then
+            if opportunity.kind == "liquidity" then
+                modeledText = tostring(opportunity.strategicSubkind or "REBALANCE") .. " " .. formatCompact(opportunity.giveTotal) .. "→" .. formatCompact(opportunity.receiveTotal)
+                modeledColor = THEME.blue
+            else
+                modeledText = "WIN +" .. formatCompact(opportunity.win)
+                modeledColor = THEME.green
+            end
+        end
+        local modeled = makeLabel(row, modeledText, 10, modeledColor, Enum.Font.ArialBold)
+        modeled.Position = UDim2.new(0.48, 2, 0, 3); modeled.Size = UDim2.new(0.20, -4, 0, 18); modeled.ZIndex = 1455
         local avatarText, avatarColor = goldAvatarLabel(info.botInfo)
         local risk = makeLabel(row, avatarText, 10, avatarColor, Enum.Font.ArialBold)
-        risk.Position = UDim2.new(0.70, 2, 0, 3); risk.Size = UDim2.new(0.14, -4, 0, 18); risk.ZIndex = 1455
+        risk.Position = UDim2.new(0.68, 2, 0, 3); risk.Size = UDim2.new(0.14, -4, 0, 18); risk.ZIndex = 1455
         local stateText = stateLabels[eligibility.state] or string.upper(tostring(eligibility.state or "unknown"))
         local stateColor = eligibility.state == "actionable" and THEME.green
-            or (eligibility.state == "economic_hop_preferred" and THEME.yellow or THEME.faint)
+            or ((eligibility.state == "retry_later" or eligibility.state == "transport_deferred" or eligibility.state == "search_inconclusive") and THEME.yellow or THEME.faint)
         local state = makeLabel(row, stateText, 10, stateColor, Enum.Font.ArialBold)
-        state.Position = UDim2.new(0.84, 2, 0, 3); state.Size = UDim2.new(0.16, -8, 0, 18); state.TextXAlignment = Enum.TextXAlignment.Right; state.TextTruncate = Enum.TextTruncate.AtEnd; state.ZIndex = 1455
+        state.Position = UDim2.new(0.82, 2, 0, 3); state.Size = UDim2.new(0.18, -8, 0, 18); state.TextXAlignment = Enum.TextXAlignment.Right; state.TextTruncate = Enum.TextTruncate.AtEnd; state.ZIndex = 1455
         local subText = tostring(eligibility.reason or "")
-        if eligibility.state == "retry_later" then
+        if eligibility.state == "retry_later" or eligibility.state == "transport_deferred" then
             subText = "retry in " .. formatNumber(eligibility.retryIn or 0) .. "s · " .. subText
+        elseif opportunity then
+            subText = (opportunity.kind == "liquidity" and ((opportunity.strategicSubkind or "REBALANCE") .. " · ") or "VALUE WIN · ")
+                .. State.AutoTrader.FormatOpportunityItems(opportunity.giveItems) .. " → "
+                .. State.AutoTrader.FormatOpportunityItems(opportunity.receiveItems)
+                .. " · order score " .. rateText(info.score)
         elseif subText == "" then
-            local profile = State.AutoTrader.GetTargetProfile(p)
-            subText = profile and ("demand " .. tostring(profile.demand or "?") .. " · useful types " .. tostring(profile.usefulTypes or 0) .. " · coverage " .. string.format("%.1f%%", (tonumber(profile.numericCoverage) or 0) * 100)) or "inventory profile unresolved"
+            subText = "No proven exchange from resolved inventory."
         end
-        local sub = makeLabel(row, subText, 10, THEME.faint, Enum.Font.Arial)
-        sub.Position = UDim2.fromOffset(8, 25); sub.Size = UDim2.new(1, -16, 0, 18); sub.TextTruncate = Enum.TextTruncate.AtEnd; sub.ZIndex = 1455
+        local sub = makeLabel(row, subText, 9, THEME.faint, Enum.Font.Arial)
+        sub.Position = UDim2.fromOffset(8, 25); sub.Size = UDim2.new(1, -16, 0, 24); sub.TextWrapped = true; sub.TextTruncate = Enum.TextTruncate.AtEnd; sub.ZIndex = 1455
         row.MouseButton1Click:Connect(function()
-            local stats = State.AutoTrader.GetPlayerStats(p)
+            local stats = State.AutoTrader.GetPlayerStats(p) or {}
             local botClass = info.botInfo and info.botInfo.class or "unknown"
-            UI.AutoTraderPlayerDetailText.Text = p.Name .. " · " .. stateText .. " · value " .. (info.total ~= nil and formatCompact(info.total) or "?") .. " · EV " .. rateText(info.score) .. " · avatar DB " .. botClass .. " (informational only)\nReason: " .. tostring(eligibility.reason or "ready") .. "\nHistory: " .. tostring(math.floor(tonumber(stats.requests) or 0)) .. " requests, " .. tostring(math.floor(tonumber(stats.responses) or 0)) .. " responses, " .. tostring(math.floor(tonumber(stats.successes) or 0)) .. " audited wins."
+            if opportunity then
+                local feasibility = eligibility.feasibility or {}
+                local witness = opportunity.feasibilityWitness or opportunity
+                local bestValue = opportunity.bestFoundValueWitness
+                local strategic = opportunity.strategicWitness
+                local delta = opportunity.portfolioDelta or (strategic and strategic.portfolioDelta)
+                UI.AutoTraderPlayerDetailText.Text =
+                    p.Name .. " · " .. (opportunity.kind == "liquidity" and ("STRATEGIC " .. tostring(opportunity.strategicSubkind or "REBALANCE")) or "VALUE WIN")
+                    .. " · queue " .. tostring(info.queuePosition or "?") .. "/" .. tostring(#(snapshot.queue or {}))
+                    .. "\nELIGIBILITY: " .. tostring(eligibility.feasibilityState or "?") .. " · CONTACT: " .. tostring(eligibility.contactState or "NOT_CONTACTED")
+                    .. " · search complete " .. tostring(feasibility.solverComplete == true)
+                    .. "\nFEASIBILITY WITNESS: " .. State.AutoTrader.FormatOpportunityItems(witness.giveItems or {}) .. " (" .. formatCompact(witness.giveTotal or 0) .. ") → "
+                    .. State.AutoTrader.FormatOpportunityItems(witness.receiveItems or {}) .. " (" .. formatCompact(witness.receiveTotal or 0) .. ")"
+                    .. (bestValue and ("\nBEST FOUND VALUE: +" .. formatCompact(bestValue.win or 0) .. " · " .. State.AutoTrader.FormatOpportunityItems(bestValue.giveItems or {}) .. " → " .. State.AutoTrader.FormatOpportunityItems(bestValue.receiveItems or {})) or "\nBEST FOUND VALUE: none")
+                    .. (strategic and ("\nSTRATEGIC: " .. tostring(strategic.strategicSubkind or "REBALANCE") .. " · " .. tostring(strategic.reason or "portfolio reach improves")) or "\nSTRATEGIC: none")
+                    .. "\nSAFETY/PORTFOLIO: " .. tostring(delta and delta.reason or "live trade validator remains authoritative")
+                    .. " · Reach trusted " .. tostring(delta and delta.reachTrusted == true)
+                    .. "\nWHY QUEUED: " .. tostring(opportunity.reason or "planner proved a useful trade")
+                    .. " · order score " .. rateText(info.score) .. " · avatar DB " .. botClass
+                    .. ". History: " .. tostring(math.floor(tonumber(stats.requests) or 0)) .. " ACKed requests / "
+                    .. tostring(math.floor(tonumber(stats.responses) or 0)) .. " responses / " .. tostring(math.floor(tonumber(stats.successes) or 0)) .. " audited wins."
+            else
+                UI.AutoTraderPlayerDetailText.Text =
+                    p.Name .. " · " .. stateText .. " · inventory " .. (info.total ~= nil and formatCompact(info.total) or "?")
+                    .. " · ordering EV " .. rateText(info.score) .. "\nWhy not queued: " .. tostring(eligibility.reason or "not eligible")
+                    .. "\nUnknown inventory alone never causes a speculative request. Avatar DB: " .. botClass .. "."
+            end
         end)
     end
     if #rows == 0 then
@@ -16401,15 +17407,40 @@ State.AutoTrader.RebuildPlayerDashboard = function()
     end
     local target = State.AutoTrader.SelectedTarget
     if target then
-        local eligibility = State.AutoTrader.EvaluatePlayerEligibility(target, context)
-        local _, botInfo = State.AutoTrader.GetPlayerBotRisk(target)
-        UI.AutoTraderPlayerDetailText.Text = target.Name .. " is currently next · value " .. (eligibility.verifiedTotal and formatCompact(eligibility.verifiedTotal) or "?") .. " · expected " .. rateText(eligibility.score) .. " · avatar DB " .. tostring(botInfo and botInfo.class or "unknown") .. " (does not affect target ranking)."
-    elseif State.AutoTrader.LastEligibilitySnapshot then
-        local c = State.AutoTrader.LastEligibilitySnapshot.counts or {}
-        UI.AutoTraderPlayerDetailText.Text = "No player is actionable now · ready " .. tostring(c.actionable or 0)
-            .. " · economic-hop " .. tostring(c.economicHopPreferred or 0)
-            .. " · retry " .. tostring(c.retryLater or 0)
-            .. " · discovery/friend pending " .. tostring((c.discoveryPending or 0) + (c.friendPending or 0)) .. "."
+        local eligibility = nil
+        for _, row in ipairs(snapshot.queue or {}) do if row.player == target then eligibility = row; break end end
+        eligibility = eligibility or State.AutoTrader.EvaluatePlayerEligibility(target, snapshot.context)
+        local opportunity = eligibility.opportunity
+        if opportunity then
+            UI.AutoTraderPlayerDetailText.Text =
+                target.Name .. " is Q1 · " .. (opportunity.kind == "liquidity" and "STRATEGIC LIQUIDITY" or "VALUE WIN")
+                .. " · order score " .. rateText(eligibility.score) .. " · feasibility " .. tostring(eligibility.feasibilityState or "FEASIBLE") .. " · contact " .. tostring(eligibility.contactState or "NOT_CONTACTED") .. "\nGive: "
+                .. State.AutoTrader.FormatOpportunityItems(opportunity.giveItems) .. " = " .. formatCompact(opportunity.giveTotal)
+                .. "   →   Receive: " .. State.AutoTrader.FormatOpportunityItems(opportunity.receiveItems) .. " = " .. formatCompact(opportunity.receiveTotal)
+                .. "\nWhy: " .. tostring(opportunity.reason or "planner proved a useful exchange")
+        end
+    elseif snapshot then
+        local c = snapshot.counts or {}
+        UI.AutoTraderPlayerDetailText.Text =
+            "No proven trade queued right now. Discovery " .. tostring(c.discoveryPending or 0)
+            .. " · inconclusive " .. tostring(c.searchInconclusive or 0) .. " · proven impossible " .. tostring(c.provenImpossible or 0)
+            .. " · transport deferred " .. tostring(c.transportDeferred or 0) .. " · already done " .. tostring(c.exhausted or 0)
+            .. ". Unknown/inconclusive inventory is never contacted merely to test it."
+    end
+    local projection = State.AutoTrader.BuildQueueProjection(snapshot)
+    if projection then
+        local nextText = #projection.projectedOrder > 0 and table.concat(projection.projectedOrder, " → ") or "none"
+        local unlocked = #projection.newlyUnlocked > 0 and (" · unlocks " .. table.concat(projection.newlyUnlocked, ", ")) or ""
+        local lost = #projection.lostFeasibility > 0 and (" · loses " .. table.concat(projection.lostFeasibility, ", ")) or ""
+        UI.AutoTraderQueueProjection.Text =
+            "Assume " .. projection.basedOnName .. " does the modeled " .. string.upper(tostring(projection.kind))
+            .. ": " .. projection.modeledGive .. " → " .. projection.modeledReceive
+            .. ". Lowest denomination " .. formatCompact(projection.beforeMetrics.minValue) .. " → " .. formatCompact(projection.afterMetrics.minValue)
+            .. "; high anchor " .. formatCompact(projection.beforeMetrics.maxValue) .. " → " .. formatCompact(projection.afterMetrics.maxValue)
+            .. "; Reach4 trusted " .. tostring(projection.beforeMetrics.reach and projection.beforeMetrics.reach.trusted == true) .. " → " .. tostring(projection.afterMetrics.reach and projection.afterMetrics.reach.trusted == true)
+            .. ". Next queue: " .. nextText .. unlocked .. lost .. ". HYPOTHETICAL only; actual queue rebuilds from audited inventory."
+    else
+        UI.AutoTraderQueueProjection.Text = "No projection: there is no Q1 representative trade yet. The queue will appear only after resolved inventory proves an exchange."
     end
 end
 
@@ -16545,7 +17576,8 @@ local function humanEvent(entry)
     if kind == "server_hop_queue_built" then return "Gold-hash server scan finished" end
     if kind == "server_hop_candidate_attempt" then return "Teleporting to gold-hash-screened server" end
     if kind == "current_server_avatar_screen" then return "Avatar bot screen refreshed" end
-    if kind == "target_economic_skip" then return "Low-EV target skipped" .. (name and (" · " .. tostring(name)) or "") end
+    if kind == "target_economic_skip" then return "Legacy low-EV skip event" .. (name and (" · " .. tostring(name)) or "") end
+    if kind == "trade_queue_changed" then return "Planner queue rebuilt from current audited/resolved inventory" end
     if kind == "gold_bot_server_certified" then return "Gold bot server certified · hashes saved" end
     if kind == "gold_bot_certification_regular" then return "Bot learning vetoed · remote MoveDirection/facing looked human" .. (name and (" · " .. tostring(name)) or "") end
     if kind == "gold_bot_certification_inconclusive" then return "Bot certification inconclusive · waiting for useful zero-MoveDirection movement" end
@@ -16591,7 +17623,9 @@ State.AutoTrader.Render = function()
     UI.AutoTraderTarget.Text = target and ((State.AutoTrader.LastTradePartner and "Partner: " or "Next eligible: ") .. target.Name) or "Target: —"
     local plan, summary = State.AutoTrader.Plan, State.AutoTrader.OtherSummary
     if plan then
-        UI.AutoTraderTotals.Text = "Them: " .. formatCompact(plan.receiveTotal) .. (plan.unknownCount and plan.unknownCount > 0 and "+" or "") .. "   Plan: " .. formatCompact(plan.total) .. "   Win: +" .. formatCompact(plan.win)
+        UI.AutoTraderTotals.Text = plan.strategicKind == "liquidity"
+            and ("Liquidity: give " .. formatCompact(plan.total) .. " → receive " .. formatCompact(plan.receiveTotal) .. " · non-loss · portfolio reach improves")
+            or ("Them: " .. formatCompact(plan.receiveTotal) .. (plan.unknownCount and plan.unknownCount > 0 and "+" or "") .. "   Plan: " .. formatCompact(plan.total) .. "   Win: +" .. formatCompact(plan.win))
     elseif State.AutoTrader.Anchor and summary and summary.slotCount == 0 then
         UI.AutoTraderTotals.Text = "Anchor: " .. State.AutoTrader.Anchor.name .. " · " .. formatCompact(State.AutoTrader.Anchor.unitValue)
     elseif summary then
@@ -16605,17 +17639,17 @@ State.AutoTrader.Render = function()
     UI.AutoTraderServerRisk.Text = "Bot learning: " .. string.upper(tostring(cert.status or "waiting"))
     UI.AutoTraderServerRisk.TextColor3 = cert.status == "certified_learned" and THEME.green or cert.status == "regular" and THEME.blue or THEME.yellow
     UI.AutoTraderServerPopulation.Text = "Players " .. tostring(counts.total or 0)
-        .. " · ready " .. tostring(counts.actionable or 0)
-        .. " · hop-better " .. tostring(counts.economicHopPreferred or 0)
+        .. " · queued " .. tostring(counts.actionable or 0)
+        .. " · no trade " .. tostring(counts.noFeasibleTrade or 0)
         .. " · retry " .. tostring(counts.retryLater or 0)
         .. " · unknown " .. tostring(counts.unknown or 0)
     UI.AutoTraderServerDisposition.Text = "Disposition: " .. tostring(disposition)
     if State.AutoTrader.FastBotHopActive then
         UI.AutoTraderServerDecision.Text = "LEAVE · " .. tostring(State.AutoTrader.FastBotHopReason or "manual/liveness")
     elseif State.AutoTrader.SelectedTarget then
-        UI.AutoTraderServerDecision.Text = "STAY · actionable opportunity " .. State.AutoTrader.SelectedTarget.Name
+        UI.AutoTraderServerDecision.Text = "STAY · Q1 has a planner-proven useful trade with " .. State.AutoTrader.SelectedTarget.Name
     elseif string.sub(tostring(disposition), 1, 9) == "EXHAUSTED" then
-        UI.AutoTraderServerDecision.Text = "LEAVE · no player is actionable under the shared eligibility model"
+        UI.AutoTraderServerDecision.Text = "LEAVE · everyone is attempted, impossible from resolved inventory, ignored, or otherwise unavailable"
     elseif tostring(disposition):find("WAITING", 1, true) then
         UI.AutoTraderServerDecision.Text = "WAIT BRIEFLY · bounded discovery/friend/retry state"
     else
@@ -16623,16 +17657,17 @@ State.AutoTrader.Render = function()
     end
 
     local opp = State.AutoTrader.LastOpportunityDecision or {}
-    UI.AutoTraderOpportunityBest.Text = opp.bestName and ("Best: " .. tostring(opp.bestName))
-        or (opp.bestEconomicName and ("Best below floor: " .. tostring(opp.bestEconomicName)) or "Best target: —")
-    local shownTargetRate = opp.bestScore or opp.bestEconomicScore
-    UI.AutoTraderOpportunityRates.Text = "Target EV " .. rateText(shownTargetRate) .. "   Hop EV " .. rateText(opp.hopOpportunityRate)
-    UI.AutoTraderOpportunityFloor.Text = "Stay floor: " .. rateText(opp.retentionFloor)
-    if opp.bestScore and opp.retentionFloor then
-        UI.AutoTraderOpportunityDecision.Text = "STAY: at least one target is actionable above the current stay-vs-hop floor."
-    elseif opp.bestEconomicScore and opp.retentionFloor then
-        UI.AutoTraderOpportunityDecision.Text = "HOP: remaining positive targets are below the current stay-vs-hop floor; the controller will leave instead of idling."
-    else UI.AutoTraderOpportunityDecision.Text = "Waiting for enough verified inventory to compare stay-vs-hop value." end
+    UI.AutoTraderOpportunityBest.Text = opp.bestName and ("Q1: " .. tostring(opp.bestName) .. " · " .. tostring(opp.queueLength or 0) .. " proven")
+        or "Q1: — · no proven trade yet"
+    local liveEligibility = State.AutoTrader.LastEligibilitySnapshot or {}
+    local liveCounts = liveEligibility.counts or {}
+    UI.AutoTraderOpportunityRates.Text = "Feasible " .. tostring(liveCounts.actionable or 0) .. "   Inconclusive " .. tostring(liveCounts.searchInconclusive or 0)
+    UI.AutoTraderOpportunityFloor.Text = "Deep search " .. tostring(liveCounts.deepSearchPending or 0) .. " · transport deferred " .. tostring(liveCounts.transportDeferred or 0)
+    if (tonumber(opp.queueLength) or 0) > 0 then
+        UI.AutoTraderOpportunityDecision.Text = "STAY: Q1 is planner-proven. Ordering telemetry changes who goes first, never whether a feasible human is tried."
+    else
+        UI.AutoTraderOpportunityDecision.Text = "No proven trade yet. Inconclusive search is labeled honestly and never treated as proof that no trade exists."
+    end
 
     local dataFresh, _, dataAge = State.AutoTrader.DecisionDataFresh()
     local safety = {
@@ -16656,7 +17691,9 @@ State.AutoTrader.Render = function()
 
     local partner = State.AutoTrader.LastTradePartner
     UI.AutoTraderTradePartner.Text = partner and ("Partner: " .. partner.Name) or "Partner: —"
-    if plan then UI.AutoTraderTradeTotals.Text = "Them " .. formatCompact(plan.receiveTotal) .. " · Us " .. formatCompact(plan.total) .. " · Profit +" .. formatCompact(plan.win)
+    if plan then UI.AutoTraderTradeTotals.Text = plan.strategicKind == "liquidity"
+        and ("Them " .. formatCompact(plan.receiveTotal) .. " · Us " .. formatCompact(plan.total) .. " · STRATEGIC LIQUIDITY · no value loss")
+        or ("Them " .. formatCompact(plan.receiveTotal) .. " · Us " .. formatCompact(plan.total) .. " · Profit +" .. formatCompact(plan.win))
     elseif summary then UI.AutoTraderTradeTotals.Text = "Them known " .. formatCompact(summary.knownFloor) .. " · waiting for plan"
     else UI.AutoTraderTradeTotals.Text = "Them: —   Us: —   Profit: —" end
     UI.AutoTraderTradeState.Text = State.CurrentTrade and tostring(State.AutoTrader.StatusDetail or status) or "No active managed trade. The page will populate when a trade begins."
@@ -16664,7 +17701,9 @@ State.AutoTrader.Render = function()
     if negotiation then
         UI.AutoTraderNegotiationStage.Text = "Stage " .. tostring(negotiation.stage) .. (negotiation.final and " · FINAL FLOOR" or (" · target " .. formatPercent((negotiation.margin or 0) * 100, false)))
         UI.AutoTraderNegotiationTimer.Text = negotiation.nextIn and ("Next concession in " .. string.format("%.1fs", negotiation.nextIn) .. " · stable for " .. string.format("%.1fs", negotiation.stableFor)) or "Final concession stage · no lower margin allowed."
-        UI.AutoTraderNegotiationSafety.Text = "Target profit +" .. formatCompact(negotiation.targetProfit) .. " · hard floor +" .. formatCompact(State.AutoTrader.GetEffectiveMinimumWin(summary))
+        UI.AutoTraderNegotiationSafety.Text = plan and plan.strategicKind == "liquidity"
+            and "Strategic portfolio trade · minimum Supreme gain 0 · Reach1/Reach2/Reach4 + anchor validation required"
+            or ("Target profit +" .. formatCompact(negotiation.targetProfit) .. " · hard floor +" .. formatCompact(State.AutoTrader.GetEffectiveMinimumWin(summary)))
     else
         UI.AutoTraderNegotiationStage.Text = "Stage: —"; UI.AutoTraderNegotiationTimer.Text = "Waiting for their offer."; UI.AutoTraderNegotiationSafety.Text = "Hard minimum: —"
     end
@@ -16678,7 +17717,16 @@ State.AutoTrader.Render = function()
         UI.AutoTraderAudit.Text = "Last audit: " .. tostring(audit.result or "captured") .. (audit.inventoryMismatches and (" · inventory mismatches " .. tostring(#audit.inventoryMismatches)) or "")
     else UI.AutoTraderAudit.Text = "Last audit: —" end
     local market = State.AutoTrader.LastMarketGate
-    UI.AutoTraderTradeWhy.Text = plan and ("Planner stage " .. tostring(plan.negotiationStage or "?") .. " targeted a +" .. formatCompact(plan.win) .. " audited gain. " .. (market and ("Market gate: " .. tostring(market.reason or market.ok or "checked") .. ". ") or "") .. "The hard minimum-win and post-trade audit remain non-negotiable.") or "The planner will explain its margin, market gate, and acceptance state here."
+    UI.AutoTraderTradeWhy.Text = plan and (
+        plan.strategicKind == "liquidity"
+        and ("STRATEGIC LIQUIDITY · modeled " .. State.AutoTrader.FormatOpportunityItems(plan.items) .. " = " .. formatCompact(plan.total)
+            .. " for their resolved " .. formatCompact(plan.receiveTotal) .. ". Immediate Supreme loss is forbidden; the normal +win floor is relaxed to 0 only because the current audited portfolio simulation proves better denomination reach while preserving anchor strength. "
+            .. (plan.portfolioDelta and tostring(plan.portfolioDelta.reason or "") or "")
+            .. " Market gate and post-trade inventory audit still remain mandatory.")
+        or ("VALUE WIN · planner stage " .. tostring(plan.negotiationStage or "?") .. " targets +" .. formatCompact(plan.win)
+            .. ". " .. (market and ("Market gate: " .. tostring(market.reason or market.ok or "checked") .. ". ") or "")
+            .. "The dynamic minimum-win and post-trade audit remain mandatory.")
+    ) or "No active plan. The PEOPLE page shows the pre-trade queue, representative exchanges, and projected queue changes before a request is sent."
 
     local scan = State.AutoTrader.LastServerScan
     if scan then
@@ -16725,8 +17773,8 @@ State.AutoTrader.Render = function()
         "Requests: " .. tostring(requests),
         "Responses: " .. tostring(responses) .. " (" .. (requests > 0 and pct01(responses / requests) or "—") .. ")",
         "Trades started: " .. tostring(trades),
-        "Audited wins: " .. tostring(successes),
-        "Avg profit/win: " .. (successes > 0 and ("+" .. formatCompact(profit / successes)) or "—"),
+        "Audited useful trades: " .. tostring(successes),
+        "Avg value gain/useful trade: " .. (successes > 0 and ("+" .. formatCompact(profit / successes)) or "—"),
         "Gold bot DB: " .. tostring(goldDbCount) .. " hashes",
     }
     for i, text in ipairs(sessionRows) do UI.AutoTraderSessionRows[i].Text = text end
@@ -16735,7 +17783,7 @@ State.AutoTrader.Render = function()
         "Requests learned: " .. tostring(math.floor(global.requests or 0)),
         "Response rate: " .. ((global.requests or 0) > 0 and pct01((global.responses or 0) / global.requests) or "—"),
         "Trade/start rate: " .. ((global.responses or 0) > 0 and pct01((global.trades or 0) / global.responses) or "—"),
-        "Win/trade rate: " .. ((global.trades or 0) > 0 and pct01((global.successes or 0) / global.trades) or "—"),
+        "Useful/trade rate: " .. ((global.trades or 0) > 0 and pct01((global.successes or 0) / global.trades) or "—"),
         "Learned profit: +" .. formatCompact(global.totalProfit or 0),
         "Interaction profit/hr: +" .. formatCompact(learnedProfitHr),
         "Fresh-server EV: " .. rateText(State.AutoTrader.GetHopOpportunityRate()),
@@ -16822,9 +17870,11 @@ connect(UI.AutoTraderCertifyBots.MouseButton1Click, function()
         State.AutoTrader.Render()
         return
     end
+    local expectedIds = table.clone(ids)
+    local expectedRosterKey = rosterKey
     State.AutoTrader.ManualBotConfirmUntil = 0
     State.AutoTrader.ManualBotConfirmRosterKey = nil
-    task.spawn(function() State.AutoTrader.ManuallyCertifyCurrentServerBots() end)
+    task.spawn(function() State.AutoTrader.ManuallyCertifyCurrentServerBots(expectedIds, expectedRosterKey) end)
 end)
 connect(UI.AutoTraderRefreshServerScan.MouseButton1Click, function()
     if State.AutoTrader.ServerHopInProgress then
@@ -16957,7 +18007,7 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                 State.AutoTrader.RecordTargetEvent(partnerPlayer, "trade")
                 State.AutoTrader.MarkServerPlayerOutcome(partnerPlayer, "trading", incoming and "incoming request accepted" or "trade started externally")
             end
-            if incoming and (not partnerPlayer or incoming.userId == partnerPlayer.UserId) then
+            if incoming and partnerPlayer and incoming.userId == partnerPlayer.UserId then
                 State.AutoTrader.AcknowledgeIncomingTradeStart(partnerPlayer, "StartTradeRemote")
                 State.AutoTrader.IncomingRequestGeneration += 1
                 State.AutoTrader.IncomingRequestResolvingSignature = nil
@@ -18568,6 +19618,7 @@ local function refreshTrackedCards()
             itemId = info.itemId,
             itemType = info.itemType,
             displayName = info.displayName,
+            variant = info.variant,
             showValue = info.showValue,
             showInfo = info.showInfo,
             compactMode = info.compactMode,
@@ -18588,6 +19639,7 @@ local function refreshTrackedCards()
             itemId = context.itemId,
             itemType = context.itemType,
             displayName = context.displayName,
+            variant = context.variant,
             showValue = true,
             showInfo = true,
             compactMode =
@@ -18631,6 +19683,7 @@ local function annotateOfferSlots(localEntries, otherEntries)
                 itemId = entry.itemId,
                 itemType = entry.itemType,
                 record = entry.record,
+                variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
                 showValue = CONFIG.ValueBadgeOnTrade,
                 showInfo = CONFIG.StatsButtons,
                 compactMode = true,
@@ -18645,6 +19698,7 @@ local function annotateOfferSlots(localEntries, otherEntries)
                 itemId = entry.itemId,
                 itemType = entry.itemType,
                 record = entry.record,
+                variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
                 showValue = CONFIG.ValueBadgeOnTrade,
                 showInfo = CONFIG.StatsButtons,
                 compactMode = true,
@@ -18672,7 +19726,8 @@ local function gatherTradeInventoryCards()
                     local itemType,
                         itemId,
                         displayName,
-                        iconAssetId =
+                        iconAssetId,
+                        variantHint =
                         classifyTradeCard(
                             child,
                             preferredType
@@ -18698,7 +19753,8 @@ local function gatherTradeInventoryCards()
                                     resolveGameItem(
                                         itemId or displayName,
                                         itemType,
-                                        displayName
+                                        displayName,
+                                        variantHint and {variant = variantHint} or nil
                                     )
                                 )
                         end
@@ -18711,6 +19767,7 @@ local function gatherTradeInventoryCards()
                             showInfo = CONFIG.StatsButtons,
                             compactMode = true,
                             allowLooseCard = true,
+                            variant = variantHint,
                         })
                         if record then
                             local candidateId =
@@ -18732,6 +19789,8 @@ local function gatherTradeInventoryCards()
                                         iconAssetId = iconAssetId,
                                         itemType = itemType,
                                         record = record,
+                                        variant = variantHint or (record.category == "chromas" and "Chroma" or nil),
+                                        identityHint = variantHint and {variant = variantHint} or nil,
                                     }
                                 )
                             end
@@ -18748,7 +19807,8 @@ local function offeredQuantityForCandidate(entries, candidate)
         findOfferEntry(
             entries,
             candidate.itemId,
-            candidate.itemType
+            candidate.itemType,
+            candidate.variant
         )
     if exact then
         return exact.quantity or 0
@@ -18783,7 +19843,8 @@ local function createHypotheticalOffer(currentEntries, candidate)
         findOfferEntry(
             copy,
             candidate.itemId,
-            candidate.itemType
+            candidate.itemType,
+            candidate.variant
         )
     if not existing and candidate.record then
         local wantedName =
@@ -18811,6 +19872,8 @@ local function createHypotheticalOffer(currentEntries, candidate)
             itemType = candidate.itemType,
             quantity = 1,
             record = candidate.record,
+            variant = candidate.variant,
+            identityHint = candidate.identityHint,
         })
     end
     return copy
@@ -20841,7 +21904,8 @@ end
 State.Profile.ResolveRemoteInventoryItem = function(
     itemId,
     itemType,
-    quantity
+    quantity,
+    identityHint
 )
     if type(itemId) ~= "string"
         or itemId == "" then
@@ -20878,7 +21942,8 @@ State.Profile.ResolveRemoteInventoryItem = function(
         resolveGameItem(
             itemId,
             itemType,
-            itemId
+            State.ComposeVariantDisplayName(itemId, identityHint and identityHint.variant),
+            identityHint
         )
     local trusted =
         not CONFIG.ProfileRequireTrustedMatches
@@ -20920,6 +21985,8 @@ State.Profile.ResolveRemoteInventoryItem = function(
                 record,
             resolutionMeta =
                 resolutionMeta,
+            identityHint = identityHint,
+            variant = identityHint and identityHint.variant or nil,
         }
     end
     local unitValue =
@@ -20954,6 +22021,8 @@ State.Profile.ResolveRemoteInventoryItem = function(
         unitValue = unitValue,
         resolutionMeta =
             returnedMeta,
+        identityHint = identityHint,
+        variant = identityHint and identityHint.variant or ((record and record.category == "chromas") and "Chroma" or nil),
     }
 end
 State.Profile.CalculateRemoteSection = function(
@@ -20984,7 +22053,8 @@ State.Profile.CalculateRemoteSection = function(
     local nodeCount = 0
     local function addResult(
         itemId,
-        quantity
+        quantity,
+        identityHint
     )
         quantity = tonumber(quantity) or 1
         if quantity <= 0 then
@@ -20999,6 +22069,8 @@ State.Profile.CalculateRemoteSection = function(
                 tostring(itemType)
                 .. "|"
                 .. tostring(itemId)
+                .. "|variant:"
+                .. tostring(identityHint and identityHint.variant or "")
             local previous =
                 tonumber(
                     seenQuantities[
@@ -21020,7 +22092,8 @@ State.Profile.CalculateRemoteSection = function(
             State.Profile.ResolveRemoteInventoryItem(
                 tostring(itemId),
                 itemType,
-                quantity
+                quantity,
+                identityHint
             )
         if not resolved then
             return false
@@ -21039,6 +22112,8 @@ State.Profile.CalculateRemoteSection = function(
                         resolved.record,
                     resolutionMeta =
                         resolved.resolutionMeta,
+                    identityHint = resolved.identityHint,
+                    variant = resolved.variant,
                 }
             )
             result.resolvedItems =
@@ -21113,6 +22188,8 @@ State.Profile.CalculateRemoteSection = function(
                         or nil,
                     resolutionMeta =
                         resolved.resolutionMeta,
+                    identityHint = resolved.identityHint,
+                    variant = resolved.variant,
                 }
             )
             if #result.samples < 30 then
@@ -21183,7 +22260,8 @@ State.Profile.CalculateRemoteSection = function(
             and tonumber(objectQuantity) then
             if addResult(
                 objectId,
-                objectQuantity
+                objectQuantity,
+                State.BuildInventoryIdentityHint(node, parentKey)
             ) then
                 visited[node] = nil
                 return
@@ -21192,15 +22270,15 @@ State.Profile.CalculateRemoteSection = function(
         for key, value in pairs(node) do
             if type(key) == "string"
                 and type(value) == "number" then
-                addResult(key, value)
+                addResult(key, value, State.BuildInventoryIdentityHint(nil, parentKey))
             elseif type(key) == "string"
                 and type(value) == "boolean" then
                 if value then
-                    addResult(key, 1)
+                    addResult(key, 1, State.BuildInventoryIdentityHint(nil, parentKey))
                 end
             elseif type(value) == "string"
                 and type(key) == "number" then
-                addResult(value, 1)
+                addResult(value, 1, State.BuildInventoryIdentityHint(nil, parentKey))
             elseif type(value) == "table" then
                 local nestedQuantity =
                     value.Amount
@@ -21217,14 +22295,15 @@ State.Profile.CalculateRemoteSection = function(
                     handled =
                         addResult(
                             key,
-                            nestedQuantity
+                            nestedQuantity,
+                            State.BuildInventoryIdentityHint(value, (parentKey and parentKey ~= "" and (tostring(parentKey) .. ">" .. tostring(key)) or tostring(key)))
                         )
                 end
                 if not handled then
                     walk(
                         value,
                         depth + 1,
-                        key
+                        (parentKey and parentKey ~= "" and (tostring(parentKey) .. ">" .. tostring(key)) or tostring(key))
                     )
                 end
             end
@@ -22082,6 +23161,1345 @@ HARDEN.startPeriodic = function(baseSeconds, backoff, callback, name)
         end
     end)
 end
+-- v36 frozen architecture overrides (no new top-level locals)
+-- v36 frozen-architecture implementation overrides.
+-- Keep this inside a scoped block: the source is near Luau's top-level local-register limit.
+do
+    CONFIG.AutoTraderFeasibilityFrontierLimit = 2600
+    CONFIG.AutoTraderFeasibilityDeepFrontierLimit = 7200
+    CONFIG.AutoTraderFeasibilityBudgetMs = 5.0
+    CONFIG.AutoTraderFeasibilityDeepBudgetMs = 16.0
+    CONFIG.AutoTraderFeasibilityCrossCheckLimit = 6500
+    CONFIG.AutoTraderFeasibilityDeepCrossCheckLimit = 26000
+    CONFIG.AutoTraderReachDynamicBudgetLimit = 32
+    CONFIG.AutoTraderReachStateLimit = 12000
+    CONFIG.AutoTraderReachExactQuantityLimit = 400
+    CONFIG.AutoTraderReachYieldBudgetMs = 3.0
+    CONFIG.AutoTraderTransportDeferredSeconds = 8.0
+    CONFIG.AutoTraderCriticalHistoryLimit = 48
+    CONFIG.AutoTraderVerboseHistoryLimit = 96
+
+    State.AutoTrader.FeasibilityDeepSearch = State.AutoTrader.FeasibilityDeepSearch or {}
+    State.AutoTrader.FeasibilityDeepSearchGeneration = tonumber(State.AutoTrader.FeasibilityDeepSearchGeneration) or 0
+    State.AutoTrader.FeasibilityDeepInFlight = tonumber(State.AutoTrader.FeasibilityDeepInFlight) or 0
+    State.AutoTrader.LastFeasibilityDiagnostics = State.AutoTrader.LastFeasibilityDiagnostics or {}
+    State.AutoTrader.BotEscapeEpoch = tonumber(State.AutoTrader.BotEscapeEpoch) or 0
+    State.AutoTrader.ServerHopEscapeEpoch = nil
+    State.AutoTrader.BotIconDbPending = nil
+    State.AutoTrader.BotTrustStageFile = "SV_AutoTrader_BotHashes_v36.pending.json"
+    State.AutoTrader.BotTrustMarkerFile = "SV_AutoTrader_BotHashes_v36.trusted.json"
+    State.AutoTrader.BotTrustCommitSerial = tonumber(State.AutoTrader.BotTrustCommitSerial) or 0
+    State.AutoTrader.CriticalSessionEventHistory = State.AutoTrader.CriticalSessionEventHistory or {}
+    State.AutoTrader.LastProjectionActualDiff = State.AutoTrader.LastProjectionActualDiff or nil
+    State.AutoTrader.IncomingInspectionPendingUserId = nil
+
+    State.AutoTrader.CopyPlannerItemIdentity = function(source, destination)
+        destination = destination or {}
+        if type(source) ~= "table" then return destination end
+        destination.key = source.key
+        destination.itemId = source.itemId
+        destination.nativeKey = source.nativeKey or source.itemId
+        destination.itemType = source.itemType
+        destination.name = source.name
+        destination.variant = source.variant
+        destination.identityHint = type(source.identityHint) == "table" and table.clone(source.identityHint) or source.identityHint
+        destination.numericItemId = source.numericItemId
+            or (type(source.identityHint) == "table" and source.identityHint.numericItemId)
+            or (type(source.gameData) == "table" and (source.gameData.ItemID or source.gameData.ItemId or source.gameData.ID))
+        destination.valueIdentity = source.valueIdentity
+        destination.mutationIdentity = source.mutationIdentity
+        destination.familyIdentity = source.familyIdentity
+        return destination
+    end
+
+    State.AutoTrader.GetMutationIdentityKey = function(entry)
+        if type(entry) ~= "table" then return nil end
+        local itemType = tostring(entry.itemType or "")
+        local nativeKey = tostring(entry.nativeKey or entry.itemId or "")
+        if itemType == "" or nativeKey == "" then return nil end
+        return normalizeTradeItemType(itemType) .. "|" .. nativeKey
+    end
+
+    State.AutoTrader.GetValueIdentityKey = function(entry)
+        if type(entry) ~= "table" then return nil end
+        local mutation = State.AutoTrader.GetMutationIdentityKey(entry) or "?"
+        local hint = type(entry.identityHint) == "table" and entry.identityHint or {}
+        local record = entry.record
+        local data = record and record.data or {}
+        local variant = entry.variant or hint.variant or (record and record.category == "chromas" and "Chroma") or ""
+        local event = hint.event or data.event or data.Event or data.holiday or data.Holiday or data.season or data.Season or ""
+        local year = hint.year or data.year or data.Year or data.releaseYear or data.ReleaseYear or ""
+        local supreme = record and (tostring(record.category or "") .. "/" .. tostring(record.key or record.name or "")) or ""
+        return mutation .. "|variant=" .. tostring(variant) .. "|event=" .. tostring(event)
+            .. "|year=" .. tostring(year) .. "|supreme=" .. supreme
+    end
+
+    State.AutoTrader.GetFamilyIdentityKey = function(entry)
+        if type(entry) ~= "table" then return nil end
+        return normalizeTradeItemType(entry.itemType or "") .. "|" .. tostring(entry.itemId or entry.nativeKey or "")
+    end
+
+    State.AutoTrader.AnnotateIdentity = function(entry)
+        if type(entry) ~= "table" then return entry end
+        entry.nativeKey = entry.nativeKey or entry.itemId
+        local gameData = nil
+        pcall(function() gameData = getGameItemData(entry.itemType, entry.nativeKey) end)
+        if type(gameData) == "table" then
+            entry.gameData = entry.gameData or gameData
+            entry.numericItemId = entry.numericItemId or tonumber(gameData.ItemID or gameData.ItemId or gameData.DataID or gameData.DataId or gameData.ID or gameData.Id)
+            local hint = type(entry.identityHint) == "table" and table.clone(entry.identityHint) or {}
+            if not hint.variant and (gameData.Chroma == true or gameData.IsChroma == true or normalize(entry.nativeKey or ""):find("chroma",1,true)) then hint.variant = "Chroma" end
+            if not hint.year then hint.year = tonumber(gameData.Year or gameData.year or gameData.ReleaseYear or gameData.releaseYear) end
+            if not hint.event then hint.event = gameData.Event or gameData.event or gameData.Holiday or gameData.holiday or gameData.Season or gameData.season or gameData.Origin or gameData.origin end
+            if next(hint) ~= nil then entry.identityHint = hint end
+            entry.variant = entry.variant or hint.variant
+        end
+        entry.mutationIdentity = State.AutoTrader.GetMutationIdentityKey(entry)
+        entry.familyIdentity = State.AutoTrader.GetFamilyIdentityKey(entry)
+        entry.valueIdentity = State.AutoTrader.GetValueIdentityKey(entry)
+        return entry
+    end
+
+    State.AutoTrader.FindMutationIdentityCollisions = function(entries)
+        local byMutation, collisions = {}, {}
+        for _, entry in ipairs(entries or {}) do
+            State.AutoTrader.AnnotateIdentity(entry)
+            local mutation = entry.mutationIdentity
+            local valueIdentity = entry.valueIdentity
+            if mutation and valueIdentity then
+                local row = byMutation[mutation]
+                if not row then row = {values={}, entries={}}; byMutation[mutation] = row end
+                row.values[valueIdentity] = true
+                table.insert(row.entries, entry)
+            end
+        end
+        for mutation, row in pairs(byMutation) do
+            local count = 0
+            for _ in pairs(row.values) do count += 1 end
+            if count > 1 then
+                collisions[mutation] = {mutationIdentity=mutation, valueIdentityCount=count, entries=row.entries, failure="AMBIGUOUS_MUTATION_IDENTITY"}
+                for _, entry in ipairs(row.entries) do entry.mutationAmbiguous = true; entry.identityFailure = "AMBIGUOUS_MUTATION_IDENTITY" end
+            end
+        end
+        return collisions
+    end
+
+    State.AutoTrader.V35GetTradableInventory = State.AutoTrader.V35GetTradableInventory or State.AutoTrader.GetTradableInventory
+    State.AutoTrader.GetTradableInventory = function()
+        local entries, reason, inventory = State.AutoTrader.V35GetTradableInventory()
+        if type(entries) ~= "table" then return entries, reason, inventory end
+        local collisions = State.AutoTrader.FindMutationIdentityCollisions(entries)
+        if next(collisions) == nil then return entries, reason, inventory end
+        local safe = {}
+        for _, entry in ipairs(entries) do if not entry.mutationAmbiguous then table.insert(safe, entry) end end
+        State.AutoTrader.LastMutationIdentityCollisions = collisions
+        State.AutoTrader.Log("mutation_identity_ambiguity", {scope="local_tradable", collisions=collisions})
+        if #safe == 0 then return nil, "all otherwise-tradable entries are blocked by ambiguous mutation identity", inventory end
+        return safe, nil, inventory
+    end
+
+    State.AutoTrader.V35ResolveGameItem = State.AutoTrader.V35ResolveGameItem or resolveGameItem
+    State.AutoTrader.IsRecordCompatibleWithIdentityHint = function(record, identityHint)
+        if type(record) ~= "table" or type(identityHint) ~= "table" then return true end
+        local data = record.data or {}
+        if identityHint.variant == "Chroma" and record.category ~= "chromas" then return false end
+        local hintYear = tonumber(identityHint.year)
+        local recordYear = tonumber(data.year or data.Year or data.releaseYear or data.ReleaseYear)
+        if hintYear and recordYear and hintYear ~= recordYear then return false end
+        local hintEvent = normalize(identityHint.event or "")
+        local recordEvent = normalize(data.event or data.Event or data.holiday or data.Holiday or data.season or data.Season or "")
+        if hintEvent ~= "" and recordEvent ~= "" and not recordEvent:find(hintEvent, 1, true) and not hintEvent:find(recordEvent, 1, true) then
+            return false
+        end
+        return true
+    end
+    resolveGameItem = function(itemId, itemType, displayName, identityHint)
+        local linkKey = State.Mapping.MakeItemKey(itemType, itemId)
+        local manualLink = State.Mapping.ItemLinks[linkKey]
+        if type(manualLink) == "table" and type(identityHint) == "table" then
+            local manualRecord = State.Mapping.ResolveLinkRecord(manualLink)
+            if manualRecord and not State.AutoTrader.IsRecordCompatibleWithIdentityHint(manualRecord, identityHint) then
+                State.Mapping.ItemLinks[linkKey] = nil
+                local packed = {pcall(State.AutoTrader.V35ResolveGameItem, itemId, itemType, displayName, identityHint)}
+                State.Mapping.ItemLinks[linkKey] = manualLink
+                if not packed[1] then error(packed[2]) end
+                local record, reason, meta = packed[2], packed[3], packed[4]
+                meta = type(meta) == "table" and meta or {}
+                meta.rejectedManualMapping = {key=linkKey, reason="conflicts with explicit variant/event/year evidence"}
+                return record, reason, meta
+            end
+        end
+        return State.AutoTrader.V35ResolveGameItem(itemId, itemType, displayName, identityHint)
+    end
+
+    State.AutoTrader.GetCurrentServerReachBudgets = function()
+        local values = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local info = State.Profile.totalsByName and State.Profile.totalsByName[player.Name] or nil
+                if type(info) == "table" and info.source == "GetFullInventoryVerified" and not info.stale then
+                    local total = tonumber(info.total)
+                    if total and total > 0 then table.insert(values, total) end
+                end
+            end
+        end
+        return values
+    end
+
+    State.AutoTrader.GetReachBudgetSet = function(entries, extraBudgets)
+        extraBudgets = type(extraBudgets) == "table" and extraBudgets or {}
+        local values = {2,3,5,8,10,15,20,30,50,75,100,150,250,500,1000,2500}
+        local seen = {}
+        local result = {}
+        local function add(value)
+            value = tonumber(value)
+            if not value or value <= 0 then return end
+            local key = string.format("%.3f", value)
+            if seen[key] then return end
+            seen[key] = true
+            table.insert(result, value)
+        end
+        for _, value in ipairs(values) do add(value) end
+        local dynamic = {}
+        for _, value in ipairs(extraBudgets) do
+            value = tonumber(value)
+            if value and value > 0 then table.insert(dynamic, value) end
+        end
+        table.sort(dynamic)
+        local sampled = #dynamic > CONFIG.AutoTraderReachDynamicBudgetLimit
+        if sampled then
+            local picked = {}
+            for i=1,CONFIG.AutoTraderReachDynamicBudgetLimit do
+                local index = math.floor((i-1) * (#dynamic-1) / math.max(1, CONFIG.AutoTraderReachDynamicBudgetLimit-1) + 1.5)
+                table.insert(picked, dynamic[math.min(#dynamic, index)])
+            end
+            dynamic = picked
+        end
+        for _, value in ipairs(dynamic) do add(value) end
+        table.sort(result)
+        return result, sampled
+    end
+
+    State.AutoTrader.BuildReachProfile = function(entries, extraBudgets, options)
+        options = type(options) == "table" and options or {}
+        local budgets, budgetSampled = State.AutoTrader.GetReachBudgetSet(entries, extraBudgets or {})
+        local profile = {budgets=budgets, reach1={}, reach2={}, reach4={}, trusted=true,
+            diagnostics={budgetSampled=budgetSampled,stateCapHit=false,quantityApproximationUsed=false,cancelled=false,timeBudgetHit=false,peakStates=1}}
+        local started = os.clock()
+        local segmentStarted = started
+        local activeMs = 0
+        local function isCurrent()
+            return not options.isCurrent or options.isCurrent()
+        end
+        local function maybeYield(force)
+            if not isCurrent() then profile.trusted=false;profile.diagnostics.cancelled=true;return false end
+            local now = os.clock()
+            local segmentMs = (now-segmentStarted)*1000
+            if options.budgetMs and activeMs+segmentMs >= options.budgetMs then
+                profile.trusted=false;profile.diagnostics.timeBudgetHit=true;return false
+            end
+            if force or segmentMs >= CONFIG.AutoTraderReachYieldBudgetMs then
+                activeMs += segmentMs
+                RunService.Heartbeat:Wait()
+                segmentStarted = os.clock()
+                if not isCurrent() then profile.trusted=false;profile.diagnostics.cancelled=true;return false end
+            end
+            return true
+        end
+        if #budgets == 0 then profile.diagnostics.elapsedMs=0;return profile end
+        local maxBudget = budgets[#budgets]
+        local maxScaled = math.max(0, math.floor(maxBudget*10+0.5))
+        local states = {{},{},{},{},{}}
+        states[1][0] = true
+        local stateCount = 1
+        for _, entry in ipairs(entries or {}) do
+            if not maybeYield(false) then break end
+            local value = tonumber(entry.unitValue) or (entry.record and entry.record.data and numericValue(entry.record.data))
+            local maximum = math.max(0, math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0))
+            if value and value > 0 and maximum > 0 then
+                local valueScaled = math.max(1, math.floor(value*10+0.5))
+                local maxQ = math.min(maximum, math.floor(maxScaled/valueScaled))
+                if maxQ > 0 then
+                    local quantities = {}
+                    if maxQ <= CONFIG.AutoTraderReachExactQuantityLimit then
+                        for q=1,maxQ do table.insert(quantities,q) end
+                    else
+                        profile.trusted=false
+                        profile.diagnostics.quantityApproximationUsed=true
+                        quantities = State.AutoTrader.QuantityOptions(maximum, value, 0, maxBudget)
+                    end
+                    local nextStates = {{},{},{},{},{}}
+                    for slots=0,CONFIG.MaxOfferSlots do
+                        for total in pairs(states[slots+1] or {}) do
+                            nextStates[slots+1][total] = true
+                            if slots < CONFIG.MaxOfferSlots then
+                                for _, q in ipairs(quantities) do
+                                    local nextTotal = total + valueScaled*q
+                                    if nextTotal <= maxScaled then nextStates[slots+2][nextTotal] = true end
+                                end
+                            end
+                        end
+                    end
+                    states = nextStates
+                    stateCount = 0
+                    for slots=0,CONFIG.MaxOfferSlots do for _ in pairs(states[slots+1]) do stateCount += 1 end end
+                    profile.diagnostics.peakStates = math.max(profile.diagnostics.peakStates or 0, stateCount)
+                    if stateCount > CONFIG.AutoTraderReachStateLimit then
+                        profile.trusted=false
+                        profile.diagnostics.stateCapHit=true
+                        break
+                    end
+                end
+            end
+        end
+        local buckets = {{},{},{},{}}
+        for slots=1,CONFIG.MaxOfferSlots do
+            for total in pairs(states[slots+1] or {}) do table.insert(buckets[slots], total) end
+            table.sort(buckets[slots])
+        end
+        for _, budget in ipairs(budgets) do
+            local limit = math.floor(budget*10+0.5)
+            local best1,best2,best4 = 0,0,0
+            for slots=1,CONFIG.MaxOfferSlots do
+                local best = 0
+                for _, total in ipairs(buckets[slots]) do
+                    if total > limit then break end
+                    best = total
+                end
+                if slots <= 1 then best1 = math.max(best1,best) end
+                if slots <= 2 then best2 = math.max(best2,best) end
+                best4 = math.max(best4,best)
+            end
+            local key = string.format("%.3f",budget)
+            profile.reach1[key] = best1/10
+            profile.reach2[key] = best2/10
+            profile.reach4[key] = best4/10
+        end
+        activeMs += (os.clock()-segmentStarted)*1000
+        profile.diagnostics.activeMs = activeMs
+        profile.diagnostics.elapsedMs = (os.clock()-started)*1000
+        return profile
+    end
+
+    State.AutoTrader.GetPortfolioMetrics = function(entries, extraBudgets, options)
+        local totalValue, unitCount, distinctValues, minValue, maxValue = 0,0,{},math.huge,0
+        local values = {}
+        for _, entry in ipairs(entries or {}) do
+            local value = tonumber(entry.unitValue) or (entry.record and entry.record.data and numericValue(entry.record.data))
+            local quantity = math.max(0, math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0))
+            if value and value>0 and quantity>0 then
+                totalValue += value*quantity; unitCount+=quantity
+                distinctValues[string.format("%.3f",value)]=true; minValue=math.min(minValue,value); maxValue=math.max(maxValue,value)
+                table.insert(values,{value=value,quantity=quantity})
+            end
+        end
+        local distinctCount=0; for _ in pairs(distinctValues) do distinctCount+=1 end
+        if minValue==math.huge then minValue=0 end
+        local anchorThreshold=math.max(CONFIG.AutoTraderLiquidityAnchorMinValue,totalValue*0.12)
+        local anchorValue,anchorCount=0,0
+        for _,row in ipairs(values) do if row.value>=anchorThreshold then anchorValue+=row.value*row.quantity;anchorCount+=row.quantity end end
+        local reach=State.AutoTrader.BuildReachProfile(entries,extraBudgets or {},options)
+        return {totalValue=totalValue,unitCount=unitCount,distinctValues=distinctCount,minValue=minValue,maxValue=maxValue,
+            anchorThreshold=anchorThreshold,anchorValue=anchorValue,anchorCount=anchorCount,coverage=0,reach=reach}
+    end
+
+    State.AutoTrader.EvaluatePortfolioDelta = function(baseEntries, giveItems, receiveItems, options)
+        options = type(options)=="table" and options or {}
+        local beforeExtra, afterExtra = {}, {}
+        local giveTotal, receiveTotal = 0,0
+        for _,item in ipairs(giveItems or {}) do
+            local v=tonumber(item.unitValue) or (item.record and item.record.data and numericValue(item.record.data)) or 0
+            local q=math.max(1,math.floor(tonumber(item.quantity) or 1)); giveTotal+=v*q; table.insert(beforeExtra,v*q)
+        end
+        for _,item in ipairs(receiveItems or {}) do
+            local v=tonumber(item.unitValue) or (item.record and item.record.data and numericValue(item.record.data)) or 0
+            local q=math.max(1,math.floor(tonumber(item.quantity) or 1)); receiveTotal+=v*q; table.insert(afterExtra,v*q)
+        end
+        local extra={}
+        if options.excludeServerBudgets ~= true then
+            for _,v in ipairs(State.AutoTrader.GetCurrentServerReachBudgets()) do table.insert(extra,v) end
+        end
+        for _,v in ipairs(beforeExtra) do table.insert(extra,v) end
+        for _,v in ipairs(afterExtra) do table.insert(extra,v) end
+        local reachOptions={isCurrent=options.isCurrent,budgetMs=options.reachBudgetMs}
+        local before=State.AutoTrader.GetPortfolioMetrics(baseEntries,extra,reachOptions)
+        local afterEntries=State.AutoTrader.SimulatePortfolioExchange(baseEntries,giveItems,receiveItems)
+        local after=State.AutoTrader.GetPortfolioMetrics(afterEntries,extra,reachOptions)
+        local hardAnchorOK=true; local anchorReason=nil
+        if before.maxValue>=before.anchorThreshold and before.maxValue>0 then
+            if after.maxValue+0.000001<before.maxValue*CONFIG.AutoTraderLiquidityAnchorRetention then hardAnchorOK=false;anchorReason="would liquidate too much one-slot anchor strength"
+            elseif before.anchorValue>0 and after.anchorValue+0.000001<before.anchorValue*0.45 then hardAnchorOK=false;anchorReason="would liquidate too much high-value anchor inventory" end
+        end
+        local profit=receiveTotal-giveTotal
+        local reachTrusted=before.reach and after.reach and before.reach.trusted==true and after.reach.trusted==true
+        local catastropheOK=true; local catastropheReason=nil; local noReach4Regression=true
+        local meaningfulImprovement=false; local reachGain=0
+        if reachTrusted then
+            local seen={}
+            for _,budget in ipairs(before.reach.budgets or {}) do seen[string.format("%.3f",budget)]=budget end
+            for _,budget in ipairs(after.reach.budgets or {}) do seen[string.format("%.3f",budget)]=budget end
+            for key,budget in pairs(seen) do
+                local b4=tonumber(before.reach.reach4[key]) or 0; local a4=tonumber(after.reach.reach4[key]) or 0
+                local b1=tonumber(before.reach.reach1[key]) or 0; local a1=tonumber(after.reach.reach1[key]) or 0
+                local b2=tonumber(before.reach.reach2[key]) or 0; local a2=tonumber(after.reach.reach2[key]) or 0
+                if a4+0.000001<b4 then noReach4Regression=false end
+                if a4+0.000001 < b4-math.max(0,profit)-0.000001 then catastropheOK=false;catastropheReason="Reach4 catastrophe floor failed near budget "..formatCompact(budget);break end
+                local gain=(a1-b1)+(a2-b2)*0.6
+                if gain>0.000001 then meaningfulImprovement=true;reachGain+=gain end
+                local beforeEfficiency=b4>0 and ((b1/b4)+(b2/b4))*0.5 or 0
+                local afterEfficiency=a4>0 and ((a1/a4)+(a2/a4))*0.5 or 0
+                if afterEfficiency>beforeEfficiency+0.04 then meaningfulImprovement=true;reachGain+=afterEfficiency-beforeEfficiency end
+            end
+        else
+            -- Conservative sufficient fallback: removing at most giveTotal value can reduce
+            -- any pre-trade reachable total by no more than giveTotal. Therefore the frozen
+            -- catastrophe inequality is certified only when giveTotal <= immediateProfit.
+            if profit>0 and giveTotal<=profit+0.000001 then
+                catastropheOK=true;catastropheReason="conservative degraded-Reach bound certified by removed value <= immediate profit"
+            else
+                catastropheOK=false;catastropheReason="Reach analysis degraded and conservative catastrophe bound could not certify safety"
+            end
+            noReach4Regression=false
+        end
+        local strategicOK=profit>=-0.001 and reachTrusted and hardAnchorOK and noReach4Regression and meaningfulImprovement
+        local subkind="REBALANCE"
+        local beforeUnits,afterUnits=before.unitCount or 0,after.unitCount or 0
+        if afterUnits>beforeUnits then subkind="SPLIT" elseif afterUnits<beforeUnits then subkind="CONSOLIDATE" end
+        local anchorOK=hardAnchorOK and catastropheOK
+        local reason
+        if not hardAnchorOK then reason=anchorReason
+        elseif not catastropheOK then reason=catastropheReason
+        elseif strategicOK then reason="portfolio reach improves under ≤4-slot Reach1/Reach2/Reach4 while preserving anchors"
+        elseif profit>=0 and not reachTrusted then reason=catastropheReason
+        elseif profit>=0 and not noReach4Regression then reason="strategic zero-loss trade would regress Reach4 at a critical budget"
+        else reason="strategic portfolio improvement was not proven" end
+        return {ok=strategicOK,score=reachGain,before=before,after=after,hardAnchorOK=hardAnchorOK,anchorOK=anchorOK,anchorReason=anchorReason,
+            catastropheOK=catastropheOK,catastropheReason=catastropheReason,reachTrusted=reachTrusted,noReach4Regression=noReach4Regression,
+            meaningfulImprovement=meaningfulImprovement,strategicSubkind=subkind,profit=profit,giveTotal=giveTotal,receiveTotal=receiveTotal,
+            reason=reason,simulatedEntries=afterEntries,reachPolicyDegraded=not reachTrusted}
+    end
+
+    State.AutoTrader.ReconstructFrontierItems = function(state)
+        local reversed={}; local cursor=state
+        while cursor and cursor.addedItem do table.insert(reversed,cursor.addedItem);cursor=cursor.parent end
+        local items={}
+        for i=#reversed,1,-1 do table.insert(items,reversed[i]) end
+        return items
+    end
+
+    State.AutoTrader.BuildParetoOfferFrontier = function(entries, cap, options)
+        options=type(options)=="table" and options or {}
+        cap=math.max(0,tonumber(cap) or 0)
+        local diagnostics={solverComplete=true,inventoryComplete=options.inventoryComplete~=false,quantityApproximationUsed=false,frontierPruned=false,stateCapHit=false,
+            timeBudgetHit=false,cancelled=false,superseded=false,typesOmitted=0,expansions=0,peakStates=1,status="COMPLETE"}
+        if cap<=0 then return {},diagnostics end
+        local candidates={}
+        for _,entry in ipairs(entries or {}) do
+            local value=tonumber(entry.unitValue) or (entry.record and entry.record.data and numericValue(entry.record.data))
+            local maximum=math.max(0,math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0))
+            if value and value>0 and maximum>0 and value<=cap+0.000001 and not entry.mutationAmbiguous then
+                local copy={}; for k,v in pairs(entry) do copy[k]=v end
+                State.AutoTrader.AnnotateIdentity(copy); copy.unitValue=value;copy.maxQuantity=maximum;table.insert(candidates,copy)
+            end
+        end
+        table.sort(candidates,function(a,b) if a.unitValue~=b.unitValue then return a.unitValue<b.unitValue end return tostring(a.mutationIdentity)<tostring(b.mutationIdentity) end)
+        local states={{total=0,slots=0,parent=nil,addedItem=nil}}
+        local segmentStarted=os.clock()
+        local activeMs=0
+        local stateLimit=math.max(100,tonumber(options.stateLimit) or CONFIG.AutoTraderFeasibilityFrontierLimit)
+        local function interrupt(forceYield)
+            if options.isCurrent and not options.isCurrent() then diagnostics.cancelled=true;diagnostics.superseded=true;diagnostics.status="SUPERSEDED";return true end
+            local now=os.clock();local segmentMs=(now-segmentStarted)*1000
+            if options.budgetMs and activeMs+segmentMs>=options.budgetMs then diagnostics.timeBudgetHit=true;diagnostics.status="TIME_BUDGET";return true end
+            if options.deadline and now>=options.deadline then diagnostics.timeBudgetHit=true;diagnostics.status="TIME_BUDGET";return true end
+            if forceYield or segmentMs>=4 then
+                activeMs+=segmentMs;RunService.Heartbeat:Wait();segmentStarted=os.clock()
+                if options.isCurrent and not options.isCurrent() then diagnostics.cancelled=true;diagnostics.superseded=true;diagnostics.status="SUPERSEDED";return true end
+            end
+            return false
+        end
+        for _,entry in ipairs(candidates) do
+            if interrupt() then break end
+            local maxUsable=math.min(entry.maxQuantity,math.max(0,math.floor(cap/entry.unitValue+0.000001)))
+            local quantities={}
+            if maxUsable<=CONFIG.AutoTraderExactQuantityLimit then for q=1,maxUsable do table.insert(quantities,q) end
+            else diagnostics.quantityApproximationUsed=true; quantities=State.AutoTrader.QuantityOptions(entry.maxQuantity,entry.unitValue,0,cap) end
+            local nextStates={}
+            for _,state in ipairs(states) do
+                table.insert(nextStates,state)
+                if state.slots<CONFIG.MaxOfferSlots then
+                    for _,q in ipairs(quantities) do
+                        local total=state.total+entry.unitValue*q
+                        if total<=cap+0.000001 then
+                            local item={quantity=q,unitValue=entry.unitValue,record=entry.record,demand=entry.demand,reserve=entry.reserve,name=entry.name}
+                            State.AutoTrader.CopyPlannerItemIdentity(entry,item)
+                            table.insert(nextStates,{total=total,slots=state.slots+1,parent=state,addedItem=item})
+                            diagnostics.expansions+=1
+                        end
+                        if interrupt() then break end
+                    end
+                end
+                if diagnostics.cancelled or diagnostics.timeBudgetHit then break end
+            end
+            states=nextStates; diagnostics.peakStates=math.max(diagnostics.peakStates,#states)
+            if #states>stateLimit then
+                diagnostics.frontierPruned=true;diagnostics.stateCapHit=true;diagnostics.status="STATE_CAP"
+                table.sort(states,function(a,b) if a.total~=b.total then return a.total>b.total end return a.slots<b.slots end)
+                while #states>stateLimit do table.remove(states) end
+            end
+            if diagnostics.cancelled or diagnostics.timeBudgetHit then break end
+        end
+        activeMs += (os.clock()-segmentStarted)*1000
+        diagnostics.activeMs=activeMs
+        diagnostics.solverComplete=not diagnostics.quantityApproximationUsed and not diagnostics.frontierPruned and not diagnostics.stateCapHit
+            and not diagnostics.timeBudgetHit and not diagnostics.cancelled and diagnostics.inventoryComplete==true
+        if diagnostics.solverComplete then diagnostics.status="COMPLETE" elseif diagnostics.status=="COMPLETE" then diagnostics.status="APPROXIMATE" end
+        local result={}
+        for _,state in ipairs(states) do
+            if state.slots>0 and state.total>0 then state.items=State.AutoTrader.ReconstructFrontierItems(state);table.insert(result,state) end
+        end
+        table.sort(result,function(a,b) if a.total~=b.total then return a.total<b.total end return a.slots<b.slots end)
+        return result,diagnostics
+    end
+
+    State.AutoTrader.BuildOpportunityFrontier = function(entries, cap)
+        return State.AutoTrader.BuildParetoOfferFrontier(entries,cap,{budgetMs=CONFIG.AutoTraderFeasibilityBudgetMs,stateLimit=CONFIG.AutoTraderFeasibilityFrontierLimit,inventoryComplete=true})
+    end
+
+    State.AutoTrader.GetFeasibilityPolicySignature = function()
+        return table.concat({
+            tostring(CONFIG.MaxOfferSlots),tostring(CONFIG.AutoTraderExactQuantityLimit),tostring(CONFIG.AutoTraderMinWinPercent),
+            tostring(CONFIG.AutoTraderMaxDemandDrop),tostring(CONFIG.AutoTraderMaxFlipDrop),tostring(CONFIG.AutoTraderMaxStabilityDrop),
+            tostring(CONFIG.AutoTraderLiquidityAnchorMinValue),tostring(CONFIG.AutoTraderLiquidityAnchorRetention),
+            tostring(State.AutoTrader.Preferences.unknownTheirZero),tostring(State.AutoTrader.Preferences.openingAnchor),
+        },"|")
+    end
+
+    State.AutoTrader.GetPortfolioIdentitySignature = function(entries)
+        local parts={}
+        for _,entry in ipairs(entries or {}) do
+            State.AutoTrader.AnnotateIdentity(entry)
+            table.insert(parts,tostring(entry.valueIdentity or entry.mutationIdentity or entry.key).."x"..tostring(math.max(0,math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0))))
+        end
+        table.sort(parts); return table.concat(parts,";")
+    end
+
+    State.AutoTrader.BuildFeasibilitySignatureFromParts = function(parts)
+        parts=type(parts)=="table" and parts or {}
+        return table.concat({tostring(parts.userId or 0),tostring(parts.presenceGeneration or 0),tostring(parts.remoteStamp or 0),tostring(parts.localStamp or 0),
+            tostring(parts.localIdentity or ""),tostring(parts.unresolvedUnits or 0),tostring(parts.nonNumericUnits or 0),tostring(parts.partial==true),
+            tostring(parts.mappingRevision or 0),tostring(parts.supremeRevision or 0),tostring(parts.supremeHash or ""),tostring(parts.gameDataRevision or 0),
+            tostring(parts.reserveSignature or ""),tostring(parts.policySignature or "")},"|")
+    end
+    State.AutoTrader.BuildFeasibilitySignature = function(player, localEntries, localInventory, profile)
+        local entry=player and State.AutoTrader.EnsureServerPlayer(player) or nil
+        local remoteState=State.Profile.remoteTotals
+        local remoteStamp=player and remoteState and remoteState.lastSuccessByUserId[player.UserId] or 0
+        local localStamp=(localInventory and localInventory.lastSuccess) or (State.AutoTrader.InventoryCache and State.AutoTrader.InventoryCache.lastSuccess) or 0
+        return State.AutoTrader.BuildFeasibilitySignatureFromParts({userId=player and player.UserId or 0,presenceGeneration=entry and entry.presenceGeneration or 0,remoteStamp=remoteStamp,localStamp=localStamp,
+            localIdentity=State.AutoTrader.GetPortfolioIdentitySignature(localEntries),unresolvedUnits=profile and profile.unresolvedUnits or 0,nonNumericUnits=profile and profile.nonNumericUnits or 0,partial=profile and profile.partial==true,
+            mappingRevision=State.Mapping.Revision,supremeRevision=HARDEN.supremeDataRevision,supremeHash=HARDEN.supremeDataHash,gameDataRevision=State.GameDataRevision,reserveSignature=State.AutoTrader.GetReserveSignature(),policySignature=State.AutoTrader.GetFeasibilityPolicySignature()})
+    end
+
+    State.AutoTrader.BuildPreTradeOpportunity = function(player, localOverride, noCacheOrOptions)
+        local options=type(noCacheOrOptions)=="table" and noCacheOrOptions or {noCache=noCacheOrOptions==true}
+        if not player or player==LocalPlayer or not player.Parent then return nil,"player unavailable",{feasibilityState="SEARCH_INCONCLUSIVE",solverComplete=false} end
+        local remoteState=State.Profile.remoteTotals; local remoteStamp=remoteState and remoteState.lastSuccessByUserId[player.UserId]
+        if not remoteStamp then return nil,"inventory unresolved",{feasibilityState="DISCOVERY_PENDING",solverComplete=false} end
+        local localEntries,inventoryReason,localInventory
+        if type(localOverride)=="table" then localEntries=localOverride
+        else localEntries,inventoryReason,localInventory=State.AutoTrader.GetTradableInventory() end
+        if not localEntries or #localEntries==0 then return nil,tostring(inventoryReason or "no tradable numeric local inventory"),{feasibilityState="SEARCH_INCONCLUSIVE",solverComplete=false} end
+        local remoteEntries,profile=State.AutoTrader.GetResolvedRemoteOpportunityEntries(player)
+        State.AutoTrader.FindMutationIdentityCollisions(remoteEntries)
+        local safeRemote={}; local remoteCollision=false
+        for _,entry in ipairs(remoteEntries) do if entry.mutationAmbiguous then remoteCollision=true else table.insert(safeRemote,entry) end end
+        remoteEntries=safeRemote
+        local signature=State.AutoTrader.BuildFeasibilitySignature(player,localEntries,localInventory,profile)
+        if not options.noCache then
+            local cached=State.AutoTrader.OpportunityCache[player.UserId]
+            if cached and cached.key==signature then return cached.opportunity,cached.reason,cached.meta end
+            local deep=State.AutoTrader.FeasibilityDeepSearch[player.UserId]
+            if deep and deep.signature==signature and deep.finished and deep.meta then return deep.opportunity,deep.reason,deep.meta end
+        end
+        local inventoryComplete=not remoteCollision and not (profile and (profile.partial==true or (tonumber(profile.unresolvedUnits) or 0)>0 or (tonumber(profile.nonNumericUnits) or 0)>0))
+            and not (localInventory and localInventory.partial==true)
+        if #remoteEntries==0 then
+            local state=inventoryComplete and "PROVEN_IMPOSSIBLE" or "SEARCH_INCONCLUSIVE"
+            local reason=inventoryComplete and "complete resolved inventory contains no positive numeric trade value" or "resolved inventory does not yet prove a trade; unresolved data could still matter"
+            local meta={feasibilityState=state,solverComplete=true,inventoryComplete=inventoryComplete,signature=signature,remoteCollision=remoteCollision}
+            if not options.noCache then State.AutoTrader.OpportunityCache[player.UserId]={key=signature,opportunity=nil,reason=reason,meta=meta} end
+            return nil,reason,meta
+        end
+        local remoteKnownTotal=0; for _,e in ipairs(remoteEntries) do remoteKnownTotal+=e.unitValue*e.maxQuantity end
+        local deep=options.deep==true
+        local budgetMs=deep and CONFIG.AutoTraderFeasibilityDeepBudgetMs or CONFIG.AutoTraderFeasibilityBudgetMs
+        local stateLimit=deep and CONFIG.AutoTraderFeasibilityDeepFrontierLimit or CONFIG.AutoTraderFeasibilityFrontierLimit
+        local crossLimit=deep and CONFIG.AutoTraderFeasibilityDeepCrossCheckLimit or CONFIG.AutoTraderFeasibilityCrossCheckLimit
+        local currentSignature=signature
+        local capturedPresence=State.AutoTrader.EnsureServerPlayer(player) and State.AutoTrader.EnsureServerPlayer(player).presenceGeneration or 0
+        local capturedRemoteStamp=remoteStamp
+        local capturedLocalStamp=(localInventory and localInventory.lastSuccess) or (State.AutoTrader.InventoryCache and State.AutoTrader.InventoryCache.lastSuccess) or 0
+        local capturedMappingRevision=State.Mapping.Revision
+        local capturedSupremeRevision=HARDEN.supremeDataRevision
+        local capturedSupremeHash=HARDEN.supremeDataHash
+        local capturedGameDataRevision=State.GameDataRevision
+        local capturedReserveSignature=State.AutoTrader.GetReserveSignature()
+        local capturedPolicySignature=State.AutoTrader.GetFeasibilityPolicySignature()
+        local function stillCurrent()
+            if Destroyed or not player.Parent then return false end
+            local liveEntry=State.AutoTrader.EnsureServerPlayer(player)
+            if not liveEntry or liveEntry.presenceGeneration~=capturedPresence then return false end
+            local liveRemote=State.Profile.remoteTotals and State.Profile.remoteTotals.lastSuccessByUserId[player.UserId] or nil
+            if liveRemote~=capturedRemoteStamp then return false end
+            if State.Mapping.Revision~=capturedMappingRevision or HARDEN.supremeDataRevision~=capturedSupremeRevision or HARDEN.supremeDataHash~=capturedSupremeHash or State.GameDataRevision~=capturedGameDataRevision then return false end
+            if State.AutoTrader.GetReserveSignature()~=capturedReserveSignature or State.AutoTrader.GetFeasibilityPolicySignature()~=capturedPolicySignature then return false end
+            if type(localOverride)~="table" then
+                local liveLocalStamp=State.AutoTrader.InventoryCache and State.AutoTrader.InventoryCache.lastSuccess or 0
+                if liveLocalStamp~=capturedLocalStamp then return false end
+            end
+            if options.signature and options.signature~=currentSignature then return false end
+            return true
+        end
+        local receiveFrontier,receiveDiag=State.AutoTrader.BuildParetoOfferFrontier(remoteEntries,remoteKnownTotal,{budgetMs=budgetMs,stateLimit=stateLimit,inventoryComplete=inventoryComplete,isCurrent=stillCurrent,generation=options.generation})
+        local giveFrontier,giveDiag=State.AutoTrader.BuildParetoOfferFrontier(localEntries,remoteKnownTotal,{budgetMs=budgetMs,stateLimit=stateLimit,inventoryComplete=not (localInventory and localInventory.partial==true),isCurrent=stillCurrent,generation=options.generation})
+        local meta={signature=signature,inventoryComplete=inventoryComplete,receiveDiagnostics=receiveDiag,giveDiagnostics=giveDiag,deep=deep,remoteCollision=remoteCollision,
+            solverComplete=receiveDiag.solverComplete==true and giveDiag.solverComplete==true,crossComplete=true,crossChecks=0}
+        if receiveDiag.superseded or giveDiag.superseded then meta.feasibilityState="SUPERSEDED";return nil,"feasibility search superseded by a newer revision",meta end
+        local feasibilityWitness,bestFoundValueWitness,strategicWitness=nil,nil,nil
+        local profitPairs,strategicPairs={},{}
+        local crossStarted=os.clock();local crossSegmentStarted=crossStarted;local crossActiveMs=0
+        local function crossInterrupted(forceYield)
+            if not stillCurrent() then meta.crossComplete=false;meta.superseded=true;return true end
+            local now=os.clock();local segmentMs=(now-crossSegmentStarted)*1000
+            if crossActiveMs+segmentMs>=budgetMs then meta.crossComplete=false;meta.crossTimeBudgetHit=true;return true end
+            if forceYield or segmentMs>=4 then
+                crossActiveMs+=segmentMs;RunService.Heartbeat:Wait();crossSegmentStarted=os.clock()
+                if not stillCurrent() then meta.crossComplete=false;meta.superseded=true;return true end
+            end
+            return false
+        end
+        local function unitCount(items)
+            local count=0
+            for _,item in ipairs(items or {}) do count+=math.max(1,math.floor(tonumber(item.quantity) or 1)) end
+            return count
+        end
+        for _,receive in ipairs(receiveFrontier) do
+            if crossInterrupted(false) then break end
+            local receiveSummary=summarizeResolvedOffer(receive.items)
+            local minWin=State.AutoTrader.GetEffectiveMinimumWin(receiveSummary)
+            for _,give in ipairs(giveFrontier) do
+                meta.crossChecks+=1
+                if meta.crossChecks>crossLimit then meta.crossComplete=false;meta.crossLimitHit=true;break end
+                if give.total<=receive.total+0.000001 then
+                    local win=receive.total-give.total
+                    local marketOK,market=State.AutoTrader.EvaluateMarketGate({items=give.items,total=give.total},receiveSummary)
+                    if marketOK then
+                        local pair={receive=receive,give=give,receiveSummary=receiveSummary,minWin=minWin,market=market,win=win,
+                            giveUnits=unitCount(give.items),receiveUnits=unitCount(receive.items)}
+                        if win+0.000001>=minWin then
+                            table.insert(profitPairs,pair)
+                        elseif win>=-0.001 and (tonumber(receiveSummary.unknownCount) or 0)==0 then
+                            pair.strategicHint=math.abs(pair.receiveUnits-pair.giveUnits)*2-math.abs(win)
+                            table.insert(strategicPairs,pair)
+                        end
+                    end
+                end
+                if crossInterrupted(false) then break end
+            end
+            if not meta.crossComplete then break end
+        end
+        crossActiveMs+=(os.clock()-crossSegmentStarted)*1000;meta.crossActiveMs=crossActiveMs
+        if meta.superseded then meta.feasibilityState="SUPERSEDED";return nil,"feasibility search superseded by a newer revision",meta end
+
+        table.sort(profitPairs,function(a,b) if a.win~=b.win then return a.win<b.win end return a.receive.total<b.receive.total end)
+        table.sort(strategicPairs,function(a,b) if a.strategicHint~=b.strategicHint then return a.strategicHint>b.strategicHint end return a.win>b.win end)
+        local selectedProfit,selectedStrategic={},{}
+        local profitLimit=deep and 16 or 8
+        local strategicLimit=deep and 16 or 8
+        if #profitPairs<=profitLimit then
+            selectedProfit=profitPairs
+        else
+            meta.candidateSelectionPruned=true
+            local half=math.floor(profitLimit/2)
+            for i=1,half do table.insert(selectedProfit,profitPairs[i]) end
+            for i=math.max(half+1,#profitPairs-(profitLimit-half)+1),#profitPairs do table.insert(selectedProfit,profitPairs[i]) end
+        end
+        for i=1,math.min(#strategicPairs,strategicLimit) do table.insert(selectedStrategic,strategicPairs[i]) end
+        if #strategicPairs>strategicLimit then meta.candidateSelectionPruned=true end
+        meta.profitCandidateCount=#profitPairs;meta.strategicCandidateCount=#strategicPairs
+        meta.portfolioCandidatesEvaluated=0
+
+        local function considerProfit(pair)
+            if not stillCurrent() then meta.superseded=true;return end
+            local delta=State.AutoTrader.EvaluatePortfolioDelta(localEntries,pair.give.items,pair.receive.items,{isCurrent=stillCurrent,reachBudgetMs=deep and 16 or 8})
+            meta.portfolioCandidatesEvaluated+=1
+            if not delta.anchorOK then return end
+            local candidate={kind="profit",giveItems=pair.give.items,receiveItems=pair.receive.items,giveTotal=pair.give.total,receiveTotal=pair.receive.total,win=pair.win,minWin=pair.minWin,marketGate=pair.market,portfolioDelta=delta,
+                reason="resolved inventory proves a safe value-winning exchange ("..formatCompact(pair.give.total).." → "..formatCompact(pair.receive.total)..", +"..formatCompact(pair.win)..")"}
+            if not feasibilityWitness or (feasibilityWitness.kind=="profit" and pair.win<feasibilityWitness.win) or feasibilityWitness.kind~="profit" then feasibilityWitness=candidate end
+            if not bestFoundValueWitness or pair.win>bestFoundValueWitness.win+0.000001 or (math.abs(pair.win-bestFoundValueWitness.win)<=0.000001 and pair.receive.total>bestFoundValueWitness.receiveTotal) then bestFoundValueWitness=candidate end
+        end
+        local function considerStrategic(pair)
+            if not stillCurrent() then meta.superseded=true;return end
+            local delta=State.AutoTrader.EvaluatePortfolioDelta(localEntries,pair.give.items,pair.receive.items,{isCurrent=stillCurrent,reachBudgetMs=deep and 16 or 8})
+            meta.portfolioCandidatesEvaluated+=1
+            if not delta.ok then return end
+            local candidate={kind="liquidity",strategicKind="liquidity",strategicSubkind=delta.strategicSubkind,giveItems=pair.give.items,receiveItems=pair.receive.items,giveTotal=pair.give.total,receiveTotal=pair.receive.total,
+                win=pair.win,minWin=0,marketGate=pair.market,portfolioDelta=delta,reason="resolved inventory proves a non-loss "..string.lower(delta.strategicSubkind or "rebalance").." that improves ≤4-slot portfolio reach"}
+            if not strategicWitness or (delta.score or 0)>(strategicWitness.portfolioDelta and strategicWitness.portfolioDelta.score or 0)+0.000001 then strategicWitness=candidate end
+            if not feasibilityWitness then feasibilityWitness=candidate end
+        end
+        for _,pair in ipairs(selectedProfit) do considerProfit(pair);if meta.superseded then break end end
+        if not meta.superseded then for _,pair in ipairs(selectedStrategic) do considerStrategic(pair);if meta.superseded then break end end end
+        if meta.superseded then meta.feasibilityState="SUPERSEDED";return nil,"feasibility search superseded by a newer revision",meta end
+        meta.solverComplete=meta.solverComplete and meta.crossComplete and not meta.candidateSelectionPruned and stillCurrent()
+        local opportunity=bestFoundValueWitness or strategicWitness or feasibilityWitness
+        if opportunity then
+            local knownTotal=profile and tonumber(profile.total) or remoteKnownTotal
+            opportunity.expectedRate=State.AutoTrader.GetTargetScore(player,math.max(knownTotal or 0,opportunity.receiveTotal))
+            if feasibilityWitness and feasibilityWitness ~= opportunity then opportunity.feasibilityWitness=feasibilityWitness end
+            if bestFoundValueWitness and bestFoundValueWitness ~= opportunity then opportunity.bestFoundValueWitness=bestFoundValueWitness end
+            if strategicWitness and strategicWitness ~= opportunity then opportunity.strategicWitness=strategicWitness end
+            opportunity.bestFoundWin=bestFoundValueWitness and bestFoundValueWitness.win or nil
+            opportunity.strategicScore=strategicWitness and strategicWitness.portfolioDelta and strategicWitness.portfolioDelta.score or nil
+            opportunity.searchComplete=meta.solverComplete; opportunity.feasibilitySignature=signature
+            opportunity.remoteKnownTotal=remoteKnownTotal; opportunity.partial=profile and profile.partial==true or false
+            opportunity.unresolvedUnits=profile and profile.unresolvedUnits or 0; opportunity.nonNumericUnits=profile and profile.nonNumericUnits or 0
+            meta.feasibilityState="FEASIBLE"
+            local reason=opportunity.reason
+            if not options.noCache then State.AutoTrader.OpportunityCache[player.UserId]={key=signature,opportunity=opportunity,reason=reason,meta=meta} end
+            State.AutoTrader.LastFeasibilityDiagnostics[player.UserId]=meta
+            return opportunity,reason,meta
+        end
+        local complete=meta.solverComplete and inventoryComplete
+        meta.feasibilityState=complete and "PROVEN_IMPOSSIBLE" or "SEARCH_INCONCLUSIVE"
+        local reason=complete and "complete resolved search proves no safe value-win or strategic non-loss exchange"
+            or "bounded feasibility search could not prove an exchange; this is SEARCH INCONCLUSIVE, not proof of impossibility"
+        if not options.noCache then State.AutoTrader.OpportunityCache[player.UserId]={key=signature,opportunity=nil,reason=reason,meta=meta} end
+        State.AutoTrader.LastFeasibilityDiagnostics[player.UserId]=meta
+        return nil,reason,meta
+    end
+
+    State.AutoTrader.QueueDeepFeasibilitySearch = function(player, signature)
+        if not player or not player.Parent or not signature then return end
+        local row=State.AutoTrader.FeasibilityDeepSearch[player.UserId]
+        if row and row.signature==signature and (row.inFlight or row.finished) then return end
+        State.AutoTrader.FeasibilityDeepSearchGeneration+=1
+        local generation=State.AutoTrader.FeasibilityDeepSearchGeneration
+        State.AutoTrader.FeasibilityDeepSearch[player.UserId]={signature=signature,inFlight=true,finished=false,generation=generation,startedAt=os.clock()}
+        task.spawn(function()
+            while not Destroyed and State.AutoTrader.FeasibilityDeepInFlight>=2 do task.wait(0.08) end
+            if Destroyed then return end
+            State.AutoTrader.FeasibilityDeepInFlight+=1
+            local opportunity,reason,meta=State.AutoTrader.BuildPreTradeOpportunity(player,nil,{noCache=true,deep=true,signature=signature,generation=generation})
+            State.AutoTrader.FeasibilityDeepInFlight=math.max(0,State.AutoTrader.FeasibilityDeepInFlight-1)
+            local current=State.AutoTrader.FeasibilityDeepSearch[player.UserId]
+            if Destroyed or not current or current.signature~=signature or current.generation~=generation then return end
+            current.inFlight=false;current.finished=true;current.finishedAt=os.clock();current.opportunity=opportunity;current.reason=reason;current.meta=meta
+            State.AutoTrader.OpportunityCache[player.UserId]={key=signature,opportunity=opportunity,reason=reason,meta=meta}
+            State.AutoTrader.Log("feasibility_deep_search_finished",{userId=player.UserId,name=player.Name,state=meta and meta.feasibilityState,reason=reason,diagnostics=meta})
+            State.AutoTrader.QueueProjectionCache=nil
+        end)
+    end
+
+    State.AutoTrader.GetContactState = function(player)
+        local entry=player and State.AutoTrader.EnsureServerPlayer(player) or nil
+        if not entry then return "NOT_CONTACTED",entry end
+        if not entry.contactState then entry.contactState="NOT_CONTACTED" end
+        if entry.contactState=="TRANSPORT_DEFERRED" and os.clock()>=(tonumber(entry.transportDeferredUntil) or 0) then entry.contactState="NOT_CONTACTED";entry.transportDeferredUntil=0 end
+        return entry.contactState,entry
+    end
+    State.AutoTrader.SetContactState = function(player,state,reason)
+        local entry=player and State.AutoTrader.EnsureServerPlayer(player) or nil
+        if not entry then return false end
+        entry.contactState=state;entry.contactStateAt=os.clock();entry.contactReason=reason
+        if state=="TRANSPORT_DEFERRED" then entry.transportDeferredUntil=os.clock()+CONFIG.AutoTraderTransportDeferredSeconds end
+        State.AutoTrader.Log("contact_state_changed",{userId=player.UserId,name=player.Name,state=state,reason=reason,presenceGeneration=entry.presenceGeneration})
+        return true
+    end
+
+    State.AutoTrader.CompareQueueRows = function(a,b)
+        local ao=a and a.opportunity or {}; local bo=b and b.opportunity or {}
+        local atier=(ao.bestFoundValueWitness or ao.kind=="profit") and 2 or 1
+        local btier=(bo.bestFoundValueWitness or bo.kind=="profit") and 2 or 1
+        if atier~=btier then return atier>btier end
+        local as=tonumber(a and a.score) or -math.huge; local bs=tonumber(b and b.score) or -math.huge
+        if as~=bs then return as>bs end
+        local aw=(ao.bestFoundValueWitness and ao.bestFoundValueWitness.win) or tonumber(ao.win) or 0
+        local bw=(bo.bestFoundValueWitness and bo.bestFoundValueWitness.win) or tonumber(bo.win) or 0
+        if aw~=bw then return aw>bw end
+        local ac=ao.searchComplete==true and 1 or 0; local bc=bo.searchComplete==true and 1 or 0
+        if ac~=bc then return ac>bc end
+        return tonumber(a and a.player and a.player.UserId) < tonumber(b and b.player and b.player.UserId)
+    end
+
+    State.AutoTrader.EvaluatePlayerEligibility = function(player,context)
+        context=context or State.AutoTrader.BuildEligibilityContext(); local now=context.now or os.clock()
+        local entry=State.AutoTrader.EnsureServerPlayer(player)
+        if not entry then return {state="ineligible",feasibilityState="SEARCH_INCONCLUSIVE",contactState="NOT_CONTACTED",player=player,actionable=false,reason="player unavailable"} end
+        State.AutoTrader.ReconcilePlayerActivityOutcome(player,entry)
+        local contactState=State.AutoTrader.GetContactState(player)
+        if State.AutoTrader.IsTerminalServerOutcome(entry.outcome) then
+            entry.contactState="TERMINAL_THIS_PRESENCE"
+            return {state="terminal",feasibilityState=entry.feasibilityState,contactState=entry.contactState,player=player,entry=entry,actionable=false,reason=entry.reason or entry.outcome,outcome=entry.outcome}
+        end
+        if entry.outcome=="request_pending" then return {state="active_request",contactState="CONTACT_ACKNOWLEDGED",feasibilityState=entry.feasibilityState,player=player,entry=entry,actionable=false,reason=entry.reason} end
+        if entry.outcome=="trading" then return {state="active_trade",contactState="CONTACT_ACKNOWLEDGED",feasibilityState=entry.feasibilityState,player=player,entry=entry,actionable=false,reason=entry.reason} end
+        local total,verified,valueReason=State.AutoTrader.GetVerifiedPlayerValue(player)
+        if State.AutoTrader.Preferences.ignoreFriends then
+            local friend=State.AutoTrader.GetFriendStatus(player)
+            if friend==nil then
+                entry.friendWaitStartedAt=(entry.friendWaitStartedAt or 0)>0 and entry.friendWaitStartedAt or now
+                if now-entry.friendWaitStartedAt>=CONFIG.AutoTraderFriendLookupMaxWaitSeconds then return {state="unresolvable",feasibilityState="SEARCH_INCONCLUSIVE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=verified and total or nil,reason="friend status remained unresolved past bounded wait"} end
+                return {state="friend_pending",feasibilityState="DISCOVERY_PENDING",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=verified and total or nil,reason="friend status pending"}
+            elseif friend==true then entry.friendWaitStartedAt=0;return {state="friend",feasibilityState=entry.feasibilityState,contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=verified and total or nil,reason="Ignore Friends is ON"} end
+            entry.friendWaitStartedAt=0
+        end
+        if not verified or total==nil then
+            local age=now-(entry.firstSeenAt or State.AutoTrader.ServerJoinedAt or now)
+            return {state=age>=CONFIG.AutoTraderUnresolvedMaxWaitSeconds and "unresolvable" or "discovery_pending",feasibilityState=age>=CONFIG.AutoTraderUnresolvedMaxWaitSeconds and "SEARCH_INCONCLUSIVE" or "DISCOVERY_PENDING",contactState=contactState,
+                player=player,entry=entry,actionable=false,reason=valueReason or "inventory unresolved"}
+        end
+        if total<=0 then entry.feasibilityState="PROVEN_IMPOSSIBLE";return {state="zero",feasibilityState="PROVEN_IMPOSSIBLE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=total,reason="verified zero"} end
+        if contactState=="TRANSPORT_DEFERRED" then
+            return {state="transport_deferred",feasibilityState=entry.feasibilityState or "FEASIBLE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=total,retryIn=math.max(0,(entry.transportDeferredUntil or now)-now),reason=entry.contactReason or "client transport deferred"}
+        end
+        local cooldown=State.AutoTrader.CooldownRemaining(player)
+        if cooldown>0 then return {state="retry_later",feasibilityState=entry.feasibilityState,contactState=contactState,player=player,entry=entry,actionable=false,retryIn=cooldown,verifiedTotal=total,reason=State.AutoTrader.Cooldowns[player.UserId] and State.AutoTrader.Cooldowns[player.UserId].reason or "cooldown"} end
+        local lastRequest=State.AutoTrader.RequestHistory[player.UserId] or 0
+        local repeatRemaining=math.max(0,CONFIG.AutoTraderRepeatRequestSeconds-(now-lastRequest))
+        if repeatRemaining>0 then return {state="retry_later",feasibilityState=entry.feasibilityState,contactState=contactState,player=player,entry=entry,actionable=false,retryIn=repeatRemaining,verifiedTotal=total,reason="repeat-request spacing"} end
+        local score=State.AutoTrader.GetTargetScore(player,total)
+        local opportunity,reason,meta=State.AutoTrader.BuildPreTradeOpportunity(player)
+        local feasibilityState=meta and meta.feasibilityState or (opportunity and "FEASIBLE" or "SEARCH_INCONCLUSIVE")
+        entry.feasibilityState=feasibilityState;entry.feasibilitySignature=meta and meta.signature or entry.feasibilitySignature
+        if opportunity then
+            return {state="actionable",feasibilityState="FEASIBLE",contactState=contactState,player=player,entry=entry,actionable=true,verifiedTotal=total,score=score,opportunity=opportunity,reason=reason,feasibility=meta}
+        end
+        if feasibilityState=="SEARCH_INCONCLUSIVE" and meta and meta.signature then State.AutoTrader.QueueDeepFeasibilitySearch(player,meta.signature) end
+        return {state=feasibilityState=="PROVEN_IMPOSSIBLE" and "proven_impossible" or "search_inconclusive",feasibilityState=feasibilityState,contactState=contactState,
+            player=player,entry=entry,actionable=false,verifiedTotal=total,score=score,reason=reason,feasibility=meta}
+    end
+
+    State.AutoTrader.BuildEligibilitySnapshot = function()
+        local context=State.AutoTrader.BuildEligibilityContext()
+        local counts={total=0,valued=0,zero=0,unknown=0,unresolvable=0,friend=0,exhausted=0,active=0,verifiedPositive=0,verifiedZero=0,verifiedCount=0,
+            actionable=0,retryLater=0,friendPending=0,discoveryPending=0,provenImpossible=0,searchInconclusive=0,deepSearchPending=0,transportDeferred=0}
+        local rows={}; local earliestRetry=math.huge
+        for _,player in ipairs(Players:GetPlayers()) do
+            if player~=LocalPlayer and player.Parent then
+                counts.total+=1; local row=State.AutoTrader.EvaluatePlayerEligibility(player,context);table.insert(rows,row)
+                if row.verifiedTotal~=nil then counts.verifiedCount+=1;if row.verifiedTotal>0 then counts.verifiedPositive+=1;counts.valued+=1 else counts.verifiedZero+=1 end end
+                if row.state=="actionable" then counts.actionable+=1
+                elseif row.state=="retry_later" then counts.retryLater+=1;earliestRetry=math.min(earliestRetry,tonumber(row.retryIn) or math.huge)
+                elseif row.state=="transport_deferred" then counts.transportDeferred+=1;counts.retryLater+=1;earliestRetry=math.min(earliestRetry,tonumber(row.retryIn) or math.huge)
+                elseif row.state=="friend_pending" then counts.friendPending+=1;counts.unknown+=1
+                elseif row.state=="discovery_pending" then counts.discoveryPending+=1;counts.unknown+=1
+                elseif row.state=="search_inconclusive" then counts.searchInconclusive+=1;local d=State.AutoTrader.FeasibilityDeepSearch[player.UserId];if d and d.inFlight then counts.deepSearchPending+=1 end
+                elseif row.state=="proven_impossible" then counts.provenImpossible+=1
+                elseif row.state=="unresolvable" then counts.unresolvable+=1
+                elseif row.state=="friend" then counts.friend+=1
+                elseif row.state=="zero" then counts.zero+=1
+                elseif row.state=="active_request" or row.state=="active_trade" then counts.active+=1
+                elseif row.state=="terminal" then counts.exhausted+=1 end
+            end
+        end
+        local queue={};for _,row in ipairs(rows) do if row.state=="actionable" then table.insert(queue,row) end end
+        table.sort(queue,State.AutoTrader.CompareQueueRows)
+        for index,row in ipairs(queue) do row.queuePosition=index end
+        local queueSignature=State.AutoTrader.BuildOrderedQueueSignature and State.AutoTrader.BuildOrderedQueueSignature(queue) or ""
+        if queueSignature~=State.AutoTrader.LastTradeQueueSignature then
+            local previous=State.AutoTrader.LastTradeQueueSignature
+            State.AutoTrader.LastTradeQueueSignature=queueSignature;State.AutoTrader.QueueProjectionCache=nil
+            State.AutoTrader.Log("trade_queue_changed",{previousSignature=previous,signature=queueSignature,length=#queue})
+        end
+        State.AutoTrader.LastTradeQueue=queue
+        local bestRow=queue[1]
+        local snapshot={at=context.now,context=context,rows=rows,queue=queue,counts=counts,best=bestRow and bestRow.player or nil,bestRow=bestRow,
+            bestScore=bestRow and bestRow.score or nil,bestTotal=bestRow and bestRow.verifiedTotal or 0,earliestRetry=earliestRetry<math.huge and earliestRetry or nil,queueSignature=queueSignature}
+        State.AutoTrader.LastEligibilitySnapshot=snapshot
+        if State.AutoTrader.ProjectionAwaitingActual then
+            local projection=State.AutoTrader.ProjectionAwaitingActual;local actual={};for i,row in ipairs(snapshot.queue) do if i>CONFIG.AutoTraderQueueProjectionLimit then break end;if row.player then table.insert(actual,row.player.Name) end end
+            local predicted=type(projection.projectedOrder)=="table" and projection.projectedOrder or {};local same=#predicted==#actual
+            if same then for i=1,#actual do if predicted[i]~=actual[i] then same=false;break end end end
+            State.AutoTrader.LastProjectionActualDiff={at=os.clock(),basedOnUserId=projection.basedOnUserId,basedOnName=projection.basedOnName,predicted=table.clone(predicted),actual=actual,matched=same,actualQueueSignature=snapshot.queueSignature,projectionCacheIdentity=projection.cacheIdentity}
+            State.AutoTrader.Log("queue_projection_actual_diff",State.AutoTrader.LastProjectionActualDiff);State.AutoTrader.ProjectionAwaitingActual=nil
+        end
+        return snapshot
+    end
+
+    State.AutoTrader.BuildOrderedQueueSignature = function(queue)
+        local parts={tostring(State.Mapping.Revision),tostring(HARDEN.supremeDataRevision),tostring(HARDEN.supremeDataHash),tostring(State.GameDataRevision),State.AutoTrader.GetReserveSignature(),State.AutoTrader.GetFeasibilityPolicySignature()}
+        for _,row in ipairs(queue or {}) do
+            local opportunity=row.opportunity or {};local witness=opportunity.bestFoundValueWitness or opportunity.strategicWitness or opportunity.feasibilityWitness or opportunity
+            table.insert(parts,table.concat({tostring(row.player and row.player.UserId or 0),tostring(row.feasibility and row.feasibility.signature or row.entry and row.entry.feasibilitySignature or ""),tostring(opportunity.kind or ""),tostring(opportunity.strategicSubkind or ""),tostring(opportunity.giveTotal or 0),tostring(opportunity.receiveTotal or 0),State.AutoTrader.GetPortfolioIdentitySignature(witness.giveItems or opportunity.giveItems or {}),State.AutoTrader.GetPortfolioIdentitySignature(witness.receiveItems or opportunity.receiveItems or {}),tostring(row.feasibility and row.feasibility.solverComplete==true)},"~"))
+        end
+        local raw=table.concat(parts,"||");return sha256Hex(raw) or raw
+    end
+
+    State.AutoTrader.GetServerDisposition = function()
+        local counts={total=0}
+        if not State.AutoTrader.Preferences.automation then return "OFF",counts end
+        if State.AutoTrader.SessionFrozen then return "FROZEN",counts end
+        if State.AutoTrader.PostTradeAuditPending or State.AutoTrader.PendingRequest or State.AutoTrader.IsAnyNativeOutgoingPending() or State.AutoTrader.RequestLifecycle~="idle"
+            or State.AutoTrader.TradeDeclinePending or State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return "ACTIVE",counts end
+        local snapshot=State.AutoTrader.BuildEligibilitySnapshot();counts=snapshot.counts
+        if counts.actionable>0 or counts.active>0 then return "ACTIVE",counts end
+        if counts.discoveryPending>0 then return "WAITING_FOR_DISCOVERY",counts end
+        if counts.friendPending>0 then return "WAITING_FOR_FRIEND_STATUS",counts end
+        if counts.deepSearchPending>0 then return "WAITING_FOR_DEEP_SEARCH",counts end
+        if counts.retryLater>0 and (snapshot.earliestRetry or math.huge)<=CONFIG.AutoTraderRetryWaitMaxSeconds then counts.earliestRetry=snapshot.earliestRetry;return "WAITING_FOR_RETRY",counts end
+        if counts.searchInconclusive>0 then return "EXHAUSTED_SEARCH_INCONCLUSIVE",counts end
+        if counts.provenImpossible>0 then return "EXHAUSTED_PROVEN_IMPOSSIBLE",counts end
+        if counts.retryLater>0 then counts.earliestRetry=snapshot.earliestRetry;return "EXHAUSTED_RETRY_LATER",counts end
+        if counts.total==0 or counts.friend==counts.total then return "EXHAUSTED_NO_ELIGIBLE_PLAYERS",counts end
+        if counts.exhausted>0 then return "EXHAUSTED_ALL_ATTEMPTED",counts end
+        if counts.unresolvable>0 then return "EXHAUSTED_UNRESOLVABLE",counts end
+        return "EXHAUSTED_NO_VALUE",counts
+    end
+
+    State.AutoTrader.SelectTarget = function()
+        local snapshot=State.AutoTrader.BuildEligibilitySnapshot();local row=snapshot.queue and snapshot.queue[1] or nil;local best=row and row.player or nil
+        State.AutoTrader.LastOpportunityDecision={at=snapshot.at,queueLength=#(snapshot.queue or {}),queueSignature=snapshot.queueSignature,bestName=best and best.Name or nil,bestUserId=best and best.UserId or nil,
+            bestScore=row and row.score or nil,counts=snapshot.counts,orderingRule="FEASIBLE only; profit tier → empirical history telemetry → best-found quality → completeness → UserId"}
+        State.AutoTrader.SelectedTarget=best;State.AutoTrader.SelectedTargetScore=row and tonumber(row.score) or -math.huge;State.AutoTrader.SelectedTargetValue=row and tonumber(row.verifiedTotal) or 0
+        State.AutoTrader.SelectedTargetProfile=best and State.AutoTrader.GetTargetProfile(best) or nil
+        return best
+    end
+
+    State.AutoTrader.BuildQueueProjection = function(snapshot)
+        snapshot=snapshot or State.AutoTrader.LastEligibilitySnapshot;local queue=snapshot and snapshot.queue or {};local first=queue[1]
+        if not first or not first.player or not first.opportunity then State.AutoTrader.LastQueueProjection=nil;return nil end
+        local inventory=select(1,State.AutoTrader.GetTradableInventory());if type(inventory)~="table" or #inventory==0 then State.AutoTrader.LastQueueProjection=nil;return nil end
+        local opportunity=first.opportunity;local witness=opportunity.bestFoundValueWitness or opportunity.strategicWitness or opportunity
+        local key=State.AutoTrader.BuildOrderedQueueSignature(queue).."|q1="..tostring(first.player.UserId).."|give="..State.AutoTrader.GetPortfolioIdentitySignature(witness.giveItems or {})
+            .."|recv="..State.AutoTrader.GetPortfolioIdentitySignature(witness.receiveItems or {}).."|local="..State.AutoTrader.GetPortfolioIdentitySignature(inventory)
+        local cached=State.AutoTrader.QueueProjectionCache
+        if cached and cached.key==key and os.clock()-(cached.at or 0)<2 then State.AutoTrader.LastQueueProjection=cached.projection;return cached.projection end
+        local simulated=State.AutoTrader.SimulatePortfolioExchange(inventory,witness.giveItems,witness.receiveItems)
+        local projectedRows={};local beforeSet={};for _,row in ipairs(queue) do if row.player then beforeSet[row.player.UserId]=true end end
+        local newlyUnlocked,lostFeasibility={},{}
+        for _,row in ipairs(snapshot.rows or {}) do
+            local player=row.player
+            if player and player~=first.player and player.Parent and row.state~="terminal" and row.state~="friend" and row.state~="active_trade" and row.state~="active_request" then
+                local projectedOpportunity,_,meta=State.AutoTrader.BuildPreTradeOpportunity(player,simulated,{noCache=true,deep=false})
+                if projectedOpportunity then
+                    table.insert(projectedRows,{player=player,verifiedTotal=row.verifiedTotal,score=row.score,opportunity=projectedOpportunity,feasibility=meta})
+                    if not beforeSet[player.UserId] then table.insert(newlyUnlocked,player.Name) end
+                elseif beforeSet[player.UserId] and meta and meta.feasibilityState=="PROVEN_IMPOSSIBLE" then table.insert(lostFeasibility,player.Name) end
+            end
+        end
+        table.sort(projectedRows,State.AutoTrader.CompareQueueRows)
+        local projectedNames={};for i,row in ipairs(projectedRows) do if i>CONFIG.AutoTraderQueueProjectionLimit then break end;table.insert(projectedNames,row.player.Name) end
+        local projection={at=os.clock(),basedOnUserId=first.player.UserId,basedOnName=first.player.Name,kind=witness.kind,strategicSubkind=witness.strategicSubkind,
+            modeledGive=State.AutoTrader.FormatOpportunityItems(witness.giveItems),modeledReceive=State.AutoTrader.FormatOpportunityItems(witness.receiveItems),giveTotal=witness.giveTotal,receiveTotal=witness.receiveTotal,
+            beforeMetrics=State.AutoTrader.GetPortfolioMetrics(inventory),afterMetrics=State.AutoTrader.GetPortfolioMetrics(simulated),projectedOrder=projectedNames,projectedRows=projectedRows,
+            newlyUnlocked=newlyUnlocked,lostFeasibility=lostFeasibility,queueSignature=snapshot.queueSignature,cacheIdentity=key,
+            disclaimer="HYPOTHETICAL — assumes the representative Q1 trade succeeds; actual queue is rebuilt from audited inventory."}
+        State.AutoTrader.QueueProjectionCache={key=key,at=os.clock(),projection=projection};State.AutoTrader.LastQueueProjection=projection;return projection
+    end
+
+    State.AutoTrader.V35ValidatePlan = State.AutoTrader.V35ValidatePlan or State.AutoTrader.ValidatePlan
+    State.AutoTrader.ValidatePlan = function(plan,context)
+        local ok,checks=State.AutoTrader.V35ValidatePlan(plan,context)
+        if not ok then return ok,checks end
+        local delta=checks and checks.portfolioDelta
+        if plan and plan.strategicKind~="liquidity" and delta and delta.catastropheOK~=true then
+            checks.ok=false;checks.reason="positive-profit trade failed Reach4 catastrophe floor: "..tostring(delta.catastropheReason or "uncertified")
+            return false,checks
+        end
+        return true,checks
+    end
+
+    State.AutoTrader.AcknowledgeOutgoingTransport = function(pending,source)
+        if type(pending)~="table" then return false end
+        if pending.transportAckCounted then State.AutoTrader.TradeTransport.outgoingUnacknowledgedConsecutive=0;return false end
+        pending.transportAckCounted=true;pending.contactAcknowledged=true;pending.contactAcknowledgedAt=os.clock()
+        local tt=State.AutoTrader.TradeTransport;tt.outgoingAcknowledged=(tt.outgoingAcknowledged or 0)+1;tt.outgoingUnacknowledgedConsecutive=0
+        tt.lastOutgoing={result="acknowledged",source=tostring(source or "unknown"),userId=pending.userId,name=pending.name,generation=pending.generation,seconds=os.clock()-(pending.sentAt or os.clock()),at=os.clock()}
+        local player=Players:GetPlayerByUserId(pending.userId)
+        if player then
+            State.AutoTrader.RequestHistory[player.UserId]=pending.contactAcknowledgedAt
+            State.AutoTrader.RecordTargetEvent(player,"request")
+            State.AutoTrader.SetContactState(player,"CONTACT_ACKNOWLEDGED","MM2 acknowledged outgoing contact via "..tostring(source or "unknown"))
+        end
+        State.AutoTrader.Log("request_transport_acknowledged",tt.lastOutgoing);return true
+    end
+
+    State.AutoTrader.ClassifyPendingCancellation = function(pending, outcome)
+        if type(pending) ~= "table" then return outcome end
+        if pending.contactAcknowledged ~= true and (outcome == "trade_unavailable" or outcome == "no_response") then return "transport_deferred" end
+        if pending.contactAcknowledged == true and outcome == "trade_unavailable" then return "no_response" end
+        return outcome
+    end
+
+    State.AutoTrader.FinalizePendingCancellation = function(pending)
+        if not pending or State.AutoTrader.PendingRequest~=pending then return false end
+        local player=Players:GetPlayerByUserId(pending.userId);local outcome=State.AutoTrader.ClassifyPendingCancellation(pending,pending.cancelOutcome);local recovery=pending.recoveryAfterCleanup==true;local recoveryReason=pending.recoveryReason
+        if player and outcome=="transport_deferred" then
+            State.AutoTrader.RequestHistory[player.UserId]=nil
+            State.AutoTrader.SetContactState(player,"TRANSPORT_DEFERRED",pending.cancelReason or "outgoing transport failed before acknowledgement")
+            local entry=State.AutoTrader.EnsureServerPlayer(player);if entry and (entry.outcome=="request_attempted" or entry.outcome=="trade_unavailable") then entry.outcome=nil;entry.reason=nil;entry.outcomeAt=0 end
+        elseif player and outcome=="no_response" then
+            State.AutoTrader.RecordTargetEvent(player,"ignored",{seconds=os.clock()-(pending.contactAcknowledgedAt or pending.sentAt or os.clock())})
+            State.AutoTrader.MarkServerPlayerOutcome(player,"no_response",pending.cancelReason or "request timed out");State.AutoTrader.SetCooldown(player,"request ignored",75);State.AutoTrader.SetContactState(player,"TERMINAL_THIS_PRESENCE","acknowledged request received no response")
+        elseif player and outcome=="deferred" then
+            State.AutoTrader.MarkServerPlayerOutcome(player,"deferred",pending.cancelReason or "outgoing request deferred");State.AutoTrader.RequestHistory[player.UserId]=nil
+        elseif player and outcome=="local_cancel" then State.AutoTrader.MarkServerPlayerOutcome(player,"local_cancel",pending.cancelReason or "request canceled locally") end
+        State.AutoTrader.Log("request_cancel_confirmed",{userId=pending.userId,name=pending.name,outcome=outcome,reason=pending.cancelReason,age=os.clock()-(pending.sentAt or os.clock()),recoveryAfterCleanup=recovery})
+        State.AutoTrader.PendingRequest=nil;State.AutoTrader.RequestLifecycle="idle";State.AutoTrader.NextRequestAt=os.clock()+CONFIG.AutoTraderRequestCancelQuietSeconds;State.AutoTrader.RequestConfirmGeneration+=1
+        if recovery then State.AutoTrader.RequestRecoveryTeleport(recoveryReason or "repeated outgoing request transport failures")
+        else local _,receiving=State.AutoTrader.GetIncomingRequestUi();if receiving and State.AutoTrader.IsGuiShown(receiving) then task.defer(State.AutoTrader.HandleIncomingRequest) end end
+        return true
+    end
+
+    State.AutoTrader.IsExpectedPartner = function(expectedUserId, player)
+        return tonumber(expectedUserId) ~= nil and player ~= nil and tonumber(player.UserId) == tonumber(expectedUserId)
+    end
+
+    State.AutoTrader.AcknowledgeIncomingTradeStart = function(player,source)
+        local action=State.AutoTrader.IncomingRequestActionInFlight or State.AutoTrader.IncomingRequestDecision
+        if type(action)~="table" or action.decision~="accept" or action.acknowledged then return false end
+        if not State.AutoTrader.IsExpectedPartner(action.userId,player) then return false end
+        action.acknowledged=true;action.ackAt=os.clock();action.phase="acknowledged";action.ackSource=tostring(source or "trade_state")
+        local tt=State.AutoTrader.TradeTransport;tt.incomingAcknowledged=(tt.incomingAcknowledged or 0)+1
+        tt.lastIncoming={result="accepted_acknowledged",source=action.ackSource,userId=action.userId,player=action.player,signature=action.signature,attempts=action.attempts or 0,seconds=action.ackAt-(action.at or action.ackAt),at=action.ackAt,inspection=action.inspection==true}
+        if action.inspection then local entry=State.AutoTrader.EnsureServerPlayer(player);if entry then entry.incomingInspectionDone=true end end
+        State.AutoTrader.IncomingRequestDecision=action;State.AutoTrader.IncomingRequestActionInFlight=nil;State.AutoTrader.IncomingRequestLastHandledAt=action.ackAt
+        State.AutoTrader.RecordTargetEvent(player,"incomingAccepted");State.AutoTrader.Log("incoming_request_authoritative_ack",tt.lastIncoming);return true
+    end
+
+    State.AutoTrader.IsAuthoritativeTradeWithPlayer = function(player)
+        if not player or type(State.CurrentTrade)~="table" then return false end
+        local _,otherSide=getTradeSides(State.CurrentTrade);local partner=otherSide and State.AutoTrader.GetPlayerFromSide(otherSide) or nil
+        return partner~=nil and partner.UserId==player.UserId
+    end
+
+    State.AutoTrader.DecideIncomingRequester = function(player)
+        State.AutoTrader.IncomingInspectionPendingUserId=nil
+        if not player or player==LocalPlayer or not player.Parent then return "decline","requester unavailable" end
+        if State.AutoTrader.IsBotEscapeActive and State.AutoTrader.IsBotEscapeActive() then return "decline","current server is scheduled for bot escape" end
+        if State.AutoTrader.Preferences.ignoreFriends then local friend=State.AutoTrader.GetFriendStatus(player);if friend==true then return "decline","Ignore Friends is ON" elseif friend==nil then return "wait","friend status pending" end end
+        local contactState=State.AutoTrader.GetContactState(player)
+        if contactState=="TERMINAL_THIS_PRESENCE" then return "decline","this player already reached a terminal contact outcome for this presence" end
+        local total,verified,valueReason=State.AutoTrader.GetVerifiedPlayerValue(player);if not verified or total==nil then return "wait",valueReason or "inventory unresolved" end
+        if total<=0 then return "decline","verified inventory value is 0" end
+        local eligibility=State.AutoTrader.EvaluatePlayerEligibility(player,State.AutoTrader.BuildEligibilityContext())
+        if eligibility.feasibilityState=="PROVEN_IMPOSSIBLE" then return "decline","complete feasibility search proves no safe useful exchange" end
+        if eligibility.feasibilityState=="FEASIBLE" then return "accept","planner-proven incoming opportunity" end
+        local entry=State.AutoTrader.EnsureServerPlayer(player)
+        if eligibility.feasibilityState=="SEARCH_INCONCLUSIVE" and entry and not entry.incomingInspectionDone then
+            State.AutoTrader.IncomingInspectionPendingUserId=player.UserId;return "accept","INCOMING_INSPECTION · requester initiated contact and has trustworthy positive resolved value"
+        end
+        if entry and entry.incomingInspectionDone then return "decline","incoming inspection already used for this presence" end
+        return "wait","bounded feasibility/discovery still resolving"
+    end
+
+    State.AutoTrader.V35ActOnIncomingRequest = State.AutoTrader.V35ActOnIncomingRequest or State.AutoTrader.ActOnIncomingRequest
+    -- The source-level acknowledgement predicates inside ActOnIncomingRequest are patched
+    -- separately to call IsAuthoritativeTradeWithPlayer; this wrapper only annotates inspection.
+    State.AutoTrader.ActOnIncomingRequest = function(player,decision,reason,signature)
+        local inspection=decision=="accept" and player and State.AutoTrader.IncomingInspectionPendingUserId==player.UserId
+        local result=State.AutoTrader.V35ActOnIncomingRequest(player,decision,reason,signature)
+        local action=State.AutoTrader.IncomingRequestActionInFlight or State.AutoTrader.IncomingRequestDecision
+        if result and inspection and type(action)=="table" and action.userId==player.UserId then action.inspection=true;State.AutoTrader.IncomingInspectionPendingUserId=nil end
+        return result
+    end
+
+    State.AutoTrader.V35EvaluateBotAvoidanceHop = State.AutoTrader.V35EvaluateBotAvoidanceHop or State.AutoTrader.EvaluateBotAvoidanceHop
+    State.AutoTrader.EvaluateBotAvoidanceHop = function(certification)
+        local before=State.AutoTrader.FastBotHopReason;local result=State.AutoTrader.V35EvaluateBotAvoidanceHop(certification)
+        local reason=State.AutoTrader.FastBotHopReason
+        if result and (reason=="SUSPECTED_BOT_SERVER" or reason=="CERTIFIED_BOT_SERVER") and reason~=before then
+            State.AutoTrader.BotEscapeEpoch+=1;State.AutoTrader.BotEscapeJobId=game.JobId
+            State.AutoTrader.Log("bot_escape_epoch_armed",{epoch=State.AutoTrader.BotEscapeEpoch,reason=reason,jobId=game.JobId})
+        end
+        return result
+    end
+
+    State.AutoTrader.ShouldRevokeAutomatedBotEscape = function(hopReason)
+        return hopReason=="SUSPECTED_BOT_SERVER" or hopReason=="CERTIFIED_BOT_SERVER"
+    end
+    State.AutoTrader.V35MarkGoldCertificationRegular = State.AutoTrader.V35MarkGoldCertificationRegular or State.AutoTrader.MarkGoldCertificationRegular
+    State.AutoTrader.MarkGoldCertificationRegular = function(reason,details)
+        local result=State.AutoTrader.V35MarkGoldCertificationRegular(reason,details)
+        local hopReason=State.AutoTrader.FastBotHopReason
+        if State.AutoTrader.ShouldRevokeAutomatedBotEscape(hopReason) then
+            State.AutoTrader.BotEscapeEpoch+=1;State.AutoTrader.FastBotHopActive=false;State.AutoTrader.FastBotHopReason=nil
+            State.AutoTrader.LastBotHopEvidence=State.AutoTrader.LastBotHopEvidence or {};State.AutoTrader.LastBotHopEvidence.revoked=true;State.AutoTrader.LastBotHopEvidence.revokedAt=os.clock();State.AutoTrader.LastBotHopEvidence.revokedReason="human MoveDirection contradiction"
+            State.AutoTrader.Log("bot_escape_revoked_human",{previousReason=hopReason,epoch=State.AutoTrader.BotEscapeEpoch,details=details})
+            if State.AutoTrader.ServerHopInProgress and State.AutoTrader.ServerHopCurrentDisposition==hopReason and not State.AutoTrader.TeleportInProgress then State.AutoTrader.AbortServerHop("human contradiction revoked automated bot escape") end
+        end
+        return result
+    end
+
+    State.AutoTrader.V35TryServerHop = State.AutoTrader.V35TryServerHop or State.AutoTrader.TryServerHop
+    State.AutoTrader.TryServerHop = function(disposition,counts)
+        if disposition=="SUSPECTED_BOT_SERVER" or disposition=="CERTIFIED_BOT_SERVER" then State.AutoTrader.ServerHopEscapeEpoch=State.AutoTrader.BotEscapeEpoch else State.AutoTrader.ServerHopEscapeEpoch=nil end
+        return State.AutoTrader.V35TryServerHop(disposition,counts)
+    end
+    State.AutoTrader.IsServerHopEscapeEpochCurrent = function()
+        if not State.AutoTrader.ServerHopEscapeEpoch then return true end
+        return State.AutoTrader.ServerHopEscapeEpoch==State.AutoTrader.BotEscapeEpoch and State.AutoTrader.BotEscapeJobId==game.JobId
+            and State.AutoTrader.FastBotHopActive==true and (State.AutoTrader.FastBotHopReason=="SUSPECTED_BOT_SERVER" or State.AutoTrader.FastBotHopReason=="CERTIFIED_BOT_SERVER")
+            and not (State.AutoTrader.GoldBotCertification and State.AutoTrader.GoldBotCertification.status=="regular")
+    end
+
+    State.AutoTrader.ClonePlainTable = function(value,seen)
+        if type(value)~="table" then return value end;seen=seen or {};if seen[value] then return seen[value] end
+        local out={};seen[value]=out;for k,v in pairs(value) do out[State.AutoTrader.ClonePlainTable(k,seen)]=State.AutoTrader.ClonePlainTable(v,seen) end;return out
+    end
+    State.AutoTrader.ApplyBotEvidenceToDb = function(db,kind,fingerprint,jobId,playerSightings,sampleUserId,sampleName)
+        fingerprint=State.AutoTrader.ExtractAvatarHeadshotHash(fingerprint) or fingerprint
+        if type(fingerprint)~="string" or not fingerprint:match("^[0-9a-fA-F]+$") or #fingerprint~=32 then return false end
+        fingerprint=string.lower(fingerprint);db.icons=type(db.icons)=="table" and db.icons or {};local record=db.icons[fingerprint]
+        if type(record)~="table" then record={botEvidence=0,humanEvidence=0,botJobs={},humanJobs={},botPlayerSightings=0,humanPlayerSightings=0,goldBotJobs={},goldBotSightings=0,strictGoldBotJobs={},strictGoldBotSightings=0,manualGoldBotJobs={},manualGoldBotSightings=0,firstSeen=os.time(),lastSeen=os.time()};db.icons[fingerprint]=record end
+        record.strictGoldBotJobs=type(record.strictGoldBotJobs)=="table" and record.strictGoldBotJobs or {};record.manualGoldBotJobs=type(record.manualGoldBotJobs)=="table" and record.manualGoldBotJobs or {}
+        record.strictGoldBotSightings=tonumber(record.strictGoldBotSightings) or 0;record.manualGoldBotSightings=tonumber(record.manualGoldBotSightings) or 0
+        local jobs=kind=="manual" and record.manualGoldBotJobs or record.strictGoldBotJobs;local source=tostring(jobId or "");local newJob=source~="" and jobs[source]==nil
+        if source~="" then jobs[source]=os.time() end;local sightings=math.max(1,tonumber(playerSightings) or 1)
+        if kind=="manual" then if newJob then record.manualGoldBotSightings+=sightings end else if newJob then record.strictGoldBotSightings+=sightings end end
+        if not record.sampleUserId then record.sampleUserId=tonumber(sampleUserId) end;if (not record.sampleName or record.sampleName=="") and type(sampleName)=="string" then record.sampleName=sampleName end
+        record.lastSeen=os.time();return true
+    end
+    State.AutoTrader.CommitTrustedBotDbCandidate = function(candidate,provenance)
+        if type(candidate)~="table" or type(candidate.icons)~="table" then return false,"invalid candidate bot DB" end
+        State.AutoTrader.BotTrustCommitSerial+=1;candidate.version=5;candidate.trustedRevision=(tonumber(State.AutoTrader.BotIconDb.trustedRevision) or 0)+1
+        candidate.writtenByVersion=CONTROLLER_VERSION;candidate.lastTrustedCommitUnix=os.time()
+        local okBody,body=pcall(function() return HttpService:JSONEncode(candidate) end);if not okBody then return false,"candidate JSON encode failed: "..tostring(body) end
+        local digest=sha256Hex(body);if not digest then return false,"candidate SHA failed" end
+        local envelope={schema=1,kind="untrusted_staging_only",revision=candidate.trustedRevision,sha256=digest,body=body,provenance=provenance,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()}
+        local okEnvelope,envelopeBody=pcall(function() return HttpService:JSONEncode(envelope) end);if not okEnvelope then return false,"staging envelope encode failed" end
+        State.AutoTrader.BotIconDbPending={revision=candidate.trustedRevision,sha256=digest,provenance=provenance,stage="writing_staging",at=os.clock()}
+        local okStage,stageErr=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustStageFile,envelopeBody);if not okStage then State.AutoTrader.BotIconDbPending.stage="staging_write_failed";return false,"staging write failed: "..tostring(stageErr) end
+        local staged=HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustStageFile)
+        if type(staged)~="table" or staged.sha256~=digest or staged.body~=body then State.AutoTrader.BotIconDbPending.stage="staging_verify_failed";return false,"staging read-back verification failed" end
+        State.AutoTrader.BotIconDbPending.stage="writing_trusted_primary"
+        local okTrusted,trustedErr=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotIconDbFile,body);if not okTrusted then State.AutoTrader.BotIconDbPending.stage="trusted_write_uncertain";return false,"trusted primary write failed/uncertain: "..tostring(trustedErr) end
+        local trustedBody=HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile)
+        if type(trustedBody)~="string" or sha256Hex(trustedBody)~=digest then State.AutoTrader.BotIconDbPending.stage="trusted_readback_failed";return false,"trusted primary read-back verification failed" end
+        local markerBody=HttpService:JSONEncode({schema=1,revision=candidate.trustedRevision,sha256=digest,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()})
+        State.AutoTrader.BotIconDbPending.stage="writing_trusted_marker"
+        local okMarker,markerErr=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustMarkerFile,markerBody);if not okMarker then State.AutoTrader.BotIconDbPending.stage="marker_write_uncertain";return false,"trusted marker write failed/uncertain: "..tostring(markerErr) end
+        local marker=HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile)
+        if type(marker)~="table" or tonumber(marker.revision)~=tonumber(candidate.trustedRevision) or marker.sha256~=digest then State.AutoTrader.BotIconDbPending.stage="marker_readback_failed";return false,"trusted marker read-back verification failed" end
+        State.AutoTrader.BotIconDb=candidate;rawset(_G,State.AutoTrader.BotIconDbKey,candidate);rawset(ExecutorEnvironment,State.AutoTrader.BotIconDbKey,candidate)
+        State.AutoTrader.BotIconDbPending={revision=candidate.trustedRevision,sha256=digest,provenance=provenance,stage="PROMOTED_TRUSTED",at=os.clock(),promotedAtUnix=os.time()}
+        State.AutoTrader.Log("bot_trust_promoted",State.AutoTrader.BotIconDbPending);return true
+    end
+    State.AutoTrader.SaveBotIconDb = function(immediate)
+        State.AutoTrader.BotIconDbSaveGeneration+=1;local generation=State.AutoTrader.BotIconDbSaveGeneration
+        local function saveTrusted()
+            local candidate=State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb);local okBody,body=pcall(function() return HttpService:JSONEncode(candidate) end);if not okBody then return false,tostring(body) end
+            local ok,err=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotIconDbFile,body);if not ok then return false,err end
+            local digest=sha256Hex(body);local readback=HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile);if type(readback)~="string" or not digest or sha256Hex(readback)~=digest then return false,"trusted bot DB read-back mismatch" end
+            if (tonumber(candidate.trustedRevision) or 0)>0 then
+                local markerBody=HttpService:JSONEncode({schema=1,revision=candidate.trustedRevision,sha256=digest,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()})
+                local okMarker,markerErr=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustMarkerFile,markerBody);if not okMarker then return false,"trusted bot marker write failed/uncertain: "..tostring(markerErr) end
+                local marker=HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile);if type(marker)~="table" or tonumber(marker.revision)~=tonumber(candidate.trustedRevision) or marker.sha256~=digest then return false,"trusted bot marker read-back mismatch" end
+            end
+            rawset(_G,State.AutoTrader.BotIconDbKey,State.AutoTrader.BotIconDb);rawset(ExecutorEnvironment,State.AutoTrader.BotIconDbKey,State.AutoTrader.BotIconDb);return true
+        end
+        if immediate then return saveTrusted() end
+        task.delay(0.75,function() if not Destroyed and generation==State.AutoTrader.BotIconDbSaveGeneration then saveTrusted() end end);return true
+    end
+    State.AutoTrader.FlushBotIconDb = function() return State.AutoTrader.SaveBotIconDb(true) end
+
+    State.AutoTrader.ImportStrictGoldTeleportCommit = function(payload)
+        if type(payload)~="table" or tonumber(payload.version)~=3 then return false,"invalid strict payload" end
+        local sourceJobId=payload.sourceJobId;if type(sourceJobId)~="string" or sourceJobId=="" or sourceJobId==game.JobId then return false,"invalid source JobId" end
+        if math.max(0,tonumber(payload.certifiedPlayers) or 0)<CONFIG.AutoTraderGoldMinRemotePlayers or type(payload.fingerprints)~="table" or #payload.fingerprints==0 or #payload.fingerprints>50 then return false,"invalid strict payload membership" end
+        local candidate=State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb);local learned=0
+        for _,row in ipairs(payload.fingerprints) do
+            if type(row)~="table" then return false,"malformed fingerprint row" end
+            if State.AutoTrader.ApplyBotEvidenceToDb(candidate,"strict",row.fingerprint,sourceJobId,math.max(1,math.min(20,math.floor(tonumber(row.count) or 1))),tonumber(row.sampleUserId),row.sampleName) then learned+=1 else return false,"invalid strict fingerprint" end
+        end
+        local saved,err=State.AutoTrader.CommitTrustedBotDbCandidate(candidate,{source="strict_gold_departure_commit",sourceJobId=sourceJobId,certifiedPlayers=payload.certifiedPlayers})
+        if not saved then State.AutoTrader.Status="BOT CERTIFY · SAVE FAILED";State.AutoTrader.StatusDetail="Strict bot evidence remains UNTRUSTED because persistence did not verify: "..tostring(err);State.AutoTrader.Log("strict_bot_commit_failed",{reason=err,hashesPrepared=learned});State.AutoTrader.Render();return false,err end
+        State.AutoTrader.LastBotLearning={jobId=sourceJobId,importedIntoJobId=game.JobId,action="strict_gold_departure_commit_imported",source="trusted_persistence_verified",certifiedPlayers=payload.certifiedPlayers,hashesLearned=learned,atUnix=os.time()}
+        State.AutoTrader.Log("strict_gold_departure_commit_imported",State.AutoTrader.LastBotLearning);return true
+    end
+
+    State.AutoTrader.RosterKeyMatches = function(expectedRosterKey,currentRosterKey)
+        return type(expectedRosterKey)=="string" and expectedRosterKey~="" and expectedRosterKey==currentRosterKey
+    end
+    State.AutoTrader.ManuallyCertifyCurrentServerBots = function(expectedUserIds,expectedRosterKey)
+        if Destroyed then return false,"controller destroyed" end
+        local function currentRoster()
+            local ids={};for _,player in ipairs(Players:GetPlayers()) do if player~=LocalPlayer and player.Parent then table.insert(ids,player.UserId) end end;table.sort(ids);return ids,table.concat(ids,",")
+        end
+        expectedUserIds=type(expectedUserIds)=="table" and table.clone(expectedUserIds) or select(1,currentRoster());table.sort(expectedUserIds);expectedRosterKey=expectedRosterKey or table.concat(expectedUserIds,",")
+        local ids,key=currentRoster();if not State.AutoTrader.RosterKeyMatches(expectedRosterKey,key) then return false,"roster changed before manual certification began; zero evidence written" end
+        local okThumb,current,reason=State.AutoTrader.ResolveUserIdsFingerprints(expectedUserIds);if not okThumb or type(current)~="table" then return false,"manual certification thumbnail resolution failed: "..tostring(reason) end
+        ids,key=currentRoster();if not State.AutoTrader.RosterKeyMatches(expectedRosterKey,key) then return false,"roster changed during fingerprint resolution; zero evidence written" end
+        local grouped={};for _,userId in ipairs(expectedUserIds) do
+            local fingerprint=current.fingerprintByUserId and current.fingerprintByUserId[userId];fingerprint=State.AutoTrader.ExtractAvatarHeadshotHash(fingerprint) or fingerprint
+            if type(fingerprint)~="string" or not fingerprint:match("^[0-9a-fA-F]+$") or #fingerprint~=32 then return false,"invalid fingerprint for user "..tostring(userId) end
+            fingerprint=string.lower(fingerprint);local row=grouped[fingerprint];if not row then row={fingerprint=fingerprint,count=0,sampleUserId=userId,sampleName=current.playerNameByUserId and current.playerNameByUserId[userId]};grouped[fingerprint]=row end;row.count+=1
+        end
+        ids,key=currentRoster();if not State.AutoTrader.RosterKeyMatches(expectedRosterKey,key) then return false,"roster changed immediately before trust commit; zero evidence written" end
+        local candidate=State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb);local sourceJob="manual:"..tostring(game.JobId);local learned=0
+        for _,row in pairs(grouped) do if State.AutoTrader.ApplyBotEvidenceToDb(candidate,"manual",row.fingerprint,sourceJob,row.count,row.sampleUserId,row.sampleName) then learned+=1 end end
+        local saved,saveErr=State.AutoTrader.CommitTrustedBotDbCandidate(candidate,{source="manual_user_certification",jobId=game.JobId,rosterKey=expectedRosterKey,certifiedPlayers=#expectedUserIds})
+        if not saved then State.AutoTrader.Status="BOT CERTIFY · SAVE FAILED";State.AutoTrader.StatusDetail="Manual evidence is still UNTRUSTED; persistence did not verify, so this server will not be left as learned: "..tostring(saveErr);State.AutoTrader.Log("manual_bot_certification_failed",{reason=saveErr,stage="trusted_persistence",hashesPrepared=learned});State.AutoTrader.Render();return false,saveErr end
+        State.AutoTrader.LastBotLearning={jobId=game.JobId,action="manual_user_certification",source="manual_user_certification",certifiedPlayers=#expectedUserIds,hashesLearned=learned,atUnix=os.time(),guarantee="exact confirmed roster remained identical through fingerprint resolution and trusted persistence promotion"}
+        local c=State.AutoTrader.GoldBotCertification;if type(c)=="table" and c.jobId==game.JobId then c.manualCertifiedAt=os.clock();c.manualCertifiedPlayers=#expectedUserIds;c.manualCertifiedHashes=learned end
+        State.AutoTrader.FastBotHopActive=true;State.AutoTrader.FastBotHopReason="MANUAL_CERTIFIED_BOT_SERVER"
+        State.AutoTrader.LastBotHopEvidence={source="manual_user_certification",jobId=game.JobId,at=os.clock(),atUnix=os.time(),passed=#expectedUserIds,total=#expectedUserIds,ratio=1,learningEligible=true,manual=true,hashesLearned=learned}
+        State.AutoTrader.Log("manual_bot_server_certified",State.AutoTrader.LastBotLearning);State.AutoTrader.Status="BOT SERVER · MANUALLY CERTIFIED";State.AutoTrader.StatusDetail="Exact roster certification persisted and promoted "..tostring(learned).." trusted hash(es); leaving this server.";State.AutoTrader.Render()
+        if not State.CurrentTrade then task.defer(function() if not Destroyed then State.AutoTrader.TryServerHop("MANUAL_CERTIFIED_BOT_SERVER",select(2,State.AutoTrader.GetServerDisposition())) end end) end
+        return true
+    end
+
+    HARDEN.supportJsonValueV35 = HARDEN.supportJsonValueV35 or HARDEN.supportJsonValue
+    HARDEN.supportJsonValue = function(value,depth,seen)
+        depth=depth or 0;seen=seen or {};local kind=typeof(value)
+        if kind=="nil" or kind=="boolean" then return value end
+        if kind=="number" then if value~=value or value==math.huge or value==-math.huge then return tostring(value) end;return value end
+        if kind=="string" then return #value>5000 and (string.sub(value,1,5000).."…") or value end
+        if kind=="Instance" then local name,className="?","Instance";pcall(function() name=value.Name end);pcall(function() className=value.ClassName end);return {__type="Instance",class=tostring(className),name=tostring(name)} end
+        if kind~="table" then return tostring(value) end;if seen[value] then return "<cycle>" end;if depth>=8 then return "<depth-limit>" end;seen[value]=true
+        local dense=true;local maxIndex=0;local count=0
+        for k in pairs(value) do count+=1;if type(k)~="number" or k<1 or k%1~=0 then dense=false;break end;maxIndex=math.max(maxIndex,k) end
+        if dense and maxIndex==count then local out={};for i=1,maxIndex do out[i]=HARDEN.supportJsonValue(value[i],depth+1,seen) end;seen[value]=nil;return out end
+        local out={};count=0;for k,v in pairs(value) do count+=1;if count>200 then out.__truncated=true;break end;out[tostring(k)]=HARDEN.supportJsonValue(v,depth+1,seen) end;seen[value]=nil;return out
+    end
+
+    State.AutoTrader.V35RecordSessionEvent = State.AutoTrader.V35RecordSessionEvent or State.AutoTrader.RecordSessionEvent
+    State.AutoTrader.IsCriticalSessionEvent = function(kind)
+        kind=tostring(kind or "")
+        return kind:find("recovery",1,true) or kind:find("freeze",1,true) or kind:find("fatal",1,true) or kind:find("teleport",1,true)
+            or kind:find("settlement",1,true) or kind:find("audit",1,true) or kind=="trade_queue_changed" or kind:find("bot_escape",1,true)
+            or kind:find("bot_trust",1,true) or kind:find("manual_bot",1,true) or kind=="server_player_outcome" or kind=="mutation_identity_ambiguity"
+    end
+    State.AutoTrader.RecordSessionEvent = function(event)
+        local recorded=State.AutoTrader.V35RecordSessionEvent(event)
+        if type(event)=="table" and State.AutoTrader.IsCriticalSessionEvent(event.kind) then
+            table.insert(State.AutoTrader.CriticalSessionEventHistory,{seq=event.seq,t=event.t,unix=event.unix,kind=event.kind,data=HARDEN.supportJsonValue(event.data)})
+            while #State.AutoTrader.CriticalSessionEventHistory>CONFIG.AutoTraderCriticalHistoryLimit do table.remove(State.AutoTrader.CriticalSessionEventHistory,1) end
+        end
+        while #State.AutoTrader.SessionEventHistory>CONFIG.AutoTraderVerboseHistoryLimit do table.remove(State.AutoTrader.SessionEventHistory,1) end
+        return recorded
+    end
+
+    State.AutoTrader.V35BuildDebug = State.AutoTrader.V35BuildDebug or State.AutoTrader.BuildDebug
+    State.AutoTrader.BuildDebug = function()
+        local text,err=State.AutoTrader.V35BuildDebug();if not text then return nil,err end
+        local newline=string.find(text,"\n",1,true);if not newline then return text end
+        local body=string.sub(text,newline+1);local ok,payload=pcall(function() return HttpService:JSONDecode(body) end);if not ok or type(payload)~="table" then return text end
+        payload.v36={architecture="planner-first proven feasibility + orthogonal contact lifecycle",queueSignature=State.AutoTrader.LastTradeQueueSignature,
+            feasibilityDiagnostics=HARDEN.supportJsonValue(State.AutoTrader.LastFeasibilityDiagnostics),deepSearch=HARDEN.supportJsonValue(State.AutoTrader.FeasibilityDeepSearch),
+            mutationIdentityCollisions=HARDEN.supportJsonValue(State.AutoTrader.LastMutationIdentityCollisions),botEscapeEpoch=State.AutoTrader.BotEscapeEpoch,
+            serverHopEscapeEpoch=State.AutoTrader.ServerHopEscapeEpoch,botTrustPending=HARDEN.supportJsonValue(State.AutoTrader.BotIconDbPending),botTrustLoad=HARDEN.supportJsonValue(State.AutoTrader.BotTrustLoad),
+            criticalLifecycleEvents=HARDEN.supportJsonValue(State.AutoTrader.CriticalSessionEventHistory),projectionActualDiff=HARDEN.supportJsonValue(State.AutoTrader.LastProjectionActualDiff)}
+        if State.AutoTrader.LastEligibilitySnapshot then payload.v36.eligibility=HARDEN.supportJsonValue(State.AutoTrader.LastEligibilitySnapshot) end
+        if State.AutoTrader.LastQueueProjection then payload.v36.queueProjection=HARDEN.supportJsonValue(State.AutoTrader.LastQueueProjection) end
+        local okEncode,encoded=pcall(function() return HttpService:JSONEncode(HARDEN.supportJsonValue(payload)) end);if not okEncode then return nil,tostring(encoded) end
+        return HARDEN.supportFormat.."\n"..encoded
+    end
+
+    State.AutoTrader.V35RunSelfTests = State.AutoTrader.V35RunSelfTests or State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local base=State.AutoTrader.V35RunSelfTests();local tests={};for _,row in ipairs(base.tests or {}) do table.insert(tests,row) end
+        local function add(name,callback)
+            local ok,passed,detail=pcall(callback);table.insert(tests,{name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+        add("feasibility-pruned-failure-inconclusive",function()
+            local item={itemId="x",itemType="Weapons",name="X",unitValue=1,maxQuantity=CONFIG.AutoTraderExactQuantityLimit+5,quantity=CONFIG.AutoTraderExactQuantityLimit+5,record={name="X",data={value=1,demand=5}}}
+            local _,diag=State.AutoTrader.BuildParetoOfferFrontier({item},20,{stateLimit=4,inventoryComplete=true});return diag.solverComplete==false,"pruned/sampled frontier was incorrectly called complete"
+        end)
+        add("feasibility-cancelled-never-impossible",function()
+            local item={itemId="x",itemType="Weapons",name="X",unitValue=1,maxQuantity=1,quantity=1,record={name="X",data={value=1,demand=5}}}
+            local _,diag=State.AutoTrader.BuildParetoOfferFrontier({item},2,{inventoryComplete=true,isCurrent=function() return false end});return diag.superseded==true and diag.solverComplete==false,"superseded frontier must never be a proof of impossibility"
+        end)
+        add("mutation-identity-distinct-native-key",function()
+            local a={itemType="Weapons",itemId="Boneblade",variant=nil,record={category="godlies",name="Boneblade",data={value=1}}};local b={itemType="Weapons",itemId="BonebladeChroma",variant="Chroma",record={category="chromas",name="Chroma Boneblade",data={value=1}}}
+            return State.AutoTrader.GetMutationIdentityKey(a)~=State.AutoTrader.GetMutationIdentityKey(b),"Boneblade and BonebladeChroma mutation identities collided"
+        end)
+        add("mutation-identity-collision-fails-closed",function()
+            local a={itemType="Weapons",itemId="same",variant=nil,record={category="godlies",name="A",data={value=1}}};local b={itemType="Weapons",itemId="same",variant="Chroma",record={category="chromas",name="B",data={value=1}}}
+            local c=State.AutoTrader.FindMutationIdentityCollisions({a,b});return c[State.AutoTrader.GetMutationIdentityKey(a)]~=nil and a.mutationAmbiguous==true and b.mutationAmbiguous==true,"ambiguous mutation family did not fail closed"
+        end)
+        add("derived-item-identity-copy",function()
+            local a={itemType="Weapons",itemId="BonebladeChroma",variant="Chroma",identityHint={variant="Chroma",year=2018,event="Halloween"}};local b={};State.AutoTrader.CopyPlannerItemIdentity(a,b);return b.itemId==a.itemId and b.variant=="Chroma" and b.identityHint and b.identityHint.year==2018,"derived planner item lost identity"
+        end)
+        add("reach-split",function()
+            local six={itemType="Weapons",itemId="six",unitValue=6,quantity=1,maxQuantity=1,record={name="Six",data={value=6,demand=5}}};local three={itemType="Weapons",itemId="three",unitValue=3,quantity=2,maxQuantity=2,record={name="Three",data={value=3,demand=5}}}
+            local d=State.AutoTrader.EvaluatePortfolioDelta({six},{{itemType="Weapons",itemId="six",unitValue=6,quantity=1,record=six.record}},{{itemType="Weapons",itemId="three",unitValue=3,quantity=2,record=three.record}},{excludeServerBudgets=true});return d.ok==true and d.strategicSubkind=="SPLIT","6→3+3 did not qualify as strategic split"
+        end)
+        add("reach-anchor-preservation",function()
+            local h={itemType="Weapons",itemId="hundred",unitValue=100,quantity=1,maxQuantity=1,record={name="Hundred",data={value=100,demand=5}}};local q={itemType="Weapons",itemId="quarter",unitValue=25,quantity=4,maxQuantity=4,record={name="Quarter",data={value=25,demand=5}}}
+            local d=State.AutoTrader.EvaluatePortfolioDelta({h},{{itemType="Weapons",itemId="hundred",unitValue=100,quantity=1,record=h.record}},{{itemType="Weapons",itemId="quarter",unitValue=25,quantity=4,record=q.record}},{excludeServerBudgets=true});return d.ok==false and d.hardAnchorOK==false,"sole 100 anchor was allowed to liquidate into 25×4"
+        end)
+        add("reach-degraded-cannot-bypass-catastrophe",function()
+            local filler={itemType="Weapons",itemId="filler",unitValue=1,quantity=CONFIG.AutoTraderReachExactQuantityLimit+1,maxQuantity=CONFIG.AutoTraderReachExactQuantityLimit+1,record={name="Filler",data={value=1,demand=5}}}
+            local ninety={itemType="Weapons",itemId="ninety",unitValue=90,quantity=1,maxQuantity=1,record={name="Ninety",data={value=90,demand=5}}}
+            local d=State.AutoTrader.EvaluatePortfolioDelta({filler,ninety},{{itemType="Weapons",itemId="ninety",unitValue=90,quantity=1,record=ninety.record}},{{itemType="Weapons",itemId="recv",unitValue=91,quantity=1,record={name="R",data={value=91,demand=5}}}},{excludeServerBudgets=true})
+            return d.reachPolicyDegraded==true and d.catastropheOK==false,"degraded Reach analysis bypassed catastrophe certification"
+        end)
+        add("support-dense-array",function()
+            local v=HARDEN.supportJsonValue({"a","b","c"});return type(v)=="table" and #v==3 and v[1]=="a","dense support array was converted to object keys"
+        end)
+        add("bot-stage-restart-untrusted",function()
+            local candidate={trustedRevision=7};local body=HttpService:JSONEncode(candidate);local missing=State.AutoTrader.BotTrustBodyMatchesMarker(body,candidate,nil)
+            local wrong=State.AutoTrader.BotTrustBodyMatchesMarker(body,candidate,{revision=6,sha256=sha256Hex(body)})
+            local good=State.AutoTrader.BotTrustBodyMatchesMarker(body,candidate,{revision=7,sha256=sha256Hex(body)})
+            return missing==false and wrong==false and good==true,"uncommitted staged/newer trustedRevision could be accepted without matching marker"
+        end)
+        add("feasibility-witness-proves-feasible",function()
+            local item={itemId="w",itemType="Weapons",name="W",unitValue=2,maxQuantity=1,quantity=1,record={name="W",data={value=2,demand=5}}}
+            local frontier,diag=State.AutoTrader.BuildParetoOfferFrontier({item},2,{inventoryComplete=true,stateLimit=100,budgetMs=50})
+            return #frontier>0 and diag.superseded~=true,"constructive frontier witness was not produced"
+        end)
+        add("feasibility-complete-failure-impossible",function()
+            local frontier,diag=State.AutoTrader.BuildParetoOfferFrontier({},5,{inventoryComplete=true,stateLimit=100,budgetMs=50})
+            return #frontier==0 and diag.solverComplete==true,"complete empty frontier did not establish complete search"
+        end)
+        add("feasibility-cache-revision-invalidation",function()
+            local base={userId=987654,presenceGeneration=1,remoteStamp=1,localStamp=2,localIdentity="x",mappingRevision=3,supremeRevision=4,supremeHash="h",gameDataRevision=5,reserveSignature="r",policySignature="p"}
+            local a=State.AutoTrader.BuildFeasibilitySignatureFromParts(base);local changed=table.clone(base);changed.presenceGeneration=2;local b=State.AutoTrader.BuildFeasibilitySignatureFromParts(changed)
+            return a~=b,"presence revision did not invalidate feasibility signature"
+        end)
+        add("projection-cache-identity-invalidation",function()
+            local a={{player={UserId=1},opportunity={kind="VALUE_WIN",giveTotal=6,receiveTotal=8,giveItems={{itemType="Weapons",itemId="A",unitValue=6,quantity=1}},receiveItems={{itemType="Weapons",itemId="X",unitValue=8,quantity=1}}},feasibility={signature="s1"}}}
+            local b={{player={UserId=1},opportunity={kind="VALUE_WIN",giveTotal=6,receiveTotal=8,giveItems={{itemType="Weapons",itemId="B",unitValue=6,quantity=1}},receiveItems={{itemType="Weapons",itemId="X",unitValue=8,quantity=1}}},feasibility={signature="s1"}}}
+            return State.AutoTrader.BuildOrderedQueueSignature(a)~=State.AutoTrader.BuildOrderedQueueSignature(b),"concrete witness identity did not invalidate queue/projection signature"
+        end)
+        add("transport-unacked-not-contacted",function()
+            return State.AutoTrader.ClassifyPendingCancellation({contactAcknowledged=false},"trade_unavailable")=="transport_deferred" and State.AutoTrader.ClassifyPendingCancellation({contactAcknowledged=false},"no_response")=="transport_deferred","pre-ACK failure became human outcome"
+        end)
+        add("transport-ack-establishes-contact",function()
+            return State.AutoTrader.ClassifyPendingCancellation({contactAcknowledged=true},"trade_unavailable")=="no_response","acknowledged contact was not classified as player no-response"
+        end)
+        add("incoming-partner-correlation",function()
+            return State.AutoTrader.IsExpectedPartner(10,{UserId=10})==true and State.AutoTrader.IsExpectedPartner(10,{UserId=11})==false and State.AutoTrader.IsExpectedPartner(10,nil)==false,"incoming partner correlation accepted wrong/unresolved partner"
+        end)
+        add("queue-comparator-consistency",function()
+            local a={player={UserId=2},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}};local b={player={UserId=1},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}};local q={a,b};table.sort(q,State.AutoTrader.CompareQueueRows);return q[1]==b,"canonical comparator lacked deterministic UserId tie break"
+        end)
+        add("manual-mapping-context-conflict",function()
+            return State.AutoTrader.IsRecordCompatibleWithIdentityHint({category="godlies",data={year=2018,event="Halloween"}},{variant="Chroma",year=2018,event="Halloween"})==false,"explicit Chroma evidence allowed normal mapped record"
+        end)
+        add("reach-consolidation",function()
+            local two={itemType="Weapons",itemId="two",unitValue=2,quantity=4,maxQuantity=4,record={name="Two",data={value=2,demand=5}}};local nine={itemType="Weapons",itemId="nine",unitValue=9,quantity=1,maxQuantity=1,record={name="Nine",data={value=9,demand=5}}}
+            local d=State.AutoTrader.EvaluatePortfolioDelta({two},{{itemType="Weapons",itemId="two",unitValue=2,quantity=4,record=two.record}},{{itemType="Weapons",itemId="nine",unitValue=9,quantity=1,record=nine.record}},{excludeServerBudgets=true});return d.strategicSubkind=="CONSOLIDATE" or d.profit>0,"2+2+2+2→9 was not recognized as consolidation/value improvement"
+        end)
+        add("profit-catastrophe-floor",function()
+            local h={itemType="Weapons",itemId="h",unitValue=20,quantity=1,maxQuantity=1,record={name="H",data={value=20,demand=5}}};local r={itemType="Weapons",itemId="r",unitValue=21,quantity=1,maxQuantity=1,record={name="R",data={value=21,demand=5}}};local d=State.AutoTrader.EvaluatePortfolioDelta({h},{{itemType="Weapons",itemId="h",unitValue=20,quantity=1,record=h.record}},{{itemType="Weapons",itemId="r",unitValue=21,quantity=1,record=r.record}},{excludeServerBudgets=true});return d.profit==1 and type(d.catastropheOK)=="boolean","positive-profit catastrophe policy produced no deterministic verdict"
+        end)
+        add("bot-human-revokes-auto-escape",function()
+            return State.AutoTrader.ShouldRevokeAutomatedBotEscape("SUSPECTED_BOT_SERVER") and State.AutoTrader.ShouldRevokeAutomatedBotEscape("CERTIFIED_BOT_SERVER") and not State.AutoTrader.ShouldRevokeAutomatedBotEscape("MANUAL_CERTIFIED_BOT_SERVER"),"automated/manual bot escape revocation policy mismatch"
+        end)
+        add("manual-bot-roster-atomic",function()
+            return State.AutoTrader.RosterKeyMatches("1,2,3","1,2,3") and not State.AutoTrader.RosterKeyMatches("1,2,3","1,2,4"),"manual certification roster equality invariant failed"
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        local result={passed=passed,total=#tests,ok=passed==#tests,tests=tests,atUnix=os.time(),controllerVersion=CONTROLLER_VERSION};State.AutoTrader.SelfTest=result;State.AutoTrader.Log("self_test_v36",{passed=passed,total=#tests,ok=result.ok,tests=tests});return result
+    end
+end
+
+
 State.QueueNativeDatabaseWarmup()
 rawset(_G, GLOBAL_KEY, Controller)
 do

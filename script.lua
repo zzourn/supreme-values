@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.54-public-auto-trader-v22-httpget-startup-hotfix",
+    version = "18.55-public-auto-trader-v23-movedirection-gold-learning",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -77,6 +77,7 @@ local CONFIG = {
     AutoTraderServerHopGraceSeconds = 2.5,
     AutoTraderServerHopRetrySeconds = 5,
     AutoTraderServerRescanDelaySeconds = 2.0,
+    AutoTraderServerRateLimitMaxBackoffSeconds = 16,
     AutoTraderServerTeleportAttemptTimeoutSeconds = 8,
     AutoTraderServerListPages = 2,
     AutoTraderServerCandidateLimit = 180,
@@ -107,11 +108,14 @@ local CONFIG = {
     AutoTraderBootstrapBotDbJobsPerIcon = 12,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
     AutoTraderThumbnailBatchSize = 100,
-    -- v21 bot architecture: bot learning, current-server hop decisions, and
+    -- v23 bot architecture: bot learning, current-server hop decisions, and
     -- pre-join server selection are deliberately independent systems. Only a
     -- physically certified all-bot server may add hashes to the strict database.
     -- Server-list GETs prefer game:HttpGet and validate token-bearing rows before
     -- falling back to executor HTTP; unavailable previews are UNKNOWN, not blocked.
+    -- Bot certification uses only replicated remote Humanoid.MoveDirection plus
+    -- RootPart movement/facing. Animation tracks and inventory/value behavior are
+    -- completely excluded from bot learning.
     AutoTraderBotCurrentPreviewRetrySeconds = 5,
     AutoTraderGoldBotMinPreviewSamples = 5,
     AutoTraderGoldBotRejectRatio = 0.50,
@@ -120,21 +124,15 @@ local CONFIG = {
     AutoTraderGoldBotKnownMinJobs = 2,
     AutoTraderGoldBotConfirmMinJobs = 3,
     AutoTraderGoldObserveSeconds = 10,
-    AutoTraderGoldSampleSeconds = 0.25,
+    AutoTraderGoldSampleSeconds = 0.05,
+    AutoTraderGoldMoveDirectionEpsilon = 0.05,
     AutoTraderGoldOrientationFuzzDegrees = 7,
     AutoTraderGoldMovementStepStuds = 0.35,
     AutoTraderGoldMinTotalDistanceStuds = 8,
-    AutoTraderGoldMinMovingSamples = 4,
+    AutoTraderGoldMinMaxDisplacementStuds = 4,
+    AutoTraderGoldMinMovingSamples = 6,
     AutoTraderGoldMinMovementSpanSeconds = 2.5,
-    AutoTraderGoldMinPathTurnDegrees = 35,
-    AutoTraderGoldMinFacingMismatchDegrees = 20,
-    AutoTraderGoldMinFacingMismatchSamples = 2,
     AutoTraderGoldMinRemotePlayers = 5,
-    -- v21: animation history can only DISQUALIFY a server from bot learning.
-    -- Two distinct legitimate replicated animation IDs from any one remote player
-    -- permanently mark the JobId regular; animation behavior can never certify bots.
-    -- Asset id 0/1 are ignored as placeholder/noise values observed in live clients.
-    AutoTraderGoldAnimationDisqualifyDistinctIds = 2,
     AutoTraderGoldThumbnailRetrySeconds = 2,
     AutoTraderBotDatabaseMaxIcons = 1200,
     AutoTraderBotDatabaseJobsPerIcon = 64,
@@ -6303,15 +6301,13 @@ State.AutoTrader = {
     BotLearningLastAttemptAt = 0,
     LastBotLearning = nil,
     GoldBotCertification = {
-        jobId = game.JobId, status = "waiting", reason = "Waiting for a fully trackable physical observation window.",
+        jobId = game.JobId, status = "waiting", reason = "Waiting for a fully trackable MoveDirection + RootPart observation window.",
         windowStartedAt = 0, membershipKey = nil, players = {}, sampleCount = 0, attempts = 0,
         certifiedAt = 0, lastHashAttemptAt = 0, learnedHashes = 0, certifiedUserIds = nil,
-        animationIdsByUserId = {}, animationDistinctByUserId = {}, animationEventsSeen = 0,
+        moveDirectionViolation = nil, maxObservedMoveDirection = 0,
         candidateFingerprintByUserId = nil, candidateImageByUserId = nil, candidatePreparedAt = 0,
     },
-    -- RBXScriptConnections are kept outside GoldBotCertification because the latter
-    -- is copied into support JSON and must remain serializable.
-    GoldAnimationConnections = setmetatable({}, {__mode = "k"}),
+    ServerRateLimitBackoffSeconds = 0,
     LastServerScan = nil,
     CurrentServerAvatarScreen = nil,
     CurrentServerAvatarScreenAt = 0,
@@ -6790,7 +6786,7 @@ State.AutoTrader.RecordTargetEvent = function(player, kind, data)
     end
     stats.lastEventUnix = os.time()
     State.AutoTrader.RecordStrategyEvent(player, kind, data)
-    -- v21 bot identity is intentionally isolated from all trade/inventory behavior.
+    -- v23 bot identity is intentionally isolated from all trade/inventory behavior.
     State.AutoTrader.SaveTargetStats()
 end
 State.AutoTrader.GetTargetProfile = function(player)
@@ -6984,7 +6980,7 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
     local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.45)
     local declinePenalty = 1 / (1 + (tonumber(stats.declines) or 0) * 0.10)
 
-    -- v21: avatar/bot knowledge intentionally has ZERO influence on current-server
+    -- v23: avatar/bot knowledge intentionally has ZERO influence on current-server
     -- target economics. The bot database is only a pre-join server filter.
     return (
         expectedProfit
@@ -7412,9 +7408,9 @@ State.AutoTrader.NormalizeBotIconDb = function(value)
                     -- Legacy fields are retained only so existing local files remain readable.
                     botEvidence = 0, humanEvidence = 0, botJobs = {}, humanJobs = {},
                     botPlayerSightings = 0, humanPlayerSightings = 0,
-                    -- v19 gold fields are preserved as legacy history only. v20 server
-                    -- filtering uses ONLY strictGoldBotJobs, which can be written only
-                    -- after physical certification survives the whole-JobId animation gate.
+                    -- v19/v20-era gold fields are preserved as legacy history only. v23 server
+                    -- filtering uses ONLY strictGoldBotJobs, written only after the
+                    -- strict MoveDirection + fixed-facing departure commit is validated.
                     goldBotJobs = {}, goldBotSightings = 0,
                     strictGoldBotJobs = {}, strictGoldBotSightings = 0,
                     sampleUserId = tonumber(oldRecord.sampleUserId), sampleName = oldRecord.sampleName,
@@ -7608,8 +7604,8 @@ end
 State.AutoTrader.GetBotIconClass = function(fingerprint)
     local record = State.AutoTrader.GetBotIconRecord(fingerprint, false)
     if not record then return "unknown", 0, nil end
-    -- v21 intentionally ignores legacy v19 goldBotJobs. Only strictGoldBotJobs passed
-    -- physical certification + whole-JobId animation disqualification.
+    -- v23 intentionally ignores legacy v19 goldBotJobs. Only strictGoldBotJobs that
+    -- passed remote MoveDirection + fixed-facing certification participate.
     local goldJobs = State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs)
     if goldJobs >= CONFIG.AutoTraderGoldBotConfirmMinJobs then return "confirmed_bot", 0.99, record end
     if goldJobs >= CONFIG.AutoTraderGoldBotKnownMinJobs then return "known_bot", 0.93, record end
@@ -7637,7 +7633,7 @@ State.AutoTrader.AddStrictGoldBotIconEvidence = function(fingerprint, jobId, pla
     record.lastSeen = now
     return true
 end
--- Compatibility shim: legacy reputation writers are disabled in v21. The strict
+-- Compatibility shim: legacy reputation writers are disabled in v23. The strict
 -- writer above is called only by ImportStrictGoldTeleportCommit from a validated departure payload.
 State.AutoTrader.AddBotIconEvidence = function()
     return false
@@ -8295,25 +8291,12 @@ State.AutoTrader.ResolveUserIdsFingerprints = function(userIds)
     return completed == #userIds, result, completed == #userIds and nil or ("resolved " .. tostring(completed) .. "/" .. tostring(#userIds) .. " certified headshots")
 end
 
-State.AutoTrader.NormalizeGoldAnimationId = function(value)
-    if type(value) ~= "string" then value = tostring(value or "") end
-    value = string.lower(value)
-    local numeric = value:match("rbxassetid://(%d+)") or value:match("[?&]id=(%d+)") or value:match("(%d+)")
-    -- Live support data exposed AnimationId "1" alongside a legitimate asset ID.
-    -- Treat only the known empty/placeholder ids as noise; do NOT broadly ignore
-    -- small IDs because missing a legitimate second animation is less safe than
-    -- conservatively disqualifying a training server.
-    if numeric == "0" or numeric == "1" then return nil end
-    if numeric and numeric ~= "" then return numeric end
-    return nil
-end
-
 State.AutoTrader.MarkGoldCertificationRegular = function(reason, details)
     local c = State.AutoTrader.GoldBotCertification
     if type(c) ~= "table" or c.jobId ~= game.JobId then return false end
     if c.status == "certified_learned" then return false end
     c.status = "regular"
-    c.reason = tostring(reason or "A human-like physical/animation signal permanently disqualified this JobId from bot learning.")
+    c.reason = tostring(reason or "A remote player exposed human-controlled MoveDirection; this JobId is permanently excluded from bot learning.")
     c.failedAt = os.clock()
     c.candidateFingerprintByUserId = nil
     c.candidateImageByUserId = nil
@@ -8322,65 +8305,10 @@ State.AutoTrader.MarkGoldCertificationRegular = function(reason, details)
     if type(details) == "table" then
         c.failedPlayer = details.name or c.failedPlayer
         c.failedUserId = details.userId or c.failedUserId
-        c.animationViolation = details.animationViolation or c.animationViolation
+        c.moveDirectionViolation = details.moveDirectionViolation or c.moveDirectionViolation
     end
     State.AutoTrader.Log("gold_bot_certification_regular", details or {reason = c.reason})
     return true
-end
-
-State.AutoTrader.RecordGoldAnimationId = function(player, animationId, source)
-    if not player or player == LocalPlayer or player.Parent ~= Players then return false end
-    local c = State.AutoTrader.GoldBotCertification
-    if type(c) ~= "table" or c.jobId ~= game.JobId or c.status == "regular" or c.status == "certified_learned" then return false end
-    local normalized = State.AutoTrader.NormalizeGoldAnimationId(animationId)
-    if not normalized then return false end
-    c.animationIdsByUserId = type(c.animationIdsByUserId) == "table" and c.animationIdsByUserId or {}
-    c.animationDistinctByUserId = type(c.animationDistinctByUserId) == "table" and c.animationDistinctByUserId or {}
-    local key = tostring(player.UserId)
-    local ids = c.animationIdsByUserId[key]
-    if type(ids) ~= "table" then ids = {}; c.animationIdsByUserId[key] = ids end
-    if ids[normalized] then return false end
-    ids[normalized] = true
-    local count = 0
-    for _ in pairs(ids) do count += 1 end
-    c.animationDistinctByUserId[key] = count
-    c.animationEventsSeen = (tonumber(c.animationEventsSeen) or 0) + 1
-    if count >= CONFIG.AutoTraderGoldAnimationDisqualifyDistinctIds then
-        local list = {}
-        for id in pairs(ids) do table.insert(list, id) end
-        table.sort(list)
-        State.AutoTrader.MarkGoldCertificationRegular(
-            player.Name .. " exposed " .. tostring(count) .. " distinct replicated animation IDs (" .. table.concat(list, ", ") .. "); this JobId is REGULAR for learning and will teach ZERO bot hashes.",
-            {name = player.Name, userId = player.UserId, animationViolation = {ids = list, count = count, source = source}}
-        )
-        return true
-    end
-    return false
-end
-
-State.AutoTrader.ObserveGoldAnimationsForPlayer = function(player, humanoid)
-    if not player or not humanoid then return false end
-    local animator = humanoid:FindFirstChildOfClass("Animator")
-    if not animator then return false end
-    local registry = State.AutoTrader.GoldAnimationConnections
-    if not registry[animator] then
-        registry[animator] = true
-        connect(animator.AnimationPlayed, function(track)
-            if Destroyed or player.Parent ~= Players or not player.Character or not animator:IsDescendantOf(player.Character) then return end
-            local animation = track and track.Animation
-            State.AutoTrader.RecordGoldAnimationId(player, animation and animation.AnimationId, "AnimationPlayed")
-        end)
-    end
-    local okTracks, tracks = pcall(function() return animator:GetPlayingAnimationTracks() end)
-    if okTracks and type(tracks) == "table" then
-        for _, track in ipairs(tracks) do
-            local animation = track and track.Animation
-            if State.AutoTrader.RecordGoldAnimationId(player, animation and animation.AnimationId, "GetPlayingAnimationTracks") then
-                return true
-            end
-        end
-    end
-    return false
 end
 
 State.AutoTrader.PrepareStrictGoldCandidate = function(certification)
@@ -8392,13 +8320,13 @@ State.AutoTrader.PrepareStrictGoldCandidate = function(certification)
     certification.lastHashAttemptAt = now
     local okThumb, resolved, reason = State.AutoTrader.ResolveUserIdsFingerprints(certification.certifiedUserIds)
     if not okThumb then
-        certification.reason = "Physical candidate passed and animation gate is still clean; waiting for every candidate avatar headshot: " .. tostring(reason)
+        certification.reason = "Physical candidate passed the MoveDirection + fixed-facing gate; waiting for every candidate avatar headshot: " .. tostring(reason)
         return false
     end
     certification.candidateFingerprintByUserId = resolved.fingerprintByUserId
     certification.candidateImageByUserId = resolved.imageByUserId
     certification.candidatePreparedAt = now
-    certification.reason = "STRICT GOLD CANDIDATE staged. Continuing whole-JobId animation monitoring; hashes will be carried only at the actual normal teleport call and committed by the destination server."
+    certification.reason = "STRICT GOLD CANDIDATE staged. Continuing whole-JobId MoveDirection monitoring; hashes will be carried only at the actual normal teleport call and committed by the destination server."
     return true
 end
 
@@ -8433,18 +8361,19 @@ State.AutoTrader.BuildStrictGoldTeleportCommitPayload = function()
     for _, row in pairs(grouped) do table.insert(rows, row) end
     table.sort(rows, function(a, b) return a.fingerprint < b.fingerprint end)
     return {
-        version = 1,
+        version = 2,
         sourceJobId = game.JobId,
         certifiedPlayers = #c.certifiedUserIds,
         certifiedAt = c.certifiedAt,
         observeSeconds = CONFIG.AutoTraderGoldObserveSeconds,
-        animationEventsSeen = tonumber(c.animationEventsSeen) or 0,
+        moveDirectionEpsilon = CONFIG.AutoTraderGoldMoveDirectionEpsilon,
+        maxObservedMoveDirection = tonumber(c.maxObservedMoveDirection) or 0,
         fingerprints = rows,
     }
 end
 
 State.AutoTrader.ImportStrictGoldTeleportCommit = function(payload)
-    if type(payload) ~= "table" or tonumber(payload.version) ~= 1 then return false end
+    if type(payload) ~= "table" or tonumber(payload.version) ~= 2 then return false end
     local sourceJobId = payload.sourceJobId
     if type(sourceJobId) ~= "string" or sourceJobId == "" or sourceJobId == game.JobId then return false end
     if math.max(0, tonumber(payload.certifiedPlayers) or 0) < CONFIG.AutoTraderGoldMinRemotePlayers then return false end
@@ -8465,9 +8394,10 @@ State.AutoTrader.ImportStrictGoldTeleportCommit = function(payload)
     State.AutoTrader.LastBotLearning = {
         jobId = sourceJobId, importedIntoJobId = game.JobId,
         action = "strict_gold_departure_commit_imported",
-        source = "teleport_data_after_physical_plus_whole_job_animation_gate",
+        source = "teleport_data_after_remote_movedirection_plus_fixed_facing_gate",
         certifiedPlayers = payload.certifiedPlayers, hashesLearned = learned,
-        observeSeconds = payload.observeSeconds, animationEventsSeen = payload.animationEventsSeen,
+        observeSeconds = payload.observeSeconds, moveDirectionEpsilon = payload.moveDirectionEpsilon,
+        maxObservedMoveDirection = payload.maxObservedMoveDirection,
     }
     State.AutoTrader.Log("strict_gold_departure_commit_imported", State.AutoTrader.LastBotLearning)
     return true
@@ -8478,13 +8408,13 @@ State.AutoTrader.ResetGoldBotObservationWindow = function(reason)
     if type(c) ~= "table" or c.jobId ~= game.JobId then
         c = {
             jobId = game.JobId, attempts = 0,
-            animationIdsByUserId = {}, animationDistinctByUserId = {}, animationEventsSeen = 0,
+            moveDirectionViolation = nil, maxObservedMoveDirection = 0,
         }
         State.AutoTrader.GoldBotCertification = c
     end
     if c.status == "regular" or c.status == "certified_learned" then return c end
     c.status = "waiting"
-    c.reason = tostring(reason or "Waiting for a useful movement window.")
+    c.reason = tostring(reason or "Waiting for a useful MoveDirection + RootPart movement window.")
     c.windowStartedAt = 0
     c.membershipKey = nil
     c.players = {}
@@ -8502,7 +8432,9 @@ State.AutoTrader.SampleGoldBotCertification = function()
     if Destroyed then return false end
     local now = os.clock()
     local c = State.AutoTrader.GoldBotCertification
-    if type(c) ~= "table" or c.jobId ~= game.JobId then c = State.AutoTrader.ResetGoldBotObservationWindow("New JobId; starting strict physical + animation observation.") end
+    if type(c) ~= "table" or c.jobId ~= game.JobId then
+        c = State.AutoTrader.ResetGoldBotObservationWindow("New JobId; starting strict remote MoveDirection + RootPart observation.")
+    end
     if c.status == "regular" or c.status == "certified_learned" then return true end
 
     local rows, ids, names = {}, {}, {}
@@ -8513,15 +8445,27 @@ State.AutoTrader.SampleGoldBotCertification = function()
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
-            if humanoid then
-                State.AutoTrader.ObserveGoldAnimationsForPlayer(player, humanoid)
-                if c.status == "regular" then return true end
-            end
             if not humanoid or not root or not root:IsA("BasePart") or humanoid.Health <= 0 then
-                State.AutoTrader.ResetGoldBotObservationWindow("Waiting: every remote player must have a live Humanoid and HumanoidRootPart before a strict physical window can count. Animation history is preserved.")
+                State.AutoTrader.ResetGoldBotObservationWindow("Waiting: every remote player must have a live Humanoid and HumanoidRootPart before a strict window can count.")
                 return true
             end
-            table.insert(rows, {player = player, humanoid = humanoid, root = root})
+            local moveDirection = humanoid.MoveDirection
+            local moveMagnitude = typeof(moveDirection) == "Vector3" and moveDirection.Magnitude or 0
+            c.maxObservedMoveDirection = math.max(tonumber(c.maxObservedMoveDirection) or 0, moveMagnitude)
+            if moveMagnitude > CONFIG.AutoTraderGoldMoveDirectionEpsilon then
+                State.AutoTrader.MarkGoldCertificationRegular(
+                    player.Name .. " exposed Humanoid.MoveDirection magnitude " .. string.format("%.3f", moveMagnitude)
+                        .. " (> " .. string.format("%.3f", CONFIG.AutoTraderGoldMoveDirectionEpsilon)
+                        .. "); this JobId is REGULAR for learning and will teach ZERO bot hashes.",
+                    {
+                        name = player.Name,
+                        userId = player.UserId,
+                        moveDirectionViolation = {magnitude = moveMagnitude, vector = tostring(moveDirection), at = now},
+                    }
+                )
+                return true
+            end
+            table.insert(rows, {player = player, humanoid = humanoid, root = root, moveMagnitude = moveMagnitude})
         end
     end
     table.sort(ids)
@@ -8531,8 +8475,9 @@ State.AutoTrader.SampleGoldBotCertification = function()
     end
     local membershipKey = table.concat(ids, ",")
 
-    -- A staged candidate remains provisional for the rest of the JobId. Continue
-    -- animation monitoring on every sample; membership changes discard the candidate.
+    -- A staged candidate remains provisional for the rest of the JobId. We keep
+    -- checking every remote MoveDirection sample; any later nonzero movement vetoes
+    -- the pending evidence before teleport. Membership changes also discard it.
     if c.status == "candidate" then
         if c.membershipKey ~= membershipKey then
             State.AutoTrader.ResetGoldBotObservationWindow("Membership changed after physical certification; staged candidate discarded and a new full window is required.")
@@ -8544,7 +8489,9 @@ State.AutoTrader.SampleGoldBotCertification = function()
 
     if c.windowStartedAt <= 0 or c.membershipKey ~= membershipKey then
         c.status = "observing"
-        c.reason = c.membershipKey and "Server membership changed; restarting the strict 10-second physical window. Animation history remains cumulative for the JobId." or "Strict physical observation started; animation history is monitored for the entire JobId."
+        c.reason = c.membershipKey
+            and "Server membership changed; restarting the strict 10-second MoveDirection + fixed-facing physical window."
+            or "Strict physical observation started. Any remote MoveDirection above the fuzz permanently disqualifies this JobId; stationary lobby time is only inconclusive."
         c.windowStartedAt = now
         c.membershipKey = membershipKey
         c.players = {}
@@ -8554,11 +8501,17 @@ State.AutoTrader.SampleGoldBotCertification = function()
             local look = Vector3.new(row.root.CFrame.LookVector.X, 0, row.root.CFrame.LookVector.Z)
             if look.Magnitude > 0.001 then look = look.Unit else look = Vector3.new(0, 0, -1) end
             c.players[row.player.UserId] = {
-                root = row.root, startPosition = row.root.Position, lastPosition = row.root.Position,
-                startLook = look, totalDistance = 0, movingSamples = 0,
-                firstMovedAt = nil, lastMovedAt = nil, maxDisplacement = 0,
-                previousMoveDirection = nil, pathTurnDegrees = 0, facingMismatchSamples = 0,
+                root = row.root,
+                startPosition = row.root.Position,
+                lastPosition = row.root.Position,
+                startLook = look,
+                totalDistance = 0,
+                movingSamples = 0,
+                firstMovedAt = nil,
+                lastMovedAt = nil,
+                maxDisplacement = 0,
                 maxFacingAngle = 0,
+                maxMoveDirectionMagnitude = row.moveMagnitude,
             }
         end
         return true
@@ -8569,9 +8522,10 @@ State.AutoTrader.SampleGoldBotCertification = function()
     for _, row in ipairs(rows) do
         local track = c.players[row.player.UserId]
         if not track or track.root ~= row.root then
-            State.AutoTrader.ResetGoldBotObservationWindow("A character/root changed during observation; restarting rather than guessing. Animation history remains cumulative.")
+            State.AutoTrader.ResetGoldBotObservationWindow("A character/root changed during observation; restarting rather than guessing.")
             return true
         end
+        track.maxMoveDirectionMagnitude = math.max(tonumber(track.maxMoveDirectionMagnitude) or 0, row.moveMagnitude)
         local position = row.root.Position
         local delta = position - track.lastPosition
         local step = delta.Magnitude
@@ -8583,11 +8537,12 @@ State.AutoTrader.SampleGoldBotCertification = function()
 
         if facingAngle > CONFIG.AutoTraderGoldOrientationFuzzDegrees then
             if track.movingSamples < 2 then
-                State.AutoTrader.ResetGoldBotObservationWindow("Facing changed before a useful movement sequence began (possible round/spawn transition); restarting instead of guessing.")
+                State.AutoTrader.ResetGoldBotObservationWindow("Facing changed before a useful movement sequence began (possible spawn/round transition); restarting instead of guessing.")
                 return true
             end
             State.AutoTrader.MarkGoldCertificationRegular(
-                row.player.Name .. " changed facing by " .. string.format("%.1f°", facingAngle) .. " while moving; this JobId is REGULAR and will teach ZERO bot hashes.",
+                row.player.Name .. " changed facing by " .. string.format("%.1f°", facingAngle)
+                    .. " after useful movement while MoveDirection stayed near zero; this JobId is REGULAR for conservative learning.",
                 {name = row.player.Name, userId = row.player.UserId, facingDegrees = facingAngle}
             )
             return true
@@ -8595,20 +8550,10 @@ State.AutoTrader.SampleGoldBotCertification = function()
 
         track.totalDistance += step
         track.maxDisplacement = math.max(track.maxDisplacement, (position - track.startPosition).Magnitude)
-        local horizontal = Vector3.new(delta.X, 0, delta.Z)
-        if horizontal.Magnitude >= CONFIG.AutoTraderGoldMovementStepStuds then
-            local moveDirection = horizontal.Unit
+        if step >= CONFIG.AutoTraderGoldMovementStepStuds then
             track.movingSamples += 1
             track.firstMovedAt = track.firstMovedAt or now
             track.lastMovedAt = now
-            if track.previousMoveDirection then
-                local turnDot = math.clamp(track.previousMoveDirection:Dot(moveDirection), -1, 1)
-                track.pathTurnDegrees += math.deg(math.acos(turnDot))
-            end
-            local mismatchDot = math.clamp(look:Dot(moveDirection), -1, 1)
-            local mismatchDegrees = math.deg(math.acos(mismatchDot))
-            if mismatchDegrees >= CONFIG.AutoTraderGoldMinFacingMismatchDegrees then track.facingMismatchSamples += 1 end
-            track.previousMoveDirection = moveDirection
         end
         track.lastPosition = position
     end
@@ -8622,24 +8567,26 @@ State.AutoTrader.SampleGoldBotCertification = function()
         local track = c.players[row.player.UserId]
         local span = track.firstMovedAt and track.lastMovedAt and (track.lastMovedAt - track.firstMovedAt) or 0
         local useful = track.totalDistance >= CONFIG.AutoTraderGoldMinTotalDistanceStuds
+            and track.maxDisplacement >= CONFIG.AutoTraderGoldMinMaxDisplacementStuds
             and track.movingSamples >= CONFIG.AutoTraderGoldMinMovingSamples
             and span >= CONFIG.AutoTraderGoldMinMovementSpanSeconds
-            and track.pathTurnDegrees >= CONFIG.AutoTraderGoldMinPathTurnDegrees
-            and track.facingMismatchSamples >= CONFIG.AutoTraderGoldMinFacingMismatchSamples
             and track.maxFacingAngle <= CONFIG.AutoTraderGoldOrientationFuzzDegrees
+            and (tonumber(track.maxMoveDirectionMagnitude) or 0) <= CONFIG.AutoTraderGoldMoveDirectionEpsilon
         if not useful then
             table.insert(insufficient,
                 row.player.Name
                 .. " (distance " .. string.format("%.1f", track.totalDistance)
+                .. ", displacement " .. string.format("%.1f", track.maxDisplacement)
                 .. ", move samples " .. tostring(track.movingSamples)
-                .. ", path turn " .. string.format("%.0f°", track.pathTurnDegrees)
-                .. ", mismatch samples " .. tostring(track.facingMismatchSamples) .. ")"
+                .. ", movement span " .. string.format("%.1fs", span)
+                .. ", facing " .. string.format("%.1f°", track.maxFacingAngle)
+                .. ", max MoveDirection " .. string.format("%.3f", tonumber(track.maxMoveDirectionMagnitude) or 0) .. ")"
             )
         end
     end
     if #insufficient > 0 then
         c.attempts = (tonumber(c.attempts) or 0) + 1
-        local reason = "10-second physical window was inconclusive (commonly lobby/no coins or ambiguous straight motion); no hashes learned. Animation history remains cumulative. " .. table.concat(insufficient, "; ")
+        local reason = "10-second MoveDirection/RootPart window was inconclusive (commonly lobby/no coins, spawn transition, or not enough sustained motion); no hashes learned. " .. table.concat(insufficient, "; ")
         State.AutoTrader.ResetGoldBotObservationWindow(reason)
         State.AutoTrader.GoldBotCertification.attempts = c.attempts
         State.AutoTrader.Log("gold_bot_certification_inconclusive", {reason = reason, attempts = c.attempts})
@@ -8647,7 +8594,7 @@ State.AutoTrader.SampleGoldBotCertification = function()
     end
 
     c.status = "candidate"
-    c.reason = "STRICT GOLD CANDIDATE: every remote player passed the fixed-facing curved-path test. No hashes are learned yet; monitoring animation IDs until normal departure."
+    c.reason = "STRICT GOLD CANDIDATE: every remote player moved substantially for multiple samples while MoveDirection stayed within fuzz and facing stayed essentially fixed. No hashes are learned yet; MoveDirection monitoring continues until normal departure."
     c.certifiedAt = now
     c.certifiedUserIds = ids
     c.names = names
@@ -8655,14 +8602,20 @@ State.AutoTrader.SampleGoldBotCertification = function()
     for _, row in ipairs(rows) do
         local track = c.players[row.player.UserId]
         summaries[row.player.UserId] = {
-            distance = track.totalDistance, movingSamples = track.movingSamples, maxDisplacement = track.maxDisplacement,
-            pathTurnDegrees = track.pathTurnDegrees, facingMismatchSamples = track.facingMismatchSamples,
+            distance = track.totalDistance,
+            maxDisplacement = track.maxDisplacement,
+            movingSamples = track.movingSamples,
+            movementSpanSeconds = track.firstMovedAt and track.lastMovedAt and (track.lastMovedAt - track.firstMovedAt) or 0,
             maxFacingAngle = track.maxFacingAngle,
+            maxMoveDirectionMagnitude = track.maxMoveDirectionMagnitude,
         }
     end
     c.physicalSummaries = summaries
     State.AutoTrader.PrepareStrictGoldCandidate(c)
-    State.AutoTrader.Log("strict_gold_candidate_staged", {players = #ids, animationEventsSeen = c.animationEventsSeen})
+    State.AutoTrader.Log("strict_gold_candidate_staged", {
+        players = #ids,
+        maxObservedMoveDirection = tonumber(c.maxObservedMoveDirection) or 0,
+    })
     return true
 end
 
@@ -8677,27 +8630,17 @@ end
 
 State.AutoTrader.BuildGoldCertificationSupport = function()
     local c = State.AutoTrader.GoldBotCertification or {}
-    local out = {
+    return {
         jobId = c.jobId, status = c.status, reason = c.reason,
         windowStartedAt = c.windowStartedAt, windowAge = c.windowAge,
         membershipKey = c.membershipKey, sampleCount = c.sampleCount, attempts = c.attempts,
         certifiedAt = c.certifiedAt, candidatePreparedAt = c.candidatePreparedAt,
         committedAt = c.committedAt, learnedHashes = c.learnedHashes,
         failedPlayer = c.failedPlayer, failedUserId = c.failedUserId, failedAt = c.failedAt,
-        animationEventsSeen = c.animationEventsSeen, animationViolation = c.animationViolation,
+        moveDirectionViolation = c.moveDirectionViolation,
+        maxObservedMoveDirection = c.maxObservedMoveDirection,
         certifiedUserIds = c.certifiedUserIds, physicalSummaries = c.physicalSummaries,
-        animationDistinctByUserId = {}, animationIdsByUserId = {},
     }
-    for key, count in pairs(type(c.animationDistinctByUserId) == "table" and c.animationDistinctByUserId or {}) do
-        out.animationDistinctByUserId[tostring(key)] = tonumber(count) or 0
-    end
-    for key, ids in pairs(type(c.animationIdsByUserId) == "table" and c.animationIdsByUserId or {}) do
-        local list = {}
-        for id in pairs(type(ids) == "table" and ids or {}) do table.insert(list, tostring(id)) end
-        table.sort(list)
-        out.animationIdsByUserId[tostring(key)] = list
-    end
-    return out
 end
 
 -- Compatibility functions retained for support code; they can no longer train or trigger hops.
@@ -8705,7 +8648,7 @@ State.AutoTrader.LearnCurrentServerBotIcons = function()
     return State.AutoTrader.LastBotLearning
 end
 State.AutoTrader.ShouldFastRejectInventoryBotLobby = function()
-    return false, {disabled = true, reason = "v22 bot identity learning never uses inventory/trade state"}
+    return false, {disabled = true, reason = "v23 bot identity learning never uses inventory/trade/animation state"}
 end
 State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     if State.AutoTrader.CurrentServerAvatarScreenInFlight then return State.AutoTrader.CurrentServerAvatarScreen end
@@ -8908,6 +8851,30 @@ State.AutoTrader.ServerHopStillAllowed = function()
     return (exhausted or explicitNonBotHop) and noWork,
         explicitNonBotHop and tostring(State.AutoTrader.FastBotHopReason) or currentDisposition
 end
+State.AutoTrader.GetServerRescanDelay = function(scan)
+    local base = math.max(1, tonumber(CONFIG.AutoTraderServerRescanDelaySeconds) or 2)
+    local maxDelay = math.max(base, tonumber(CONFIG.AutoTraderServerRateLimitMaxBackoffSeconds) or 16)
+    local fetch = scan and scan.fetch
+    local rateLimited = false
+    for _, page in ipairs(fetch and fetch.transportPages or {}) do
+        local gameInfo = type(page.gameHttpGet) == "table" and page.gameHttpGet or {}
+        local execInfo = type(page.executor) == "table" and page.executor or {}
+        local function is429(info)
+            if tonumber(info.status) == 429 then return true end
+            return string.find(string.lower(tostring(info.error or "")), "429", 1, true) ~= nil
+        end
+        if is429(gameInfo) or is429(execInfo) then rateLimited = true break end
+    end
+    if rateLimited then
+        local previous = tonumber(State.AutoTrader.ServerRateLimitBackoffSeconds) or 0
+        local delay = previous > 0 and math.min(maxDelay, previous * 2) or math.min(maxDelay, base * 2)
+        State.AutoTrader.ServerRateLimitBackoffSeconds = delay
+        return delay, true
+    end
+    State.AutoTrader.ServerRateLimitBackoffSeconds = 0
+    return base, false
+end
+
 State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     if Destroyed
         or not State.AutoTrader.ServerHopInProgress
@@ -8930,19 +8897,20 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     if not server then
         local scan = State.AutoTrader.LastServerScan
         local best = scan and scan.bestScanned or nil
-        State.AutoTrader.Status = "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
+        local rescanDelay, rateLimited = State.AutoTrader.GetServerRescanDelay(scan)
+        State.AutoTrader.Status = rateLimited and "SERVER HOP · RATE LIMITED" or "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
         if best and best.previewTrusted then
             State.AutoTrader.StatusDetail = string.format(
                 "Best scanned server still has %.0f%% learned-gold bot-avatar matches / %.0f%% unmatched previews. Need gold matches below %.0f%%; rescanning in %.0fs.",
                 (tonumber(best.goldBotMatchRatio) or 1) * 100,
                 (tonumber(best.safeConfidence) or 0) * 100,
                 CONFIG.AutoTraderGoldBotRejectRatio * 100,
-                CONFIG.AutoTraderServerRescanDelaySeconds
+                rescanDelay
             )
         else
             State.AutoTrader.StatusDetail = string.format(
-                "No joinable candidate is currently available. Thumbnail-unresolved servers are allowed in v21, so this usually means the server list itself was empty/unusable or all trusted candidates matched the strict bot reject gate. Rescanning in %.0fs.",
-                CONFIG.AutoTraderServerRescanDelaySeconds
+                "No joinable candidate is currently available. Thumbnail-unresolved servers are allowed in v23, so this usually means the server list itself was empty/unusable or all trusted candidates matched the strict bot reject gate. Rescanning in %.0fs.",
+                rescanDelay
             )
         end
         State.AutoTrader.Log("server_hop_queue_exhausted", {
@@ -8950,7 +8918,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             tried = State.AutoTrader.ServerHopQueueIndex - 1,
         })
         State.AutoTrader.Render()
-        task.delay(CONFIG.AutoTraderServerRescanDelaySeconds, function()
+        task.delay(rescanDelay, function()
             if Destroyed
                 or not State.AutoTrader.ServerHopInProgress
                 or queueGeneration ~= State.AutoTrader.ServerHopQueueGeneration then
@@ -8971,21 +8939,22 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             State.AutoTrader.LastServerScan = scan
             if #queue == 0 then
                 local best = scan and scan.bestScanned or nil
-                State.AutoTrader.Status = "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
+                local nextDelay, rateLimited = State.AutoTrader.GetServerRescanDelay(scan)
+                State.AutoTrader.Status = rateLimited and "SERVER HOP · RATE LIMITED" or "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
                 State.AutoTrader.StatusDetail = best and best.previewTrusted
                     and string.format(
                         "Fresh scan still has no server below the %.0f%% learned-gold-avatar gate; best has %.0f%% gold matches. Rescanning in %.0fs.",
                         CONFIG.AutoTraderGoldBotRejectRatio * 100,
                         (tonumber(best.goldBotMatchRatio) or 1) * 100,
-                        CONFIG.AutoTraderServerRescanDelaySeconds
+                        nextDelay
                     )
                     or string.format(
                         "Fresh scan still has no eligible server. Unknown thumbnail previews are allowed; waiting only because no usable candidate was returned or every trusted candidate hit the strict bot reject gate. Rescanning in %.0fs.",
-                        CONFIG.AutoTraderServerRescanDelaySeconds
+                        nextDelay
                     )
                 State.AutoTrader.Log("server_hop_rescan_empty", {scan = scan})
                 State.AutoTrader.Render()
-                task.delay(CONFIG.AutoTraderServerRescanDelaySeconds, function()
+                task.delay(nextDelay, function()
                     if not Destroyed and State.AutoTrader.ServerHopInProgress then
                         State.AutoTrader.TryNextServerHopCandidate(nextGeneration)
                     end
@@ -12209,7 +12178,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V22",
+        format = "SV_AUTO_TRADER_SUPPORT_V23",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -12251,6 +12220,7 @@ State.AutoTrader.BuildDebug = function()
             serverHopHardTimeoutSeconds = CONFIG.AutoTraderServerHopHardTimeoutSeconds,
             serverGoldBotRejectRatio = CONFIG.AutoTraderGoldBotRejectRatio,
             serverRescanDelaySeconds = CONFIG.AutoTraderServerRescanDelaySeconds,
+            serverRateLimitMaxBackoffSeconds = CONFIG.AutoTraderServerRateLimitMaxBackoffSeconds,
             teleportHardTimeoutSeconds = CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds,
             noEligibleWorkTimeoutSeconds = CONFIG.AutoTraderNoEligibleWorkTimeoutSeconds,
             targetOpportunityFloor = CONFIG.AutoTraderTargetOpportunityFloor,
@@ -12258,12 +12228,12 @@ State.AutoTrader.BuildDebug = function()
             learnedHopOpportunityRate = State.AutoTrader.GetHopOpportunityRate(),
             hopOpportunityRetentionFactor = CONFIG.AutoTraderHopOpportunityRetentionFactor,
             goldBotLearning = {
-                source = "strict_physical_plus_animation_disqualifier", observeSeconds = CONFIG.AutoTraderGoldObserveSeconds,
-                remoteSignal = "replicated_root_cframe_path_only",
+                source = "strict_remote_movedirection_plus_fixed_facing", observeSeconds = CONFIG.AutoTraderGoldObserveSeconds,
+                remoteSignal = "Humanoid.MoveDirection + HumanoidRootPart.CFrame",
+                moveDirectionEpsilon = CONFIG.AutoTraderGoldMoveDirectionEpsilon,
                 orientationFuzzDegrees = CONFIG.AutoTraderGoldOrientationFuzzDegrees,
-                minPathTurnDegrees = CONFIG.AutoTraderGoldMinPathTurnDegrees,
-                minFacingMismatchDegrees = CONFIG.AutoTraderGoldMinFacingMismatchDegrees,
                 minTotalDistanceStuds = CONFIG.AutoTraderGoldMinTotalDistanceStuds,
+                minMaxDisplacementStuds = CONFIG.AutoTraderGoldMinMaxDisplacementStuds,
                 minMovingSamples = CONFIG.AutoTraderGoldMinMovingSamples,
                 minMovementSpanSeconds = CONFIG.AutoTraderGoldMinMovementSpanSeconds,
                 minRemotePlayers = CONFIG.AutoTraderGoldMinRemotePlayers,
@@ -12369,6 +12339,7 @@ State.AutoTrader.BuildDebug = function()
             auditedTradesThisServer = State.AutoTrader.AuditedTradesThisServer,
             fastBotHopActive = State.AutoTrader.FastBotHopActive,
             fastBotHopReason = State.AutoTrader.FastBotHopReason,
+            serverRateLimitBackoffSeconds = State.AutoTrader.ServerRateLimitBackoffSeconds,
         },
         incomingRequest = {
             decision = State.AutoTrader.IncomingRequestDecision,
@@ -12452,7 +12423,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V22\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V23\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -12794,7 +12765,7 @@ local botsPage = UI.AutoTraderPages.BOTS
 UI.AutoTraderBotHeaderCard = uiCard(botsPage, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 92))
 uiSectionTitle(UI.AutoTraderBotHeaderCard, "BOT INTELLIGENCE", 6)
 UI.AutoTraderBotSummary = uiValueLabel(UI.AutoTraderBotHeaderCard, "Waiting for avatar evidence.", 26, 11, THEME.blue, Enum.Font.GothamBold)
-UI.AutoTraderBotDetail = makeLabel(UI.AutoTraderBotHeaderCard, "Only strict replicated RootPart path/facing certification can teach hashes. Remote Humanoid.MoveDirection is not used; inventory/value/trade behavior never changes bot learning.", 9, THEME.faint, Enum.Font.Gotham)
+UI.AutoTraderBotDetail = makeLabel(UI.AutoTraderBotHeaderCard, "Only strict remote MoveDirection + RootPart movement/facing certification can teach hashes. Animation tracks and inventory/value/trade behavior never change bot learning.", 9, THEME.faint, Enum.Font.Gotham)
 UI.AutoTraderBotDetail.Position = UDim2.fromOffset(10, 49)
 UI.AutoTraderBotDetail.Size = UDim2.new(1, -125, 0, 36)
 UI.AutoTraderBotDetail.TextWrapped = true
@@ -13102,7 +13073,7 @@ State.AutoTrader.RebuildServerDashboard = function()
         local resultColor = not safe and THEME.red or trusted and THEME.green or THEME.yellow
         local result = makeLabel(row, resultText, 9, resultColor, Enum.Font.GothamBold)
         result.Position = UDim2.new(0.78, 2, 0, 3); result.Size = UDim2.new(0.22, -10, 0, 17); result.TextXAlignment = Enum.TextXAlignment.Right; result.ZIndex = 1455
-        local sub = makeLabel(row, "samples " .. tostring(candidate.previewSample or 0) .. " · strict learned avatars " .. tostring(candidate.goldBotMatches or 0) .. " · only strict physical + whole-JobId-animation-gated hashes participate", 8, THEME.faint, Enum.Font.Gotham)
+        local sub = makeLabel(row, "samples " .. tostring(candidate.previewSample or 0) .. " · strict learned avatars " .. tostring(candidate.goldBotMatches or 0) .. " · only strict MoveDirection + fixed-facing hashes participate", 8, THEME.faint, Enum.Font.Gotham)
         sub.Position = UDim2.fromOffset(8, 22); sub.Size = UDim2.new(1, -16, 0, 15); sub.TextTruncate = Enum.TextTruncate.AtEnd; sub.ZIndex = 1455
     end
 end
@@ -13118,10 +13089,9 @@ State.AutoTrader.RebuildBotDashboard = function()
     local certColor = (cert.status == "certified_learned" or cert.status == "candidate") and THEME.green or cert.status == "regular" and THEME.blue or THEME.yellow
     local headline = makeLabel(certBox, string.upper(tostring(cert.status or "waiting")) .. (cert.status == "observing" and (" · " .. string.format("%.1f/%.1fs", math.min(age, CONFIG.AutoTraderGoldObserveSeconds), CONFIG.AutoTraderGoldObserveSeconds)) or ""), 10, certColor, Enum.Font.GothamBold)
     headline.Position = UDim2.fromOffset(8, 6); headline.Size = UDim2.new(1, -16, 0, 18); headline.ZIndex = 1455
-    local maxAnimations = 0
-    for _, count in pairs(type(cert.animationDistinctByUserId) == "table" and cert.animationDistinctByUserId or {}) do maxAnimations = math.max(maxAnimations, tonumber(count) or 0) end
-    local animationSummary = " · max distinct animations/player " .. tostring(maxAnimations) .. "/" .. tostring(CONFIG.AutoTraderGoldAnimationDisqualifyDistinctIds)
-    local reason = makeLabel(certBox, tostring(cert.reason or "Waiting for observation.") .. animationSummary, 8, THEME.muted, Enum.Font.Gotham)
+    local moveSummary = " · max MoveDirection " .. string.format("%.3f", tonumber(cert.maxObservedMoveDirection) or 0)
+        .. "/" .. string.format("%.3f", CONFIG.AutoTraderGoldMoveDirectionEpsilon)
+    local reason = makeLabel(certBox, tostring(cert.reason or "Waiting for observation.") .. moveSummary, 8, THEME.muted, Enum.Font.Gotham)
     reason.Position = UDim2.fromOffset(8, 25); reason.Size = UDim2.new(1, -16, 0, 32); reason.TextWrapped = true; reason.TextYAlignment = Enum.TextYAlignment.Top; reason.ZIndex = 1455
 
     local section = makeLabel(UI.AutoTraderBotContent, "CURRENT SERVER AVATARS · INFORMATIONAL ONLY", 9, THEME.faint, Enum.Font.GothamBold)
@@ -13142,7 +13112,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         local goldJobs = tonumber(info and info.goldJobs) or 0
         local classColor = class == "confirmed_bot" and THEME.red or (class == "known_bot" or class == "observed_bot") and THEME.yellow or THEME.faint
         local name = makeLabel(row, player.Name, 10, THEME.text, Enum.Font.GothamBold); name.Position = UDim2.fromOffset(64, 6); name.Size = UDim2.new(1, -72, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
-        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict-v21 avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
+        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict-v23 avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
         local hash = makeLabel(row, info and tostring(info.fingerprint or "") or "Press REFRESH to resolve this player's avatar hash", 8, THEME.faint, Enum.Font.Code); hash.Position = UDim2.fromOffset(64, 42); hash.Size = UDim2.new(1, -72, 0, 13); hash.TextTruncate = Enum.TextTruncate.AtEnd; hash.ZIndex = 1455
     end
 
@@ -13161,7 +13131,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         return (tonumber(a.record.strictGoldBotSightings) or 0) > (tonumber(b.record.strictGoldBotSightings) or 0)
     end)
     if #learned == 0 then
-        local empty = makeLabel(UI.AutoTraderBotContent, "No strict v21 hashes learned yet. Legacy v18/v19/v20 evidence is preserved locally but only strict departure-committed evidence participates in v21 filtering.", 9, THEME.faint, Enum.Font.Gotham)
+        local empty = makeLabel(UI.AutoTraderBotContent, "No strict v23 hashes learned yet. Legacy evidence is preserved locally, but server filtering uses only strict departure-committed gold hashes.", 9, THEME.faint, Enum.Font.Gotham)
         empty.Size = UDim2.new(1, 0, 0, 36); empty.TextWrapped = true; empty.ZIndex = 1454
     end
     for index, info in ipairs(learned) do
@@ -13192,9 +13162,8 @@ local function humanEvent(entry)
     if kind == "current_server_avatar_screen" then return "Avatar bot screen refreshed" end
     if kind == "target_economic_skip" then return "Low-EV target skipped" .. (name and (" · " .. tostring(name)) or "") end
     if kind == "gold_bot_server_certified" then return "Gold bot server certified · hashes saved" end
-    if kind == "gold_bot_certification_failed_human_motion" then return "Bot certification failed · human-like turning motion seen" .. (name and (" · " .. tostring(name)) or "") end
-    if kind == "gold_bot_certification_failed_orientation" then return "Bot certification failed · facing changed" .. (name and (" · " .. tostring(name)) or "") end
-    if kind == "gold_bot_certification_inconclusive" then return "Bot certification inconclusive · waiting for useful movement" end
+    if kind == "gold_bot_certification_regular" then return "Bot learning vetoed · remote MoveDirection/facing looked human" .. (name and (" · " .. tostring(name)) or "") end
+    if kind == "gold_bot_certification_inconclusive" then return "Bot certification inconclusive · waiting for useful zero-MoveDirection movement" end
     if kind == "mutation_verified" then return "Offer mutation verified" end
     if kind == "auto_accept_sent" then return "Final verified accept sent" end
     return kind:gsub("_", " ")

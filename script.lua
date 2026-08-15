@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.65.6-public-auto-trader-v33-teleport-handoff-fix",
+    version = "18.66.0-public-auto-trader-v34-consolidated-reliability",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -152,11 +152,20 @@ local CONFIG = {
     AutoTraderRecoverySameReasonCooldownSeconds = 8,
     AutoTraderDiskLogMaxBytes = 524288,
     AutoTraderDiskLogFlushEveryEvents = 12,
+    AutoTraderSessionHistoryLimit = 3,
+    AutoTraderSessionEventLimit = 64,
+    AutoTraderSessionHistorySaveDelaySeconds = 0.75,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
+    -- v34: an input API returning successfully is not a trade acknowledgement.
+    -- Incoming request actions are retried through independent input paths and
+    -- must produce an authoritative MM2 state transition.
+    AutoTraderIncomingActionAckSeconds = 1.10,
+    AutoTraderIncomingActionMaxRounds = 2,
+    AutoTraderTradeTransportRecoveryFailures = 3,
     AutoTraderThumbnailBatchSize = 100,
-    -- v27 bot architecture: bot learning, current-server hop decisions, and
-    -- pre-join server selection are deliberately independent systems. Only a
-    -- physically certified all-bot server may add hashes to the strict database.
+    -- v34 bot architecture: current-server evidence MAY force a fast escape, but
+    -- automated permanent learning remains stricter: only a physically certified
+    -- 100%-of-current-remotes bot server may add automated trusted hashes.
     -- Server-list GETs prefer game:HttpGet and validate token-bearing rows before
     -- falling back to executor HTTP; unavailable previews are UNKNOWN, not blocked. Bot certification uses persistent per-player evidence across deaths, respawns, and membership changes.
     -- Bot certification uses only replicated remote Humanoid.MoveDirection plus
@@ -164,8 +173,15 @@ local CONFIG = {
     -- completely excluded from bot learning.
     AutoTraderBotCurrentPreviewRetrySeconds = 5,
     AutoTraderGoldBotMinPreviewSamples = 5,
-    AutoTraderGoldBotRejectRatio = 0.50,
-    AutoTraderGoldBotWarnRatio = 0.30,
+    -- v34 goal: avoid bot servers aggressively. Permanent AUTOMATED learning
+    -- remains 100%-of-current-remotes only; this lower pre-join threshold merely
+    -- refuses destinations containing already-trusted bot fingerprints.
+    AutoTraderGoldBotRejectRatio = 0.30,
+    AutoTraderGoldBotWarnRatio = 0.20,
+    AutoTraderSuspectedBotHopRatio = 0.75,
+    AutoTraderSuspectedBotHopMinPassed = 5,
+    AutoTraderSuspectedBotHopObserveSeconds = 8.0,
+    AutoTraderManualBotConfirmSeconds = 4.0,
     AutoTraderGoldBotObservedMinJobs = 1,
     AutoTraderGoldBotKnownMinJobs = 2,
     AutoTraderGoldBotConfirmMinJobs = 3,
@@ -229,8 +245,8 @@ local CONFIG = {
 }
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
-    supportFormat = "SV_AUTO_TRADER_SUPPORT_V33",
-    distributionNormalizedSha256 = "9c8fd7d717a21d1350432f53d2de21d48bc7829268619f4630e9beb650c70c35",
+    supportFormat = "SV_AUTO_TRADER_SUPPORT_V34",
+    distributionNormalizedSha256 = "a064c12654d89f3adc80ff9747d4b4056690da83c9023db14863c8387de9e165",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -251,6 +267,11 @@ local function validateConfigRelationships()
     need(CONFIG.AutoTraderMinWinPercent >= 0 and CONFIG.AutoTraderMinWinPercent <= 1, "minimum-win percentage is invalid")
     need(CONFIG.AutoTraderGoldBotRejectRatio >= 0 and CONFIG.AutoTraderGoldBotRejectRatio <= 1, "bot reject ratio is invalid")
     need(CONFIG.AutoTraderGoldBotWarnRatio >= 0 and CONFIG.AutoTraderGoldBotWarnRatio <= CONFIG.AutoTraderGoldBotRejectRatio, "bot warn/reject ratios are invalid")
+    need(CONFIG.AutoTraderSuspectedBotHopRatio > 0 and CONFIG.AutoTraderSuspectedBotHopRatio <= 1, "suspected bot-server hop ratio is invalid")
+    need(CONFIG.AutoTraderSuspectedBotHopMinPassed >= CONFIG.AutoTraderGoldMinRemotePlayers, "suspected bot-server minimum evidence is too small")
+    need(CONFIG.AutoTraderIncomingActionAckSeconds > 0 and CONFIG.AutoTraderIncomingActionMaxRounds >= 1, "incoming trade acknowledgement policy is invalid")
+    need(CONFIG.AutoTraderTradeTransportRecoveryFailures >= 1, "trade transport recovery threshold is invalid")
+    need(CONFIG.AutoTraderSessionHistoryLimit >= 1 and CONFIG.AutoTraderSessionEventLimit >= 8, "session history limits are invalid")
     need(CONFIG.RemoteTimeoutSeconds > 0 and CONFIG.AutoTraderHttpTimeoutSeconds > 0, "remote/http timeouts must be positive")
     need(CONFIG.AutoTraderBootstrapMaxAttempts > 0 and CONFIG.AutoTraderBootstrapInitialRetrySeconds > 0, "bootstrap retry policy is invalid")
     need(CONFIG.AutoTraderBootstrapHttpAttemptTimeoutSeconds > 0 and CONFIG.AutoTraderBootstrapExecutionTimeoutSeconds > 0, "bootstrap operation timeouts must be positive")
@@ -6580,6 +6601,7 @@ State.AutoTrader = {
     PreferencesKey = "__SV_AUTO_TRADER_PREFS_V3",
     PreferencesFile = "SV_AutoTrader_Preferences_v3.json",
     DebugLogFile = "SV_AutoTrader_DebugLog_v1.jsonl",
+    SessionHistoryFile = "SV_AutoTrader_SessionHistory_v1.json",
     TeleportScriptLkgFile = "SV_AutoTrader_LastKnownGoodScript_v1.lua",
     TargetStatsKey = "__SV_AUTO_TRADER_TARGET_STATS_V2",
     TargetStatsFile = "SV_AutoTrader_TargetStats_v2.json",
@@ -6643,6 +6665,8 @@ State.AutoTrader = {
     IncomingRequestFrame = nil,
     IncomingRequestUsernameObject = nil,
     IncomingRequestGeneration = 0,
+    IncomingRequestActionGeneration = 0,
+    IncomingRequestActionInFlight = nil,
     IncomingRequestDecision = nil,
     IncomingRequestResolvingSignature = nil,
     IncomingRequestLastSignature = nil,
@@ -6699,7 +6723,7 @@ State.AutoTrader = {
     ServerCandidateCache = {version = 1, entries = {}},
     ServerCandidateCacheSaveGeneration = 0,
     LastServerCandidateCacheUse = nil,
-    BotIconDb = {version = 4, icons = {}},
+    BotIconDb = {version = 5, icons = {}},
     BotIconDbSaveGeneration = 0,
     BotLearningDoneJobId = nil,
     BotLearningLastAttemptAt = 0,
@@ -6724,6 +6748,9 @@ State.AutoTrader = {
     CurrentServerAvatarScreenJobId = nil,
     FastBotHopActive = false,
     FastBotHopReason = nil,
+    LastBotHopEvidence = nil,
+    ManualBotConfirmUntil = 0,
+    ManualBotConfirmRosterKey = nil,
     PlayerBotRiskByUserId = {},
     LastOpportunityDecision = nil,
     AuditedTradesThisServer = 0,
@@ -6786,6 +6813,17 @@ State.AutoTrader = {
     DiskLogPending = 0,
     LastRecoveryReason = nil,
     AutomaticRecoveryCount = 0,
+    TradeTransport = {
+        incomingAttempts = 0, incomingAcknowledged = 0, incomingFailures = 0,
+        outgoingAcknowledged = 0, outgoingFailures = 0, outgoingUnacknowledgedConsecutive = 0,
+        lastIncoming = nil, lastOutgoing = nil, lastFailure = nil,
+    },
+    SessionHistory = {version = 1, sessions = {}},
+    SessionEventHistory = {},
+    SessionHistorySaveGeneration = 0,
+    SessionHistoryLoaded = false,
+    SessionStartedAtUnix = os.time(),
+    SessionStartedAtClock = os.clock(),
     RecoveryReasonLastAt = {},
     ControllerEpoch = tostring(os.time()) .. "-" .. tostring(math.random(100000,999999)),
     DataDegradedReason = nil,
@@ -7348,6 +7386,9 @@ State.AutoTrader.Log = function(kind, data)
     while #log > 120 do table.remove(log, 1) end
     table.insert(State.AutoTrader.DebugLogBuffer, event)
     State.AutoTrader.DiskLogPending = #State.AutoTrader.DebugLogBuffer
+    if type(State.AutoTrader.RecordSessionEvent) == "function" then
+        State.AutoTrader.RecordSessionEvent(event)
+    end
     if #State.AutoTrader.DebugLogBuffer >= CONFIG.AutoTraderDiskLogFlushEveryEvents and not State.AutoTrader.DiskLogFlushInFlight then
         task.defer(function()
             if not Destroyed then
@@ -7357,6 +7398,132 @@ State.AutoTrader.Log = function(kind, data)
         end)
     end
 end
+
+-- v34 cross-teleport support history. Compact, build-aware evidence from the
+-- current session is kept separate from up to three previous controller sessions.
+State.AutoTrader.IsSessionHistoryEvent = function(kind)
+    kind = tostring(kind or "")
+    return kind:find("request", 1, true) ~= nil
+        or kind:find("trade", 1, true) ~= nil
+        or kind:find("teleport", 1, true) ~= nil
+        or kind:find("recovery", 1, true) ~= nil
+        or kind:find("bot_server", 1, true) ~= nil
+        or kind:find("gold_bot_certification", 1, true) ~= nil
+        or kind:find("strict_gold", 1, true) ~= nil
+        or kind:find("manual_bot", 1, true) ~= nil
+        or kind:find("self_test", 1, true) ~= nil
+        or kind:find("integrity", 1, true) ~= nil
+        or kind:find("freeze", 1, true) ~= nil
+        or kind:find("fatal", 1, true) ~= nil
+        or kind:find("server_hop", 1, true) ~= nil
+end
+State.AutoTrader.RecordSessionEvent = function(event)
+    if type(event) ~= "table" or not State.AutoTrader.IsSessionHistoryEvent(event.kind) then return false end
+    local data = event.data
+    if event.kind == "server_hop_queue_built" and type(data) == "table" then
+        data = {count = data.count, selected = data.scan and data.scan.selected}
+    elseif event.kind == "self_test" and type(data) == "table" then
+        data = {ok = data.ok, total = data.total, passed = data.passed, controllerVersion = data.controllerVersion}
+    end
+    table.insert(State.AutoTrader.SessionEventHistory, {
+        seq = event.seq, t = event.t, unix = event.unix, kind = event.kind, data = HARDEN.supportJsonValue(data),
+    })
+    while #State.AutoTrader.SessionEventHistory > CONFIG.AutoTraderSessionEventLimit do
+        table.remove(State.AutoTrader.SessionEventHistory, 1)
+    end
+    if State.AutoTrader.SessionHistoryLoaded and type(State.AutoTrader.ScheduleSessionHistorySave) == "function" then
+        State.AutoTrader.ScheduleSessionHistorySave("event:" .. tostring(event.kind))
+    end
+    return true
+end
+State.AutoTrader.BuildSessionHistoryRecord = function(checkpointReason)
+    local c = State.AutoTrader.GoldBotCertification or {}
+    local session = State.AutoTrader.UiSession or {}
+    local tt = State.AutoTrader.TradeTransport or {}
+    local scan = State.AutoTrader.LastServerScan or {}
+    return HARDEN.supportJsonValue({
+        historySchema = 1, supportFormat = HARDEN.supportFormat, controllerVersion = CONTROLLER_VERSION,
+        distributionSha256 = HARDEN.distributionNormalizedSha256, sessionId = State.AutoTrader.ControllerEpoch,
+        jobId = game.JobId, placeId = game.PlaceId, startedAtUnix = State.AutoTrader.SessionStartedAtUnix,
+        checkpointAtUnix = os.time(), checkpointReason = tostring(checkpointReason or "periodic"),
+        runtimeSeconds = math.max(0, os.clock() - (State.AutoTrader.SessionStartedAtClock or os.clock())),
+        status = State.AutoTrader.Status, statusDetail = State.AutoTrader.StatusDetail,
+        requestLifecycle = State.AutoTrader.RequestLifecycle, lastRequestAttempt = State.AutoTrader.LastRequestAttempt,
+        lastRequestGate = State.AutoTrader.LastRequestGate, incomingRequestDecision = State.AutoTrader.IncomingRequestDecision,
+        tradeTransport = tt, tradeCorrelationId = State.AutoTrader.TradeCorrelationId,
+        pendingRequest = State.AutoTrader.PendingRequest and {
+            userId = State.AutoTrader.PendingRequest.userId, name = State.AutoTrader.PendingRequest.name,
+            phase = State.AutoTrader.PendingRequest.phase, nativeConfirmed = State.AutoTrader.PendingRequest.nativeConfirmed,
+            age = os.clock() - (State.AutoTrader.PendingRequest.sentAt or os.clock()),
+            correlationId = State.AutoTrader.PendingRequest.correlationId,
+        } or nil,
+        uiSession = {requests=session.requests,responses=session.responses,trades=session.trades,successes=session.successes,
+            declines=session.declines,tradeDeclines=session.tradeDeclines,ignored=session.ignored,profit=session.profit},
+        bot = {certificationStatus=c.status,reason=c.reason,currentRemoteCount=c.currentRemoteCount,
+            passedRemoteCount=c.passedRemoteCount,pendingRemoteCount=c.pendingRemoteCount,windowAge=c.windowAge,
+            fastHopActive=State.AutoTrader.FastBotHopActive,fastHopReason=State.AutoTrader.FastBotHopReason,
+            lastHopEvidence=State.AutoTrader.LastBotHopEvidence,lastLearning=State.AutoTrader.LastBotLearning,
+            trustedHashCount=State.AutoTrader.GetGoldBotIconDbCount and State.AutoTrader.GetGoldBotIconDbCount() or nil},
+        database = {status=DatabaseStatus,dataRevision=HARDEN.supremeDataRevision,dataHash=HARDEN.supremeDataHash,source=HARDEN.lastDatabaseSource,
+            hashMilliseconds=HARDEN.lastSupremeHashMilliseconds,hashYields=HARDEN.lastSupremeHashYields,degradedReason=State.AutoTrader.DataDegradedReason},
+        mapping = {revision=State.Mapping.Revision,source=HARDEN.lastMappingSource},
+        runtimeHealth = {externalOperations=externalOperationHealth(),remoteInvoke={hung=State.AutoTrader.HungRemoteInvokes,
+            circuitOpen=State.AutoTrader.RemoteInvokeCircuitOpen,timeoutsThisServer=State.AutoTrader.RemoteInvokeTimeoutsThisServer}},
+        teleport = {integrity=State.AutoTrader.TeleportScriptIntegrity,queueOutcome=State.AutoTrader.TeleportQueueOutcome,lastReason=State.AutoTrader.LastTeleportReason},
+        recovery = {count=State.AutoTrader.AutomaticRecoveryCount,lastReason=State.AutoTrader.LastRecoveryReason},
+        serverScan = {selected=scan.selected,queueCount=scan.queueCount,safeCandidateCount=scan.safeCandidateCount,
+            trustedCandidateCount=scan.trustedCandidateCount,unknownCandidateCount=scan.unknownCandidateCount},
+        recentEvents = table.clone(State.AutoTrader.SessionEventHistory),
+    })
+end
+State.AutoTrader.LoadSessionHistory = function()
+    local decoded = HARDEN.readJsonFileBestEffort(State.AutoTrader.SessionHistoryFile)
+    local sessions = {}
+    if type(decoded) == "table" and tonumber(decoded.version) == 1 then
+        if type(decoded.current) == "table" and decoded.current.sessionId ~= State.AutoTrader.ControllerEpoch then
+            table.insert(sessions, decoded.current)
+        end
+        for _, row in ipairs(type(decoded.sessions) == "table" and decoded.sessions or {}) do
+            if type(row) == "table" and row.sessionId ~= State.AutoTrader.ControllerEpoch then
+                local duplicate = false
+                for _, existing in ipairs(sessions) do
+                    if existing.sessionId == row.sessionId then duplicate = true; break end
+                end
+                if not duplicate then table.insert(sessions, row) end
+            end
+            if #sessions >= CONFIG.AutoTraderSessionHistoryLimit then break end
+        end
+    end
+    while #sessions > CONFIG.AutoTraderSessionHistoryLimit do table.remove(sessions) end
+    State.AutoTrader.SessionHistory = {version = 1, sessions = sessions}
+    State.AutoTrader.SessionHistoryLoaded = true
+    return true
+end
+State.AutoTrader.SaveSessionHistory = function(reason)
+    if not State.AutoTrader.SessionHistoryLoaded then return false, "session history not loaded" end
+    local document = {version=1,historySchema=1,writtenByVersion=CONTROLLER_VERSION,writtenBySupportFormat=HARDEN.supportFormat,
+        current=State.AutoTrader.BuildSessionHistoryRecord(reason),sessions=State.AutoTrader.SessionHistory.sessions or {}}
+    local okEncode, body = pcall(function() return HttpService:JSONEncode(document) end)
+    if not okEncode or type(body) ~= "string" then return false, tostring(body) end
+    return HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.SessionHistoryFile, body)
+end
+State.AutoTrader.ScheduleSessionHistorySave = function(reason)
+    State.AutoTrader.SessionHistorySaveGeneration += 1
+    local generation = State.AutoTrader.SessionHistorySaveGeneration
+    task.delay(CONFIG.AutoTraderSessionHistorySaveDelaySeconds, function()
+        if Destroyed or generation ~= State.AutoTrader.SessionHistorySaveGeneration then return end
+        State.AutoTrader.SaveSessionHistory(reason)
+    end)
+    return true
+end
+State.AutoTrader.BuildSessionHistorySupport = function()
+    return {historySchema=1,current=State.AutoTrader.BuildSessionHistoryRecord("support_snapshot"),
+        previousSessions=HARDEN.supportJsonValue(State.AutoTrader.SessionHistory.sessions or {}),
+        previousSessionLimit=CONFIG.AutoTraderSessionHistoryLimit,historyFile=State.AutoTrader.SessionHistoryFile}
+end
+State.AutoTrader.LoadSessionHistory()
+State.AutoTrader.ScheduleSessionHistorySave("startup")
+
 State.AutoTrader.GetMinimumWin = function()
     local index = clamp(
         math.floor(tonumber(State.AutoTrader.Preferences.winPreset) or 2),
@@ -7423,6 +7590,11 @@ State.AutoTrader.RunSelfTests = function()
             return indexFailures==0, tostring(indexFailures).."/"..tostring(indexChecked).." sampled records did not round-trip"
         end)
     end
+    run("bot-trust-provenance", function()
+        local record = {strictGoldBotJobs={autoA=1,shared=1},manualGoldBotJobs={manualB=1,shared=2}}
+        return State.AutoTrader.GetTrustedBotIconJobCount(record) == 3,
+            "trusted bot hash provenance must count the union of automated full-server and explicit manual certifications"
+    end)
     run("linked-mapping-shape", function()
         local mappingChecked, mappingFailures = 0, 0
         for _, link in pairs(State.Mapping.ItemLinks or {}) do
@@ -8512,11 +8684,12 @@ State.AutoTrader.NormalizeBotIconDb = function(value)
                     -- Legacy fields are retained only so existing local files remain readable.
                     botEvidence = 0, humanEvidence = 0, botJobs = {}, humanJobs = {},
                     botPlayerSightings = 0, humanPlayerSightings = 0,
-                    -- v19/v20-era gold fields are preserved as legacy history only. v26 server
-                    -- filtering uses ONLY strictGoldBotJobs, written only after the
-                    -- strict MoveDirection + fixed-facing departure commit is validated.
+                    -- v19/v20-era gold fields are preserved as legacy history only. v34 server
+                    -- filtering trusts only automated strict full-server jobs plus explicit
+                    -- two-step manual certifications; legacy heuristic evidence never filters.
                     goldBotJobs = {}, goldBotSightings = 0,
                     strictGoldBotJobs = {}, strictGoldBotSightings = 0,
+                    manualGoldBotJobs = {}, manualGoldBotSightings = 0,
                     sampleUserId = tonumber(oldRecord.sampleUserId), sampleName = oldRecord.sampleName,
                     firstSeen = tonumber(oldRecord.firstSeen) or tonumber(oldRecord.lastSeen) or os.time(),
                     lastSeen = 0,
@@ -8529,6 +8702,7 @@ State.AutoTrader.NormalizeBotIconDb = function(value)
             record.humanPlayerSightings += math.max(0, tonumber(oldRecord.humanPlayerSightings) or 0)
             record.goldBotSightings += math.max(0, tonumber(oldRecord.goldBotSightings) or 0)
             record.strictGoldBotSightings += math.max(0, tonumber(oldRecord.strictGoldBotSightings) or 0)
+            record.manualGoldBotSightings = (tonumber(record.manualGoldBotSightings) or 0) + math.max(0, tonumber(oldRecord.manualGoldBotSightings) or 0)
             record.lastSeen = math.max(record.lastSeen or 0, tonumber(oldRecord.lastSeen) or 0)
             if not record.sampleUserId then record.sampleUserId = tonumber(oldRecord.sampleUserId) end
             if (not record.sampleName or record.sampleName == "") and type(oldRecord.sampleName) == "string" then
@@ -8538,10 +8712,12 @@ State.AutoTrader.NormalizeBotIconDb = function(value)
             mergeJobs(record.humanJobs, oldRecord.humanJobs)
             mergeJobs(record.goldBotJobs, oldRecord.goldBotJobs)
             mergeJobs(record.strictGoldBotJobs, oldRecord.strictGoldBotJobs)
+            record.manualGoldBotJobs = type(record.manualGoldBotJobs) == "table" and record.manualGoldBotJobs or {}
+            mergeJobs(record.manualGoldBotJobs, oldRecord.manualGoldBotJobs)
         end
     end
     value.icons = merged
-    value.version = 4
+    value.version = 5
     return value
 end
 State.AutoTrader.LoadBotIconDb = function()
@@ -8588,22 +8764,24 @@ State.AutoTrader.PruneBotIconDb = function()
             record.humanPlayerSightings = tonumber(record.humanPlayerSightings) or 0
             record.goldBotSightings = tonumber(record.goldBotSightings) or 0
             record.strictGoldBotSightings = tonumber(record.strictGoldBotSightings) or 0
+            record.manualGoldBotSightings = tonumber(record.manualGoldBotSightings) or 0
             record.firstSeen = tonumber(record.firstSeen) or tonumber(record.lastSeen) or os.time()
             record.lastSeen = tonumber(record.lastSeen) or 0
             record.botJobs = pruneJobs(record.botJobs)
             record.humanJobs = pruneJobs(record.humanJobs)
             record.goldBotJobs = pruneJobs(record.goldBotJobs)
             record.strictGoldBotJobs = pruneJobs(record.strictGoldBotJobs)
+            record.manualGoldBotJobs = pruneJobs(record.manualGoldBotJobs)
             table.insert(rows, {fingerprint = fingerprint, record = record})
         end
     end
     table.sort(rows, function(a, b)
-        local ag = State.AutoTrader.BotIconJobCount and State.AutoTrader.BotIconJobCount(a.record.strictGoldBotJobs) or 0
-        local bg = State.AutoTrader.BotIconJobCount and State.AutoTrader.BotIconJobCount(b.record.strictGoldBotJobs) or 0
+        local ag = State.AutoTrader.GetTrustedBotIconJobCount and State.AutoTrader.GetTrustedBotIconJobCount(a.record) or 0
+        local bg = State.AutoTrader.GetTrustedBotIconJobCount and State.AutoTrader.GetTrustedBotIconJobCount(b.record) or 0
         if ag ~= bg then return ag > bg end
-        if (a.record.strictGoldBotSightings or 0) ~= (b.record.strictGoldBotSightings or 0) then
-            return (a.record.strictGoldBotSightings or 0) > (b.record.strictGoldBotSightings or 0)
-        end
+        local as = (tonumber(a.record.strictGoldBotSightings) or 0) + (tonumber(a.record.manualGoldBotSightings) or 0)
+        local bs = (tonumber(b.record.strictGoldBotSightings) or 0) + (tonumber(b.record.manualGoldBotSightings) or 0)
+        if as ~= bs then return as > bs end
         return (a.record.lastSeen or 0) > (b.record.lastSeen or 0)
     end)
     local nextIcons = {}
@@ -8638,6 +8816,17 @@ State.AutoTrader.BotIconJobCount = function(jobTable)
     for _ in pairs(type(jobTable) == "table" and jobTable or {}) do count += 1 end
     return count
 end
+State.AutoTrader.GetTrustedBotIconJobCount = function(record)
+    if type(record) ~= "table" then return 0 end
+    local seen, count = {}, 0
+    for jobId in pairs(type(record.strictGoldBotJobs) == "table" and record.strictGoldBotJobs or {}) do
+        if type(jobId) == "string" and not seen[jobId] then seen[jobId] = true; count += 1 end
+    end
+    for jobId in pairs(type(record.manualGoldBotJobs) == "table" and record.manualGoldBotJobs or {}) do
+        if type(jobId) == "string" and not seen[jobId] then seen[jobId] = true; count += 1 end
+    end
+    return count
+end
 State.AutoTrader.GetBotIconDbCount = function()
     local count = 0
     for _ in pairs(State.AutoTrader.BotIconDb.icons or {}) do count += 1 end
@@ -8654,6 +8843,7 @@ State.AutoTrader.GetBotIconRecord = function(fingerprint, create)
             botPlayerSightings = 0, humanPlayerSightings = 0,
             goldBotJobs = {}, goldBotSightings = 0,
             strictGoldBotJobs = {}, strictGoldBotSightings = 0,
+            manualGoldBotJobs = {}, manualGoldBotSightings = 0,
             sampleUserId = nil, sampleName = nil,
             firstSeen = os.time(), lastSeen = os.time(),
         }
@@ -8670,6 +8860,8 @@ State.AutoTrader.GetBotIconRecord = function(fingerprint, create)
         record.goldBotSightings = tonumber(record.goldBotSightings) or 0
         record.strictGoldBotJobs = type(record.strictGoldBotJobs) == "table" and record.strictGoldBotJobs or {}
         record.strictGoldBotSightings = tonumber(record.strictGoldBotSightings) or 0
+        record.manualGoldBotJobs = type(record.manualGoldBotJobs) == "table" and record.manualGoldBotJobs or {}
+        record.manualGoldBotSightings = tonumber(record.manualGoldBotSightings) or 0
         record.sampleUserId = tonumber(record.sampleUserId)
         record.sampleName = type(record.sampleName) == "string" and record.sampleName or nil
         record.firstSeen = tonumber(record.firstSeen) or os.time()
@@ -8680,9 +8872,10 @@ end
 State.AutoTrader.GetBotIconClass = function(fingerprint)
     local record = State.AutoTrader.GetBotIconRecord(fingerprint, false)
     if not record then return "unknown", 0, nil end
-    -- v26 intentionally ignores legacy v19 goldBotJobs. Only strictGoldBotJobs that
-    -- passed remote MoveDirection + fixed-facing certification participate.
-    local goldJobs = State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs)
+    -- v34 trusts only two high-confidence provenance classes: automated full-server
+    -- physical certification and explicit two-step user certification. Legacy
+    -- heuristic evidence remains diagnostic-only and never filters a server.
+    local goldJobs = State.AutoTrader.GetTrustedBotIconJobCount(record)
     if goldJobs >= CONFIG.AutoTraderGoldBotConfirmMinJobs then return "confirmed_bot", 0.99, record end
     if goldJobs >= CONFIG.AutoTraderGoldBotKnownMinJobs then return "known_bot", 0.93, record end
     if goldJobs >= CONFIG.AutoTraderGoldBotObservedMinJobs then return "observed_bot", 0.80, record end
@@ -8691,7 +8884,7 @@ end
 State.AutoTrader.GetGoldBotIconDbCount = function()
     local count = 0
     for _, record in pairs(State.AutoTrader.BotIconDb.icons or {}) do
-        if State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs) >= CONFIG.AutoTraderGoldBotObservedMinJobs then count += 1 end
+        if State.AutoTrader.GetTrustedBotIconJobCount(record) >= CONFIG.AutoTraderGoldBotObservedMinJobs then count += 1 end
     end
     return count
 end
@@ -8709,8 +8902,26 @@ State.AutoTrader.AddStrictGoldBotIconEvidence = function(fingerprint, jobId, pla
     record.lastSeen = now
     return true
 end
--- Compatibility shim: legacy reputation writers are disabled in v26. The strict
--- writer above is called only by ImportStrictGoldTeleportCommit from a validated departure payload.
+State.AutoTrader.AddManualGoldBotIconEvidence = function(fingerprint, jobId, playerSightings, sampleUserId, sampleName)
+    fingerprint = State.AutoTrader.ExtractAvatarHeadshotHash(fingerprint) or fingerprint
+    local record = State.AutoTrader.GetBotIconRecord(fingerprint, true)
+    if not record then return false end
+    local now = os.time()
+    playerSightings = math.max(1, tonumber(playerSightings) or 1)
+    record.manualGoldBotJobs = type(record.manualGoldBotJobs) == "table" and record.manualGoldBotJobs or {}
+    record.manualGoldBotSightings = tonumber(record.manualGoldBotSightings) or 0
+    local sourceJob = type(jobId) == "string" and jobId ~= "" and jobId or ("manual:" .. tostring(game.JobId))
+    local newJob = record.manualGoldBotJobs[sourceJob] == nil
+    record.manualGoldBotJobs[sourceJob] = now
+    if newJob then record.manualGoldBotSightings += playerSightings end
+    if not record.sampleUserId then record.sampleUserId = tonumber(sampleUserId) end
+    if (not record.sampleName or record.sampleName == "") and type(sampleName) == "string" then record.sampleName = sampleName end
+    record.lastSeen = now
+    return true
+end
+-- Compatibility shim: legacy heuristic reputation writers remain disabled. Automated
+-- strict evidence still enters only through validated full-server departure commits; the
+-- separate manual writer is used only by the explicit two-step user certification control.
 State.AutoTrader.AddBotIconEvidence = function()
     return false
 end
@@ -8833,8 +9044,8 @@ State.AutoTrader.BuildCompactTeleportBotDb = function()
     local rows = {}
     for fingerprint, record in pairs(State.AutoTrader.BotIconDb.icons or {}) do table.insert(rows, {fingerprint = fingerprint, record = record}) end
     table.sort(rows, function(a, b)
-        local ag = State.AutoTrader.BotIconJobCount(a.record.strictGoldBotJobs)
-        local bg = State.AutoTrader.BotIconJobCount(b.record.strictGoldBotJobs)
+        local ag = State.AutoTrader.GetTrustedBotIconJobCount(a.record)
+        local bg = State.AutoTrader.GetTrustedBotIconJobCount(b.record)
         if ag ~= bg then return ag > bg end
         return (tonumber(a.record.lastSeen) or 0) > (tonumber(b.record.lastSeen) or 0)
     end)
@@ -8855,6 +9066,7 @@ State.AutoTrader.BuildCompactTeleportBotDb = function()
         local r = row.record or {}
         icons[row.fingerprint] = {
             strictGoldBotJobs = compactJobs(r.strictGoldBotJobs), strictGoldBotSightings = tonumber(r.strictGoldBotSightings) or 0,
+            manualGoldBotJobs = compactJobs(r.manualGoldBotJobs), manualGoldBotSightings = tonumber(r.manualGoldBotSightings) or 0,
             -- v19 gold and older evidence are retained only for backwards-compatible diagnostics
             goldBotJobs = compactJobs(r.goldBotJobs), goldBotSightings = tonumber(r.goldBotSightings) or 0,
             botEvidence = tonumber(r.botEvidence) or 0, humanEvidence = tonumber(r.humanEvidence) or 0,
@@ -8864,7 +9076,7 @@ State.AutoTrader.BuildCompactTeleportBotDb = function()
             firstSeen = tonumber(r.firstSeen) or 0, lastSeen = tonumber(r.lastSeen) or 0,
         }
     end
-    return {version = 4, icons = icons}
+    return {version = 5, icons = icons}
 end
 State.AutoTrader.RefreshTeleportScriptLkg = function()
     local ok, response, source = fetchStaticTextCompat(CONFIG.AutoTraderTeleportScriptUrl, {["Cache-Control"]="no-cache"}, CONFIG.AutoTraderHttpTimeoutSeconds)
@@ -8970,6 +9182,9 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
     }, ";\n")
 end
 State.AutoTrader.QueueTeleportScript = function(reason)
+    if type(State.AutoTrader.SaveSessionHistory) == "function" then
+        State.AutoTrader.SaveSessionHistory("queue_teleport:" .. tostring(reason or "unknown"))
+    end
     if State.AutoTrader.TeleportQueued then return true, State.AutoTrader.TeleportQueueOutcome end
     local queueFunction = State.AutoTrader.GetQueueOnTeleport()
     if type(queueFunction) ~= "function" then
@@ -9440,7 +9655,7 @@ State.AutoTrader.ClassifyServerPreview = function(server, scanContext)
     for _, fingerprint in ipairs(fingerprints) do
         frequencies[fingerprint] = (frequencies[fingerprint] or 0) + 1
         local class, confidence, record = State.AutoTrader.GetBotIconClass(fingerprint)
-        local goldJobs = record and State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs) or 0
+        local goldJobs = record and State.AutoTrader.GetTrustedBotIconJobCount(record) or 0
         classes[fingerprint] = {class = class, confidence = confidence, goldJobs = goldJobs}
         if class ~= "unknown" then goldMatched += 1 end
         if class == "observed_bot" then observed += 1
@@ -9681,7 +9896,14 @@ State.AutoTrader.ImportStrictGoldTeleportCommit = function(payload)
             learned += 1
         end
     end
-    State.AutoTrader.SaveBotIconDb(true)
+    local saved, saveError = State.AutoTrader.SaveBotIconDb(true)
+    if not saved then
+        State.AutoTrader.Status = "BOT CERTIFY · SAVE FAILED"
+        State.AutoTrader.StatusDetail = "Manual certification updated only the live in-memory database, but persistence failed. Staying here so you can copy support/retry: " .. tostring(saveError)
+        State.AutoTrader.Log("manual_bot_certification_failed", {reason=tostring(saveError), stage="persistence", hashesPrepared=learned})
+        State.AutoTrader.Render()
+        return false, tostring(saveError)
+    end
     State.AutoTrader.LastBotLearning = {
         jobId = sourceJobId, importedIntoJobId = game.JobId,
         action = "strict_gold_departure_commit_imported",
@@ -9768,6 +9990,74 @@ State.AutoTrader.ClearStrictGoldCandidateStaging = function(certification, reaso
     c.candidatePreparedAt = 0
     if c.status == "candidate" then c.status = "observing" end
     if reason then c.reason = tostring(reason) end
+    return true
+end
+
+State.AutoTrader.IsBotEscapeActive = function()
+    if State.AutoTrader.FastBotHopActive ~= true then return false end
+    local reason = State.AutoTrader.FastBotHopReason
+    return reason == "SUSPECTED_BOT_SERVER"
+        or reason == "CERTIFIED_BOT_SERVER"
+        or reason == "MANUAL_CERTIFIED_BOT_SERVER"
+end
+
+State.AutoTrader.EvaluateBotAvoidanceHop = function(certification)
+    local c = certification or State.AutoTrader.GoldBotCertification
+    if type(c) ~= "table" or c.jobId ~= game.JobId or c.status == "regular" then return false end
+    if not State.AutoTrader.Preferences.automation or not CONFIG.AutoTraderServerHopEnabled then return false end
+    local total = math.max(0, tonumber(c.currentRemoteCount) or 0)
+    local passed = math.max(0, tonumber(c.passedRemoteCount) or 0)
+    if total < CONFIG.AutoTraderGoldMinRemotePlayers or passed < CONFIG.AutoTraderSuspectedBotHopMinPassed then return false end
+    local ratio = total > 0 and passed / total or 0
+    local observeFloor = math.max(
+        tonumber(CONFIG.AutoTraderSuspectedBotHopObserveSeconds) or 8,
+        State.AutoTrader.GetGoldAdaptiveObserveSeconds() + 1
+    )
+    if (tonumber(c.windowAge) or 0) < observeFloor then return false end
+
+    local reason = nil
+    local learningEligible = false
+    if passed == total and c.status == "candidate" and type(c.candidateFingerprintByUserId) == "table" then
+        reason = "CERTIFIED_BOT_SERVER"
+        learningEligible = true
+    elseif ratio >= CONFIG.AutoTraderSuspectedBotHopRatio then
+        reason = "SUSPECTED_BOT_SERVER"
+    end
+    if not reason then return false end
+    if State.AutoTrader.FastBotHopActive and State.AutoTrader.FastBotHopReason == reason then return true end
+
+    State.AutoTrader.FastBotHopActive = true
+    State.AutoTrader.FastBotHopReason = reason
+    if not State.CurrentTrade and State.AutoTrader.PendingRequest
+        and State.AutoTrader.PendingRequest.phase ~= "canceling"
+        and type(State.AutoTrader.BeginPendingRequestCancellation) == "function" then
+        local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(
+            "outgoing request canceled because current server is bot-heavy", "deferred", false
+        )
+        if not started then State.AutoTrader.Log("bot_server_request_cancel_failed", {reason=cancelReason}) end
+    end
+    if not State.CurrentTrade and type(State.AutoTrader.HandleIncomingRequest) == "function" then
+        task.defer(State.AutoTrader.HandleIncomingRequest)
+    end
+    State.AutoTrader.LastBotHopEvidence = {
+        source = "physical_current_server", jobId = game.JobId, at = os.clock(), atUnix = os.time(),
+        passed = passed, total = total, ratio = ratio, windowAge = c.windowAge,
+        learningEligible = learningEligible, certificationStatus = c.status,
+        rule = learningEligible
+            and "100% physical certification; strict hashes may commit only after successful teleport"
+            or "high-confidence escape only; incomplete evidence teaches ZERO bot hashes",
+    }
+    State.AutoTrader.Log(learningEligible and "certified_bot_server_hop" or "suspected_bot_server_hop", State.AutoTrader.LastBotHopEvidence)
+    State.AutoTrader.Status = learningEligible and "BOT SERVER · CERTIFIED" or "BOT SERVER · SUSPECTED"
+    State.AutoTrader.StatusDetail = learningEligible
+        and ("All " .. tostring(total) .. " remote players passed strict physical certification. Leaving and committing only the fully certified roster after a successful teleport.")
+        or (tostring(passed) .. "/" .. tostring(total) .. " remote players passed the physical bot pattern with no human contradiction. Leaving without learning any new icons from this incomplete server.")
+    State.AutoTrader.Render()
+    task.defer(function()
+        if not Destroyed and State.AutoTrader.FastBotHopActive then
+            State.AutoTrader.TryServerHop(reason, select(2, State.AutoTrader.GetServerDisposition()))
+        end
+    end)
     return true
 end
 
@@ -10035,6 +10325,7 @@ State.AutoTrader.SampleGoldBotCertification = function()
                 .. " + " .. string.format("%.2fs", CONFIG.AutoTraderGoldAdaptiveObservePaddingSeconds)
                 .. " padding, capped at " .. string.format("%.1fs", CONFIG.AutoTraderGoldObserveSeconds) .. ")."
         end
+        State.AutoTrader.EvaluateBotAvoidanceHop(c)
         return true
     end
 
@@ -10053,6 +10344,7 @@ State.AutoTrader.SampleGoldBotCertification = function()
         })
     end
     State.AutoTrader.PrepareStrictGoldCandidate(c)
+    State.AutoTrader.EvaluateBotAvoidanceHop(c)
     return true
 end
 
@@ -10089,6 +10381,8 @@ State.AutoTrader.BuildGoldCertificationSupport = function()
         membershipKey = c.membershipKey, sampleCount = c.sampleCount, attempts = c.attempts,
         certifiedAt = c.certifiedAt, candidatePreparedAt = c.candidatePreparedAt,
         committedAt = c.committedAt, learnedHashes = c.learnedHashes,
+        manualCertifiedAt = c.manualCertifiedAt, manualCertifiedPlayers = c.manualCertifiedPlayers,
+        manualCertifiedHashes = c.manualCertifiedHashes, lastBotHopEvidence = State.AutoTrader.LastBotHopEvidence,
         failedPlayer = c.failedPlayer, failedUserId = c.failedUserId, failedAt = c.failedAt,
         humanDetectionSeconds = c.humanDetectionSeconds, requiredObserveSeconds = c.requiredObserveSeconds,
         moveDirectionViolation = c.moveDirectionViolation, maxObservedMoveDirection = c.maxObservedMoveDirection,
@@ -10124,7 +10418,7 @@ State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     local matched = 0
     for userId, fingerprint in pairs(current.fingerprintByUserId or {}) do
         local class, confidence, record = State.AutoTrader.GetBotIconClass(fingerprint)
-        local goldJobs = record and State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs) or 0
+        local goldJobs = record and State.AutoTrader.GetTrustedBotIconJobCount(record) or 0
         local displayRisk = class == "confirmed_bot" and 0.99 or class == "known_bot" and 0.93 or class == "observed_bot" and 0.80 or 0
         if class ~= "unknown" then matched += 1 end
         botByUserId[userId] = {fingerprint = fingerprint, class = class, confidence = confidence, goldJobs = goldJobs, displayRisk = displayRisk}
@@ -10141,6 +10435,93 @@ State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     State.AutoTrader.CurrentServerAvatarScreen = result
     State.AutoTrader.Log("current_server_avatar_screen", result)
     return result
+end
+
+State.AutoTrader.ManuallyCertifyCurrentServerBots = function()
+    if Destroyed then return false, "controller destroyed" end
+    local okThumb, current, reason = State.AutoTrader.ResolveCurrentPlayerFingerprints()
+    if not okThumb or type(current) ~= "table" then
+        State.AutoTrader.Status = "BOT CERTIFY · FAILED"
+        State.AutoTrader.StatusDetail = "Manual certification learned nothing because every current remote avatar could not be resolved: " .. tostring(reason)
+        State.AutoTrader.Log("manual_bot_certification_failed", {reason = reason, stage = "thumbnail_resolution"})
+        State.AutoTrader.Render()
+        return false, reason
+    end
+    local remoteCount = math.max(0, tonumber(current.playing) or 0)
+    local resolvedCount = 0
+    for _ in pairs(current.fingerprintByUserId or {}) do resolvedCount += 1 end
+    if remoteCount <= 0 or resolvedCount ~= remoteCount then
+        local detail = "resolved " .. tostring(resolvedCount) .. "/" .. tostring(remoteCount) .. " remote avatar fingerprints"
+        State.AutoTrader.Status = "BOT CERTIFY · INCOMPLETE"
+        State.AutoTrader.StatusDetail = detail .. "; no manual bot evidence was written."
+        State.AutoTrader.Log("manual_bot_certification_failed", {reason = detail, stage = "all_or_nothing_guard"})
+        State.AutoTrader.Render()
+        return false, detail
+    end
+
+    local grouped = {}
+    for userId, fingerprint in pairs(current.fingerprintByUserId or {}) do
+        fingerprint = State.AutoTrader.ExtractAvatarHeadshotHash(fingerprint) or fingerprint
+        if type(fingerprint) ~= "string" or not fingerprint:match("^[0-9a-fA-F]+$") or #fingerprint ~= 32 then
+            local detail = "invalid canonical fingerprint for user " .. tostring(userId)
+            State.AutoTrader.Status = "BOT CERTIFY · FAILED"
+            State.AutoTrader.StatusDetail = detail .. "; no manual bot evidence was written."
+            State.AutoTrader.Log("manual_bot_certification_failed", {reason = detail, stage = "fingerprint_validation"})
+            State.AutoTrader.Render()
+            return false, detail
+        end
+        fingerprint = string.lower(fingerprint)
+        local row = grouped[fingerprint]
+        if not row then
+            row = {fingerprint = fingerprint, count = 0, sampleUserId = userId, sampleName = current.playerNameByUserId and current.playerNameByUserId[userId]}
+            grouped[fingerprint] = row
+        end
+        row.count += 1
+    end
+
+    local sourceJob = "manual:" .. tostring(game.JobId)
+    local learned = 0
+    for _, row in pairs(grouped) do
+        if State.AutoTrader.AddManualGoldBotIconEvidence(row.fingerprint, sourceJob, row.count, row.sampleUserId, row.sampleName) then
+            learned += 1
+        end
+    end
+    State.AutoTrader.SaveBotIconDb(true)
+    State.AutoTrader.LastBotLearning = {
+        jobId = game.JobId, action = "manual_user_certification", source = "manual_user_certification",
+        certifiedPlayers = remoteCount, hashesLearned = learned, atUnix = os.time(),
+        guarantee = "user explicitly certified every current remote player as a bot; all-or-nothing thumbnail resolution",
+    }
+    local c = State.AutoTrader.GoldBotCertification
+    if type(c) == "table" and c.jobId == game.JobId then
+        c.manualCertifiedAt = os.clock()
+        c.manualCertifiedPlayers = remoteCount
+        c.manualCertifiedHashes = learned
+    end
+    State.AutoTrader.FastBotHopActive = true
+    State.AutoTrader.FastBotHopReason = "MANUAL_CERTIFIED_BOT_SERVER"
+    if not State.CurrentTrade and State.AutoTrader.PendingRequest
+        and State.AutoTrader.PendingRequest.phase ~= "canceling"
+        and type(State.AutoTrader.BeginPendingRequestCancellation) == "function" then
+        local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(
+            "outgoing request canceled after manual all-bot certification", "deferred", false
+        )
+        if not started then State.AutoTrader.Log("manual_bot_server_request_cancel_failed", {reason=cancelReason}) end
+    end
+    State.AutoTrader.LastBotHopEvidence = {
+        source = "manual_user_certification", jobId = game.JobId, at = os.clock(), atUnix = os.time(),
+        passed = remoteCount, total = remoteCount, ratio = 1, learningEligible = true, manual = true, hashesLearned = learned,
+    }
+    State.AutoTrader.Log("manual_bot_server_certified", State.AutoTrader.LastBotLearning)
+    State.AutoTrader.Status = "BOT SERVER · MANUALLY CERTIFIED"
+    State.AutoTrader.StatusDetail = "You certified all " .. tostring(remoteCount) .. " remote players as bots. Trusted manual hashes were saved; leaving this server now."
+    State.AutoTrader.Render()
+    task.defer(function()
+        if not Destroyed then
+            State.AutoTrader.TryServerHop("MANUAL_CERTIFIED_BOT_SERVER", select(2, State.AutoTrader.GetServerDisposition()))
+        end
+    end)
+    return true
 end
 
 State.AutoTrader.BuildCachedServerQueue = function()
@@ -10380,8 +10761,12 @@ State.AutoTrader.ServerHopStillAllowed = function()
     local _, liveIncoming = State.AutoTrader.GetIncomingRequestUi()
     local exhausted = string.sub(tostring(currentDisposition), 1, 9) == "EXHAUSTED"
     local forcedReason = State.AutoTrader.FastBotHopReason
-    local explicitNonBotHop = State.AutoTrader.FastBotHopActive == true
-        and (forcedReason == "MANUAL_SERVER_SEARCH" or forcedReason == "EXHAUSTED_NO_PROGRESS")
+    local explicitForcedHop = State.AutoTrader.FastBotHopActive == true
+        and (forcedReason == "MANUAL_SERVER_SEARCH"
+            or forcedReason == "EXHAUSTED_NO_PROGRESS"
+            or forcedReason == "SUSPECTED_BOT_SERVER"
+            or forcedReason == "CERTIFIED_BOT_SERVER"
+            or forcedReason == "MANUAL_CERTIFIED_BOT_SERVER")
     if forcedReason == "EXHAUSTED_NO_PROGRESS" and currentDisposition == "ACTIVE" and State.AutoTrader.SelectTarget then
         local revivedTarget = State.AutoTrader.SelectTarget()
         if revivedTarget then return false, "new trading opportunity appeared: " .. tostring(revivedTarget.Name) end
@@ -10393,8 +10778,8 @@ State.AutoTrader.ServerHopStillAllowed = function()
         and not State.CurrentTrade
         and not State.AutoTrader.PostTradeAuditPending
         and not (liveIncoming and State.AutoTrader.IsGuiShown(liveIncoming))
-    return (exhausted or explicitNonBotHop) and noWork,
-        explicitNonBotHop and tostring(State.AutoTrader.FastBotHopReason) or currentDisposition
+    return (exhausted or explicitForcedHop) and noWork,
+        explicitForcedHop and tostring(State.AutoTrader.FastBotHopReason) or currentDisposition
 end
 State.AutoTrader.GetServerRescanDelay = function(scan)
     local base = math.max(1, tonumber(CONFIG.AutoTraderServerRescanDelaySeconds) or 2)
@@ -10682,7 +11067,8 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
     State.AutoTrader.Render()
 
     task.spawn(function()
-        -- v27: hopping never DECIDES bot identity. A staged strict-gold candidate may be carried only after this ordinary hop decision was already made.
+        -- v34: bot evidence may decide that this server is not worth staying in, but
+        -- only a fully staged 100% physical candidate may carry automated learning evidence.
         if Destroyed
             or not State.AutoTrader.ServerHopInProgress
             or queueGeneration ~= State.AutoTrader.ServerHopQueueGeneration then
@@ -13244,6 +13630,47 @@ State.AutoTrader.IsAnyNativeOutgoingPending = function()
     local _, sending = State.AutoTrader.GetOutgoingRequestUi()
     return sending ~= nil and State.AutoTrader.IsGuiShown(sending)
 end
+State.AutoTrader.AcknowledgeOutgoingTransport = function(pending, source)
+    if type(pending) ~= "table" then return false end
+    if pending.transportAckCounted then
+        State.AutoTrader.TradeTransport.outgoingUnacknowledgedConsecutive = 0
+        return false
+    end
+    pending.transportAckCounted = true
+    local tt = State.AutoTrader.TradeTransport
+    tt.outgoingAcknowledged = (tt.outgoingAcknowledged or 0) + 1
+    tt.outgoingUnacknowledgedConsecutive = 0
+    tt.lastOutgoing = {
+        result = "acknowledged", source = tostring(source or "unknown"),
+        userId = pending.userId, name = pending.name, generation = pending.generation,
+        seconds = os.clock() - (pending.sentAt or os.clock()), at = os.clock(),
+    }
+    State.AutoTrader.Log("request_transport_acknowledged", tt.lastOutgoing)
+    return true
+end
+State.AutoTrader.AcknowledgeIncomingTradeStart = function(player, source)
+    local action = State.AutoTrader.IncomingRequestActionInFlight or State.AutoTrader.IncomingRequestDecision
+    if type(action) ~= "table" or action.decision ~= "accept" or action.acknowledged then return false end
+    if player and action.userId and player.UserId ~= action.userId then return false end
+    action.acknowledged = true
+    action.ackAt = os.clock()
+    action.phase = "acknowledged"
+    action.ackSource = tostring(source or "trade_state")
+    local tt = State.AutoTrader.TradeTransport
+    tt.incomingAcknowledged = (tt.incomingAcknowledged or 0) + 1
+    tt.lastIncoming = {
+        result = "accepted_acknowledged", source = action.ackSource,
+        userId = action.userId, player = action.player, signature = action.signature,
+        attempts = action.attempts or 0, seconds = action.ackAt - (action.at or action.ackAt),
+        at = action.ackAt,
+    }
+    State.AutoTrader.IncomingRequestDecision = action
+    State.AutoTrader.IncomingRequestActionInFlight = nil
+    State.AutoTrader.IncomingRequestLastHandledAt = action.ackAt
+    if player then State.AutoTrader.RecordTargetEvent(player, "incomingAccepted") end
+    State.AutoTrader.Log("incoming_request_authoritative_ack", tt.lastIncoming)
+    return true
+end
 State.AutoTrader.FireCancelRequest = function()
     local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
     local remote = tradeFolder and tradeFolder:FindFirstChild("CancelRequest")
@@ -13255,6 +13682,8 @@ State.AutoTrader.FinalizePendingCancellation = function(pending)
     if not pending or State.AutoTrader.PendingRequest ~= pending then return false end
     local player = Players:GetPlayerByUserId(pending.userId)
     local outcome = pending.cancelOutcome
+    local recoveryAfterCleanup = pending.recoveryAfterCleanup == true
+    local recoveryReason = pending.recoveryReason
     if player and outcome == "trade_unavailable" then
         State.AutoTrader.RecordTargetEvent(player, "ignored", {seconds = os.clock() - (pending.sentAt or os.clock())})
         State.AutoTrader.MarkServerPlayerOutcome(player, "trade_unavailable", pending.cancelReason or "request could not become pending")
@@ -13265,8 +13694,6 @@ State.AutoTrader.FinalizePendingCancellation = function(pending)
         State.AutoTrader.SetCooldown(player, "request ignored", 75)
     elseif player and outcome == "deferred" then
         State.AutoTrader.MarkServerPlayerOutcome(player, "deferred", pending.cancelReason or "outgoing request deferred")
-        -- v30: we canceled this ourselves; do not penalize the player with the full
-        -- repeat-request window after the single-flight quiet barrier completes.
         State.AutoTrader.RequestHistory[player.UserId] = nil
     elseif player and outcome == "local_cancel" then
         State.AutoTrader.MarkServerPlayerOutcome(player, "local_cancel", pending.cancelReason or "request canceled locally")
@@ -13274,14 +13701,19 @@ State.AutoTrader.FinalizePendingCancellation = function(pending)
     State.AutoTrader.Log("request_cancel_confirmed", {
         userId = pending.userId, name = pending.name, outcome = outcome,
         reason = pending.cancelReason, age = os.clock() - (pending.sentAt or os.clock()),
+        recoveryAfterCleanup = recoveryAfterCleanup,
     })
     State.AutoTrader.PendingRequest = nil
     State.AutoTrader.RequestLifecycle = "idle"
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestCancelQuietSeconds
     State.AutoTrader.RequestConfirmGeneration += 1
-    local _, receiving = State.AutoTrader.GetIncomingRequestUi()
-    if receiving and State.AutoTrader.IsGuiShown(receiving) then
-        task.defer(State.AutoTrader.HandleIncomingRequest)
+    if recoveryAfterCleanup then
+        State.AutoTrader.RequestRecoveryTeleport(recoveryReason or "repeated outgoing request transport failures")
+    else
+        local _, receiving = State.AutoTrader.GetIncomingRequestUi()
+        if receiving and State.AutoTrader.IsGuiShown(receiving) then
+            task.defer(State.AutoTrader.HandleIncomingRequest)
+        end
     end
     return true
 end
@@ -13358,6 +13790,7 @@ State.AutoTrader.ReconcileOutgoingRequestState = function()
                 pending.phase = "pending"
                 pending.nativeConfirmed = true
                 pending.confirmedAt = now
+                State.AutoTrader.AcknowledgeOutgoingTransport(pending, "native_sending_request_reconciled")
                 State.AutoTrader.RequestLifecycle = "pending"
                 if player then State.AutoTrader.MarkServerPlayerOutcome(player, "request_pending", "native SendingRequest confirmed") end
                 State.AutoTrader.LastRequestAttempt = {
@@ -13418,33 +13851,48 @@ State.AutoTrader.ReconcileOutgoingRequestState = function()
     end
     return false
 end
-State.AutoTrader.ClickNativeGuiButton = function(button, actionName)
+State.AutoTrader.ClickNativeGuiButton = function(button, actionName, requestedMode)
     if not button or not button:IsA("GuiButton") or not State.AutoTrader.IsGuiShown(button) then
         return false, "button unavailable/hidden"
     end
-    if VirtualInputManager then
-        local center = button.AbsolutePosition + button.AbsoluteSize / 2
-        local ok, err = pcall(function()
-            VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
-            task.wait(0.04)
-            VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0)
-        end)
-        if ok then
-            State.AutoTrader.Log("native_gui_click", {action = actionName, mode = "VirtualInputManager"})
-            return true
+    local modes = requestedMode and {requestedMode}
+        or {"VirtualInputManager", "firesignal.MouseButton1Click", "firesignal.Activated"}
+    local lastReason = "no working GUI click method"
+    for _, mode in ipairs(modes) do
+        if mode == "VirtualInputManager" then
+            if VirtualInputManager then
+                local center = button.AbsolutePosition + button.AbsoluteSize / 2
+                local ok, err = pcall(function()
+                    VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
+                    task.wait(0.04)
+                    VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0)
+                end)
+                if ok then
+                    State.AutoTrader.Log("native_gui_click_attempt", {action = actionName, mode = mode})
+                    return true, mode
+                end
+                lastReason = tostring(err)
+                State.AutoTrader.Log("native_gui_click_failed", {action = actionName, mode = mode, error = lastReason})
+            else
+                lastReason = "VirtualInputManager unavailable"
+            end
+        elseif mode == "firesignal.MouseButton1Click" or mode == "firesignal.Activated" then
+            local firesignalFunction = State.TryGetExecutorGlobal("firesignal")
+            if type(firesignalFunction) == "function" then
+                local signal = mode == "firesignal.Activated" and button.Activated or button.MouseButton1Click
+                local ok, err = pcall(firesignalFunction, signal)
+                if ok then
+                    State.AutoTrader.Log("native_gui_click_attempt", {action = actionName, mode = mode})
+                    return true, mode
+                end
+                lastReason = tostring(err)
+                State.AutoTrader.Log("native_gui_click_failed", {action = actionName, mode = mode, error = lastReason})
+            else
+                lastReason = "firesignal unavailable"
+            end
         end
-        State.AutoTrader.Log("native_gui_click_failed", {action = actionName, mode = "VirtualInputManager", error = tostring(err)})
     end
-    local firesignalFunction = State.TryGetExecutorGlobal("firesignal")
-    if type(firesignalFunction) == "function" then
-        local ok, err = pcall(firesignalFunction, button.MouseButton1Click)
-        if ok then
-            State.AutoTrader.Log("native_gui_click", {action = actionName, mode = "firesignal.MouseButton1Click"})
-            return true
-        end
-        State.AutoTrader.Log("native_gui_click_failed", {action = actionName, mode = "firesignal", error = tostring(err)})
-    end
-    return false, "no working GUI click method"
+    return false, lastReason
 end
 State.AutoTrader.CancelOutgoingForIncoming = function(incomingPlayer)
     local pending = State.AutoTrader.PendingRequest
@@ -13480,7 +13928,7 @@ State.AutoTrader.DecideIncomingRequester = function(player)
 end
 State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signature)
     State.AutoTrader.IncomingRequestResolvingSignature = nil
-    local _, receiving, title, username, accept, decline = State.AutoTrader.GetIncomingRequestUi()
+    local _, receiving, title, username = State.AutoTrader.GetIncomingRequestUi()
     if not receiving or not State.AutoTrader.IsGuiShown(receiving) then return false end
     local currentSignature = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
         .. "|" .. State.AutoTrader.GetTextValue(title)
@@ -13488,7 +13936,7 @@ State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signa
     if decision == "accept" then
         local canceled, cancelReason = State.AutoTrader.CancelOutgoingForIncoming(player)
         if not canceled then
-            State.AutoTrader.Log("incoming_blocked_cancel_pending", {player = player.Name, reason = cancelReason})
+            State.AutoTrader.Log("incoming_blocked_cancel_pending", {player = player and player.Name or nil, reason = cancelReason})
             State.AutoTrader.IncomingRequestLastHandledAt = 0
             task.delay(0.15, function()
                 if not Destroyed then State.AutoTrader.HandleIncomingRequest() end
@@ -13496,29 +13944,136 @@ State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signa
             return false
         end
     end
-    local button = decision == "accept" and accept or decline
-    local ok, clickReason = State.AutoTrader.ClickNativeGuiButton(button, "incoming_" .. decision)
-    State.AutoTrader.IncomingRequestDecision = {
-        player = player and player.Name or nil,
-        userId = player and player.UserId or nil,
-        decision = decision,
-        reason = reason,
-        signature = signature,
-        at = os.clock(),
-        clickOk = ok,
-        clickReason = clickReason,
-    }
-    State.AutoTrader.IncomingRequestLastHandledAt = os.clock()
-    State.AutoTrader.IncomingRequestLastSignature = signature
-    State.AutoTrader.Log("incoming_request_decision", State.AutoTrader.IncomingRequestDecision)
-    if player then
-        State.AutoTrader.RecordTargetEvent(player, "incomingRequest")
-        if decision == "accept" and ok then State.AutoTrader.RecordTargetEvent(player, "incomingAccepted") end
+    if State.AutoTrader.IncomingRequestActionInFlight
+        and State.AutoTrader.IncomingRequestActionInFlight.signature == signature then
+        return true
     end
+
+    State.AutoTrader.IncomingRequestActionGeneration += 1
+    local generation = State.AutoTrader.IncomingRequestActionGeneration
+    local action = {
+        player = player and player.Name or nil, userId = player and player.UserId or nil,
+        decision = decision, reason = reason, signature = signature, at = os.clock(),
+        phase = "attempting", attempts = 0, acknowledged = false, generation = generation,
+    }
+    State.AutoTrader.IncomingRequestDecision = action
+    State.AutoTrader.IncomingRequestActionInFlight = action
+    State.AutoTrader.IncomingRequestLastHandledAt = action.at
+    State.AutoTrader.IncomingRequestLastSignature = signature
+    State.AutoTrader.Log("incoming_request_decision", action)
+    if player then State.AutoTrader.RecordTargetEvent(player, "incomingRequest") end
     State.AutoTrader.Status = decision == "accept" and "INCOMING · ACCEPTING" or "INCOMING · DECLINING"
     State.AutoTrader.StatusDetail = (player and player.Name or "Unknown requester") .. " · " .. tostring(reason)
+        .. " · waiting for MM2 to acknowledge the action."
     State.AutoTrader.Render()
-    return ok
+
+    task.spawn(function()
+        local modes = {"VirtualInputManager", "firesignal.MouseButton1Click", "firesignal.Activated"}
+        local requestDisappeared = false
+        local lastClickReason = nil
+        for round = 1, CONFIG.AutoTraderIncomingActionMaxRounds do
+            for _, mode in ipairs(modes) do
+                if Destroyed or generation ~= State.AutoTrader.IncomingRequestActionGeneration then return end
+                if decision == "accept" and (State.CurrentTrade or (isTradeVisible and isTradeVisible())) then
+                    State.AutoTrader.AcknowledgeIncomingTradeStart(player, "trade_visible_before_click")
+                    return
+                end
+                local _, liveReceiving, liveTitle, liveUsername, liveAccept, liveDecline = State.AutoTrader.GetIncomingRequestUi()
+                local liveSignature = liveReceiving and State.AutoTrader.IsGuiShown(liveReceiving)
+                    and (State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(liveUsername))
+                        .. "|" .. State.AutoTrader.GetTextValue(liveTitle)) or nil
+                if not liveSignature or liveSignature ~= signature then
+                    requestDisappeared = true
+                    break
+                end
+                local liveButton = decision == "accept" and liveAccept or liveDecline
+                local clickOk, clickReason = State.AutoTrader.ClickNativeGuiButton(liveButton, "incoming_" .. decision, mode)
+                lastClickReason = clickReason
+                action.attempts += 1
+                action.lastMode = mode
+                action.lastClickOk = clickOk
+                action.lastClickReason = clickReason
+                State.AutoTrader.TradeTransport.incomingAttempts = (State.AutoTrader.TradeTransport.incomingAttempts or 0) + 1
+                State.AutoTrader.Log("incoming_request_action_attempt", {
+                    decision = decision, player = action.player, userId = action.userId, signature = signature,
+                    generation = generation, round = round, mode = mode, clickOk = clickOk, clickReason = clickReason,
+                })
+                local deadline = os.clock() + CONFIG.AutoTraderIncomingActionAckSeconds
+                while not Destroyed and generation == State.AutoTrader.IncomingRequestActionGeneration and os.clock() < deadline do
+                    if decision == "accept" then
+                        if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then
+                            State.AutoTrader.AcknowledgeIncomingTradeStart(player, "trade_visible_after_click")
+                            return
+                        end
+                    else
+                        local _, checkReceiving, checkTitle, checkUsername = State.AutoTrader.GetIncomingRequestUi()
+                        local checkSignature = checkReceiving and State.AutoTrader.IsGuiShown(checkReceiving)
+                            and (State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(checkUsername))
+                                .. "|" .. State.AutoTrader.GetTextValue(checkTitle)) or nil
+                        if checkSignature ~= signature then
+                            action.acknowledged = true
+                            action.ackAt = os.clock()
+                            action.phase = "acknowledged"
+                            action.ackSource = "request_ui_closed"
+                            local tt = State.AutoTrader.TradeTransport
+                            tt.incomingAcknowledged = (tt.incomingAcknowledged or 0) + 1
+                            tt.lastIncoming = {result="declined_acknowledged", source=action.ackSource, userId=action.userId,
+                                player=action.player, attempts=action.attempts, seconds=action.ackAt-action.at, at=action.ackAt}
+                            State.AutoTrader.IncomingRequestActionInFlight = nil
+                            State.AutoTrader.Log("incoming_request_authoritative_ack", tt.lastIncoming)
+                            State.AutoTrader.Status = "INCOMING · DECLINED"
+                            State.AutoTrader.StatusDetail = (action.player or "Requester") .. " · MM2 closed the incoming request after decline."
+                            State.AutoTrader.Render()
+                            return
+                        end
+                    end
+                    task.wait(0.06)
+                end
+            end
+            if requestDisappeared then break end
+        end
+
+        if Destroyed or generation ~= State.AutoTrader.IncomingRequestActionGeneration then return end
+        if decision == "accept" then
+            local graceDeadline = os.clock() + CONFIG.AutoTraderIncomingActionAckSeconds
+            while os.clock() < graceDeadline do
+                if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then
+                    State.AutoTrader.AcknowledgeIncomingTradeStart(player, "trade_visible_final_grace")
+                    return
+                end
+                task.wait(0.06)
+            end
+        end
+        local _, finalReceiving, finalTitle, finalUsername = State.AutoTrader.GetIncomingRequestUi()
+        local finalSignature = finalReceiving and State.AutoTrader.IsGuiShown(finalReceiving)
+            and (State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(finalUsername))
+                .. "|" .. State.AutoTrader.GetTextValue(finalTitle)) or nil
+        State.AutoTrader.IncomingRequestActionInFlight = nil
+        action.phase = finalSignature == signature and "failed_visible" or "ended_without_ack"
+        action.finishedAt = os.clock()
+        if finalSignature == signature then
+            local tt = State.AutoTrader.TradeTransport
+            tt.incomingFailures = (tt.incomingFailures or 0) + 1
+            tt.lastFailure = {kind="incoming_request_transport", decision=decision, userId=action.userId, player=action.player,
+                attempts=action.attempts, lastClickReason=lastClickReason, at=action.finishedAt}
+            tt.lastIncoming = {result="failed_unacknowledged", decision=decision, userId=action.userId, player=action.player,
+                attempts=action.attempts, at=action.finishedAt}
+            State.AutoTrader.Log("incoming_request_transport_failed", tt.lastFailure)
+            State.AutoTrader.Status = "INCOMING · CONTROL FAILURE"
+            State.AutoTrader.StatusDetail = "MM2 kept the same incoming request visible after every bounded input method; rejoining before trading again."
+            State.AutoTrader.RequestRecoveryTeleport("incoming trade request controls failed authoritative acknowledgement")
+        else
+            State.AutoTrader.TradeTransport.lastIncoming = {result="request_disappeared_without_authoritative_trade", decision=decision,
+                userId=action.userId, player=action.player, attempts=action.attempts, at=action.finishedAt}
+            State.AutoTrader.Log("incoming_request_ended_without_authoritative_ack", State.AutoTrader.TradeTransport.lastIncoming)
+            State.AutoTrader.Status = decision == "accept" and "INCOMING · ENDED" or "INCOMING · CLEARED"
+            State.AutoTrader.StatusDetail = decision == "accept"
+                and "The incoming request disappeared but no trade start was observed; not counting it as an accepted trade."
+                or "The incoming request disappeared before a separate decline acknowledgement was needed."
+        end
+        State.AutoTrader.Render()
+    end)
+    return true
 end
 State.AutoTrader.HandleIncomingRequest = function()
     if Destroyed or not State.AutoTrader.Preferences.automation or State.AutoTrader.SessionFrozen then return end
@@ -13528,12 +14083,18 @@ State.AutoTrader.HandleIncomingRequest = function()
     local requestName = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
     local signature = requestName .. "|" .. State.AutoTrader.GetTextValue(title)
     if requestName == "" then return end
+    if State.AutoTrader.IncomingRequestActionInFlight
+        and State.AutoTrader.IncomingRequestActionInFlight.signature == signature then return end
     if State.AutoTrader.IncomingRequestResolvingSignature == signature then return end
     if State.AutoTrader.IncomingRequestLastSignature == signature
         and os.clock() - (State.AutoTrader.IncomingRequestLastHandledAt or 0) < CONFIG.AutoTraderIncomingActionTimeoutSeconds then
         return
     end
     local player = State.AutoTrader.ResolveIncomingPlayer(requestName)
+    if State.AutoTrader.IsBotEscapeActive and State.AutoTrader.IsBotEscapeActive() then
+        State.AutoTrader.ActOnIncomingRequest(player, "decline", "current server is bot-heavy and scheduled for immediate escape", signature)
+        return
+    end
     if not player then
         State.AutoTrader.Status = "INCOMING · RESOLVING"
         State.AutoTrader.StatusDetail = "Could not uniquely resolve incoming requester " .. requestName .. " yet."
@@ -13607,10 +14168,29 @@ State.AutoTrader.FailPendingRequestAttempt = function(target, generation, reason
     end
     pending.failureReason = tostring(reason or "request failed")
     pending.failureDetail = detail and tostring(detail) or nil
+    if not pending.transportFailureCounted then
+        pending.transportFailureCounted = true
+        local tt = State.AutoTrader.TradeTransport
+        tt.outgoingFailures = (tt.outgoingFailures or 0) + 1
+        tt.outgoingUnacknowledgedConsecutive = (tt.outgoingUnacknowledgedConsecutive or 0) + 1
+        tt.lastOutgoing = {result="failed_unacknowledged", userId=pending.userId, name=pending.name,
+            generation=pending.generation, reason=pending.failureReason, detail=pending.failureDetail,
+            seconds=os.clock()-(pending.sentAt or os.clock()), at=os.clock()}
+        tt.lastFailure = {kind="outgoing_request_transport", userId=pending.userId, name=pending.name,
+            consecutive=tt.outgoingUnacknowledgedConsecutive, reason=pending.failureReason, at=os.clock()}
+        State.AutoTrader.Log("request_transport_unacknowledged", tt.lastFailure)
+        if tt.outgoingUnacknowledgedConsecutive >= CONFIG.AutoTraderTradeTransportRecoveryFailures then
+            pending.recoveryAfterCleanup = true
+            pending.recoveryReason = "repeated outgoing requests failed authoritative MM2 acknowledgement ("
+                .. tostring(tt.outgoingUnacknowledgedConsecutive) .. " consecutive)"
+        end
+    end
     State.AutoTrader.LastRequestAttempt = {
         userId = pending.userId, name = pending.name, result = "canceling_unavailable",
         reason = pending.failureReason, detail = pending.failureDetail, phase = pending.phase,
         age = os.clock() - (pending.sentAt or os.clock()), at = os.clock(),
+        transportConsecutive = State.AutoTrader.TradeTransport.outgoingUnacknowledgedConsecutive,
+        recoveryAfterCleanup = pending.recoveryAfterCleanup == true,
     }
     local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(pending.failureReason, "trade_unavailable", false)
     if not started then
@@ -13634,6 +14214,9 @@ State.AutoTrader.TrySendRequest = function()
     if not State.AutoTrader.Preferences.automation then return blocked("automation off") end
     if State.AutoTrader.SessionFrozen then return blocked("session frozen") end
     if State.AutoTrader.RecoveryTeleportRequired then return blocked("recovery rejoin pending") end
+    if State.AutoTrader.IsBotEscapeActive and State.AutoTrader.IsBotEscapeActive() then
+        return blocked("bot-heavy server escape pending")
+    end
     State.AutoTrader.ReconcileOutgoingRequestState()
     if State.AutoTrader.PendingRequest then return blocked("request already pending/canceling") end
     if State.AutoTrader.IsAnyNativeOutgoingPending() then return blocked("native outgoing request still active") end
@@ -13656,8 +14239,13 @@ State.AutoTrader.TrySendRequest = function()
     local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
     local remote = tradeFolder and tradeFolder:FindFirstChild("SendRequest")
     if not remote or not remote:IsA("RemoteFunction") then
-        State.AutoTrader.Freeze("Trade.SendRequest RemoteFunction is unavailable.")
-        return blocked("Trade.SendRequest unavailable")
+        local tt = State.AutoTrader.TradeTransport
+        tt.outgoingFailures = (tt.outgoingFailures or 0) + 1
+        tt.outgoingUnacknowledgedConsecutive = (tt.outgoingUnacknowledgedConsecutive or 0) + 1
+        tt.lastFailure = {kind="send_request_remote_missing", at=os.clock()}
+        State.AutoTrader.Log("request_transport_remote_missing", tt.lastFailure)
+        State.AutoTrader.RequestRecoveryTeleport("Trade.SendRequest RemoteFunction unavailable")
+        return blocked("Trade.SendRequest unavailable; recovery rejoin requested")
     end
 
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
@@ -13687,8 +14275,8 @@ State.AutoTrader.TrySendRequest = function()
         at = os.clock(),
     }
     State.AutoTrader.MarkServerPlayerOutcome(target, "request_attempted", "SendRequest invoked")
-    State.AutoTrader.Status = "REQUESTING"
-    State.AutoTrader.StatusDetail = "Requesting " .. target.Name .. "; verifying MM2's native SendingRequest state independently of the RemoteFunction response."
+    State.AutoTrader.Status = "REQUEST · ATTEMPTING"
+    State.AutoTrader.StatusDetail = "Attempting a request to " .. target.Name .. "; this is NOT counted as sent until MM2's native SendingRequest/trade state acknowledges it."
     State.AutoTrader.Log("request_send", {userId = target.UserId, name = target.Name, generation = generation, correlationId = State.AutoTrader.PendingRequest.correlationId})
     State.AutoTrader.Render()
 
@@ -13716,6 +14304,7 @@ State.AutoTrader.TrySendRequest = function()
                 State.AutoTrader.RequestLifecycle = "pending"
                 pending.nativeConfirmed = true
                 pending.confirmedAt = os.clock()
+                State.AutoTrader.AcknowledgeOutgoingTransport(pending, "native_sending_request")
                 State.AutoTrader.MarkServerPlayerOutcome(target, "request_pending", "native SendingRequest confirmed")
                 State.AutoTrader.LastRequestAttempt = {
                     userId = target.UserId,
@@ -13800,6 +14389,7 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     end
     State.AutoTrader.UnresolvedTradePartnerSince = 0
     if State.AutoTrader.PendingRequest and State.AutoTrader.PendingRequest.userId == partner.UserId then
+        State.AutoTrader.AcknowledgeOutgoingTransport(State.AutoTrader.PendingRequest, "trade_state")
         State.AutoTrader.TradeRequestStartedAt = State.AutoTrader.PendingRequest.sentAt or State.AutoTrader.TradeRequestStartedAt or os.clock()
         State.AutoTrader.TradeCorrelationId = State.AutoTrader.PendingRequest.correlationId or State.AutoTrader.TradeCorrelationId
         State.AutoTrader.PendingRequest = nil
@@ -13808,6 +14398,7 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     end
     if State.AutoTrader.IncomingRequestDecision
         and State.AutoTrader.IncomingRequestDecision.userId == partner.UserId then
+        State.AutoTrader.AcknowledgeIncomingTradeStart(partner, "trade_state")
         State.AutoTrader.IncomingRequestGeneration += 1
         State.AutoTrader.IncomingRequestResolvingSignature = nil
         State.AutoTrader.IncomingRequestDecision = nil
@@ -14224,8 +14815,13 @@ State.AutoTrader.OnNoTrade = function()
     local _, incomingFrame = State.AutoTrader.GetIncomingRequestUi()
     if State.AutoTrader.Preferences.automation and incomingFrame and State.AutoTrader.IsGuiShown(incomingFrame) then
         State.AutoTrader.HandleIncomingRequest()
-        State.AutoTrader.Status = "INCOMING REQUEST"
-        State.AutoTrader.StatusDetail = "Handling an incoming trade request before cold outgoing targeting."
+        State.AutoTrader.Render()
+        return
+    end
+    if State.AutoTrader.IsBotEscapeActive and State.AutoTrader.IsBotEscapeActive() then
+        State.AutoTrader.Status = State.AutoTrader.FastBotHopReason == "CERTIFIED_BOT_SERVER" and "BOT SERVER · CERTIFIED" or "BOT SERVER · LEAVING"
+        State.AutoTrader.StatusDetail = "Bot-server escape is armed; no new trades will start while the screened hop pipeline finds another server."
+        State.AutoTrader.TryServerHop(State.AutoTrader.FastBotHopReason, select(2, State.AutoTrader.GetServerDisposition()))
         State.AutoTrader.Render()
         return
     end
@@ -14314,6 +14910,8 @@ State.AutoTrader.OnNoTrade = function()
     State.AutoTrader.Render()
 end
 State.AutoTrader.BuildDebug = function()
+    -- Refresh derived freshness/degraded state before exporting support.
+    State.AutoTrader.DecisionDataFresh()
     local localEntries = nil
     local otherEntries = nil
     local partner = nil
@@ -14420,8 +15018,11 @@ State.AutoTrader.BuildDebug = function()
             humanEvidence = tonumber(record.humanEvidence) or 0,
             botJobs = State.AutoTrader.BotIconJobCount(record.botJobs),
             humanJobs = State.AutoTrader.BotIconJobCount(record.humanJobs),
-            goldBotJobs = State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs),
-            goldBotSightings = tonumber(record.strictGoldBotSightings) or 0,
+            goldBotJobs = State.AutoTrader.GetTrustedBotIconJobCount(record),
+            automatedStrictJobs = State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs),
+            manualCertifiedJobs = State.AutoTrader.BotIconJobCount(record.manualGoldBotJobs),
+            goldBotSightings = (tonumber(record.strictGoldBotSightings) or 0) + (tonumber(record.manualGoldBotSightings) or 0),
+            manualGoldBotSightings = tonumber(record.manualGoldBotSightings) or 0,
             legacyV19GoldJobs = State.AutoTrader.BotIconJobCount(record.goldBotJobs),
             legacyV19GoldSightings = tonumber(record.goldBotSightings) or 0,
             botPlayerSightings = tonumber(record.botPlayerSightings) or 0,
@@ -14442,7 +15043,7 @@ State.AutoTrader.BuildDebug = function()
         version = CONTROLLER_VERSION,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
-        supportInstruction = "Paste this entire block into ChatGPT when asking about Auto Trader behavior.",
+        supportInstruction = "Paste this entire block into ChatGPT when asking about Auto Trader behavior. It contains the current build/session plus up to three prior controller sessions with explicit version provenance.",
         executorCompatibility = {
             requestAvailable = type(httpRequest) == "function",
             queueOnTeleportAvailable = type(State.AutoTrader.GetQueueOnTeleport()) == "function",
@@ -14473,6 +15074,9 @@ State.AutoTrader.BuildDebug = function()
             requestInvokeTimeoutSeconds = CONFIG.AutoTraderRequestInvokeTimeoutSeconds,
             httpTimeoutSeconds = CONFIG.AutoTraderHttpTimeoutSeconds,
             incomingResolveSeconds = CONFIG.AutoTraderIncomingResolveSeconds,
+            incomingActionAckSeconds = CONFIG.AutoTraderIncomingActionAckSeconds,
+            incomingActionMaxRounds = CONFIG.AutoTraderIncomingActionMaxRounds,
+            tradeTransportRecoveryFailures = CONFIG.AutoTraderTradeTransportRecoveryFailures,
             incomingUnresolvedTimeoutSeconds = CONFIG.AutoTraderIncomingUnresolvedTimeoutSeconds,
             incomingStuckTimeoutSeconds = CONFIG.AutoTraderIncomingStuckTimeoutSeconds,
             staleTradeGuiTimeoutSeconds = CONFIG.AutoTraderStaleTradeGuiTimeoutSeconds,
@@ -14520,6 +15124,12 @@ State.AutoTrader.BuildDebug = function()
                 minMovingSamples = CONFIG.AutoTraderGoldMinMovingSamples,
                 minMovementSpanSeconds = CONFIG.AutoTraderGoldMinMovementSpanSeconds,
                 minRemotePlayers = CONFIG.AutoTraderGoldMinRemotePlayers,
+                automatedPermanentLearningRule = "100% of current remote players must pass physical certification; membership must remain identical through teleport commit",
+                suspectedHopRatio = CONFIG.AutoTraderSuspectedBotHopRatio,
+                suspectedHopMinPassed = CONFIG.AutoTraderSuspectedBotHopMinPassed,
+                suspectedHopObserveSeconds = CONFIG.AutoTraderSuspectedBotHopObserveSeconds,
+                suspectedHopLearningRule = "escape only; teaches ZERO permanent bot hashes",
+                manualCertification = {enabled=true, confirmSeconds=CONFIG.AutoTraderManualBotConfirmSeconds, provenance="manual_user_certification", allOrNothingAvatarResolution=true},
             },
             negotiationMargins = {
                 CONFIG.AutoTraderNegotiationStage1Margin,
@@ -14542,7 +15152,7 @@ State.AutoTrader.BuildDebug = function()
             maxStabilityDrop = CONFIG.AutoTraderMaxStabilityDrop,
         },
         solverConfig = {
-            objective = "maximize learned audited Supreme-value gain/hour; bot identity is excluded from current-server target/hop decisions",
+            objective = "maximize learned audited Supreme-value gain/hour while aggressively escaping bot-heavy servers; incomplete bot evidence never trains permanent hashes",
             maxOfferSlots = CONFIG.MaxOfferSlots,
             exactStateLimit = CONFIG.AutoTraderExactStateLimit,
             beamWidth = CONFIG.AutoTraderBeamWidth,
@@ -14719,6 +15329,8 @@ State.AutoTrader.BuildDebug = function()
         },
         incomingRequest = {
             decision = State.AutoTrader.IncomingRequestDecision,
+            actionInFlight = State.AutoTrader.IncomingRequestActionInFlight,
+            actionGeneration = State.AutoTrader.IncomingRequestActionGeneration,
             resolvingSignature = State.AutoTrader.IncomingRequestResolvingSignature,
             lastSignature = State.AutoTrader.IncomingRequestLastSignature,
             lastHandledAt = State.AutoTrader.IncomingRequestLastHandledAt,
@@ -14806,6 +15418,8 @@ State.AutoTrader.BuildDebug = function()
             strategyConfigSnapshot = State.AutoTrader.TargetStats.configSnapshot,
         },
         recentLog = State.AutoTrader.DebugLog,
+        sessionHistory = State.AutoTrader.BuildSessionHistorySupport(),
+        tradeTransport = HARDEN.supportJsonValue(State.AutoTrader.TradeTransport),
     }
     local safePayload = HARDEN.supportJsonValue(payload)
     local ok, encoded = pcall(function()
@@ -14836,7 +15450,7 @@ State.AutoTrader.CopyDebug = function()
     end
     local ok, copyErr = pcall(setter, text)
     State.AutoTrader.Status = ok and "SUPPORT COPIED" or "SUPPORT ERROR"
-    State.AutoTrader.StatusDetail = ok and ("Copied support snapshot (" .. tostring(#text) .. " chars). Paste it into ChatGPT.") or tostring(copyErr)
+    State.AutoTrader.StatusDetail = ok and ("Copied cross-session support snapshot (" .. tostring(#text) .. " chars; current + up to 3 prior sessions). Paste it into ChatGPT.") or tostring(copyErr)
     State.AutoTrader.Render()
     return ok
 end
@@ -15412,20 +16026,26 @@ uiSectionTitle(UI.AutoTraderBotHeaderCard, "BOT INTELLIGENCE", 6)
 UI.AutoTraderBotSummary = uiValueLabel(UI.AutoTraderBotHeaderCard, "Waiting for physical evidence.", 26, 10, THEME.blue, Enum.Font.ArialBold)
 UI.AutoTraderBotDetail = makeLabel(
     UI.AutoTraderBotHeaderCard,
-    "Learns only from strict persistent MoveDirection + RootPart movement/facing evidence. Inventory, trade behavior, and animations never teach bot hashes.",
+    "Automated learning requires 100% strict persistent MoveDirection + RootPart evidence. The two-step manual button is the only explicit override; inventory/trade/animations never teach hashes.",
     8,
     THEME.faint,
     Enum.Font.Arial
 )
 UI.AutoTraderBotDetail.Position = UDim2.fromOffset(10, 48)
-UI.AutoTraderBotDetail.Size = UDim2.new(1, -102, 0, 58)
+UI.AutoTraderBotDetail.Size = UDim2.new(1, -180, 0, 58)
 UI.AutoTraderBotDetail.TextWrapped = true
 UI.AutoTraderBotDetail.TextYAlignment = Enum.TextYAlignment.Top
 UI.AutoTraderBotDetail.ZIndex = 1456
-UI.AutoTraderRefreshBots = aeroButton(UI.AutoTraderBotHeaderCard, "REFRESH", UDim2.fromOffset(82, 29), false)
-UI.AutoTraderRefreshBots.Position = UDim2.new(1, -92, 0, 50)
+UI.AutoTraderRefreshBots = aeroButton(UI.AutoTraderBotHeaderCard, "REFRESH EVIDENCE", UDim2.fromOffset(160, 25), false)
+UI.AutoTraderRefreshBots.Position = UDim2.new(1, -170, 0, 45)
 UI.AutoTraderRefreshBots.TextColor3 = THEME.green
+UI.AutoTraderRefreshBots.TextSize = 10
 UI.AutoTraderRefreshBots.ZIndex = 1457
+UI.AutoTraderCertifyBots = aeroButton(UI.AutoTraderBotHeaderCard, "CERTIFY ALL BOTS", UDim2.fromOffset(160, 28), false)
+UI.AutoTraderCertifyBots.Position = UDim2.new(1, -170, 0, 75)
+UI.AutoTraderCertifyBots.TextColor3 = THEME.yellow
+UI.AutoTraderCertifyBots.TextSize = 10
+UI.AutoTraderCertifyBots.ZIndex = 1457
 
 UI.AutoTraderBotScroll = create("ScrollingFrame", {
     Position = UDim2.new(0.49, 4, 0, 302),
@@ -15883,7 +16503,7 @@ State.AutoTrader.RebuildBotDashboard = function()
     learnedTitle.Size = UDim2.new(1, 0, 0, 24); learnedTitle.ZIndex = 1454
     local learned = {}
     for fingerprint, record in pairs(State.AutoTrader.BotIconDb.icons or {}) do
-        local goldJobs = State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs)
+        local goldJobs = State.AutoTrader.GetTrustedBotIconJobCount(record)
         if goldJobs > 0 then
             local class, confidence = State.AutoTrader.GetBotIconClass(fingerprint)
             table.insert(learned, {fingerprint = fingerprint, record = record, class = class, confidence = confidence, goldJobs = goldJobs})
@@ -16089,7 +16709,12 @@ State.AutoTrader.Render = function()
 
     local dbCount = State.AutoTrader.GetBotIconDbCount()
     local goldDbCount = State.AutoTrader.GetGoldBotIconDbCount()
-    UI.AutoTraderBotSummary.Text = "Gold hashes " .. tostring(goldDbCount) .. " · legacy stored " .. tostring(math.max(0, dbCount - goldDbCount)) .. " (ignored) · certification " .. string.upper(tostring(cert.status or "waiting"))
+    UI.AutoTraderBotSummary.Text = "Trusted bot hashes " .. tostring(goldDbCount) .. " · legacy stored " .. tostring(math.max(0, dbCount - goldDbCount)) .. " (ignored) · certification " .. string.upper(tostring(cert.status or "waiting"))
+    if UI.AutoTraderCertifyBots then
+        local armed = (tonumber(State.AutoTrader.ManualBotConfirmUntil) or 0) > os.clock()
+        UI.AutoTraderCertifyBots.Text = armed and "CLICK AGAIN TO CERTIFY" or "CERTIFY ALL BOTS"
+        UI.AutoTraderCertifyBots.TextColor3 = armed and THEME.red or THEME.yellow
+    end
 
     local global = State.AutoTrader.NormalizeStrategyBucket(State.AutoTrader.GetStrategyStats().global)
     local requests, responses, trades, successes = tonumber(session.requests) or 0, tonumber(session.responses) or 0, tonumber(session.trades) or 0, tonumber(session.successes) or 0
@@ -16168,6 +16793,38 @@ connect(UI.AutoTraderRefreshBots.MouseButton1Click, function()
         State.AutoTrader.ScreenCurrentServerAvatars(true)
         if not Destroyed then State.AutoTrader.Render() end
     end)
+end)
+connect(UI.AutoTraderCertifyBots.MouseButton1Click, function()
+    if Destroyed then return end
+    local ids = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Parent and tonumber(player.UserId) and player.UserId > 0 then table.insert(ids, player.UserId) end
+    end
+    table.sort(ids)
+    local rosterKey = table.concat(ids, ",")
+    if #ids == 0 then
+        State.AutoTrader.ManualBotConfirmUntil = 0
+        State.AutoTrader.ManualBotConfirmRosterKey = nil
+        State.AutoTrader.Status = "BOT CERTIFY · EMPTY SERVER"
+        State.AutoTrader.StatusDetail = "There are no remote players to certify."
+        State.AutoTrader.Render()
+        return
+    end
+    local now = os.clock()
+    if now > (tonumber(State.AutoTrader.ManualBotConfirmUntil) or 0)
+        or State.AutoTrader.ManualBotConfirmRosterKey ~= rosterKey then
+        State.AutoTrader.ManualBotConfirmUntil = now + CONFIG.AutoTraderManualBotConfirmSeconds
+        State.AutoTrader.ManualBotConfirmRosterKey = rosterKey
+        State.AutoTrader.Status = "BOT CERTIFY · CONFIRM"
+        State.AutoTrader.StatusDetail = "Click CERTIFY ALL BOTS again within " .. tostring(CONFIG.AutoTraderManualBotConfirmSeconds)
+            .. "s to permanently trust the current " .. tostring(#ids) .. " remote avatar(s) as bots and leave this server. Roster changes cancel confirmation."
+        State.AutoTrader.Log("manual_bot_certification_armed", {players = #ids, rosterKey = rosterKey})
+        State.AutoTrader.Render()
+        return
+    end
+    State.AutoTrader.ManualBotConfirmUntil = 0
+    State.AutoTrader.ManualBotConfirmRosterKey = nil
+    task.spawn(function() State.AutoTrader.ManuallyCertifyCurrentServerBots() end)
 end)
 connect(UI.AutoTraderRefreshServerScan.MouseButton1Click, function()
     if State.AutoTrader.ServerHopInProgress then
@@ -16273,6 +16930,7 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
             local incoming = State.AutoTrader.IncomingRequestDecision
             local partnerPlayer = type(partnerName) == "string" and State.AutoTrader.ResolveIncomingPlayer(partnerName) or nil
             if pending and partnerPlayer and partnerPlayer.UserId == pending.userId then
+                State.AutoTrader.AcknowledgeOutgoingTransport(pending, "StartTradeRemote")
                 State.AutoTrader.RecordTargetEvent(partnerPlayer, "response", {seconds = os.clock() - pending.sentAt})
                 State.AutoTrader.RecordTargetEvent(partnerPlayer, "trade")
                 State.AutoTrader.MarkServerPlayerOutcome(partnerPlayer, "trading", "trade started")
@@ -16300,6 +16958,7 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                 State.AutoTrader.MarkServerPlayerOutcome(partnerPlayer, "trading", incoming and "incoming request accepted" or "trade started externally")
             end
             if incoming and (not partnerPlayer or incoming.userId == partnerPlayer.UserId) then
+                State.AutoTrader.AcknowledgeIncomingTradeStart(partnerPlayer, "StartTradeRemote")
                 State.AutoTrader.IncomingRequestGeneration += 1
                 State.AutoTrader.IncomingRequestResolvingSignature = nil
                 State.AutoTrader.IncomingRequestDecision = nil
@@ -16759,7 +17418,7 @@ State.AutoTrader.OvernightSupervisor = function()
         return true
     end
 
-    local _, receiving, title, username, _, decline = State.AutoTrader.GetIncomingRequestUi()
+    local _, receiving, title, username = State.AutoTrader.GetIncomingRequestUi()
     if receiving and State.AutoTrader.IsGuiShown(receiving) then
         local signature = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
             .. "|" .. State.AutoTrader.GetTextValue(title)
@@ -16770,11 +17429,11 @@ State.AutoTrader.OvernightSupervisor = function()
         local age = now - (State.AutoTrader.IncomingRequestFirstSeenAt or now)
         local requester = State.AutoTrader.ResolveIncomingPlayer(State.AutoTrader.GetTextValue(username))
         if not requester and age >= CONFIG.AutoTraderIncomingUnresolvedTimeoutSeconds then
-            State.AutoTrader.ClickNativeGuiButton(decline, "incoming_unresolved_timeout_decline")
+            State.AutoTrader.ActOnIncomingRequest(nil, "decline", "requester identity unresolved past bounded safety window", signature)
             State.AutoTrader.Log("incoming_unresolved_timeout", {signature = signature, age = age})
         end
         if age >= CONFIG.AutoTraderIncomingStuckTimeoutSeconds then
-            State.AutoTrader.ClickNativeGuiButton(decline, "incoming_stuck_timeout_decline")
+            State.AutoTrader.ActOnIncomingRequest(requester, "decline", "incoming request UI exceeded stuck timeout", signature)
             State.AutoTrader.RequestRecoveryTeleport("incoming request UI stayed stuck for " .. tostring(math.floor(age)) .. "s")
             return true
         end
@@ -21261,6 +21920,8 @@ function Controller.Destroy()
         State.AutoTrader.PostTradeAuditGeneration += 1
         State.AutoTrader.ServerHopQueueGeneration += 1
         State.AutoTrader.IncomingRequestGeneration += 1
+        State.AutoTrader.IncomingRequestActionGeneration += 1
+        State.AutoTrader.IncomingRequestActionInFlight = nil
         if State.AutoTrader.RestoreTradeVisuals then pcall(State.AutoTrader.RestoreTradeVisuals) end
         State.AutoTrader.Log("controller_destroying", {external=externalOperationHealth(), persistence=HARDEN.persistenceHealth})
     end
@@ -21286,6 +21947,7 @@ function Controller.Destroy()
         if State.AutoTrader.FlushBotIconDb then launch("botDb", State.AutoTrader.FlushBotIconDb) end
         if State.AutoTrader.FlushHumanDetectionTiming then launch("humanTiming", State.AutoTrader.FlushHumanDetectionTiming) end
         if State.AutoTrader.SavePreferences then launch("preferences", State.AutoTrader.SavePreferences) end
+        if State.AutoTrader.SaveSessionHistory then launch("sessionHistory", function() return State.AutoTrader.SaveSessionHistory("destroy") end) end
         if State.AutoTrader.FlushDiskDebugLog then launch("debugLog", State.AutoTrader.FlushDiskDebugLog) end
     end
     local persistDeadline = os.clock() + 4

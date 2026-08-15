@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.68.7-public-auto-trader-v36-rc7-fast-inventory-discovery",
+    version = "18.68.8-public-auto-trader-v36-rc8-async-supreme-publish",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -256,7 +256,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V36",
-    distributionNormalizedSha256 = "a3180aa3f3c14229711809a383469c6d7e5c336403196504a0e13fcbddb9301f",
+    distributionNormalizedSha256 = "d6260d0b419c39ced355392cf19933ab459261108dcaac0f7c01fc4809614e53",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -433,7 +433,10 @@ local function sha256Hex(message, cooperative)
     local function maybeYield()
         if not yieldEnabled then return end
         blocksSinceYield += 1
-        if blocksSinceYield >= 64 and os.clock() - yieldStartedAt >= 0.003 then
+        -- RC8: 64 blocks was only 4 KiB, which forced thousands of Heartbeat
+        -- waits on the ~13.7 MB Supreme JSON. Keep hashing cooperative without
+        -- turning verification into a minute-long scheduler delay.
+        if blocksSinceYield >= 2048 and os.clock() - yieldStartedAt >= 0.003 then
             blocksSinceYield = 0
             yieldCount += 1
             RunService.Heartbeat:Wait()
@@ -1478,23 +1481,22 @@ local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix, verifiedDi
     if not indexOK then return false, "The candidate database could not be indexed; keeping last-known-good values.", false, nil end
     local valid, validationError = validateSupremeCandidate(decoded, candidateCatalog, candidateDiagnostics)
     if not valid then return false, validationError, false, nil end
+
+    -- RC8: publishing the semantically validated catalog is the critical path.
+    -- A live GitHub response has no externally supplied SHA to compare against,
+    -- so computing our local LKG digest must not block inventory discovery.
     local digest = type(verifiedDigest) == "string" and verifiedDigest or nil
-    if not digest then
-        local hashYields, hashMilliseconds
-        digest, hashYields, hashMilliseconds = sha256Hex(body, true)
-        HARDEN.lastSupremeHashYields = tonumber(hashYields) or 0
-        HARDEN.lastSupremeHashMilliseconds = tonumber(hashMilliseconds) or 0
-    else
-        HARDEN.lastSupremeHashYields = 0
-        HARDEN.lastSupremeHashMilliseconds = 0
-    end
-    if not digest then return false, "SHA-256 unavailable for Supreme Values body", false, nil end
     SupremeDatabase = decoded
     IndexExact, IndexCanonical, Catalog = candidateExact, candidateCanonical, candidateCatalog
     HARDEN.supremeFastIndex, HARDEN.supremeIndexDiagnostics = candidateFast, candidateDiagnostics
     LastSupremeBody = body
     HARDEN.supremeDataRevision += 1
-    HARDEN.supremeDataHash = digest
+    HARDEN.supremeDataHash = digest or ("pending:" .. tostring(HARDEN.supremeDataRevision) .. ":" .. tostring(#body))
+    HARDEN.supremeHashPending = digest == nil
+    if digest then
+        HARDEN.lastSupremeHashYields = 0
+        HARDEN.lastSupremeHashMilliseconds = 0
+    end
     LastDatabaseLoad = os.time()
     HARDEN.lastDatabaseVerifiedAt = tonumber(verifiedAtUnix) or os.time()
     HARDEN.lastDatabaseSource = sourceLabel or "live"
@@ -1564,16 +1566,53 @@ local function fetchSupremeDatabase()
     local candidateLastModified = getResponseHeader(response, "last-modified")
     local loaded, err, changed, digest = loadSupremeFromBody(body, "live_" .. tostring(source or "http"), os.time())
     if not loaded then return tryDiskLkg(err) end
-    -- Commit validators only after the exact body they describe passed all trust gates.
+    -- Commit validators only after decode/index/semantic validation succeeded.
     HttpState.supremeETag = candidateETag
     HttpState.supremeLastModified = candidateLastModified
-    if changed and HARDEN.writeLkgEnvelope then
-        task.spawn(function()
-            if not Destroyed then
+    if changed then
+        local publishedRevision = HARDEN.supremeDataRevision
+        if digest and HARDEN.writeLkgEnvelope then
+            task.spawn(function()
+                if Destroyed or LastSupremeBody ~= body or HARDEN.supremeDataRevision ~= publishedRevision then return end
                 local okWrite, writeErr = HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body, digest)
                 if not okWrite then warn("[SV Public] Supreme LKG write failed:", writeErr) end
-            end
-        end)
+            end)
+        elseif not digest then
+            -- Hash and persist after publication. The first yield occurs inside
+            -- SHA, so inventory discovery can start from the validated catalog
+            -- before the expensive pure-Luau digest finishes.
+            HARDEN.supremeBackgroundHashStartedAt = os.clock()
+            HARDEN.supremeBackgroundHashFinishedAt = 0
+            HARDEN.supremeBackgroundHashError = nil
+            task.defer(function()
+                local computedDigest, hashYields, hashMilliseconds = sha256Hex(body, true)
+                HARDEN.lastSupremeHashYields = tonumber(hashYields) or 0
+                HARDEN.lastSupremeHashMilliseconds = tonumber(hashMilliseconds) or 0
+                HARDEN.supremeBackgroundHashFinishedAt = os.clock()
+                if not computedDigest then
+                    HARDEN.supremeBackgroundHashError = "SHA-256 unavailable for Supreme Values body"
+                    return
+                end
+                if Destroyed or LastSupremeBody ~= body or HARDEN.supremeDataRevision ~= publishedRevision then
+                    return
+                end
+                HARDEN.supremeDataHash = computedDigest
+                HARDEN.supremeHashPending = false
+                if HARDEN.writeLkgEnvelope then
+                    local okWrite, writeErr = HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body, computedDigest)
+                    if not okWrite then
+                        HARDEN.supremeBackgroundHashError = tostring(writeErr or "LKG write failed")
+                        warn("[SV Public] Supreme LKG write failed:", writeErr)
+                    end
+                end
+                -- The content did not change, but replacing the provisional
+                -- cache identity with its real digest invalidates any plan
+                -- captured while hashing was still pending.
+                if not Destroyed and HARDEN.refreshResolvedViews then
+                    HARDEN.refreshResolvedViews(false)
+                end
+            end)
+        end
     end
     return true, err, changed
 end
@@ -16270,6 +16309,15 @@ State.AutoTrader.BuildDebug = function()
             databaseSource = HARDEN.lastDatabaseSource,
             dataRevision = HARDEN.supremeDataRevision,
             dataHash = HARDEN.supremeDataHash,
+            hashPending = HARDEN.supremeHashPending == true,
+            backgroundHashAgeSeconds = HARDEN.supremeBackgroundHashStartedAt and HARDEN.supremeBackgroundHashStartedAt > 0
+                and ((HARDEN.supremeBackgroundHashFinishedAt or 0) > 0
+                    and math.max(0, HARDEN.supremeBackgroundHashFinishedAt - HARDEN.supremeBackgroundHashStartedAt)
+                    or math.max(0, os.clock() - HARDEN.supremeBackgroundHashStartedAt))
+                or 0,
+            backgroundHashError = HARDEN.supremeBackgroundHashError,
+            lastHashYields = HARDEN.lastSupremeHashYields,
+            lastHashMilliseconds = HARDEN.lastSupremeHashMilliseconds,
             catalogItems = #Catalog,
             categoryCounts = HARDEN.supremeIndexDiagnostics.categoryCounts,
             canonicalCollisions = HARDEN.supremeIndexDiagnostics.canonicalCollisions,
@@ -25389,7 +25437,7 @@ do
         end)
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
         result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
-        State.AutoTrader.Log("self_test_v36_rc7",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        State.AutoTrader.Log("self_test_v36_rc8",{passed=passed,total=#tests,ok=result.ok,tests=tests})
         return result
     end
 end

@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.68.2-public-auto-trader-v36-release-audit-fixes",
+    version = "18.68.6-public-auto-trader-v36-rc6-active-trade-identity-closure",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -256,7 +256,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V36",
-    distributionNormalizedSha256 = "679577da9fb3a884e14235be3b2fff95bdb08277945b178726828da6f2560297",
+    distributionNormalizedSha256 = "44176a2c9a45a0ed2c3a38cc281913f20175ba6c5032733b0b9dbb0376ff280c",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -4835,10 +4835,19 @@ local function summarizeResolvedOffer(entries)
             local resolvedEntry = {
                 record = record,
                 itemId = entry.itemId,
+                nativeKey = entry.nativeKey or entry.itemId,
                 itemType = entry.itemType,
                 quantity = quantity,
                 unitValue = unitValue,
                 variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
+                identityHint = entry.identityHint,
+                numericItemId = entry.numericItemId,
+                gameData = entry.gameData,
+                valueIdentity = entry.valueIdentity,
+                mutationIdentity = entry.mutationIdentity,
+                familyIdentity = entry.familyIdentity,
+                mutationAmbiguous = entry.mutationAmbiguous,
+                identityFailure = entry.identityFailure,
             }
             table.insert(summary.entries, resolvedEntry)
             table.insert(summary.items, {
@@ -10569,8 +10578,62 @@ do
         record.lastSeen = os.time()
         return true
     end
+    State.AutoTrader.PruneBotDbCandidate = function(candidate)
+        local bounded = State.AutoTrader.ClonePlainTable(type(candidate) == "table" and candidate or {})
+        bounded.icons = type(bounded.icons) == "table" and bounded.icons or {}
+        local rows = {}
+        local function pruneJobs(jobTable)
+            local jobs = {}
+            for jobId, stamp in pairs(type(jobTable) == "table" and jobTable or {}) do
+                if type(jobId) == "string" then table.insert(jobs, {jobId=jobId, stamp=tonumber(stamp) or 0}) end
+            end
+            table.sort(jobs, function(a, b) return a.stamp > b.stamp end)
+            local nextJobs = {}
+            for index, row in ipairs(jobs) do
+                if index > CONFIG.AutoTraderBotDatabaseJobsPerIcon then break end
+                nextJobs[row.jobId] = row.stamp
+            end
+            return nextJobs
+        end
+        for fingerprint, record in pairs(bounded.icons) do
+            if type(fingerprint) == "string" and type(record) == "table" then
+                record.botEvidence = tonumber(record.botEvidence) or 0
+                record.humanEvidence = tonumber(record.humanEvidence) or 0
+                record.botPlayerSightings = tonumber(record.botPlayerSightings) or 0
+                record.humanPlayerSightings = tonumber(record.humanPlayerSightings) or 0
+                record.goldBotSightings = tonumber(record.goldBotSightings) or 0
+                record.strictGoldBotSightings = tonumber(record.strictGoldBotSightings) or 0
+                record.manualGoldBotSightings = tonumber(record.manualGoldBotSightings) or 0
+                record.firstSeen = tonumber(record.firstSeen) or tonumber(record.lastSeen) or os.time()
+                record.lastSeen = tonumber(record.lastSeen) or 0
+                record.botJobs = pruneJobs(record.botJobs)
+                record.humanJobs = pruneJobs(record.humanJobs)
+                record.goldBotJobs = pruneJobs(record.goldBotJobs)
+                record.strictGoldBotJobs = pruneJobs(record.strictGoldBotJobs)
+                record.manualGoldBotJobs = pruneJobs(record.manualGoldBotJobs)
+                table.insert(rows, {fingerprint=fingerprint, record=record})
+            end
+        end
+        table.sort(rows, function(a, b)
+            local ag = State.AutoTrader.GetTrustedBotIconJobCount and State.AutoTrader.GetTrustedBotIconJobCount(a.record) or 0
+            local bg = State.AutoTrader.GetTrustedBotIconJobCount and State.AutoTrader.GetTrustedBotIconJobCount(b.record) or 0
+            if ag ~= bg then return ag > bg end
+            local as = (tonumber(a.record.strictGoldBotSightings) or 0) + (tonumber(a.record.manualGoldBotSightings) or 0)
+            local bs = (tonumber(b.record.strictGoldBotSightings) or 0) + (tonumber(b.record.manualGoldBotSightings) or 0)
+            if as ~= bs then return as > bs end
+            return (a.record.lastSeen or 0) > (b.record.lastSeen or 0)
+        end)
+        local nextIcons = {}
+        for index, row in ipairs(rows) do
+            if index > CONFIG.AutoTraderBotDatabaseMaxIcons then break end
+            nextIcons[row.fingerprint] = row.record
+        end
+        bounded.icons = nextIcons
+        return bounded
+    end
     State.AutoTrader.CommitTrustedBotDbCandidate = function(candidate, provenance)
         if type(candidate) ~= "table" or type(candidate.icons) ~= "table" then return false, "invalid candidate bot DB" end
+        candidate = State.AutoTrader.PruneBotDbCandidate(candidate)
         State.AutoTrader.BotTrustCommitSerial += 1
         candidate.version = 5
         candidate.trustedRevision = (tonumber(State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.trustedRevision) or 0) + 1
@@ -10646,6 +10709,7 @@ do
             if type(row) ~= "table" then return false, "malformed fingerprint row" end
             if State.AutoTrader.ApplyBotEvidenceToDb(candidate, "strict", row.fingerprint, sourceJobId, math.max(1, math.min(20, math.floor(tonumber(row.count) or 1))), tonumber(row.sampleUserId), row.sampleName) then learned += 1 else return false, "invalid strict fingerprint" end
         end
+        candidate = State.AutoTrader.PruneBotDbCandidate(candidate)
         local saved, err = State.AutoTrader.CommitTrustedBotDbCandidate(candidate, {source="strict_gold_departure_commit",sourceJobId=sourceJobId,certifiedPlayers=payload.certifiedPlayers})
         if not saved then
             State.AutoTrader.Status = "BOT CERTIFY · SAVE FAILED"
@@ -11069,10 +11133,16 @@ State.AutoTrader.AbortServerHop = function(reason)
     end
 end
 State.AutoTrader.ServerHopStillAllowed = function()
-    local currentDisposition = State.AutoTrader.GetServerDisposition()
+    local currentDisposition, currentCounts = State.AutoTrader.GetServerDisposition()
+    currentCounts = type(currentCounts) == "table" and currentCounts or {}
     local _, liveIncoming = State.AutoTrader.GetIncomingRequestUi()
     local exhausted = string.sub(tostring(currentDisposition), 1, 9) == "EXHAUSTED"
     local forcedReason = State.AutoTrader.FastBotHopReason
+    if forcedReason == "EXHAUSTED_NO_PROGRESS" and (tonumber(currentCounts.transportDeferred) or 0) > 0 then
+        State.AutoTrader.FastBotHopActive = false
+        State.AutoTrader.FastBotHopReason = nil
+        return false, "transport-deferred retry is pending; generic no-progress hop revoked"
+    end
     local explicitForcedHop = State.AutoTrader.FastBotHopActive == true
         and (forcedReason == "MANUAL_SERVER_SEARCH"
             or forcedReason == "EXHAUSTED_NO_PROGRESS"
@@ -11667,11 +11737,41 @@ State.AutoTrader.GetPortfolioMetrics = function(entries)
         anchorValue=anchorValue, anchorCount=anchorCount, coverage=coverage,
     }
 end
+State.AutoTrader.BuildCanonicalValueIdentityKey = function(entry)
+    if type(entry) ~= "table" then return nil end
+    local itemType = tostring(entry.itemType or "")
+    local nativeKey = tostring(entry.nativeKey or entry.itemId or "")
+    if itemType == "" or nativeKey == "" then return nil end
+    local hint = type(entry.identityHint) == "table" and entry.identityHint or {}
+    local record = entry.record
+    local data = record and record.data or {}
+    local gameData = type(entry.gameData) == "table" and entry.gameData or nil
+    if not gameData then pcall(function() gameData = getGameItemData(itemType, nativeKey) end) end
+    local variant = entry.variant or hint.variant
+        or (type(gameData) == "table" and (gameData.Chroma == true or gameData.IsChroma == true) and "Chroma")
+        or (normalize(nativeKey):find("chroma", 1, true) and "Chroma")
+        or (record and record.category == "chromas" and "Chroma") or ""
+    local event = hint.event
+        or (type(gameData) == "table" and (gameData.Event or gameData.event or gameData.Holiday or gameData.holiday or gameData.Season or gameData.season or gameData.Origin or gameData.origin))
+        or data.event or data.Event or data.holiday or data.Holiday or data.season or data.Season or ""
+    local year = hint.year
+        or (type(gameData) == "table" and (gameData.Year or gameData.year or gameData.ReleaseYear or gameData.releaseYear))
+        or data.year or data.Year or data.releaseYear or data.ReleaseYear or ""
+    local ancestry = normalize(hint.ancestryPath or "")
+    local numericItemId = entry.numericItemId or hint.numericItemId
+        or (type(gameData) == "table" and (gameData.ItemID or gameData.ItemId or gameData.DataID or gameData.DataId or gameData.ID or gameData.Id))
+    local supreme = record and (tostring(record.category or "") .. "/" .. tostring(record.key or record.name or "")) or ""
+    local mutation = normalizeTradeItemType(itemType) .. "|" .. nativeKey
+    return mutation .. "|nativeId=" .. tostring(numericItemId or "") .. "|variant=" .. tostring(variant or "") .. "|event=" .. tostring(event or "")
+        .. "|year=" .. tostring(year or "") .. "|ancestry=" .. ancestry .. "|supreme=" .. supreme
+end
+
 State.AutoTrader.SimulatePortfolioExchange = function(baseEntries, giveItems, receiveItems)
     local byKey = {}
     local function keyFor(entry)
-        return State.Mapping.MakeItemKey(entry.itemType, entry.itemId)
-            .. "|variant:" .. tostring(entry.variant or (entry.identityHint and entry.identityHint.variant) or "")
+        return State.AutoTrader.BuildCanonicalValueIdentityKey(entry)
+            or (State.Mapping.MakeItemKey(entry.itemType, entry.itemId)
+                .. "|variant:" .. tostring(entry.variant or (entry.identityHint and entry.identityHint.variant) or ""))
     end
     local function add(entry, quantity)
         local value = tonumber(entry.unitValue) or (entry.record and entry.record.data and numericValue(entry.record.data))
@@ -11680,10 +11780,10 @@ State.AutoTrader.SimulatePortfolioExchange = function(baseEntries, giveItems, re
         local row = byKey[key]
         if not row then
             row = {
-                key=entry.key or State.Mapping.MakeItemKey(entry.itemType, entry.itemId), itemId=entry.itemId,
+                key=key, itemId=entry.itemId, nativeKey=entry.nativeKey or entry.itemId,
                 itemType=entry.itemType, name=entry.name or (entry.record and entry.record.name) or entry.itemId,
                 record=entry.record, unitValue=value, demand=entry.demand, variant=entry.variant,
-                identityHint=entry.identityHint, quantity=0, maxQuantity=0,
+                identityHint=entry.identityHint, numericItemId=entry.numericItemId, quantity=0, maxQuantity=0,
             }
             byKey[key] = row
         end
@@ -12356,6 +12456,56 @@ State.AutoTrader.SelectTarget = function()
     }
     return best
 end
+State.AutoTrader.BuildLocalResolvedEntriesFromCalculated = function(calculated)
+    local entries = {}
+    local byKey = {}
+    local function addHints(section)
+        for _, hint in ipairs(section and section.cardHints or {}) do
+            local record = hint.record
+            local unitValue = record and record.data and numericValue(record.data) or nil
+            if record and unitValue and unitValue > 0 then
+                local itemType = tostring(hint.itemType or "Weapons")
+                local itemId = tostring(hint.itemId or "")
+                if itemId ~= "" then
+                    local baseKey = State.Mapping.MakeItemKey(itemType, itemId)
+                    local variant = hint.variant or (hint.identityHint and hint.identityHint.variant)
+                    local quantity = math.max(1, tonumber(hint.quantity) or 1)
+                    local candidate = {
+                        reserveKey=baseKey,itemId=itemId,nativeKey=itemId,itemType=itemType,quantity=quantity,record=record,
+                        name=tostring(record.name or itemId),unitValue=unitValue,demand=tonumberSafe(record.data.demand) or 0,
+                        resolutionMeta=hint.resolutionMeta,variant=variant,identityHint=hint.identityHint,numericItemId=hint.numericItemId,
+                    }
+                    local operationalKey = baseKey .. "|variant:" .. tostring(variant or "")
+                    local valueIdentity = State.AutoTrader.BuildCanonicalValueIdentityKey(candidate) or operationalKey
+                    candidate.key = operationalKey
+                    candidate.valueIdentity = valueIdentity
+                    local existing = byKey[valueIdentity]
+                    if existing then
+                        if math.abs(existing.unitValue - unitValue) > 0.000001 then
+                            existing.conflicted = true
+                        else
+                            existing.quantity += quantity
+                        end
+                    else
+                        byKey[valueIdentity] = candidate
+                    end
+                end
+            end
+        end
+    end
+    addHints(calculated and calculated.weapons)
+    addHints(calculated and calculated.pets)
+    for _, entry in pairs(byKey) do
+        if not entry.conflicted then table.insert(entries, entry) end
+    end
+    table.sort(entries, function(a, b)
+        if a.unitValue ~= b.unitValue then return a.unitValue > b.unitValue end
+        if normalize(a.name) ~= normalize(b.name) then return normalize(a.name) < normalize(b.name) end
+        if tostring(a.key) ~= tostring(b.key) then return tostring(a.key) < tostring(b.key) end
+        return tostring(a.valueIdentity or "") < tostring(b.valueIdentity or "")
+    end)
+    return entries
+end
 State.AutoTrader.GetLocalInventory = function(force)
     local remoteState = State.Profile.remoteTotals
     if not remoteState then
@@ -12382,63 +12532,7 @@ State.AutoTrader.GetLocalInventory = function(force)
     if not calculated then
         return nil, tostring(reason or "inventory calculation failed")
     end
-    local entries = {}
-    local byKey = {}
-    local function addHints(section)
-        for _, hint in ipairs(section and section.cardHints or {}) do
-            local record = hint.record
-            local unitValue = record and record.data and numericValue(record.data) or nil
-            if record and unitValue and unitValue > 0 then
-                local itemType = tostring(hint.itemType or "Weapons")
-                local itemId = tostring(hint.itemId or "")
-                if itemId ~= "" then
-                    local baseKey = State.Mapping.MakeItemKey(itemType, itemId)
-                    local variant = hint.variant or (hint.identityHint and hint.identityHint.variant)
-                    local key = baseKey .. "|variant:" .. tostring(variant or "")
-                    local quantity = math.max(1, tonumber(hint.quantity) or 1)
-                    local existing = byKey[key]
-                    if existing then
-                        if existing.record ~= record
-                            or math.abs(existing.unitValue - unitValue) > 0.000001 then
-                            existing.conflicted = true
-                        else
-                            existing.quantity += quantity
-                        end
-                    else
-                        existing = {
-                            key = key,
-                            reserveKey = baseKey,
-                            itemId = itemId,
-                            itemType = itemType,
-                            quantity = quantity,
-                            record = record,
-                            name = tostring(record.name or itemId),
-                            unitValue = unitValue,
-                            demand = tonumberSafe(record.data.demand) or 0,
-                            resolutionMeta = hint.resolutionMeta,
-                            variant = variant,
-                            identityHint = hint.identityHint,
-                            nativeKey = itemId,
-                        }
-                        byKey[key] = existing
-                    end
-                end
-            end
-        end
-    end
-    addHints(calculated.weapons)
-    addHints(calculated.pets)
-    for _, entry in pairs(byKey) do
-        if not entry.conflicted then
-            table.insert(entries, entry)
-        end
-    end
-    table.sort(entries, function(a, b)
-        if a.unitValue ~= b.unitValue then
-            return a.unitValue > b.unitValue
-        end
-        return normalize(a.name) < normalize(b.name)
-    end)
+    local entries = State.AutoTrader.BuildLocalResolvedEntriesFromCalculated(calculated)
     local unresolvedLocal = {}
     local nonNumericLocal = {}
     local function collectLocalDiagnostics(section)
@@ -12497,20 +12591,18 @@ State.AutoTrader.GetLocalAuditSnapshot = function(force)
     end
     local quantities = {}
     local evidence = {}
-    local function add(itemType, itemId, quantity, resolved, record, variant)
-        if itemId == nil then
-            return
-        end
-        local key = State.Mapping.MakeItemKey(itemType, itemId) .. "|variant:" .. tostring(variant or "")
+    local function add(itemType, itemId, quantity, resolved, record, variant, identityHint)
+        if itemId == nil then return end
+        local identityEntry = {itemType=tostring(itemType or "Weapons"),itemId=tostring(itemId),nativeKey=tostring(itemId),record=record,variant=variant,identityHint=identityHint}
+        local key = State.AutoTrader.BuildCanonicalValueIdentityKey(identityEntry)
+            or (State.Mapping.MakeItemKey(itemType, itemId) .. "|variant:" .. tostring(variant or ""))
+        local mutationKey = normalizeTradeItemType(itemType or "Weapons") .. "|" .. tostring(itemId)
         quantity = math.max(1, math.floor(tonumber(quantity) or 1))
         quantities[key] = (quantities[key] or 0) + quantity
         evidence[key] = evidence[key] or {
-            key = key,
-            itemType = tostring(itemType or "Weapons"),
-            itemId = tostring(itemId),
-            resolved = resolved == true,
-            name = record and record.name or tostring(itemId),
-            variant = variant,
+            key=key, mutationIdentity=mutationKey, valueIdentity=key, itemType=tostring(itemType or "Weapons"),
+            itemId=tostring(itemId), resolved=resolved==true, name=record and record.name or tostring(itemId),
+            variant=variant, identityHint=identityHint,
         }
     end
     local function ingest(section, itemType)
@@ -12521,7 +12613,8 @@ State.AutoTrader.GetLocalAuditSnapshot = function(force)
                 hint.quantity,
                 true,
                 hint.record,
-                hint.variant or (hint.identityHint and hint.identityHint.variant)
+                hint.variant or (hint.identityHint and hint.identityHint.variant),
+                hint.identityHint
             )
         end
         for _, miss in ipairs(section and section.unresolvedAll or {}) do
@@ -12531,7 +12624,8 @@ State.AutoTrader.GetLocalAuditSnapshot = function(force)
                 miss.quantity,
                 false,
                 nil,
-                miss.variant or (miss.identityHint and miss.identityHint.variant)
+                miss.variant or (miss.identityHint and miss.identityHint.variant),
+                miss.identityHint
             )
         end
     end
@@ -12629,8 +12723,17 @@ State.AutoTrader.GetOfferQuantity = function(entries, itemType, itemId, variant)
     end
     return 0
 end
-State.AutoTrader.SummarizeOther = function(entries)
+State.AutoTrader.SummarizeOther = function(entries, player)
+    if State.AutoTrader.EnrichTradeEntriesWithProfileIdentity then
+        entries = State.AutoTrader.EnrichTradeEntriesWithProfileIdentity(entries, player)
+    end
     local summary = summarizeResolvedOffer(entries)
+    for _, entry in ipairs(summary.entries or {}) do
+        if entry.mutationAmbiguous == true or entry.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
+            summary.identityFailure = "AMBIGUOUS_MUTATION_IDENTITY"
+            break
+        end
+    end
     summary.unknownCount = #summary.unresolved + #summary.nonNumeric
     summary.knownFloor = summary.totalValue
     return summary
@@ -13083,8 +13186,11 @@ State.AutoTrader.ValidatePlan = function(plan, context)
     local currentHash = State.AutoTrader.OfferHash(currentOtherEntries)
     if currentHash ~= expectedOtherHash then return fail("their offer changed") end
     if State.AutoTrader.LastOtherHash ~= expectedOtherHash or os.clock() - State.AutoTrader.OtherStableSince < CONFIG.AutoTraderStableSeconds then return fail("their offer is not stable") end
-    local otherSummary = State.AutoTrader.SummarizeOther(currentOtherEntries)
+    local otherSummary = State.AutoTrader.SummarizeOther(currentOtherEntries, currentPartner)
     if otherSummary.slotCount == 0 then return fail("their offer disappeared") end
+    if otherSummary.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
+        return fail("their live offer has AMBIGUOUS_MUTATION_IDENTITY")
+    end
     if not State.AutoTrader.Preferences.unknownTheirZero and otherSummary.unknownCount > 0 then return fail("their offer contains unknown value data") end
     local tradable, inventoryReason = State.AutoTrader.GetTradableInventory()
     if not tradable then return fail(tostring(inventoryReason or "tradable inventory unavailable")) end
@@ -13101,9 +13207,11 @@ State.AutoTrader.ValidatePlan = function(plan, context)
         if not source.unitValue or source.unitValue <= 0 then return fail("plan contains a nonnumeric local item") end
         recomputed += source.unitValue * quantity
         table.insert(validatedItems, {
-            key = source.key, itemId = source.itemId, itemType = source.itemType, name = source.name,
+            key = source.key, itemId = source.itemId, nativeKey = source.nativeKey or source.itemId, itemType = source.itemType, name = source.name,
             quantity = quantity, unitValue = source.unitValue, record = source.record,
             demand = source.demand, reserve = source.reserve, variant = source.variant, identityHint = source.identityHint,
+            numericItemId = source.numericItemId, gameData = source.gameData, valueIdentity = source.valueIdentity,
+            mutationIdentity = source.mutationIdentity, familyIdentity = source.familyIdentity,
         })
     end
     if slots < 1 or slots > CONFIG.MaxOfferSlots then return fail("plan violates the slot cap") end
@@ -13112,6 +13220,11 @@ State.AutoTrader.ValidatePlan = function(plan, context)
     local profit = otherSummary.knownFloor - recomputed
     local portfolioDelta = State.AutoTrader.EvaluatePortfolioDelta(tradable, validatedItems, otherSummary.entries or {})
     checks.portfolioDelta = portfolioDelta
+    local postExchangeCollisions = State.AutoTrader.FindMutationIdentityCollisions(portfolioDelta.simulatedEntries or {})
+    checks.postExchangeMutationCollisions = postExchangeCollisions
+    if next(postExchangeCollisions) ~= nil then
+        return fail("post-trade portfolio would create AMBIGUOUS_MUTATION_IDENTITY")
+    end
     if not portfolioDelta.anchorOK then return fail("trade would liquidate too much high-value anchor strength: " .. tostring(portfolioDelta.anchorReason or "anchor preservation failed")) end
     if plan.strategicKind == "liquidity" then
         if profit < -0.001 then return fail("strategic liquidity trade would lose Supreme value") end
@@ -13374,6 +13487,17 @@ State.AutoTrader.ActionContextValid = function(context)
     end
     return true
 end
+State.AutoTrader.FindTradableMutationCandidate = function(tradable, item)
+    if type(item) ~= "table" then return nil, nil end
+    local itemVariant = item.variant or (item.identityHint and item.identityHint.variant)
+    local operationalKey = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(itemVariant or "")
+    for _, candidate in ipairs(tradable or {}) do
+        if candidate.key == operationalKey then
+            return candidate, operationalKey
+        end
+    end
+    return nil, operationalKey
+end
 State.AutoTrader.FireMutation = function(kind, item, context, localEntries)
     if State.AutoTrader.ActionInFlight then
         return false
@@ -13407,14 +13531,7 @@ State.AutoTrader.FireMutation = function(kind, item, context, localEntries)
             State.AutoTrader.Freeze(tostring(inventoryReason or "tradable inventory unavailable"))
             return false
         end
-        local allowed = nil
-        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(itemVariant or "")
-        for _, candidate in ipairs(tradable) do
-            if candidate.key == key then
-                allowed = candidate
-                break
-            end
-        end
+        local allowed = State.AutoTrader.FindTradableMutationCandidate(tradable, item)
         if not allowed or beforeQuantity >= allowed.maxQuantity then
             State.AutoTrader.Freeze("Add mutation would violate owned quantity or configured reserve for " .. tostring(item.itemId) .. ".")
             return false
@@ -13809,24 +13926,44 @@ State.AutoTrader.CaptureAcceptAudit = function(info)
     local expected = {}
     local outgoing = {}
     local incoming = {}
+    local incomingMutation = {}
+    local function canonicalKey(item)
+        return State.AutoTrader.BuildCanonicalValueIdentityKey(item)
+            or (State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(item.variant or (item.identityHint and item.identityHint.variant) or ""))
+    end
+    local function mutationKey(item)
+        return normalizeTradeItemType(item.itemType or "Weapons") .. "|" .. tostring(item.nativeKey or item.itemId)
+    end
     local function touchExpected(key)
         if expected[key] == nil then
             expected[key] = before[key] or 0
         end
     end
     for _, item in ipairs(info.plan.items or {}) do
-        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(item.variant or (item.identityHint and item.identityHint.variant) or "")
+        local key = canonicalKey(item)
         local quantity = math.max(1, math.floor(tonumber(item.quantity) or 1))
         touchExpected(key)
         expected[key] -= quantity
         outgoing[key] = (outgoing[key] or 0) + quantity
     end
-    for _, item in ipairs(info.otherEntries or {}) do
-        local key = State.Mapping.MakeItemKey(item.itemType, item.itemId) .. "|variant:" .. tostring(item.variant or (item.identityHint and item.identityHint.variant) or "")
+    local auditOtherEntries = info.otherEntries or {}
+    if State.AutoTrader.EnrichTradeEntriesWithProfileIdentity then
+        auditOtherEntries = State.AutoTrader.EnrichTradeEntriesWithProfileIdentity(auditOtherEntries, info.partner)
+    end
+    for _, item in ipairs(auditOtherEntries) do
+        if item.mutationAmbiguous == true or item.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
+            State.AutoTrader.Log("accept_audit_ambiguous_incoming_identity", {itemId=item.itemId,itemType=item.itemType})
+            return nil
+        end
+    end
+    for _, item in ipairs(auditOtherEntries) do
+        local key = canonicalKey(item)
         local quantity = math.max(1, math.floor(tonumber(item.quantity) or 1))
         touchExpected(key)
         expected[key] += quantity
         incoming[key] = (incoming[key] or 0) + quantity
+        local mkey = mutationKey(item)
+        incomingMutation[mkey] = (incomingMutation[mkey] or 0) + quantity
     end
     for key, quantity in pairs(expected) do
         if quantity < 0 then
@@ -13843,6 +13980,7 @@ State.AutoTrader.CaptureAcceptAudit = function(info)
         expected = expected,
         outgoing = outgoing,
         incoming = incoming,
+        incomingMutation = incomingMutation,
         evidence = snapshot.evidence,
         partial = snapshot.partial,
         plan = info.plan,
@@ -14006,8 +14144,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
             local itemType = item.ItemType or item.Type or item[3] or "Weapons"
             local quantity = math.max(1, math.floor(tonumber(item[2] or item.Amount or item.Quantity) or 1))
             if itemId ~= nil then
-                local hint = State.BuildInventoryIdentityHint(item, nil)
-                local key = State.Mapping.MakeItemKey(itemType, itemId) .. "|variant:" .. tostring(hint and hint.variant or "")
+                local key = normalizeTradeItemType(itemType) .. "|" .. tostring(itemId)
                 serverIncoming[key] = (serverIncoming[key] or 0) + quantity
             end
         end
@@ -14015,10 +14152,10 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
     local serverMismatches = {}
     if next(serverIncoming) ~= nil then
         local keys = {}
-        for key in pairs(audit.incoming or {}) do keys[key] = true end
+        for key in pairs(audit.incomingMutation or {}) do keys[key] = true end
         for key in pairs(serverIncoming) do keys[key] = true end
         for key in pairs(keys) do
-            local wanted, observed = audit.incoming[key] or 0, serverIncoming[key] or 0
+            local wanted, observed = audit.incomingMutation[key] or 0, serverIncoming[key] or 0
             if wanted ~= observed then
                 table.insert(serverMismatches, {key = key, expectedReceived = wanted, serverReported = observed})
             end
@@ -15325,8 +15462,16 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         State.AutoTrader.ManualAcceptHold = false
         State.AutoTrader.Log("manual_accept_reset", {})
     end
-    local otherSummary = State.AutoTrader.SummarizeOther(otherEntries)
+    local otherSummary = State.AutoTrader.SummarizeOther(otherEntries, partner)
     State.AutoTrader.OtherSummary = otherSummary
+    if otherSummary.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
+        State.AutoTrader.Plan = nil
+        State.AutoTrader.Desired = nil
+        State.AutoTrader.Status = "WAIT · AMBIGUOUS IDENTITY"
+        State.AutoTrader.StatusDetail = "Their live offer maps to multiple canonical value identities sharing one MM2 mutation identity. Automation will not mutate or accept until the offer becomes unambiguous."
+        State.AutoTrader.Render()
+        return
+    end
     if otherSummary.slotCount > 0 and State.AutoTrader.FirstOfferAt <= 0 then
         State.AutoTrader.FirstOfferAt = os.clock()
         State.AutoTrader.Log("first_offer_seen", {partner = partner.Name, seconds = os.clock() - State.AutoTrader.TradeBeganAt})
@@ -18351,6 +18496,38 @@ State.AutoTrader.ReconcileTradeDeclineState = function()
     end
     return true
 end
+State.AutoTrader.ProcessWholeServerNoProgress = function(now, noBlockingWork)
+    if not noBlockingWork then return false end
+    local targetNow = State.AutoTrader.SelectTarget()
+    if targetNow then return false end
+    local disposition, counts = State.AutoTrader.GetServerDisposition()
+    counts = type(counts) == "table" and counts or {}
+    if (tonumber(counts.transportDeferred) or 0) > 0 then
+        if State.AutoTrader.FastBotHopReason == "EXHAUSTED_NO_PROGRESS" then
+            State.AutoTrader.FastBotHopActive = false
+            State.AutoTrader.FastBotHopReason = nil
+        end
+        State.AutoTrader.Log("server_no_progress_transport_retry_hold", {
+            disposition = disposition, transportDeferred = counts.transportDeferred, earliestRetry = counts.earliestRetry,
+        })
+        return false
+    end
+    local baseline = math.max(State.AutoTrader.ServerJoinedAt or now, State.AutoTrader.ServerMeaningfulProgressAt or 0)
+    if now - baseline < CONFIG.AutoTraderServerNoProgressTimeoutSeconds then return false end
+    State.AutoTrader.ServerNoProgressRecoveries += 1
+    State.AutoTrader.FastBotHopActive = true
+    State.AutoTrader.FastBotHopReason = "EXHAUSTED_NO_PROGRESS"
+    State.AutoTrader.Log("server_no_progress_timeout", {
+        seconds = now - baseline, recoveries = State.AutoTrader.ServerNoProgressRecoveries, disposition = disposition, counts = counts,
+    })
+    State.AutoTrader.Status = "SERVER IDLE · FORCED HOP"
+    State.AutoTrader.StatusDetail = "No actionable trading progress occurred inside the whole-server deadline; hopping even if new unresolved players keep joining."
+    State.AutoTrader.Render()
+    State.AutoTrader.ServerMeaningfulProgressAt = now
+    State.AutoTrader.TryServerHop("EXHAUSTED_NO_PROGRESS", counts)
+    return true
+end
+
 State.AutoTrader.OvernightSupervisor = function()
     if Destroyed or not State.AutoTrader.Preferences.automation then return true end
     local now = os.clock()
@@ -18555,28 +18732,8 @@ State.AutoTrader.OvernightSupervisor = function()
 
     -- Whole-server liveness deadline. PlayerAdded does intentionally NOT reset
     -- this clock, so a churny bot lobby cannot keep WAITING_FOR_DISCOVERY alive forever.
-    if noBlockingWork then
-        local targetNow = State.AutoTrader.SelectTarget()
-        if not targetNow then
-            local baseline = math.max(State.AutoTrader.ServerJoinedAt or now, State.AutoTrader.ServerMeaningfulProgressAt or 0)
-            if now - baseline >= CONFIG.AutoTraderServerNoProgressTimeoutSeconds then
-                State.AutoTrader.ServerNoProgressRecoveries += 1
-                State.AutoTrader.FastBotHopActive = true
-                State.AutoTrader.FastBotHopReason = "EXHAUSTED_NO_PROGRESS"
-                State.AutoTrader.Log("server_no_progress_timeout", {
-                    seconds = now - baseline,
-                    recoveries = State.AutoTrader.ServerNoProgressRecoveries,
-                    disposition = State.AutoTrader.GetServerDisposition(),
-                })
-                State.AutoTrader.Status = "SERVER IDLE · FORCED HOP"
-                State.AutoTrader.StatusDetail = "No actionable trading progress occurred inside the whole-server deadline; hopping even if new unresolved players keep joining."
-                State.AutoTrader.Render()
-                State.AutoTrader.ServerMeaningfulProgressAt = now
-                State.AutoTrader.TryServerHop("EXHAUSTED_NO_PROGRESS", select(2, State.AutoTrader.GetServerDisposition()))
-                return true
-            end
-        end
-    end
+    -- A promised transport retry is stronger than this generic liveness escape.
+    if State.AutoTrader.ProcessWholeServerNoProgress(now, noBlockingWork) then return true end
     return true
 end
 
@@ -23227,17 +23384,7 @@ do
     end
 
     State.AutoTrader.GetValueIdentityKey = function(entry)
-        if type(entry) ~= "table" then return nil end
-        local mutation = State.AutoTrader.GetMutationIdentityKey(entry) or "?"
-        local hint = type(entry.identityHint) == "table" and entry.identityHint or {}
-        local record = entry.record
-        local data = record and record.data or {}
-        local variant = entry.variant or hint.variant or (record and record.category == "chromas" and "Chroma") or ""
-        local event = hint.event or data.event or data.Event or data.holiday or data.Holiday or data.season or data.Season or ""
-        local year = hint.year or data.year or data.Year or data.releaseYear or data.ReleaseYear or ""
-        local supreme = record and (tostring(record.category or "") .. "/" .. tostring(record.key or record.name or "")) or ""
-        return mutation .. "|variant=" .. tostring(variant) .. "|event=" .. tostring(event)
-            .. "|year=" .. tostring(year) .. "|supreme=" .. supreme
+        return State.AutoTrader.BuildCanonicalValueIdentityKey(entry)
     end
 
     State.AutoTrader.GetFamilyIdentityKey = function(entry)
@@ -23288,6 +23435,82 @@ do
             end
         end
         return collisions
+    end
+
+    State.AutoTrader.EnrichTradeEntriesWithProfileIdentity = function(entries, player)
+        entries = type(entries) == "table" and entries or {}
+        if not player and type(State.CurrentTrade) == "table" then
+            local _, otherSide = getTradeSides(State.CurrentTrade)
+            if otherSide and State.AutoTrader.GetPlayerFromSide then
+                player = State.AutoTrader.GetPlayerFromSide(otherSide)
+            end
+        end
+        local allHints = player and State.Profile.remoteCardHintsByUserId[player.UserId] or nil
+        for _, entry in ipairs(entries) do
+            State.AutoTrader.AnnotateIdentity(entry)
+            local sectionName = normalizeTradeItemType(entry.itemType) == "pets" and "Pets" or "Weapons"
+            local hints = type(allHints) == "table" and allHints[sectionName] or nil
+            if type(hints) == "table" then
+                local matched = {}
+                local values = {}
+                local rawHint = type(entry.identityHint) == "table" and entry.identityHint or {}
+                local rawVariant = entry.variant or rawHint.variant
+                local rawYear = tonumber(rawHint.year)
+                local rawEvent = normalize(rawHint.event or "")
+                for _, hint in ipairs(hints) do
+                    if tostring(hint.itemId or "") == tostring(entry.nativeKey or entry.itemId or "") then
+                        local hintVariant = hint.variant or (hint.identityHint and hint.identityHint.variant)
+                        local hintYear = hint.identityHint and tonumber(hint.identityHint.year) or nil
+                        local hintEvent = normalize(hint.identityHint and hint.identityHint.event or "")
+                        local sameRecord = not entry.record or not hint.record
+                            or entry.record == hint.record
+                            or (tostring(entry.record.category or "") == tostring(hint.record.category or "")
+                                and tostring(entry.record.key or entry.record.name or "") == tostring(hint.record.key or hint.record.name or ""))
+                        local compatible = sameRecord
+                            and (not rawVariant or tostring(rawVariant) == tostring(hintVariant or ""))
+                            and (not rawYear or not hintYear or rawYear == hintYear)
+                            and (rawEvent == "" or hintEvent == "" or rawEvent == hintEvent)
+                        if compatible then
+                            local probe = {
+                                itemType = hint.itemType or entry.itemType,
+                                itemId = hint.itemId or entry.itemId,
+                                nativeKey = hint.itemId or entry.nativeKey or entry.itemId,
+                                record = hint.record or entry.record,
+                                variant = hintVariant or rawVariant,
+                                identityHint = type(hint.identityHint) == "table" and table.clone(hint.identityHint) or hint.identityHint,
+                                numericItemId = hint.numericItemId,
+                            }
+                            State.AutoTrader.AnnotateIdentity(probe)
+                            local valueIdentity = probe.valueIdentity or State.AutoTrader.BuildCanonicalValueIdentityKey(probe)
+                            if valueIdentity then
+                                values[valueIdentity] = true
+                                table.insert(matched, probe)
+                            end
+                        end
+                    end
+                end
+                local distinct = 0
+                for _ in pairs(values) do distinct += 1 end
+                if distinct > 1 then
+                    entry.mutationAmbiguous = true
+                    entry.identityFailure = "AMBIGUOUS_MUTATION_IDENTITY"
+                    entry.valueIdentity = nil
+                elseif distinct == 1 and #matched > 0 then
+                    local source = matched[1]
+                    entry.nativeKey = source.nativeKey or entry.nativeKey or entry.itemId
+                    entry.variant = source.variant or entry.variant
+                    entry.identityHint = type(source.identityHint) == "table" and table.clone(source.identityHint) or source.identityHint
+                    entry.numericItemId = source.numericItemId or entry.numericItemId
+                    entry.gameData = source.gameData or entry.gameData
+                    entry.valueIdentity = source.valueIdentity
+                    entry.mutationIdentity = source.mutationIdentity
+                    entry.familyIdentity = source.familyIdentity
+                    entry.mutationAmbiguous = nil
+                    entry.identityFailure = nil
+                end
+            end
+        end
+        return entries
     end
 
     State.AutoTrader.V35GetTradableInventory = State.AutoTrader.V35GetTradableInventory or State.AutoTrader.GetTradableInventory
@@ -23555,13 +23778,22 @@ do
         local reachOptions={isCurrent=options.isCurrent,budgetMs=options.reachBudgetMs}
         local before=State.AutoTrader.GetPortfolioMetrics(baseEntries,extra,reachOptions)
         local afterEntries=State.AutoTrader.SimulatePortfolioExchange(baseEntries,giveItems,receiveItems)
+        local profit=receiveTotal-giveTotal
+        local postExchangeCollisions=State.AutoTrader.FindMutationIdentityCollisions(afterEntries)
+        if next(postExchangeCollisions)~=nil then
+            local identityReason="AMBIGUOUS_MUTATION_IDENTITY: simulated post-trade portfolio contains incompatible value identities sharing one mutation identity"
+            return {ok=false,score=0,before=before,after=nil,hardAnchorOK=false,anchorOK=false,anchorReason=identityReason,
+                catastropheOK=false,catastropheReason=identityReason,reachTrusted=false,noReach4Regression=false,meaningfulImprovement=false,
+                strategicSubkind="REBALANCE",profit=profit,giveTotal=giveTotal,receiveTotal=receiveTotal,reason=identityReason,
+                simulatedEntries=afterEntries,reachPolicyDegraded=true,identityFailure="AMBIGUOUS_MUTATION_IDENTITY",mutationIdentityCollision=true,
+                mutationCollisions=postExchangeCollisions}
+        end
         local after=State.AutoTrader.GetPortfolioMetrics(afterEntries,extra,reachOptions)
         local hardAnchorOK=true; local anchorReason=nil
         if before.maxValue>=before.anchorThreshold and before.maxValue>0 then
             if after.maxValue+0.000001<before.maxValue*CONFIG.AutoTraderLiquidityAnchorRetention then hardAnchorOK=false;anchorReason="would liquidate too much one-slot anchor strength"
             elseif before.anchorValue>0 and after.anchorValue+0.000001<before.anchorValue*0.45 then hardAnchorOK=false;anchorReason="would liquidate too much high-value anchor inventory" end
         end
-        local profit=receiveTotal-giveTotal
         local reachTrusted=before.reach and after.reach and before.reach.trusted==true and after.reach.trusted==true
         local catastropheOK=true; local catastropheReason=nil; local noReach4Regression=true
         local meaningfulImprovement=false; local reachGain=0
@@ -24347,6 +24579,7 @@ do
             if type(row)~="table" then return false,"malformed fingerprint row" end
             if State.AutoTrader.ApplyBotEvidenceToDb(candidate,"strict",row.fingerprint,sourceJobId,math.max(1,math.min(20,math.floor(tonumber(row.count) or 1))),tonumber(row.sampleUserId),row.sampleName) then learned+=1 else return false,"invalid strict fingerprint" end
         end
+        candidate=State.AutoTrader.PruneBotDbCandidate(candidate)
         local saved,err=State.AutoTrader.CommitTrustedBotDbCandidate(candidate,{source="strict_gold_departure_commit",sourceJobId=sourceJobId,certifiedPlayers=payload.certifiedPlayers})
         if not saved then State.AutoTrader.Status="BOT CERTIFY · SAVE FAILED";State.AutoTrader.StatusDetail="Strict bot evidence remains UNTRUSTED because persistence did not verify: "..tostring(err);State.AutoTrader.Log("strict_bot_commit_failed",{reason=err,hashesPrepared=learned});State.AutoTrader.Render();return false,err end
         State.AutoTrader.LastBotLearning={jobId=sourceJobId,importedIntoJobId=game.JobId,action="strict_gold_departure_commit_imported",source="trusted_persistence_verified",certifiedPlayers=payload.certifiedPlayers,hashesLearned=learned,atUnix=os.time()}
@@ -24871,6 +25104,198 @@ do
     end
 end
 
+
+do
+    State.AutoTrader.V36Rc3RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local result = State.AutoTrader.V36Rc3RunSelfTests()
+        local tests = result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+        add("no-progress-supervisor-holds-transport-retry", function()
+            local oldSelect, oldDisposition, oldHop = State.AutoTrader.SelectTarget, State.AutoTrader.GetServerDisposition, State.AutoTrader.TryServerHop
+            local oldJoined, oldProgress = State.AutoTrader.ServerJoinedAt, State.AutoTrader.ServerMeaningfulProgressAt
+            local oldRecoveries, oldActive, oldReason = State.AutoTrader.ServerNoProgressRecoveries, State.AutoTrader.FastBotHopActive, State.AutoTrader.FastBotHopReason
+            local hopped = false
+            local now = os.clock()
+            State.AutoTrader.SelectTarget = function() return nil end
+            State.AutoTrader.GetServerDisposition = function() return "WAITING_FOR_RETRY", {transportDeferred=1,retryLater=1,earliestRetry=CONFIG.AutoTraderTransportDeferredSeconds} end
+            State.AutoTrader.TryServerHop = function() hopped=true; return true end
+            State.AutoTrader.ServerJoinedAt = now-CONFIG.AutoTraderServerNoProgressTimeoutSeconds-10
+            State.AutoTrader.ServerMeaningfulProgressAt = 0
+            State.AutoTrader.ServerNoProgressRecoveries = 0
+            State.AutoTrader.FastBotHopActive = true
+            State.AutoTrader.FastBotHopReason = "EXHAUSTED_NO_PROGRESS"
+            local callOk, triggered = pcall(State.AutoTrader.ProcessWholeServerNoProgress, now, true)
+            local held = callOk and triggered==false and hopped==false and State.AutoTrader.FastBotHopActive==false and State.AutoTrader.FastBotHopReason==nil
+            State.AutoTrader.SelectTarget, State.AutoTrader.GetServerDisposition, State.AutoTrader.TryServerHop = oldSelect, oldDisposition, oldHop
+            State.AutoTrader.ServerJoinedAt, State.AutoTrader.ServerMeaningfulProgressAt = oldJoined, oldProgress
+            State.AutoTrader.ServerNoProgressRecoveries, State.AutoTrader.FastBotHopActive, State.AutoTrader.FastBotHopReason = oldRecoveries, oldActive, oldReason
+            return held, "aged no-progress supervisor armed/hopped despite transport-deferred retry"
+        end)
+        add("server-hop-guard-vetoes-transport-retry", function()
+            local oldDisposition, oldIncoming, oldNative = State.AutoTrader.GetServerDisposition, State.AutoTrader.GetIncomingRequestUi, State.AutoTrader.IsAnyNativeOutgoingPending
+            local oldPending, oldLifecycle, oldDecline, oldTrade, oldAudit = State.AutoTrader.PendingRequest, State.AutoTrader.RequestLifecycle, State.AutoTrader.TradeDeclinePending, State.CurrentTrade, State.AutoTrader.PostTradeAuditPending
+            local oldActive, oldReason = State.AutoTrader.FastBotHopActive, State.AutoTrader.FastBotHopReason
+            State.AutoTrader.GetServerDisposition = function() return "WAITING_FOR_RETRY", {transportDeferred=1,retryLater=1} end
+            State.AutoTrader.GetIncomingRequestUi = function() return nil,nil end
+            State.AutoTrader.IsAnyNativeOutgoingPending = function() return false end
+            State.AutoTrader.PendingRequest=nil;State.AutoTrader.RequestLifecycle="idle";State.AutoTrader.TradeDeclinePending=false;State.CurrentTrade=nil;State.AutoTrader.PostTradeAuditPending=false
+            State.AutoTrader.FastBotHopActive=true;State.AutoTrader.FastBotHopReason="EXHAUSTED_NO_PROGRESS"
+            local callOk, allowed, why = pcall(State.AutoTrader.ServerHopStillAllowed)
+            local vetoed = callOk and allowed==false and tostring(why):find("transport%-deferred")~=nil and State.AutoTrader.FastBotHopActive==false
+            State.AutoTrader.GetServerDisposition, State.AutoTrader.GetIncomingRequestUi, State.AutoTrader.IsAnyNativeOutgoingPending = oldDisposition, oldIncoming, oldNative
+            State.AutoTrader.PendingRequest, State.AutoTrader.RequestLifecycle, State.AutoTrader.TradeDeclinePending, State.CurrentTrade, State.AutoTrader.PostTradeAuditPending = oldPending, oldLifecycle, oldDecline, oldTrade, oldAudit
+            State.AutoTrader.FastBotHopActive, State.AutoTrader.FastBotHopReason = oldActive, oldReason
+            return vetoed, "already-armed EXHAUSTED_NO_PROGRESS hop was not vetoed by transport retry"
+        end)
+        add("canonical-value-identity-includes-native-id-and-ancestry", function()
+            local base = {itemType="Weapons",itemId="same",numericItemId=123,record={category="godlies",key="A",name="A",data={year=2018,event="Halloween",value=5}},identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Owned > A"}}
+            local other = State.AutoTrader.ClonePlainTable(base);other.identityHint.ancestryPath="Weapons > Event > A"
+            local a = State.AutoTrader.GetValueIdentityKey(base);local b = State.AutoTrader.GetValueIdentityKey(other)
+            return a~=b and a:find("nativeId=123",1,true)~=nil and a:find("|ancestry=",1,true)~=nil, "canonical value identity omitted native numeric ID or ancestry"
+        end)
+        add("startup-strict-commit-prunes-before-late-overrides", function()
+            local earlyCommit = State.AutoTrader.V36AuditCommitTrustedBotDbCandidate
+            if type(earlyCommit) ~= "function" then return false, "captured pre-late commit function unavailable" end
+            local oldWrite, oldReadText, oldReadJson = HARDEN.atomicWriteTextFileBestEffort, HARDEN.readTextFileBestEffort, HARDEN.readJsonFileBestEffort
+            local oldDb, oldPending, oldSerial = State.AutoTrader.BotIconDb, State.AutoTrader.BotIconDbPending, State.AutoTrader.BotTrustCommitSerial
+            local key=State.AutoTrader.BotIconDbKey;local oldG=rawget(_G,key);local oldE=rawget(ExecutorEnvironment,key)
+            local mem={}
+            HARDEN.atomicWriteTextFileBestEffort=function(name,body) mem[name]=body;return true end
+            HARDEN.readTextFileBestEffort=function(name) return mem[name] end
+            HARDEN.readJsonFileBestEffort=function(name) local body=mem[name];if type(body)~="string" then return nil end;local ok,v=pcall(function() return HttpService:JSONDecode(body) end);return ok and v or nil end
+            State.AutoTrader.BotIconDb={version=5,trustedRevision=1,icons={}}
+            local jobs={};for i=1,CONFIG.AutoTraderBotDatabaseJobsPerIcon+3 do jobs["job"..tostring(i)]=i end
+            local candidate={version=5,icons={bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb={strictGoldBotJobs=jobs,manualGoldBotJobs={},botJobs={},humanJobs={},goldBotJobs={},lastSeen=1}}}
+            local callOk, okCommit, err = pcall(earlyCommit,candidate,{source="self_test_startup_strict"})
+            local committed=State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.icons and State.AutoTrader.BotIconDb.icons.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+            local bounded=callOk and okCommit==true and committed and State.AutoTrader.BotIconJobCount(committed.strictGoldBotJobs)<=CONFIG.AutoTraderBotDatabaseJobsPerIcon
+            local inputUntouched=State.AutoTrader.BotIconJobCount(candidate.icons.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.strictGoldBotJobs)>CONFIG.AutoTraderBotDatabaseJobsPerIcon
+            HARDEN.atomicWriteTextFileBestEffort, HARDEN.readTextFileBestEffort, HARDEN.readJsonFileBestEffort = oldWrite, oldReadText, oldReadJson
+            State.AutoTrader.BotIconDb, State.AutoTrader.BotIconDbPending, State.AutoTrader.BotTrustCommitSerial = oldDb, oldPending, oldSerial
+            rawset(_G,key,oldG);rawset(ExecutorEnvironment,key,oldE)
+            return bounded and inputUntouched, tostring(err or "pre-late strict commit did not transactionally prune")
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v36_rc3",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end
+
+do
+    State.AutoTrader.V36Rc4RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local result = State.AutoTrader.V36Rc4RunSelfTests()
+        local tests = result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+        add("local-canonical-aggregation-preserves-collision", function()
+            local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
+            local calculated={weapons={cardHints={
+                {itemType="Weapons",itemId="same",quantity=1,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Owned > A"}},
+                {itemType="Weapons",itemId="same",quantity=1,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Event > A"}},
+            }},pets={cardHints={}}}
+            local entries=State.AutoTrader.BuildLocalResolvedEntriesFromCalculated(calculated)
+            local collisions=State.AutoTrader.FindMutationIdentityCollisions(entries)
+            return #entries==2 and next(collisions)~=nil and entries[1].mutationAmbiguous==true and entries[2].mutationAmbiguous==true, "local ancestry-distinct value identities collapsed before mutation collision detection"
+        end)
+        add("portfolio-simulation-preserves-canonical-identities", function()
+            local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
+            local a={itemType="Weapons",itemId="same",unitValue=5,quantity=1,maxQuantity=1,record=record,identityHint={ancestryPath="Weapons > Owned > A"}}
+            local b={itemType="Weapons",itemId="same",unitValue=5,quantity=1,maxQuantity=1,record=record,identityHint={ancestryPath="Weapons > Event > A"}}
+            local simulated=State.AutoTrader.SimulatePortfolioExchange({a,b},{},{})
+            return #simulated==2 and State.AutoTrader.BuildCanonicalValueIdentityKey(simulated[1])~=State.AutoTrader.BuildCanonicalValueIdentityKey(simulated[2]), "portfolio simulation collapsed canonical identities"
+        end)
+        add("canonical-audit-accounting-distinguishes-ancestry", function()
+            local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
+            local a={itemType="Weapons",itemId="same",record=record,identityHint={ancestryPath="Weapons > Owned > A"}}
+            local b={itemType="Weapons",itemId="same",record=record,identityHint={ancestryPath="Weapons > Event > A"}}
+            local ak=State.AutoTrader.BuildCanonicalValueIdentityKey(a);local bk=State.AutoTrader.BuildCanonicalValueIdentityKey(b)
+            return ak~=bk and ak:find("|ancestry=",1,true)~=nil and bk:find("|ancestry=",1,true)~=nil, "audit canonical keys omitted ancestry"
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v36_rc4",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end
+
+do
+    State.AutoTrader.V36Rc5RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local result = State.AutoTrader.V36Rc5RunSelfTests()
+        local tests = result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+        add("mutation-gate-operational-key-compatible-with-canonical-local-identity", function()
+            local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
+            local calculated={weapons={cardHints={{itemType="Weapons",itemId="same",quantity=1,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Owned > A"}}}},pets={cardHints={}}}
+            local entries=State.AutoTrader.BuildLocalResolvedEntriesFromCalculated(calculated)
+            local candidate=entries[1]
+            if not candidate then return false,"canonical local builder produced no candidate" end
+            candidate.maxQuantity=1
+            local wanted={itemType="Weapons",itemId="same",variant=candidate.variant,identityHint=candidate.identityHint,valueIdentity=candidate.valueIdentity}
+            local allowed,operationalKey=State.AutoTrader.FindTradableMutationCandidate(entries,wanted)
+            return allowed==candidate and candidate.key==operationalKey and candidate.valueIdentity~=nil and candidate.valueIdentity~=candidate.key,
+                "FireMutation production availability lookup is incompatible with canonical local identity"
+        end)
+        add("post-exchange-cross-side-mutation-collision-fails-closed", function()
+            local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
+            local a={itemType="Weapons",itemId="same",nativeKey="same",unitValue=5,quantity=1,maxQuantity=1,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Owned > A"}}
+            local b={itemType="Weapons",itemId="same",nativeKey="same",unitValue=6,quantity=1,maxQuantity=1,record={category="godlies",key="B",name="B",data={value=6,year=2018,event="Halloween",demand=5}},identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Event > B"}}
+            local delta=State.AutoTrader.EvaluatePortfolioDelta({a},{},{b},{excludeServerBudgets=true})
+            return delta and delta.ok==false and delta.anchorOK==false and delta.identityFailure=="AMBIGUOUS_MUTATION_IDENTITY" and next(delta.mutationCollisions or {})~=nil,
+                "cross-side post-exchange mutation collision was not rejected before portfolio safety analysis"
+        end)
+        add("canonical-audit-production-path-distinguishes-ancestry", function()
+            local oldRemote=State.Profile.remoteTotals
+            local oldCalc=State.Profile.CalculateRemoteInventory
+            local now=os.clock()
+            local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
+            local a={itemType="Weapons",itemId="same",nativeKey="same",quantity=1,unitValue=5,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Owned > A"}}
+            local b={itemType="Weapons",itemId="same",nativeKey="same",quantity=1,unitValue=5,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Event > A"}}
+            local callOk,snapshot,audit,ak,bk=pcall(function()
+                State.Profile.remoteTotals={rawByUserId={[LocalPlayer.UserId]={}},lastSuccessByUserId={[LocalPlayer.UserId]=now}}
+                State.Profile.CalculateRemoteInventory=function() return {weapons={cardHints={{itemType=a.itemType,itemId=a.itemId,quantity=1,record=record,identityHint=a.identityHint}},unresolvedAll={}},pets={cardHints={},unresolvedAll={}},partial=false} end
+                local snap=State.AutoTrader.GetLocalAuditSnapshot(false)
+                local accepted=State.AutoTrader.CaptureAcceptAudit({plan={items={a}},otherEntries={b}})
+                return snap,accepted,State.AutoTrader.BuildCanonicalValueIdentityKey(a),State.AutoTrader.BuildCanonicalValueIdentityKey(b)
+            end)
+            State.Profile.remoteTotals=oldRemote
+            State.Profile.CalculateRemoteInventory=oldCalc
+            if not callOk then return false,tostring(snapshot) end
+            return snapshot and audit and ak~=bk and snapshot.quantities[ak]==1 and audit.expected[ak]==0 and audit.expected[bk]==1
+                and audit.incoming[bk]==1 and audit.incomingMutation[normalizeTradeItemType("Weapons").."|same"]==1,
+                "real local audit/CaptureAcceptAudit path collapsed ancestry-distinct canonical identities"
+        end)
+        add("live-offer-profile-ancestry-collision-fails-closed", function()
+            local oldHints=State.Profile.remoteCardHintsByUserId
+            local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
+            local player={UserId=987654321}
+            local a={itemId="same",itemType="Weapons",quantity=1,record=record}
+            State.Profile.remoteCardHintsByUserId=setmetatable({[player.UserId]={Weapons={
+                {itemType="Weapons",itemId="same",quantity=1,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Owned > A"}},
+                {itemType="Weapons",itemId="same",quantity=1,record=record,identityHint={year=2018,event="Halloween",ancestryPath="Weapons > Event > A"}},
+            },Pets={}}},{__index=oldHints})
+            local ok,summary=pcall(function() return State.AutoTrader.SummarizeOther({a},player) end)
+            State.Profile.remoteCardHintsByUserId=oldHints
+            return ok and summary and summary.identityFailure=="AMBIGUOUS_MUTATION_IDENTITY" and a.mutationAmbiguous==true,
+                "live trade offer lost profile ancestry before fail-closed identity validation"
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v36_rc6",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end
 
 State.QueueNativeDatabaseWarmup()
 rawset(_G, GLOBAL_KEY, Controller)

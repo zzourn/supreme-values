@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.58-public-auto-trader-v26-cached-server-pool",
+    version = "18.59-public-auto-trader-v27-state-machine-audit-cleanup",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -30,6 +30,13 @@ local CONFIG = {
     AutoTraderCooldownSeconds = 120,
     AutoTraderRepeatRequestSeconds = 20,
     AutoTraderRequestSpacingSeconds = 1.25,
+    -- v27: outgoing requests are single-flight. After asking MM2 to cancel, wait
+    -- for its native pending UI to disappear and remain quiet before another request.
+    AutoTraderRequestCancelQuietSeconds = 1.0,
+    AutoTraderRequestCancelConfirmTimeoutSeconds = 3.0,
+    AutoTraderRequestNativeGoneGraceSeconds = 0.75,
+    AutoTraderTradeDeclineConfirmTimeoutSeconds = 3.0,
+    AutoTraderTradeDeclineQuietSeconds = 0.5,
     AutoTraderStableSeconds = 0.9,
     AutoTraderTradeWarmupSeconds = 0.6,
     AutoTraderActionTimeoutSeconds = 1.8,
@@ -70,6 +77,9 @@ local CONFIG = {
     AutoTraderMaxFlipDrop = 1.25,
     AutoTraderMaxStabilityDrop = 1.50,
     AutoTraderTargetStatsDecayPerDay = 0.985,
+    AutoTraderTargetStatsMaxPlayers = 1500,
+    AutoTraderTargetStatsTtlDays = 30,
+    AutoTraderEconomicSkipCooldownSeconds = 30,
     AutoTraderServerHopEnabled = true,
     AutoTraderUnresolvedMaxWaitSeconds = 22,
     AutoTraderDiscoveryRetrySeconds = 4,
@@ -78,11 +88,13 @@ local CONFIG = {
     AutoTraderServerHopRetrySeconds = 5,
     AutoTraderServerRescanDelaySeconds = 2.0,
     AutoTraderServerRateLimitMaxBackoffSeconds = 16,
+    AutoTraderServerRateLimitBlindHopAfterScans = 2,
+    AutoTraderServerHopTotalTimeoutSeconds = 45,
     AutoTraderServerTeleportAttemptTimeoutSeconds = 8,
     AutoTraderServerListPages = 2,
     AutoTraderServerCandidateLimit = 180,
     AutoTraderServerQueueLimit = 30,
-    -- v26: successful scans feed a cross-teleport candidate pool. Entries are
+    -- v27: successful scans feed a cross-teleport candidate pool. Entries are
     -- deliberately short-lived: after three minutes the instance may be gone or
     -- its population may have changed enough that the old preview is not useful.
     AutoTraderServerCandidateCacheTtlSeconds = 180,
@@ -114,7 +126,7 @@ local CONFIG = {
     AutoTraderBootstrapBotDbJobsPerIcon = 12,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
     AutoTraderThumbnailBatchSize = 100,
-    -- v26 bot architecture: bot learning, current-server hop decisions, and
+    -- v27 bot architecture: bot learning, current-server hop decisions, and
     -- pre-join server selection are deliberately independent systems. Only a
     -- physically certified all-bot server may add hashes to the strict database.
     -- Server-list GETs prefer game:HttpGet and validate token-bearing rows before
@@ -129,7 +141,7 @@ local CONFIG = {
     AutoTraderGoldBotObservedMinJobs = 1,
     AutoTraderGoldBotKnownMinJobs = 2,
     AutoTraderGoldBotConfirmMinJobs = 3,
-    -- v26: 10s is now a hard cap/cold-start default, not an unconditional hold.
+    -- v27: 10s is now a hard cap/cold-start default, not an unconditional hold.
     -- Once human servers have been observed, the bot hold becomes
     -- min(10s, longest persisted human-detection latency + 1s).
     AutoTraderGoldObserveSeconds = 10,
@@ -137,13 +149,13 @@ local CONFIG = {
     AutoTraderGoldHumanTimingSampleLimit = 100,
     AutoTraderGoldSampleSeconds = 0.05,
     AutoTraderGoldMoveDirectionEpsilon = 0.05,
-    -- v26: transient remote movement is telemetry, not a whole-server verdict.
+    -- v27: transient remote movement is telemetry, not a whole-server verdict.
     -- After a short character settle period, only a sustained/repeated nonzero
     -- MoveDirection burst can permanently classify the JobId as regular.
     AutoTraderGoldCharacterSettleSeconds = 1.5,
     AutoTraderGoldMoveDirectionViolationMinSamples = 10,
     AutoTraderGoldMoveDirectionViolationMinSpanSeconds = 0.45,
-    AutoTraderGoldMoveDirectionViolationGapSeconds = 0.15,
+    AutoTraderGoldMoveDirectionViolationGapSeconds = 0.35,
     AutoTraderGoldOrientationFuzzDegrees = 7,
     AutoTraderGoldMovementStepStuds = 0.35,
     AutoTraderGoldMinTotalDistanceStuds = 8,
@@ -6338,6 +6350,7 @@ State.AutoTrader = {
     HumanDetectionTiming = {version = 1, count = 0, totalSeconds = 0, maxSeconds = 0, samples = {}},
     HumanTimingSaveGeneration = 0,
     ServerRateLimitBackoffSeconds = 0,
+    ServerRateLimitConsecutiveScans = 0,
     LastServerScan = nil,
     CurrentServerAvatarScreen = nil,
     CurrentServerAvatarScreenAt = 0,
@@ -6357,6 +6370,15 @@ State.AutoTrader = {
     RecoveryTeleportReason = nil,
     RecoveryTeleportLastAttemptAt = 0,
     StaleTradeGuiSince = 0,
+    RequestLifecycle = "idle",
+    OrphanRequestCancelStartedAt = 0,
+    OrphanRequestQuietSince = 0,
+    TradeDeclinePending = false,
+    TradeDeclineStartedAt = 0,
+    TradeDeclineQuietSince = 0,
+    TradeDeclinePartnerUserId = nil,
+    TradeDeclineOutcome = nil,
+    TradeRequestStartedAt = 0,
     NoEligibleWorkSince = 0,
     ServerMeaningfulProgressAt = os.clock(),
     ServerNoProgressRecoveries = 0,
@@ -6476,6 +6498,33 @@ State.AutoTrader.LoadTargetStats = function()
     State.AutoTrader.TargetStats = loaded
     rawset(_G, State.AutoTrader.TargetStatsKey, loaded)
 end
+State.AutoTrader.PruneTargetStats = function()
+    local stats = State.AutoTrader.TargetStats
+    if type(stats) ~= "table" then return end
+    local now = os.time()
+    local ttl = math.max(1, tonumber(CONFIG.AutoTraderTargetStatsTtlDays) or 30) * 86400
+    local maxPlayers = math.max(100, math.floor(tonumber(CONFIG.AutoTraderTargetStatsMaxPlayers) or 1500))
+    local rows = {}
+    for key, value in pairs(stats) do
+        if key ~= "__strategy_v1" and type(value) == "table" then
+            local last = tonumber(value.lastEventUnix) or 0
+            if last > 0 and now - last > ttl then
+                stats[key] = nil
+            else
+                table.insert(rows, {key = key, last = last})
+            end
+        end
+    end
+    if #rows > maxPlayers then
+        table.sort(rows, function(a, b)
+            if a.last ~= b.last then return a.last < b.last end
+            return tostring(a.key) < tostring(b.key)
+        end)
+        for index = 1, #rows - maxPlayers do
+            stats[rows[index].key] = nil
+        end
+    end
+end
 State.AutoTrader.SaveTargetStats = function()
     rawset(_G, State.AutoTrader.TargetStatsKey, State.AutoTrader.TargetStats)
     State.AutoTrader.TargetStatsSaveGeneration += 1
@@ -6488,6 +6537,7 @@ State.AutoTrader.SaveTargetStats = function()
     end)
 end
 State.AutoTrader.FlushTargetStats = function()
+    State.AutoTrader.PruneTargetStats()
     rawset(_G, State.AutoTrader.TargetStatsKey, State.AutoTrader.TargetStats)
     local writefileFunction = State.TryGetExecutorGlobal("writefile")
     if type(writefileFunction) ~= "function" then
@@ -6750,7 +6800,7 @@ State.AutoTrader.RecordStrategyEvent = function(player, kind, data)
         elseif kind == "tradeDecline" then
             bucket.tradeDeclines += 1
             bucket.terminalOutcomes += 1
-            bucket.terminalSeconds += math.max(1, tonumber(data.seconds) or 10)
+            bucket.terminalSeconds += math.max(1, tonumber(data.totalSeconds) or tonumber(data.seconds) or 10)
         elseif kind == "ignored" then
             bucket.ignored += 1
             bucket.terminalOutcomes += 1
@@ -6758,7 +6808,7 @@ State.AutoTrader.RecordStrategyEvent = function(player, kind, data)
         elseif kind == "idle" then
             bucket.idle += 1
             bucket.terminalOutcomes += 1
-            bucket.terminalSeconds += math.max(1, tonumber(data.seconds) or CONFIG.AutoTraderTradeIdleTimeoutSeconds)
+            bucket.terminalSeconds += math.max(1, tonumber(data.totalSeconds) or tonumber(data.seconds) or CONFIG.AutoTraderTradeIdleTimeoutSeconds)
         end
         bucket.lastEventUnix = os.time()
     end
@@ -6816,7 +6866,7 @@ State.AutoTrader.RecordTargetEvent = function(player, kind, data)
     end
     stats.lastEventUnix = os.time()
     State.AutoTrader.RecordStrategyEvent(player, kind, data)
-    -- v26 bot identity is intentionally isolated from all trade/inventory behavior.
+    -- v27 bot identity is intentionally isolated from all trade/inventory behavior.
     State.AutoTrader.SaveTargetStats()
 end
 State.AutoTrader.GetTargetProfile = function(player)
@@ -7010,7 +7060,7 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
     local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.45)
     local declinePenalty = 1 / (1 + (tonumber(stats.declines) or 0) * 0.10)
 
-    -- v26: avatar/bot knowledge intentionally has ZERO influence on current-server
+    -- v27: avatar/bot knowledge intentionally has ZERO influence on current-server
     -- target economics. The bot database is only a pre-join server filter.
     return (
         expectedProfit
@@ -7124,7 +7174,7 @@ State.AutoTrader.RequestFriendStatus = function(player, force)
             return
         end
         State.AutoTrader.FriendPending[userId] = nil
-        State.AutoTrader.FriendCache[userId] = false
+        State.AutoTrader.FriendCache[userId] = nil
         State.AutoTrader.FriendCacheMeta[userId] = {checkedAt = os.clock(), fallback = true, error = "friend lookup timed out"}
     end
     if not force and cached ~= nil and not (meta and meta.fallback and os.clock() - (meta.checkedAt or 0) >= 10) then
@@ -7143,11 +7193,11 @@ State.AutoTrader.RequestFriendStatus = function(player, force)
             State.AutoTrader.FriendCache[userId] = isFriend == true
             State.AutoTrader.FriendCacheMeta[userId] = {checkedAt = os.clock(), fallback = false}
         else
-            -- A failed Roblox friend lookup must never deadlock all targeting.
-            -- Fail open as non-friend, but mark it as retryable and retry periodically.
-            State.AutoTrader.FriendCache[userId] = false
+            -- v27: Ignore Friends must not fail open. A failed lookup leaves only this
+            -- player unresolved/retryable; other verified non-friends can still trade.
+            State.AutoTrader.FriendCache[userId] = nil
             State.AutoTrader.FriendCacheMeta[userId] = {checkedAt = os.clock(), fallback = true, error = tostring(isFriend)}
-            State.AutoTrader.Log("friend_lookup_failed_open", {userId = userId, name = player.Name, error = tostring(isFriend)})
+            State.AutoTrader.Log("friend_lookup_failed_unknown", {userId = userId, name = player.Name, error = tostring(isFriend)})
         end
         if scheduleTradeRefresh then
             scheduleTradeRefresh(0)
@@ -7167,9 +7217,10 @@ State.AutoTrader.GetFriendStatus = function(player)
         local pendingAt = State.AutoTrader.FriendPending[player.UserId]
         if pendingAt and os.clock() - (tonumber(pendingAt) or os.clock()) >= 3 then
             State.AutoTrader.FriendPending[player.UserId] = nil
-            State.AutoTrader.FriendCache[player.UserId] = false
+            State.AutoTrader.FriendCache[player.UserId] = nil
             State.AutoTrader.FriendCacheMeta[player.UserId] = {checkedAt = os.clock(), fallback = true, error = "friend lookup timed out"}
-            return false
+            State.AutoTrader.RequestFriendStatus(player, true)
+            return nil
         end
         State.AutoTrader.RequestFriendStatus(player)
         return nil
@@ -7227,7 +7278,7 @@ State.AutoTrader.IsTerminalServerOutcome = function(outcome)
         or outcome == "trade_unavailable"
         or outcome == "trade_declined"
         or outcome == "idle"
-        or outcome == "economic_skip"
+        or outcome == "manual_skip"
 end
 State.AutoTrader.GetServerPlayerClassification = function(player)
     local state = State.AutoTrader.EnsureServerPlayer(player)
@@ -7274,6 +7325,9 @@ State.AutoTrader.GetServerDisposition = function()
     if not State.AutoTrader.Preferences.automation then return "OFF", counts end
     if State.AutoTrader.SessionFrozen then return "FROZEN", counts end
     if State.AutoTrader.PostTradeAuditPending or State.AutoTrader.PendingRequest
+        or State.AutoTrader.IsAnyNativeOutgoingPending()
+        or State.AutoTrader.RequestLifecycle ~= "idle"
+        or State.AutoTrader.TradeDeclinePending
         or State.CurrentTrade or (isTradeVisible and isTradeVisible()) then
         return "ACTIVE", counts
     end
@@ -7811,7 +7865,7 @@ State.AutoTrader.AddBotIconEvidence = function()
 end
 State.AutoTrader.LoadBotIconDb()
 
--- v26: learn how quickly real human-controlled MoveDirection exposes a regular server.
+-- v27: learn how quickly real human-controlled MoveDirection exposes a regular server.
 -- This timing model is deliberately separate from bot identity. It only shortens the
 -- final "all bot-like players have passed" hold; it never causes a current server hop.
 State.AutoTrader.NormalizeHumanDetectionTiming = function(value)
@@ -8249,7 +8303,7 @@ State.AutoTrader.FetchPublicServers = function(maxPages)
         if pagePlayingRows > 0 and pageTokenRows == 0 then diagnostics.tokenlessActivePages += 1 end
         cursor = decoded.nextPageCursor
         if not cursor or cursor == "" then break end
-        -- v26: page 1 normally contains far more candidates than one hop needs.
+        -- v27: page 1 normally contains far more candidates than one hop needs.
         -- Do not spend another server-list request unless the first page was thin.
         if pageIndex == 1
             and diagnostics.usableRows >= CONFIG.AutoTraderServerFirstPageUsableTarget then
@@ -9361,7 +9415,7 @@ State.AutoTrader.FindPublicServer = function()
     local queue, scan = State.AutoTrader.BuildPublicServerQueue()
     return queue[1], scan
 end
-State.AutoTrader.BeginTeleport = function(reason, sameJob)
+State.AutoTrader.BeginTeleport = function(reason, sameJob, commitStrictGold)
     if State.AutoTrader.TeleportInProgress then return false end
     local queued, queueError = State.AutoTrader.QueueTeleportScript(reason)
     if not queued then
@@ -9377,6 +9431,7 @@ State.AutoTrader.BeginTeleport = function(reason, sameJob)
     local teleportData = {
         svAutoTrader = true, reason = tostring(reason), fromJobId = game.JobId,
         goldCertificationHistory = State.AutoTrader.BuildGoldCertificationHistoryTeleportPayload(),
+        strictGoldCommit = commitStrictGold == true and State.AutoTrader.BuildStrictGoldTeleportCommitPayload() or nil,
     }
     local ok, err = pcall(function()
         if sameJob and #Players:GetPlayers() > 1 and type(game.JobId) == "string" and game.JobId ~= "" then
@@ -9425,6 +9480,9 @@ State.AutoTrader.ServerHopStillAllowed = function()
         if revivedTarget then return false, "new trading opportunity appeared: " .. tostring(revivedTarget.Name) end
     end
     local noWork = not State.AutoTrader.PendingRequest
+        and not State.AutoTrader.IsAnyNativeOutgoingPending()
+        and State.AutoTrader.RequestLifecycle == "idle"
+        and not State.AutoTrader.TradeDeclinePending
         and not State.CurrentTrade
         and not State.AutoTrader.PostTradeAuditPending
         and not (liveIncoming and State.AutoTrader.IsGuiShown(liveIncoming))
@@ -9456,12 +9514,27 @@ State.AutoTrader.GetServerRescanDelay = function(scan)
             and math.min(maxDelay, math.max(base, retryAfterSeconds))
             or exponential
         State.AutoTrader.ServerRateLimitBackoffSeconds = delay
+        State.AutoTrader.ServerRateLimitConsecutiveScans = (tonumber(State.AutoTrader.ServerRateLimitConsecutiveScans) or 0) + 1
         return delay, true
     end
     State.AutoTrader.ServerRateLimitBackoffSeconds = 0
+    State.AutoTrader.ServerRateLimitConsecutiveScans = 0
     return base, false
 end
 
+State.AutoTrader.TryRateLimitBlindHopFallback = function(reason)
+    if (tonumber(State.AutoTrader.ServerRateLimitConsecutiveScans) or 0) < CONFIG.AutoTraderServerRateLimitBlindHopAfterScans then return false end
+    local allowed = State.AutoTrader.ServerHopStillAllowed()
+    if not allowed then return false end
+    State.AutoTrader.Log("server_rate_limit_blind_hop_fallback", {
+        scans = State.AutoTrader.ServerRateLimitConsecutiveScans, reason = tostring(reason or "rate limited"),
+    })
+    State.AutoTrader.AbortServerHop("switching from rate-limited screened scan to blind public teleport")
+    State.AutoTrader.Status = "SERVER HOP · BLIND FALLBACK"
+    State.AutoTrader.StatusDetail = "Server-list transports are repeatedly rate limited; using Roblox's normal public teleport so trading is not stranded."
+    State.AutoTrader.Render()
+    return State.AutoTrader.BeginTeleport("server_rate_limit_blind_fallback", false, true)
+end
 State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     if Destroyed
         or not State.AutoTrader.ServerHopInProgress
@@ -9485,6 +9558,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
         local scan = State.AutoTrader.LastServerScan
         local best = scan and scan.bestScanned or nil
         local rescanDelay, rateLimited = State.AutoTrader.GetServerRescanDelay(scan)
+        if rateLimited and State.AutoTrader.TryRateLimitBlindHopFallback("cached/fresh queue exhausted") then return true end
         State.AutoTrader.Status = rateLimited and "SERVER HOP · RATE LIMITED" or "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
         if best and best.previewTrusted then
             State.AutoTrader.StatusDetail = string.format(
@@ -9496,7 +9570,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             )
         else
             State.AutoTrader.StatusDetail = string.format(
-                "No joinable candidate is currently available. Cached UNKNOWN servers are allowed in v26; reaching this state means the <3-minute cache is exhausted and the fresh server list was empty/unusable or every trusted candidate hit the strict bot reject gate. Rescanning in %.0fs.",
+                "No joinable candidate is currently available. Cached UNKNOWN servers are allowed in v27; reaching this state means the <3-minute cache is exhausted and the fresh server list was empty/unusable or every trusted candidate hit the strict bot reject gate. Rescanning in %.0fs.",
                 rescanDelay
             )
         end
@@ -9527,6 +9601,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             if #queue == 0 then
                 local best = scan and scan.bestScanned or nil
                 local nextDelay, rateLimited = State.AutoTrader.GetServerRescanDelay(scan)
+                if rateLimited and State.AutoTrader.TryRateLimitBlindHopFallback("repeated empty rate-limited scan") then return end
                 State.AutoTrader.Status = rateLimited and "SERVER HOP · RATE LIMITED" or "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
                 State.AutoTrader.StatusDetail = best and best.previewTrusted
                     and string.format(
@@ -9700,7 +9775,7 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
     State.AutoTrader.Render()
 
     task.spawn(function()
-        -- v26: hopping never DECIDES bot identity. A staged strict-gold candidate may be carried only after this ordinary hop decision was already made.
+        -- v27: hopping never DECIDES bot identity. A staged strict-gold candidate may be carried only after this ordinary hop decision was already made.
         if Destroyed
             or not State.AutoTrader.ServerHopInProgress
             or queueGeneration ~= State.AutoTrader.ServerHopQueueGeneration then
@@ -9941,6 +10016,7 @@ State.AutoTrader.SelectTarget = function()
                                         and "known inventory cannot support even the cheapest safe local denomination"
                                         or ("expected value/second below learned stay-vs-hop floor: " .. tostring(score) .. " < " .. tostring(opportunityFloor))
                                 )
+                                State.AutoTrader.SetCooldown(player, "temporary economic skip", CONFIG.AutoTraderEconomicSkipCooldownSeconds)
                                 State.AutoTrader.Log("target_economic_skip", {
                                     userId = player.UserId,
                                     name = player.Name,
@@ -11478,7 +11554,7 @@ State.AutoTrader.TryAutoAccept = function()
     end
     return true
 end
-State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, completedPlan, tradeSeconds)
+State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, completedPlan, tradeSeconds, requestToCompletionSeconds)
     if not audit then
         State.AutoTrader.PostTradeAuditPending = false
         State.AutoTrader.PostTradeAuditStartedAt = 0
@@ -11538,11 +11614,16 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
     State.AutoTrader.Status = "AUDITING TRADE"
     State.AutoTrader.StatusDetail = "Trade completed. Verifying the server-reported incoming items and a fresh full inventory delta before selecting another player."
     State.AutoTrader.Render()
-    task.delay(0.35, function()
-        if Destroyed or generation ~= State.AutoTrader.PostTradeAuditGeneration then
-            return
-        end
-        State.Profile.QueueRemoteLeaderboardSweep(true)
+    task.delay(0.20, function()
+        if Destroyed or generation ~= State.AutoTrader.PostTradeAuditGeneration then return end
+        task.spawn(function()
+            if type(State.Profile.FetchRemoteTotalForPlayer) == "function" then
+                local ok, reason = State.Profile.FetchRemoteTotalForPlayer(LocalPlayer, true)
+                State.AutoTrader.Log("post_trade_local_inventory_refresh", {ok = ok, reason = reason})
+            elseif type(State.Profile.QueueRemoteLeaderboardSweep) == "function" then
+                State.Profile.QueueRemoteLeaderboardSweep(true)
+            end
+        end)
     end)
     task.spawn(function()
         local deadline = os.clock() + CONFIG.AutoTraderPostTradeAuditTimeoutSeconds
@@ -11642,6 +11723,7 @@ State.AutoTrader.RunPostTradeAudit = function(audit, receivedItems, partner, com
                 State.AutoTrader.RecordTargetEvent(partner, "success", {
                     profit = completedPlan and completedPlan.win or 0,
                     seconds = tradeSeconds,
+                    totalSeconds = requestToCompletionSeconds,
                     negotiationStage = completedPlan and completedPlan.negotiationStage or nil,
                     negotiationMargin = completedPlan and completedPlan.negotiationMargin or nil,
                 })
@@ -11839,13 +11921,9 @@ State.AutoTrader.BindRequestCancelObserver = function()
         local pending = State.AutoTrader.PendingRequest
         if not pending then return end
         State.AutoTrader.Log("request_canceled_locally", pending)
-        local player = Players:GetPlayerByUserId(pending.userId)
-        if player then State.AutoTrader.MarkServerPlayerOutcome(player, "local_cancel", "request canceled locally") end
-        State.AutoTrader.PendingRequest = nil
-        State.AutoTrader.RequestConfirmGeneration += 1
-        State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
-        State.AutoTrader.Status = "REQUEST CANCELED"
-        State.AutoTrader.StatusDetail = "You canceled the pending request; no unwilling-player cooldown was applied."
+        State.AutoTrader.BeginPendingRequestCancellation("request canceled locally", "local_cancel", true)
+        State.AutoTrader.Status = "REQUEST · CANCELING"
+        State.AutoTrader.StatusDetail = "Waiting for MM2 to confirm the outgoing request is gone before another request can start."
         State.AutoTrader.Render()
     end)
 end
@@ -11855,6 +11933,151 @@ State.AutoTrader.IsNativeOutgoingPending = function(target)
     local shownName = State.AutoTrader.NormalizeRequestName(State.AutoTrader.GetTextValue(username))
     if target and shownName ~= "" and string.lower(shownName) ~= string.lower(target.Name) then return false end
     return true
+end
+State.AutoTrader.IsAnyNativeOutgoingPending = function()
+    local _, sending = State.AutoTrader.GetOutgoingRequestUi()
+    return sending ~= nil and State.AutoTrader.IsGuiShown(sending)
+end
+State.AutoTrader.FireCancelRequest = function()
+    local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
+    local remote = tradeFolder and tradeFolder:FindFirstChild("CancelRequest")
+    if not remote or not remote:IsA("RemoteEvent") then return false, "Trade.CancelRequest unavailable" end
+    local ok, err = pcall(function() remote:FireServer() end)
+    return ok, ok and nil or tostring(err)
+end
+State.AutoTrader.FinalizePendingCancellation = function(pending)
+    if not pending or State.AutoTrader.PendingRequest ~= pending then return false end
+    local player = Players:GetPlayerByUserId(pending.userId)
+    local outcome = pending.cancelOutcome
+    if player and outcome == "trade_unavailable" then
+        State.AutoTrader.RecordTargetEvent(player, "ignored", {seconds = os.clock() - (pending.sentAt or os.clock())})
+        State.AutoTrader.MarkServerPlayerOutcome(player, "trade_unavailable", pending.cancelReason or "request could not become pending")
+        State.AutoTrader.SetCooldown(player, "trades off/unavailable", 20)
+    elseif player and outcome == "no_response" then
+        State.AutoTrader.RecordTargetEvent(player, "ignored", {seconds = os.clock() - (pending.sentAt or os.clock())})
+        State.AutoTrader.MarkServerPlayerOutcome(player, "no_response", pending.cancelReason or "request timed out")
+        State.AutoTrader.SetCooldown(player, "request ignored", 75)
+    elseif player and outcome == "deferred" then
+        State.AutoTrader.MarkServerPlayerOutcome(player, "deferred", pending.cancelReason or "outgoing request deferred")
+    elseif player and outcome == "local_cancel" then
+        State.AutoTrader.MarkServerPlayerOutcome(player, "local_cancel", pending.cancelReason or "request canceled locally")
+    end
+    State.AutoTrader.Log("request_cancel_confirmed", {
+        userId = pending.userId, name = pending.name, outcome = outcome,
+        reason = pending.cancelReason, age = os.clock() - (pending.sentAt or os.clock()),
+    })
+    State.AutoTrader.PendingRequest = nil
+    State.AutoTrader.RequestLifecycle = "idle"
+    State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestCancelQuietSeconds
+    State.AutoTrader.RequestConfirmGeneration += 1
+    local _, receiving = State.AutoTrader.GetIncomingRequestUi()
+    if receiving and State.AutoTrader.IsGuiShown(receiving) then
+        task.defer(State.AutoTrader.HandleIncomingRequest)
+    end
+    return true
+end
+State.AutoTrader.BeginPendingRequestCancellation = function(reason, outcome, alreadySent)
+    local pending = State.AutoTrader.PendingRequest
+    if not pending then return false, "no pending request" end
+    if pending.phase == "canceling" then return true, "already canceling" end
+    if not alreadySent then
+        local ok, err = State.AutoTrader.FireCancelRequest()
+        if not ok then return false, err end
+    end
+    State.AutoTrader.RequestConfirmGeneration += 1
+    pending.generation = State.AutoTrader.RequestConfirmGeneration
+    pending.phase = "canceling"
+    pending.cancelStartedAt = os.clock()
+    pending.cancelQuietSince = nil
+    pending.cancelReason = tostring(reason or "request cancellation")
+    pending.cancelOutcome = outcome
+    State.AutoTrader.RequestLifecycle = "canceling"
+    State.AutoTrader.Log("request_cancel_started", {userId = pending.userId, name = pending.name, reason = pending.cancelReason, outcome = outcome})
+    return true
+end
+State.AutoTrader.ReconcileOutgoingRequestState = function()
+    local now = os.clock()
+    local pending = State.AutoTrader.PendingRequest
+    local nativeVisible = State.AutoTrader.IsAnyNativeOutgoingPending()
+    if pending and pending.phase == "canceling" then
+        if nativeVisible then
+            pending.cancelQuietSince = nil
+        else
+            pending.cancelQuietSince = pending.cancelQuietSince or now
+            if now - pending.cancelQuietSince >= CONFIG.AutoTraderRequestCancelQuietSeconds then
+                State.AutoTrader.FinalizePendingCancellation(pending)
+                return true
+            end
+        end
+        if now - (pending.cancelStartedAt or now) >= CONFIG.AutoTraderRequestCancelConfirmTimeoutSeconds then
+            State.AutoTrader.Log("request_cancel_confirmation_timeout", {userId = pending.userId, name = pending.name})
+            State.AutoTrader.RequestRecoveryTeleport("outgoing request cancellation could not be authoritatively confirmed")
+        end
+        return true
+    end
+    if pending and pending.phase ~= "canceling" then
+        local player = Players:GetPlayerByUserId(pending.userId)
+        if nativeVisible and State.AutoTrader.IsNativeOutgoingPending(player) then
+            pending.nativeGoneSince = nil
+            if not pending.nativeConfirmed then
+                pending.phase = "pending"
+                pending.nativeConfirmed = true
+                pending.confirmedAt = now
+                State.AutoTrader.RequestLifecycle = "pending"
+                if player then State.AutoTrader.MarkServerPlayerOutcome(player, "request_pending", "native SendingRequest confirmed") end
+                State.AutoTrader.LastRequestAttempt = {
+                    userId = pending.userId, name = pending.name, result = "native_pending_late_or_reconciled",
+                    generation = pending.generation, seconds = now - (pending.sentAt or now), at = now,
+                }
+                State.AutoTrader.Log("request_native_confirmed_reconciled", State.AutoTrader.LastRequestAttempt)
+            end
+        elseif pending.nativeConfirmed and not State.CurrentTrade and not (isTradeVisible and isTradeVisible()) then
+            pending.nativeGoneSince = pending.nativeGoneSince or now
+            if now - pending.nativeGoneSince >= CONFIG.AutoTraderRequestNativeGoneGraceSeconds then
+                State.AutoTrader.Log("request_native_disappeared_without_terminal_event", pending)
+                State.AutoTrader.BeginPendingRequestCancellation(
+                    "native pending request disappeared without a StartTrade/DeclineRequest event", "no_response", false
+                )
+                return true
+            end
+        else
+            pending.nativeGoneSince = nil
+        end
+    end
+    if not pending and nativeVisible then
+        if (State.AutoTrader.OrphanRequestCancelStartedAt or 0) <= 0 then
+            local ok, err = State.AutoTrader.FireCancelRequest()
+            if ok then
+                State.AutoTrader.OrphanRequestCancelStartedAt = now
+                State.AutoTrader.OrphanRequestQuietSince = 0
+                State.AutoTrader.RequestLifecycle = "canceling_orphan"
+                State.AutoTrader.Log("orphan_native_request_cancel_started", {})
+            else
+                State.AutoTrader.Log("orphan_native_request_cancel_failed", {error = err})
+                State.AutoTrader.RequestRecoveryTeleport("orphan native outgoing request could not be canceled")
+            end
+        end
+        return true
+    end
+    if (State.AutoTrader.OrphanRequestCancelStartedAt or 0) > 0 then
+        State.AutoTrader.OrphanRequestQuietSince = State.AutoTrader.OrphanRequestQuietSince > 0 and State.AutoTrader.OrphanRequestQuietSince or now
+        if now - State.AutoTrader.OrphanRequestQuietSince >= CONFIG.AutoTraderRequestCancelQuietSeconds then
+            State.AutoTrader.Log("orphan_native_request_cancel_confirmed", {})
+            State.AutoTrader.OrphanRequestCancelStartedAt = 0
+            State.AutoTrader.OrphanRequestQuietSince = 0
+            State.AutoTrader.RequestLifecycle = "idle"
+            State.AutoTrader.NextRequestAt = now + CONFIG.AutoTraderRequestCancelQuietSeconds
+        elseif now - State.AutoTrader.OrphanRequestCancelStartedAt >= CONFIG.AutoTraderRequestCancelConfirmTimeoutSeconds then
+            State.AutoTrader.RequestRecoveryTeleport("orphan outgoing request state stayed ambiguous")
+        end
+        return true
+    end
+    if pending then
+        State.AutoTrader.RequestLifecycle = pending.phase or "pending"
+    else
+        State.AutoTrader.RequestLifecycle = "idle"
+    end
+    return false
 end
 State.AutoTrader.ClickNativeGuiButton = function(button, actionName)
     if not button or not button:IsA("GuiButton") or not State.AutoTrader.IsGuiShown(button) then
@@ -11886,21 +12109,23 @@ State.AutoTrader.ClickNativeGuiButton = function(button, actionName)
 end
 State.AutoTrader.CancelOutgoingForIncoming = function(incomingPlayer)
     local pending = State.AutoTrader.PendingRequest
-    if not pending or (incomingPlayer and pending.userId == incomingPlayer.UserId) then return true end
-    local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
-    local remote = tradeFolder and tradeFolder:FindFirstChild("CancelRequest")
-    if not remote or not remote:IsA("RemoteEvent") then return false, "Trade.CancelRequest unavailable" end
-    local outgoing = Players:GetPlayerByUserId(pending.userId)
-    local ok, err = pcall(function() remote:FireServer() end)
-    if not ok then return false, tostring(err) end
-    if outgoing then
-        State.AutoTrader.MarkServerPlayerOutcome(outgoing, "deferred", "outgoing request canceled for incoming requester")
+    if not pending then
+        if State.AutoTrader.IsAnyNativeOutgoingPending() then
+            State.AutoTrader.ReconcileOutgoingRequestState()
+            return false, "native outgoing cancellation pending"
+        end
+        return true
     end
-    State.AutoTrader.Log("outgoing_deferred_for_incoming", {outgoing = pending, incoming = incomingPlayer and incomingPlayer.Name or nil})
-    State.AutoTrader.PendingRequest = nil
-    State.AutoTrader.RequestConfirmGeneration += 1
-    State.AutoTrader.NextRequestAt = os.clock() + 0.15
-    return true
+    if incomingPlayer and pending.userId == incomingPlayer.UserId and pending.phase ~= "canceling" then return true end
+    local started, reason = State.AutoTrader.BeginPendingRequestCancellation(
+        "outgoing request canceled for incoming requester", "deferred", false
+    )
+    if not started then return false, reason end
+    State.AutoTrader.Status = "INCOMING · WAITING FOR CANCEL"
+    State.AutoTrader.StatusDetail = "Canceling the previous outgoing request and waiting for MM2's native request state to clear before accepting "
+        .. (incomingPlayer and incomingPlayer.Name or "the incoming request") .. "."
+    State.AutoTrader.Render()
+    return false, "outgoing cancellation pending"
 end
 State.AutoTrader.DecideIncomingRequester = function(player)
     if not player or player == LocalPlayer or not player.Parent then return "decline", "requester unavailable" end
@@ -11924,7 +12149,11 @@ State.AutoTrader.ActOnIncomingRequest = function(player, decision, reason, signa
     if decision == "accept" then
         local canceled, cancelReason = State.AutoTrader.CancelOutgoingForIncoming(player)
         if not canceled then
-            State.AutoTrader.Log("incoming_blocked_cancel_failed", {player = player.Name, reason = cancelReason})
+            State.AutoTrader.Log("incoming_blocked_cancel_pending", {player = player.Name, reason = cancelReason})
+            State.AutoTrader.IncomingRequestLastHandledAt = 0
+            task.delay(0.15, function()
+                if not Destroyed then State.AutoTrader.HandleIncomingRequest() end
+            end)
             return false
         end
     end
@@ -12037,28 +12266,23 @@ State.AutoTrader.FailPendingRequestAttempt = function(target, generation, reason
         or (generation and pending.generation ~= generation) then
         return false
     end
-    local player = target or Players:GetPlayerByUserId(pending.userId)
-    State.AutoTrader.PendingRequest = nil
-    State.AutoTrader.RequestConfirmGeneration += 1
-    State.AutoTrader.NextRequestAt = os.clock() + 0.15
-    if player then
-        State.AutoTrader.MarkServerPlayerOutcome(player, "trade_unavailable", tostring(reason or "request could not become pending"))
-        State.AutoTrader.SetCooldown(player, "trades off/unavailable", 20)
-    end
+    pending.failureReason = tostring(reason or "request failed")
+    pending.failureDetail = detail and tostring(detail) or nil
     State.AutoTrader.LastRequestAttempt = {
-        userId = pending.userId,
-        name = pending.name,
-        result = "unavailable",
-        reason = tostring(reason or "request failed"),
-        detail = detail and tostring(detail) or nil,
-        phase = pending.phase,
-        age = os.clock() - (pending.sentAt or os.clock()),
-        at = os.clock(),
+        userId = pending.userId, name = pending.name, result = "canceling_unavailable",
+        reason = pending.failureReason, detail = pending.failureDetail, phase = pending.phase,
+        age = os.clock() - (pending.sentAt or os.clock()), at = os.clock(),
     }
-    State.AutoTrader.Status = "SKIP · TRADES OFF/UNAVAILABLE"
-    State.AutoTrader.StatusDetail = (player and player.Name or pending.name or "That player")
-        .. " never entered MM2's real pending-request state; skipping them for this server visit."
-    State.AutoTrader.Log("request_attempt_unavailable", State.AutoTrader.LastRequestAttempt)
+    local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(pending.failureReason, "trade_unavailable", false)
+    if not started then
+        State.AutoTrader.Log("request_failure_cancel_failed", {reason = cancelReason, pending = pending})
+        State.AutoTrader.RequestRecoveryTeleport("failed outgoing request could not be canceled cleanly")
+        return false
+    end
+    State.AutoTrader.Status = "REQUEST FAILED · CANCELING"
+    State.AutoTrader.StatusDetail = (pending.name or "That player")
+        .. " did not reach a trustworthy MM2 pending state; canceling/confirming cleanup before trying anybody else."
+    State.AutoTrader.Log("request_attempt_cleanup_started", State.AutoTrader.LastRequestAttempt)
     State.AutoTrader.Render()
     return true
 end
@@ -12071,7 +12295,11 @@ State.AutoTrader.TrySendRequest = function()
     if not State.AutoTrader.Preferences.automation then return blocked("automation off") end
     if State.AutoTrader.SessionFrozen then return blocked("session frozen") end
     if State.AutoTrader.RecoveryTeleportRequired then return blocked("recovery rejoin pending") end
-    if State.AutoTrader.PendingRequest then return blocked("request already pending") end
+    State.AutoTrader.ReconcileOutgoingRequestState()
+    if State.AutoTrader.PendingRequest then return blocked("request already pending/canceling") end
+    if State.AutoTrader.IsAnyNativeOutgoingPending() then return blocked("native outgoing request still active") end
+    if State.AutoTrader.RequestLifecycle ~= "idle" then return blocked("request lifecycle not idle") end
+    if State.AutoTrader.TradeDeclinePending then return blocked("trade decline still being confirmed") end
     if type(State.CurrentTrade) == "table" then return blocked("trade state active") end
     if isTradeVisible and isTradeVisible() then return blocked("trade GUI visible") end
     if os.clock() < State.AutoTrader.NextRequestAt then
@@ -12106,8 +12334,10 @@ State.AutoTrader.TrySendRequest = function()
         nativeConfirmed = false,
         invokeFinished = false,
         nativeWindowExpired = false,
+        invokeHintUnavailable = false,
         generation = generation,
     }
+    State.AutoTrader.RequestLifecycle = "invoking"
     State.AutoTrader.LastRequestGate = nil
     State.AutoTrader.LastRequestAttempt = {
         userId = target.UserId,
@@ -12143,6 +12373,7 @@ State.AutoTrader.TrySendRequest = function()
             if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return end
             if State.AutoTrader.IsNativeOutgoingPending(target) then
                 pending.phase = "pending"
+                State.AutoTrader.RequestLifecycle = "pending"
                 pending.nativeConfirmed = true
                 pending.confirmedAt = os.clock()
                 State.AutoTrader.MarkServerPlayerOutcome(target, "request_pending", "native SendingRequest confirmed")
@@ -12165,28 +12396,22 @@ State.AutoTrader.TrySendRequest = function()
         local pending = activePending()
         if not pending then return end
         pending.nativeWindowExpired = true
-        if pending.nativeConfirmed then return end
-        if pending.invokeFinished then
-            State.AutoTrader.FailPendingRequestAttempt(
-                target,
-                generation,
-                "native SendingRequest never appeared",
-                "SendRequest returned but no native pending UI appeared within " .. tostring(CONFIG.AutoTraderOutgoingNativeConfirmSeconds) .. "s"
-            )
-        else
-            pending.phase = "awaiting_native"
-            State.AutoTrader.Status = "REQUEST · VERIFYING"
-            State.AutoTrader.StatusDetail = "MM2 has not shown a pending request for " .. target.Name .. "; waiting only until the hard request-attempt timeout."
-            State.AutoTrader.Render()
-        end
+        if pending.nativeConfirmed or pending.phase == "canceling" then return end
+        pending.phase = "awaiting_native"
+        State.AutoTrader.RequestLifecycle = "awaiting_native"
+        State.AutoTrader.Status = "REQUEST · VERIFYING"
+        State.AutoTrader.StatusDetail = "MM2 has not shown a pending request for " .. target.Name
+            .. "; the short UI probe is diagnostic only, so waiting until the full request-attempt deadline before cleanup."
+        State.AutoTrader.Render()
     end)
 
     -- Hard watchdog: even if InvokeServer never returns, this attempt cannot pin
     -- the auto trader forever. A real trade/native pending state cancels this path.
     task.delay(CONFIG.AutoTraderRequestInvokeTimeoutSeconds, function()
         if Destroyed then return end
+        State.AutoTrader.ReconcileOutgoingRequestState()
         local pending = activePending()
-        if not pending or pending.nativeConfirmed then return end
+        if not pending or pending.nativeConfirmed or pending.phase == "canceling" then return end
         if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return end
         State.AutoTrader.FailPendingRequestAttempt(
             target,
@@ -12206,25 +12431,19 @@ State.AutoTrader.TrySendRequest = function()
         pending.invokeResult = result
         -- Once MM2's native pending UI has appeared, that UI is authoritative.
         -- Ignore any odd/late RemoteFunction return instead of undoing a real request.
-        if pending.nativeConfirmed then return end
-        if not ok or result == true then
-            State.AutoTrader.FailPendingRequestAttempt(
-                target,
-                generation,
-                not ok and "request call failed" or "request unavailable/denied",
-                not ok and tostring(result) or ("InvokeServer returned " .. tostring(result))
-            )
-            return
-        end
+        if pending.nativeConfirmed or pending.phase == "canceling" then return end
+        pending.invokeHintUnavailable = (not ok) or result == true
         pending.phase = "awaiting_native"
-        if pending.nativeWindowExpired then
-            State.AutoTrader.FailPendingRequestAttempt(
-                target,
-                generation,
-                "native SendingRequest never appeared",
-                "SendRequest returned without MM2 entering native pending state"
-            )
+        State.AutoTrader.RequestLifecycle = "awaiting_native"
+        if pending.invokeHintUnavailable then
+            State.AutoTrader.Log("request_invoke_non_authoritative_hint", {
+                userId = target.UserId, generation = generation, ok = ok, result = tostring(result),
+            })
         end
+        -- v27: RemoteFunction return values are not authoritative enough to free the
+        -- single-flight slot. Native SendingRequest/StartTrade or the hard cleanup
+        -- watchdog decides the lifecycle.
+
     end)
     return true, "started"
 end
@@ -12238,7 +12457,9 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         return
     end
     if State.AutoTrader.PendingRequest and State.AutoTrader.PendingRequest.userId == partner.UserId then
+        State.AutoTrader.TradeRequestStartedAt = State.AutoTrader.PendingRequest.sentAt or State.AutoTrader.TradeRequestStartedAt or os.clock()
         State.AutoTrader.PendingRequest = nil
+        State.AutoTrader.RequestLifecycle = "idle"
         State.AutoTrader.RequestConfirmGeneration += 1
     end
     if State.AutoTrader.IncomingRequestDecision
@@ -12560,6 +12781,7 @@ State.AutoTrader.ClearTradeRuntime = function()
     State.AutoTrader.FirstOfferAt = 0
     State.AutoTrader.AutoAcceptTradeUpdateAt = 0
     State.AutoTrader.RestoreTradeVisuals()
+    State.AutoTrader.TradeRequestStartedAt = 0
 end
 State.AutoTrader.OnNoTrade = function()
     if State.AutoTrader.LastTradePartner or State.AutoTrader.ManagedPartnerUserId then
@@ -12570,6 +12792,12 @@ State.AutoTrader.OnNoTrade = function()
     if State.AutoTrader.PostTradeAuditPending then
         State.AutoTrader.Status = "AUDITING TRADE"
         State.AutoTrader.StatusDetail = "Waiting for the fresh verified post-trade inventory audit before requesting anyone else."
+        State.AutoTrader.Render()
+        return
+    end
+    if State.AutoTrader.TradeDeclinePending then
+        State.AutoTrader.Status = "TRADE END · CONFIRMING"
+        State.AutoTrader.StatusDetail = "Waiting for MM2's native trade state to remain closed before another request can start."
         State.AutoTrader.Render()
         return
     end
@@ -12593,8 +12821,14 @@ State.AutoTrader.OnNoTrade = function()
         local player = Players:GetPlayerByUserId(State.AutoTrader.PendingRequest.userId)
         if not player then
             State.AutoTrader.Log("pending_target_left", State.AutoTrader.PendingRequest)
-            State.AutoTrader.PendingRequest = nil
-            State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
+            if State.AutoTrader.PendingRequest.phase ~= "canceling" then
+                local started, err = State.AutoTrader.BeginPendingRequestCancellation("pending target left the server", "trade_unavailable", false)
+                if not started then State.AutoTrader.RequestRecoveryTeleport("pending target left and request cancellation failed: " .. tostring(err)) end
+            end
+            State.AutoTrader.Status = "REQUEST · CLEANING UP"
+            State.AutoTrader.StatusDetail = "The target left; canceling any surviving native request before selecting another player."
+            State.AutoTrader.Render()
+            return
         else
             local phase = State.AutoTrader.PendingRequest.phase or "pending"
             State.AutoTrader.Status = phase == "pending" and "REQUEST PENDING" or "REQUEST · VERIFYING"
@@ -12770,7 +13004,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V26",
+        format = "SV_AUTO_TRADER_SUPPORT_V27",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -12813,6 +13047,8 @@ State.AutoTrader.BuildDebug = function()
             serverGoldBotRejectRatio = CONFIG.AutoTraderGoldBotRejectRatio,
             serverRescanDelaySeconds = CONFIG.AutoTraderServerRescanDelaySeconds,
             serverRateLimitMaxBackoffSeconds = CONFIG.AutoTraderServerRateLimitMaxBackoffSeconds,
+            serverRateLimitBlindHopAfterScans = CONFIG.AutoTraderServerRateLimitBlindHopAfterScans,
+            serverHopTotalTimeoutSeconds = CONFIG.AutoTraderServerHopTotalTimeoutSeconds,
             serverCandidateCacheTtlSeconds = CONFIG.AutoTraderServerCandidateCacheTtlSeconds,
             serverCandidateCacheLimit = CONFIG.AutoTraderServerCandidateCacheLimit,
             serverFirstPageUsableTarget = CONFIG.AutoTraderServerFirstPageUsableTarget,
@@ -12944,6 +13180,11 @@ State.AutoTrader.BuildDebug = function()
             fastBotHopActive = State.AutoTrader.FastBotHopActive,
             fastBotHopReason = State.AutoTrader.FastBotHopReason,
             serverRateLimitBackoffSeconds = State.AutoTrader.ServerRateLimitBackoffSeconds,
+            serverRateLimitConsecutiveScans = State.AutoTrader.ServerRateLimitConsecutiveScans,
+            requestLifecycle = State.AutoTrader.RequestLifecycle,
+            nativeOutgoingVisible = State.AutoTrader.IsAnyNativeOutgoingPending(),
+            tradeDeclinePending = State.AutoTrader.TradeDeclinePending,
+            tradeDeclineAge = State.AutoTrader.TradeDeclineStartedAt > 0 and (os.clock() - State.AutoTrader.TradeDeclineStartedAt) or 0,
         },
         incomingRequest = {
             decision = State.AutoTrader.IncomingRequestDecision,
@@ -13037,7 +13278,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V26\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V27\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -13951,7 +14192,7 @@ end
 connect(UI.AutoTraderSkipTarget.MouseButton1Click, function()
     local target = State.AutoTrader.SelectedTarget
     if target and target.Parent then
-        State.AutoTrader.MarkServerPlayerOutcome(target, "economic_skip", "manual UI skip")
+        State.AutoTrader.MarkServerPlayerOutcome(target, "manual_skip", "manual UI skip")
         State.AutoTrader.SetCooldown(target, "manual UI skip", 120)
         State.AutoTrader.SelectedTarget = nil
         State.AutoTrader.Status = "TARGET SKIPPED"
@@ -14018,29 +14259,58 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
     local declineRequest = tradeFolder:FindFirstChild("DeclineRequest")
     if declineRequest and declineRequest:IsA("RemoteEvent") then
         connect(declineRequest.OnClientEvent, function()
-            local pending = State.AutoTrader.PendingRequest
-            local player = pending and Players:GetPlayerByUserId(pending.userId) or nil
-            if player then
-                local responseSeconds = pending and (os.clock() - pending.sentAt) or nil
-                State.AutoTrader.RecordTargetEvent(player, "response", {seconds = responseSeconds})
-                State.AutoTrader.RecordTargetEvent(player, "decline", {seconds = responseSeconds})
-                State.AutoTrader.MarkServerPlayerOutcome(player, "declined", "request declined")
-                State.AutoTrader.SetCooldown(player, "request declined")
-            end
-            State.AutoTrader.Log("request_declined", pending)
-            State.AutoTrader.PendingRequest = nil
-            State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
-            State.AutoTrader.Status = "COOLDOWN · DECLINED"
-            State.AutoTrader.StatusDetail = player
-                and (player.Name .. " declined; ignoring them for about 2 minutes.")
-                or "Request was declined."
-            State.AutoTrader.Render()
+            local observedPending = State.AutoTrader.PendingRequest
+            local observedGeneration = observedPending and observedPending.generation or nil
+            State.AutoTrader.Log("request_decline_event_observed", observedPending)
+            task.delay(0.12, function()
+                if Destroyed then return end
+                local pending = State.AutoTrader.PendingRequest
+                if not observedPending or not pending
+                    or pending.userId ~= observedPending.userId
+                    or pending.generation ~= observedGeneration then
+                    State.AutoTrader.Log("request_decline_event_stale", {observed = observedPending, current = pending})
+                    return
+                end
+                local player = Players:GetPlayerByUserId(pending.userId)
+                -- If the same target's native pending UI is still visibly alive after
+                -- the event, the event cannot authoritatively free this generation.
+                if State.AutoTrader.IsNativeOutgoingPending(player) then
+                    State.AutoTrader.Log("request_decline_event_ambiguous_native_still_visible", pending)
+                    return
+                end
+                if pending.phase == "canceling" then
+                    pending.cancelQuietSince = os.clock() - CONFIG.AutoTraderRequestCancelQuietSeconds
+                    State.AutoTrader.FinalizePendingCancellation(pending)
+                    State.AutoTrader.Status = "REQUEST CANCELED"
+                    State.AutoTrader.StatusDetail = "MM2 confirmed the previous outgoing request is gone; the single-flight slot is clean."
+                    State.AutoTrader.Render()
+                    return
+                end
+                if player then
+                    local responseSeconds = os.clock() - (pending.sentAt or os.clock())
+                    State.AutoTrader.RecordTargetEvent(player, "response", {seconds = responseSeconds})
+                    State.AutoTrader.RecordTargetEvent(player, "decline", {seconds = responseSeconds})
+                    State.AutoTrader.MarkServerPlayerOutcome(player, "declined", "request declined")
+                    State.AutoTrader.SetCooldown(player, "request declined")
+                end
+                State.AutoTrader.Log("request_declined", pending)
+                State.AutoTrader.PendingRequest = nil
+                State.AutoTrader.RequestConfirmGeneration += 1
+                State.AutoTrader.RequestLifecycle = "idle"
+                State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestCancelQuietSeconds
+                State.AutoTrader.Status = "COOLDOWN · DECLINED"
+                State.AutoTrader.StatusDetail = player
+                    and (player.Name .. " declined; ignoring them for about 2 minutes.")
+                    or "Request was declined."
+                State.AutoTrader.Render()
+            end)
         end)
     end
     local startTrade = tradeFolder:FindFirstChild("StartTrade")
     if startTrade and startTrade:IsA("RemoteEvent") then
         connect(startTrade.OnClientEvent, function(_, partnerName)
             State.AutoTrader.TradeBeganAt = os.clock()
+            State.AutoTrader.LocalDeclineAt = 0
             State.AutoTrader.FirstOfferAt = 0
             State.AutoTrader.LastTradeUpdateAt = os.clock()
             State.AutoTrader.LastTradeActivityAt = State.AutoTrader.LastTradeUpdateAt
@@ -14054,19 +14324,25 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
             State.AutoTrader.LastManagedLocalHash = nil
             local pending = State.AutoTrader.PendingRequest
             local incoming = State.AutoTrader.IncomingRequestDecision
-            local partnerPlayer = type(partnerName) == "string" and Players:FindFirstChild(partnerName) or nil
-            if pending then
-                local player = Players:GetPlayerByUserId(pending.userId)
-                if player then
-                    State.AutoTrader.RecordTargetEvent(player, "response", {seconds = os.clock() - pending.sentAt})
-                    State.AutoTrader.RecordTargetEvent(player, "trade")
-                    State.AutoTrader.MarkServerPlayerOutcome(player, "trading", "trade started")
-                end
-                if type(partnerName) ~= "string" or partnerName == pending.name then
+            local partnerPlayer = type(partnerName) == "string" and State.AutoTrader.ResolveIncomingPlayer(partnerName) or nil
+            if pending and partnerPlayer and partnerPlayer.UserId == pending.userId then
+                State.AutoTrader.RecordTargetEvent(partnerPlayer, "response", {seconds = os.clock() - pending.sentAt})
+                State.AutoTrader.RecordTargetEvent(partnerPlayer, "trade")
+                State.AutoTrader.MarkServerPlayerOutcome(partnerPlayer, "trading", "trade started")
+                State.AutoTrader.TradeRequestStartedAt = pending.sentAt or os.clock()
+                State.AutoTrader.PendingRequest = nil
+                State.AutoTrader.RequestLifecycle = "idle"
+                State.AutoTrader.RequestConfirmGeneration += 1
+            elseif partnerPlayer then
+                if pending then
+                    local old = Players:GetPlayerByUserId(pending.userId)
+                    if old then State.AutoTrader.MarkServerPlayerOutcome(old, "deferred", "different authoritative trade started") end
+                    State.AutoTrader.Log("trade_started_pending_mismatch", {pending = pending, partnerName = partnerName})
                     State.AutoTrader.PendingRequest = nil
+                    State.AutoTrader.RequestLifecycle = "idle"
                     State.AutoTrader.RequestConfirmGeneration += 1
                 end
-            elseif partnerPlayer then
+                State.AutoTrader.TradeRequestStartedAt = os.clock()
                 State.AutoTrader.RecordTargetEvent(partnerPlayer, "trade")
                 State.AutoTrader.MarkServerPlayerOutcome(partnerPlayer, "trading", incoming and "incoming request accepted" or "trade started externally")
             end
@@ -14094,24 +14370,38 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
     if declineTrade and declineTrade:IsA("RemoteEvent") then
         connect(declineTrade.OnClientEvent, function()
             local partner = State.AutoTrader.LastTradePartner
-            local localDecline = os.clock() - (State.AutoTrader.LocalDeclineAt or 0) <= 0.8
+            local localDecline = State.AutoTrader.TradeDeclinePending == true
+                or os.clock() - (State.AutoTrader.LocalDeclineAt or 0) <= CONFIG.AutoTraderTradeDeclineConfirmTimeoutSeconds
             if partner and not localDecline then
                 local negotiation = State.AutoTrader.LastNegotiation
+                local activeSeconds = State.AutoTrader.TradeBeganAt > 0 and (os.clock() - State.AutoTrader.TradeBeganAt) or nil
+                local totalSeconds = State.AutoTrader.TradeRequestStartedAt > 0 and (os.clock() - State.AutoTrader.TradeRequestStartedAt) or activeSeconds
                 State.AutoTrader.RecordTargetEvent(partner, "tradeDecline", {
-                    seconds = State.AutoTrader.TradeBeganAt > 0 and (os.clock() - State.AutoTrader.TradeBeganAt) or nil,
+                    seconds = activeSeconds, totalSeconds = totalSeconds,
                     negotiationStage = negotiation and negotiation.stage or nil,
                     negotiationMargin = negotiation and negotiation.margin or nil,
                 })
                 State.AutoTrader.MarkServerPlayerOutcome(partner, "trade_declined", "active trade declined")
                 State.AutoTrader.SetCooldown(partner, "active trade declined")
-            elseif partner and localDecline then
-                State.AutoTrader.MarkServerPlayerOutcome(partner, "local_cancel", "trade ended locally")
+            elseif partner and localDecline and State.AutoTrader.TradeDeclineOutcome ~= "idle" then
+                local serverEntry = State.AutoTrader.ServerPlayers[partner.UserId]
+                if not serverEntry or serverEntry.outcome ~= "idle" then
+                    State.AutoTrader.MarkServerPlayerOutcome(partner, "local_cancel", "trade ended locally")
+                end
             end
             State.AutoTrader.Log("trade_declined", {
                 partner = partner and partner.Name or nil,
                 localDecline = localDecline,
+                requestedOutcome = State.AutoTrader.TradeDeclineOutcome,
             })
+            State.AutoTrader.TradeDeclinePending = false
+            State.AutoTrader.LocalDeclineAt = 0
+            State.AutoTrader.TradeDeclineStartedAt = 0
+            State.AutoTrader.TradeDeclineQuietSince = 0
+            State.AutoTrader.TradeDeclinePartnerUserId = nil
+            State.AutoTrader.TradeDeclineOutcome = nil
             State.AutoTrader.ClearTradeRuntime()
+            State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
             State.AutoTrader.Status = localDecline and "TRADE ENDED" or "COOLDOWN · TRADE ENDED"
             State.AutoTrader.StatusDetail = localDecline
                 and "You ended the trade; no unwilling-player cooldown was applied."
@@ -14164,6 +14454,9 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                 local tradeSeconds = State.AutoTrader.TradeBeganAt > 0
                     and (os.clock() - State.AutoTrader.TradeBeganAt)
                     or nil
+                local requestToCompletionSeconds = State.AutoTrader.TradeRequestStartedAt > 0
+                    and (os.clock() - State.AutoTrader.TradeRequestStartedAt)
+                    or tradeSeconds
                 if partner then
                     State.AutoTrader.RequestHistory[partner.UserId] = os.clock()
                 end
@@ -14180,47 +14473,23 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                 State.AutoTrader.StatusDetail = "Server confirmed the fully automated trade. Starting a fresh-inventory audit."
                 State.AutoTrader.Render()
                 State.AutoTrader.ShowSuccessNotification(partner, completedPlan, "Server completion confirmed")
-                State.AutoTrader.RunPostTradeAudit(audit, receivedItems, partner, completedPlan, tradeSeconds)
+                State.AutoTrader.RunPostTradeAudit(audit, receivedItems, partner, completedPlan, tradeSeconds, requestToCompletionSeconds)
             end
         end)
     end
 end
 State.AutoTrader.CancelIgnoredRequest = function()
     local pending = State.AutoTrader.PendingRequest
-    if not pending then
-        return false
-    end
-    local player = Players:GetPlayerByUserId(pending.userId)
-    local tradeFolder = ReplicatedStorage:FindFirstChild("Trade")
-    local remote = tradeFolder and tradeFolder:FindFirstChild("CancelRequest")
-    if not remote or not remote:IsA("RemoteEvent") then
-        State.AutoTrader.Freeze("Trade.CancelRequest RemoteEvent is unavailable for the pending-request timeout.")
-        return false
-    end
+    if not pending or pending.phase == "canceling" then return false end
     State.AutoTrader.Log("request_timeout_cancel", pending)
-    local ok, err = pcall(function()
-        remote:FireServer()
-    end)
-    if not ok then
-        State.AutoTrader.Freeze("Pending request cancellation failed: " .. tostring(err))
+    local started, err = State.AutoTrader.BeginPendingRequestCancellation("request timed out", "no_response", false)
+    if not started then
+        State.AutoTrader.RequestRecoveryTeleport("pending request timeout cancellation failed: " .. tostring(err))
         return false
     end
-    State.AutoTrader.PendingRequest = nil
-    State.AutoTrader.RequestConfirmGeneration += 1
-    local requestFrame = State.AutoTrader.GetRequestFrame()
-    if requestFrame and requestFrame:IsA("GuiObject") then
-        requestFrame.Visible = false
-    end
-    State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
-    if player then
-        State.AutoTrader.RecordTargetEvent(player, "ignored", {seconds = pending and (os.clock() - pending.sentAt) or CONFIG.AutoTraderPendingRequestTimeoutSeconds})
-        State.AutoTrader.MarkServerPlayerOutcome(player, "no_response", "request timed out")
-        State.AutoTrader.SetCooldown(player, "request ignored", 75)
-    end
-    State.AutoTrader.Status = "COOLDOWN · NO RESPONSE"
-    State.AutoTrader.StatusDetail = player
-        and (player.Name .. " left the request pending for 12s; request canceled so the bot can pursue a faster target.")
-        or "Pending request timed out and was canceled."
+    State.AutoTrader.Status = "REQUEST TIMEOUT · CANCELING"
+    State.AutoTrader.StatusDetail = (pending.name or "Pending request")
+        .. " timed out; waiting for MM2 to confirm the request is gone before moving on."
     State.AutoTrader.Render()
     return true
 end
@@ -14236,6 +14505,11 @@ State.AutoTrader.EndIdleTrade = function()
         return false
     end
     State.AutoTrader.LocalDeclineAt = os.clock()
+    State.AutoTrader.TradeDeclinePending = true
+    State.AutoTrader.TradeDeclineStartedAt = State.AutoTrader.LocalDeclineAt
+    State.AutoTrader.TradeDeclineQuietSince = 0
+    State.AutoTrader.TradeDeclinePartnerUserId = partner and partner.UserId or State.AutoTrader.ManagedPartnerUserId
+    State.AutoTrader.TradeDeclineOutcome = "idle"
     State.AutoTrader.Log("idle_trade_decline", {
         partner = partner and partner.Name or nil,
         idleFor = os.clock() - (State.AutoTrader.LastTradeActivityAt or State.AutoTrader.TradeBeganAt or os.clock()),
@@ -14244,35 +14518,64 @@ State.AutoTrader.EndIdleTrade = function()
         remote:FireServer()
     end)
     if not ok then
+        State.AutoTrader.TradeDeclinePending = false
+        State.AutoTrader.TradeDeclineStartedAt = 0
+        State.AutoTrader.TradeDeclineQuietSince = 0
+        State.AutoTrader.TradeDeclinePartnerUserId = nil
+        State.AutoTrader.TradeDeclineOutcome = nil
         State.AutoTrader.Freeze("Idle trade cancellation failed: " .. tostring(err))
         return false
     end
     if partner then
         local negotiation = State.AutoTrader.LastNegotiation
+        local activeSeconds = State.AutoTrader.TradeBeganAt > 0 and (os.clock() - State.AutoTrader.TradeBeganAt) or CONFIG.AutoTraderTradeIdleTimeoutSeconds
+        local totalSeconds = State.AutoTrader.TradeRequestStartedAt > 0 and (os.clock() - State.AutoTrader.TradeRequestStartedAt) or activeSeconds
         State.AutoTrader.RecordTargetEvent(partner, "idle", {
-            seconds = State.AutoTrader.TradeBeganAt > 0 and (os.clock() - State.AutoTrader.TradeBeganAt) or CONFIG.AutoTraderTradeIdleTimeoutSeconds,
+            seconds = activeSeconds, totalSeconds = totalSeconds,
             negotiationStage = negotiation and negotiation.stage or nil,
             negotiationMargin = negotiation and negotiation.margin or nil,
         })
         State.AutoTrader.MarkServerPlayerOutcome(partner, "idle", "trade idle/no response")
         State.AutoTrader.SetCooldown(partner, "trade idle/no response", CONFIG.AutoTraderCooldownSeconds)
     end
-    local tradeGui = State.TradeGui
-    if not tradeGui or not tradeGui.Parent then
-        tradeGui = PlayerGui:FindFirstChild("TradeGUI")
-    end
-    if tradeGui and tradeGui:IsA("ScreenGui") then
-        tradeGui.Enabled = false
-    end
-    State.CurrentTrade = nil
-    State.AutoTrader.RestoreTradeVisuals()
-    State.AutoTrader.ClearTradeRuntime()
-    State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
-    State.AutoTrader.Status = "COOLDOWN · IDLE TRADE"
-    State.AutoTrader.StatusDetail = partner
-        and (partner.Name .. " made no trade progress inside the bounded trade-idle window; trade ended and player cooled down.")
-        or "Idle trade ended automatically."
+    State.AutoTrader.Status = "IDLE TRADE · DECLINING"
+    State.AutoTrader.StatusDetail = "Decline sent; waiting for MM2's authoritative trade-end state before another request can start."
     State.AutoTrader.Render()
+    return true
+end
+State.AutoTrader.ReconcileTradeDeclineState = function()
+    if not State.AutoTrader.TradeDeclinePending then return false end
+    local now = os.clock()
+    -- Read the native ScreenGui enabled state directly. Background automation hides
+    -- the trade container visually, so isTradeVisible() intentionally reports true
+    -- while CurrentTrade exists and cannot be used as a decline acknowledgement.
+    local tradeGui = State.TradeGui
+    if not tradeGui or not tradeGui.Parent then tradeGui = PlayerGui:FindFirstChild("Trade") or PlayerGui:FindFirstChild("TradeGUI") end
+    local nativeActive = tradeGui and tradeGui:IsA("ScreenGui") and tradeGui.Enabled == true
+    if nativeActive then
+        State.AutoTrader.TradeDeclineQuietSince = 0
+        return true
+    end
+    if (State.AutoTrader.TradeDeclineQuietSince or 0) <= 0 then
+        State.AutoTrader.TradeDeclineQuietSince = now
+        return true
+    end
+    if now - State.AutoTrader.TradeDeclineQuietSince >= CONFIG.AutoTraderTradeDeclineQuietSeconds then
+        State.AutoTrader.Log("trade_decline_confirmed_by_gui_absence", {
+            partnerUserId = State.AutoTrader.TradeDeclinePartnerUserId, outcome = State.AutoTrader.TradeDeclineOutcome,
+        })
+        State.AutoTrader.TradeDeclinePending = false
+        State.AutoTrader.LocalDeclineAt = 0
+        State.AutoTrader.TradeDeclineStartedAt = 0
+        State.AutoTrader.TradeDeclineQuietSince = 0
+        State.AutoTrader.TradeDeclinePartnerUserId = nil
+        State.AutoTrader.TradeDeclineOutcome = nil
+        State.AutoTrader.ClearTradeRuntime()
+        State.AutoTrader.NextRequestAt = now + CONFIG.AutoTraderRequestSpacingSeconds
+        State.AutoTrader.Status = "TRADE ENDED"
+        State.AutoTrader.StatusDetail = "MM2's trade UI stayed gone after the decline; the trade lifecycle is clean."
+        State.AutoTrader.Render()
+    end
     return true
 end
 State.AutoTrader.OvernightSupervisor = function()
@@ -14318,23 +14621,55 @@ State.AutoTrader.OvernightSupervisor = function()
         State.AutoTrader.PostTradeAuditStartedAt = 0
     end
 
+    State.AutoTrader.ReconcileOutgoingRequestState()
+    State.AutoTrader.ReconcileTradeDeclineState()
+
+    if State.AutoTrader.TradeDeclinePending
+        and State.AutoTrader.TradeDeclineStartedAt > 0
+        and now - State.AutoTrader.TradeDeclineStartedAt >= CONFIG.AutoTraderTradeDeclineConfirmTimeoutSeconds then
+        State.AutoTrader.Log("trade_decline_confirmation_timeout", {
+            seconds = now - State.AutoTrader.TradeDeclineStartedAt,
+            partnerUserId = State.AutoTrader.TradeDeclinePartnerUserId,
+        })
+        State.AutoTrader.RequestRecoveryTeleport("active trade decline could not be authoritatively confirmed")
+        return true
+    end
+
+    if State.AutoTrader.ServerHopInProgress
+        and State.AutoTrader.ServerHopStartedAt > 0
+        and now - State.AutoTrader.ServerHopStartedAt >= CONFIG.AutoTraderServerHopTotalTimeoutSeconds then
+        local reason = "server-hop pipeline exceeded its total deadline despite scan activity"
+        State.AutoTrader.Log("server_hop_total_timeout", {seconds = now - State.AutoTrader.ServerHopStartedAt})
+        State.AutoTrader.AbortServerHop(reason)
+        State.AutoTrader.Status = "SERVER HOP · BLIND FALLBACK"
+        State.AutoTrader.StatusDetail = "Screened hopping exceeded its total deadline; using a normal public teleport and carrying any staged strict bot evidence."
+        State.AutoTrader.Render()
+        State.AutoTrader.BeginTeleport("server_hop_total_timeout_blind_fallback", false, true)
+        return true
+    end
+
     if State.AutoTrader.TeleportInProgress
         and State.AutoTrader.TeleportAttemptStartedAt > 0
         and now - State.AutoTrader.TeleportAttemptStartedAt >= CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds then
         local reason = "teleport did not complete inside the hard overnight deadline"
+        local wasServerHop = State.AutoTrader.ServerHopInProgress
         State.AutoTrader.Log("teleport_hard_timeout", {
             seconds = now - State.AutoTrader.TeleportAttemptStartedAt,
             lastReason = State.AutoTrader.LastTeleportReason,
-            serverHop = State.AutoTrader.ServerHopInProgress,
+            serverHop = wasServerHop,
         })
-        if State.AutoTrader.ServerHopInProgress then
+        if wasServerHop then
             State.AutoTrader.AbortServerHop(reason)
+            State.AutoTrader.Status = "SERVER HOP · BLIND FALLBACK"
+            State.AutoTrader.StatusDetail = "A screened teleport stalled; retrying through Roblox's normal public teleport and carrying any staged strict bot evidence."
+            State.AutoTrader.Render()
+            State.AutoTrader.BeginTeleport("server_hop_teleport_timeout_blind_fallback", false, true)
         else
             State.AutoTrader.TeleportInProgress = false
             State.AutoTrader.TeleportAttemptStartedAt = 0
             State.AutoTrader.TeleportAttemptOriginJobId = nil
+            State.AutoTrader.RequestRecoveryTeleport(reason)
         end
-        State.AutoTrader.RequestRecoveryTeleport(reason)
         return true
     end
 
@@ -14349,7 +14684,10 @@ State.AutoTrader.OvernightSupervisor = function()
             queueCount = #(State.AutoTrader.ServerHopQueue or {}),
         })
         State.AutoTrader.AbortServerHop(reason)
-        State.AutoTrader.RequestRecoveryTeleport(reason)
+        State.AutoTrader.Status = "SERVER HOP · BLIND FALLBACK"
+        State.AutoTrader.StatusDetail = "The screened hop pipeline stopped making progress; using a normal public teleport and carrying any staged strict bot evidence."
+        State.AutoTrader.Render()
+        State.AutoTrader.BeginTeleport("server_hop_progress_timeout_blind_fallback", false, true)
         return true
     end
 
@@ -14470,6 +14808,8 @@ State.AutoTrader.Tick = function()
     State.AutoTrader.BindLocalDeclineObserver()
     State.AutoTrader.BindRequestCancelObserver()
     State.AutoTrader.BindIncomingRequestObserver()
+    State.AutoTrader.ReconcileOutgoingRequestState()
+    State.AutoTrader.ReconcileTradeDeclineState()
     if State.AutoTrader.Preferences.automation
         and State.AutoTrader.ManagedPartnerUserId
         and (State.CurrentTrade or isTradeVisible()) then
@@ -14487,14 +14827,17 @@ State.AutoTrader.Tick = function()
         local target = Players:GetPlayerByUserId(State.AutoTrader.PendingRequest.userId)
         if not target then
             State.AutoTrader.Log("pending_target_left", State.AutoTrader.PendingRequest)
-            State.AutoTrader.PendingRequest = nil
-            State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
+            if State.AutoTrader.PendingRequest.phase ~= "canceling" then
+                local started, err = State.AutoTrader.BeginPendingRequestCancellation("pending target left the server", "trade_unavailable", false)
+                if not started then State.AutoTrader.RequestRecoveryTeleport("pending target left and request cancellation failed: " .. tostring(err)) end
+            end
         elseif State.AutoTrader.Preferences.automation
             and State.AutoTrader.PendingRequest.phase == "pending"
             and os.clock() - (State.AutoTrader.PendingRequest.confirmedAt or State.AutoTrader.PendingRequest.sentAt) >= CONFIG.AutoTraderPendingRequestTimeoutSeconds then
             State.AutoTrader.CancelIgnoredRequest()
         elseif State.AutoTrader.Preferences.automation
             and State.AutoTrader.PendingRequest.phase ~= "pending"
+            and State.AutoTrader.PendingRequest.phase ~= "canceling"
             and os.clock() - (State.AutoTrader.PendingRequest.sentAt or os.clock()) >= CONFIG.AutoTraderRequestInvokeTimeoutSeconds + 0.75 then
             State.AutoTrader.FailPendingRequestAttempt(
                 target,
@@ -14507,6 +14850,7 @@ State.AutoTrader.Tick = function()
     if State.AutoTrader.Preferences.automation
         and State.AutoTrader.ManagedPartnerUserId
         and State.CurrentTrade
+        and not State.AutoTrader.TradeDeclinePending
         and not State.AutoTrader.PostTradeAuditPending
         and not State.AutoTrader.SessionFrozen then
         local activity = math.max(
@@ -14689,8 +15033,13 @@ end)
 connect(Players.PlayerRemoving, function(player)
     if State.AutoTrader.PendingRequest and State.AutoTrader.PendingRequest.userId == player.UserId then
         State.AutoTrader.Log("pending_target_left", State.AutoTrader.PendingRequest)
-        State.AutoTrader.PendingRequest = nil
-        State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
+        if State.AutoTrader.PendingRequest.phase ~= "canceling" then
+            local started, err = State.AutoTrader.BeginPendingRequestCancellation("pending target left the server", "trade_unavailable", false)
+            if not started then
+                State.AutoTrader.Log("pending_target_left_cancel_failed", {error = err})
+                State.AutoTrader.RequestRecoveryTeleport("outgoing request target left and cancellation failed")
+            end
+        end
     end
 end)
 State.AutoTrader.UpdateControls()
@@ -18884,6 +19233,18 @@ local function jitteredDelay(seconds)
         seconds * (0.90 + math.random() * 0.20)
     )
 end
+local function startFastPeriodic(baseSeconds, callback)
+    task.spawn(function()
+        local delaySeconds = math.max(0.02, tonumber(baseSeconds) or 0.05)
+        task.wait(delaySeconds)
+        while not Destroyed do
+            local ok, err = pcall(callback)
+            if not ok then warn("[SV Public] fast periodic callback error:", err) end
+            if Destroyed then break end
+            task.wait(delaySeconds)
+        end
+    end)
+end
 local function startPeriodic(baseSeconds, backoff, callback)
     task.spawn(function()
         local failures = 0
@@ -19072,9 +19433,8 @@ startPeriodic(
         return true
     end
 )
-startPeriodic(
+startFastPeriodic(
     CONFIG.AutoTraderGoldSampleSeconds,
-    false,
     function()
         return State.AutoTrader.SampleGoldBotCertification()
     end

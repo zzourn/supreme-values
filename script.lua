@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.68.6-public-auto-trader-v36-rc6-active-trade-identity-closure",
+    version = "18.68.7-public-auto-trader-v36-rc7-fast-inventory-discovery",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -256,7 +256,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V36",
-    distributionNormalizedSha256 = "44176a2c9a45a0ed2c3a38cc281913f20175ba6c5032733b0b9dbb0376ff280c",
+    distributionNormalizedSha256 = "a3180aa3f3c14229711809a383469c6d7e5c336403196504a0e13fcbddb9301f",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -1501,6 +1501,22 @@ local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix, verifiedDi
     DatabaseStatus = "Ready"
     return true, nil, true, digest
 end
+HARDEN.tryWarmStartSupremeLkg = function()
+    if SupremeDatabase then return true, nil, false end
+    if type(HARDEN.readLkgEnvelope) ~= "function" then return false, "Supreme LKG reader unavailable", false end
+    DatabaseStatus = "Loading cached values..."
+    local cached = HARDEN.readLkgEnvelope(HARDEN.supremeLkgFile)
+    if not cached or type(cached.body) ~= "string" then
+        HARDEN.supremeWarmStartUsed = false
+        HARDEN.supremeWarmStartError = "no verified Supreme LKG"
+        return false, HARDEN.supremeWarmStartError, false
+    end
+    local loaded, err, changed = loadSupremeFromBody(cached.body, "disk_lkg_warm_start", cached.savedAtUnix, cached.sha256)
+    HARDEN.supremeWarmStartUsed = loaded == true
+    HARDEN.supremeWarmStartError = loaded and nil or tostring(err or "disk LKG rejected")
+    HARDEN.supremeWarmStartAt = loaded and os.clock() or 0
+    return loaded, err, changed
+end
 local function fetchSupremeDatabase()
     local function tryDiskLkg(liveError)
         if SupremeDatabase then return false, liveError, false end
@@ -1566,6 +1582,25 @@ local function ensureSupremeDatabase(force)
         and SupremeDatabase
         and os.time() - LastDatabaseLoad < CONFIG.RefreshSeconds then
         return true, nil, false
+    end
+    if not force and not SupremeDatabase then
+        local warmOK, warmError, warmChanged = HARDEN.tryWarmStartSupremeLkg()
+        if warmOK then
+            -- A verified disk snapshot is sufficient to begin inventory discovery immediately.
+            -- Refresh the large live Supreme body independently so a slow GitHub/bootstrap path
+            -- cannot consume the per-player discovery window in an otherwise-good human lobby.
+            task.spawn(function()
+                if Destroyed then return end
+                HARDEN.supremeBackgroundRefreshStartedAt = os.clock()
+                local liveOK, liveError, liveChanged = fetchSupremeDatabase()
+                HARDEN.supremeBackgroundRefreshFinishedAt = os.clock()
+                HARDEN.supremeBackgroundRefreshError = liveOK and nil or tostring(liveError or "refresh failed")
+                if liveChanged and not Destroyed and HARDEN.refreshResolvedViews then
+                    HARDEN.refreshResolvedViews(false)
+                end
+            end)
+            return true, warmError, warmChanged
+        end
     end
     DatabaseStatus = "Refreshing..."
     local ok, err, changed = fetchSupremeDatabase()
@@ -8597,6 +8632,9 @@ State.AutoTrader.GetServerDispositionLegacyClassification = function()
     return "EXHAUSTED_NO_VALUE", counts
 end
 State.AutoTrader.KickServerDiscovery = function()
+    -- Do not spend a player's bounded discovery retries before the trusted value database
+    -- exists; QueueRemoteLeaderboardSweep cannot invoke GetFullInventory without it.
+    if not SupremeDatabase then return end
     if os.clock() - (State.AutoTrader.LastDiscoveryKickAt or 0) < CONFIG.AutoTraderDiscoveryRetrySeconds then
         return
     end
@@ -18498,6 +18536,17 @@ State.AutoTrader.ReconcileTradeDeclineState = function()
 end
 State.AutoTrader.ProcessWholeServerNoProgress = function(now, noBlockingWork)
     if not noBlockingWork then return false end
+    if not SupremeDatabase then
+        if State.AutoTrader.FastBotHopReason == "EXHAUSTED_NO_PROGRESS" then
+            State.AutoTrader.FastBotHopActive = false
+            State.AutoTrader.FastBotHopReason = nil
+        end
+        if now - (State.AutoTrader.LastDatabaseWarmHoldLogAt or 0) >= 5 then
+            State.AutoTrader.LastDatabaseWarmHoldLogAt = now
+            State.AutoTrader.Log("server_no_progress_database_warm_hold", {databaseStatus=DatabaseStatus})
+        end
+        return false
+    end
     local targetNow = State.AutoTrader.SelectTarget()
     if targetNow then return false end
     local disposition, counts = State.AutoTrader.GetServerDisposition()
@@ -24197,6 +24246,22 @@ do
         return tonumber(a and a.player and a.player.UserId) < tonumber(b and b.player and b.player.UserId)
     end
 
+    State.AutoTrader.GetInventoryDiscoveryAge = function(entry, now, databaseReadyOverride)
+        now = tonumber(now) or os.clock()
+        local databaseReady = databaseReadyOverride
+        if databaseReady == nil then databaseReady = SupremeDatabase ~= nil end
+        if type(entry) ~= "table" then return 0, databaseReady == true end
+        if databaseReady ~= true then
+            entry.inventoryDiscoveryReadyAt = nil
+            return 0, false
+        end
+        if not tonumber(entry.inventoryDiscoveryReadyAt) or entry.inventoryDiscoveryReadyAt <= 0 then
+            entry.inventoryDiscoveryReadyAt = now
+        end
+        local startedAt = math.max(tonumber(entry.firstSeenAt) or now, tonumber(entry.inventoryDiscoveryReadyAt) or now)
+        return math.max(0, now - startedAt), true
+    end
+
     State.AutoTrader.EvaluatePlayerEligibility = function(player,context)
         context=context or State.AutoTrader.BuildEligibilityContext(); local now=context.now or os.clock()
         local entry=State.AutoTrader.EnsureServerPlayer(player)
@@ -24220,7 +24285,11 @@ do
             entry.friendWaitStartedAt=0
         end
         if not verified or total==nil then
-            local age=now-(entry.firstSeenAt or State.AutoTrader.ServerJoinedAt or now)
+            local age, discoveryReady = State.AutoTrader.GetInventoryDiscoveryAge(entry, now)
+            if not discoveryReady then
+                return {state="discovery_pending",feasibilityState="DISCOVERY_PENDING",contactState=contactState,
+                    player=player,entry=entry,actionable=false,reason="value database warming; inventory discovery has not started"}
+            end
             return {state=age>=CONFIG.AutoTraderUnresolvedMaxWaitSeconds and "unresolvable" or "discovery_pending",feasibilityState=age>=CONFIG.AutoTraderUnresolvedMaxWaitSeconds and "SEARCH_INCONCLUSIVE" or "DISCOVERY_PENDING",contactState=contactState,
                 player=player,entry=entry,actionable=false,reason=valueReason or "inventory unresolved"}
         end
@@ -25297,6 +25366,34 @@ do
     end
 end
 
+do
+    State.AutoTrader.V36Rc7RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local result = State.AutoTrader.V36Rc7RunSelfTests()
+        local tests = result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+        add("database-bootstrap-does-not-consume-player-discovery-window", function()
+            local entry={firstSeenAt=10,inventoryDiscoveryReadyAt=nil}
+            local blockedAge,blockedReady=State.AutoTrader.GetInventoryDiscoveryAge(entry,30,false)
+            local readyAge,ready=State.AutoTrader.GetInventoryDiscoveryAge(entry,30,true)
+            local laterAge,laterReady=State.AutoTrader.GetInventoryDiscoveryAge(entry,35,true)
+            return blockedAge==0 and blockedReady==false and readyAge==0 and ready==true and laterReady==true and math.abs(laterAge-5)<0.000001,
+                "player discovery timeout advanced while the Supreme database was unavailable"
+        end)
+        add("operational-discovery-retry-requires-value-database", function()
+            return type(State.Profile.QueueRemoteLeaderboardSweep)=="function" and type(HARDEN.tryWarmStartSupremeLkg)=="function",
+                "fast inventory discovery bootstrap helpers are unavailable"
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v36_rc7",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end
+
 State.QueueNativeDatabaseWarmup()
 rawset(_G, GLOBAL_KEY, Controller)
 do
@@ -25331,6 +25428,9 @@ task.spawn(function()
             end
             if not databaseOK and databaseError then
                 warn("[SV Public] Initial value database unavailable:", databaseError)
+            end
+            if databaseOK and SupremeDatabase and type(State.Profile.QueueRemoteLeaderboardSweep) == "function" then
+                State.Profile.QueueRemoteLeaderboardSweep(true)
             end
             State.AutoTrader.RunSelfTests()
             task.spawn(function()

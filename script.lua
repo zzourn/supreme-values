@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.52-public-auto-trader-v20-animation-gated-gold-learning",
+    version = "18.53-public-auto-trader-v21-httpget-strict-bot-learning",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -107,9 +107,11 @@ local CONFIG = {
     AutoTraderBootstrapBotDbJobsPerIcon = 12,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
     AutoTraderThumbnailBatchSize = 100,
-    -- v20 bot architecture: bot learning, current-server hop decisions, and
+    -- v21 bot architecture: bot learning, current-server hop decisions, and
     -- pre-join server selection are deliberately independent systems. Only a
-    -- physically certified all-bot server may add hashes to the gold database.
+    -- physically certified all-bot server may add hashes to the strict database.
+    -- Server-list GETs prefer game:HttpGet and validate token-bearing rows before
+    -- falling back to executor HTTP; unavailable previews are UNKNOWN, not blocked.
     AutoTraderBotCurrentPreviewRetrySeconds = 5,
     AutoTraderGoldBotMinPreviewSamples = 5,
     AutoTraderGoldBotRejectRatio = 0.50,
@@ -128,9 +130,10 @@ local CONFIG = {
     AutoTraderGoldMinFacingMismatchDegrees = 20,
     AutoTraderGoldMinFacingMismatchSamples = 2,
     AutoTraderGoldMinRemotePlayers = 5,
-    -- v20: animation history can only DISQUALIFY a server from bot learning.
-    -- Two distinct replicated animation IDs from any one remote player permanently
-    -- mark the JobId regular; animation behavior can never certify bots by itself.
+    -- v21: animation history can only DISQUALIFY a server from bot learning.
+    -- Two distinct legitimate replicated animation IDs from any one remote player
+    -- permanently mark the JobId regular; animation behavior can never certify bots.
+    -- Asset id 0/1 are ignored as placeholder/noise values observed in live clients.
     AutoTraderGoldAnimationDisqualifyDistinctIds = 2,
     AutoTraderGoldThumbnailRetrySeconds = 2,
     AutoTraderBotDatabaseMaxIcons = 1200,
@@ -6787,7 +6790,7 @@ State.AutoTrader.RecordTargetEvent = function(player, kind, data)
     end
     stats.lastEventUnix = os.time()
     State.AutoTrader.RecordStrategyEvent(player, kind, data)
-    -- v20 bot identity is intentionally isolated from all trade/inventory behavior.
+    -- v21 bot identity is intentionally isolated from all trade/inventory behavior.
     State.AutoTrader.SaveTargetStats()
 end
 State.AutoTrader.GetTargetProfile = function(player)
@@ -6981,7 +6984,7 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
     local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.45)
     local declinePenalty = 1 / (1 + (tonumber(stats.declines) or 0) * 0.10)
 
-    -- v20: avatar/bot knowledge intentionally has ZERO influence on current-server
+    -- v21: avatar/bot knowledge intentionally has ZERO influence on current-server
     -- target economics. The bot database is only a pre-join server filter.
     return (
         expectedProfit
@@ -7365,7 +7368,8 @@ State.AutoTrader.LoadRecentJobs = function()
                 return reader(State.AutoTrader.RecentJobsFile)
             end)
             if okRead and type(body) == "string" then
-                local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                summary.bodyBytes = #body
+    local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
                 if okDecode then merge(decoded) end
             end
         end
@@ -7605,7 +7609,7 @@ end
 State.AutoTrader.GetBotIconClass = function(fingerprint)
     local record = State.AutoTrader.GetBotIconRecord(fingerprint, false)
     if not record then return "unknown", 0, nil end
-    -- v20 intentionally ignores v19 goldBotJobs. Only strictGoldBotJobs passed
+    -- v21 intentionally ignores legacy v19 goldBotJobs. Only strictGoldBotJobs passed
     -- physical certification + whole-JobId animation disqualification.
     local goldJobs = State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs)
     if goldJobs >= CONFIG.AutoTraderGoldBotConfirmMinJobs then return "confirmed_bot", 0.99, record end
@@ -7634,7 +7638,7 @@ State.AutoTrader.AddStrictGoldBotIconEvidence = function(fingerprint, jobId, pla
     record.lastSeen = now
     return true
 end
--- Compatibility shim: legacy reputation writers are disabled in v20. The strict
+-- Compatibility shim: legacy reputation writers are disabled in v21. The strict
 -- writer above is called only by ImportStrictGoldTeleportCommit from a validated departure payload.
 State.AutoTrader.AddBotIconEvidence = function()
     return false
@@ -7784,6 +7788,110 @@ State.AutoTrader.HttpGetBody = function(url)
     if ok and type(body) == "string" then return body end
     return nil
 end
+State.AutoTrader.InspectServerListBody = function(body)
+    local summary = {
+        ok = false, rows = 0, playingRows = 0, tokenRows = 0, tokens = 0,
+        tokenCoverage = 0, bodyBytes = 0, degraded = false, decodeError = nil,
+    }
+    if type(body) ~= "string" or body == "" then
+        summary.decodeError = "empty body"
+        return nil, summary
+    end
+    local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+    if not okDecode or type(decoded) ~= "table" then
+        summary.decodeError = "JSON decode failed"
+        return nil, summary
+    end
+    local data = type(decoded.data) == "table" and decoded.data or {}
+    summary.ok = true
+    summary.rows = #data
+    for _, server in ipairs(data) do
+        local playing = tonumber(server.playing) or 0
+        if playing > 0 then summary.playingRows += 1 end
+        local tokens = type(server.playerTokens) == "table" and server.playerTokens or nil
+        if tokens and #tokens > 0 then
+            summary.tokenRows += 1
+            summary.tokens += #tokens
+        end
+    end
+    summary.tokenCoverage = summary.playingRows > 0 and summary.tokenRows / summary.playingRows or 1
+    -- A page containing active servers but little/no playerToken coverage is
+    -- structurally valid JSON yet semantically degraded for avatar filtering.
+    -- Roblox normally exposes tokens on the active rows here; requiring 50%
+    -- coverage also catches partially stripped/proxied representations.
+    summary.degraded = summary.playingRows >= 5 and summary.tokenCoverage < 0.50
+    return decoded, summary
+end
+
+State.AutoTrader.FetchServerListPage = function(url)
+    local result = {
+        selectedTransport = nil,
+        gameHttpGet = {attempted = false, ok = false, rows = 0, playingRows = 0, tokenRows = 0, tokens = 0, tokenCoverage = 0, bodyBytes = 0, degraded = false, error = nil},
+        executor = {attempted = false, ok = false, status = nil, rows = 0, playingRows = 0, tokenRows = 0, tokens = 0, tokenCoverage = 0, bodyBytes = 0, degraded = false, error = nil},
+    }
+    local fallbackDecoded, fallbackSummary = nil, nil
+
+    -- Prefer Roblox's in-client GET path for this endpoint. In live testing some
+    -- executor request transports returned HTTP 200 server lists with playerTokens
+    -- stripped while game:HttpGet/browser responses still contained them.
+    result.gameHttpGet.attempted = true
+    local okGame, gameBody = boundedGameHttpGet(url, CONFIG.AutoTraderHttpTimeoutSeconds)
+    if okGame and type(gameBody) == "string" then
+        local decoded, summary = State.AutoTrader.InspectServerListBody(gameBody)
+        for key, value in pairs(summary) do if result.gameHttpGet[key] ~= nil then result.gameHttpGet[key] = value end end
+        result.gameHttpGet.ok = summary.ok == true
+        if decoded and not summary.degraded then
+            result.selectedTransport = "game:HttpGet"
+            return decoded, result
+        end
+        if decoded then fallbackDecoded, fallbackSummary = decoded, summary end
+        if not decoded then result.gameHttpGet.error = summary.decodeError end
+    else
+        result.gameHttpGet.error = tostring(gameBody or "game:HttpGet failed")
+    end
+
+    -- If game:HttpGet fails OR gives a tokenless active-server page, try executor
+    -- HTTP. A 200 response is accepted only after the same semantic token check.
+    if type(httpRequest) == "function" then
+        result.executor.attempted = true
+        local okReq, rawResponse = boundedHttpRequest({
+            Url = url,
+            URL = url,
+            Method = "GET",
+            Headers = { ["Cache-Control"] = "no-cache", ["Accept"] = "application/json" },
+        }, CONFIG.AutoTraderHttpTimeoutSeconds)
+        if okReq then
+            local normalized = normalizeHttpResponse(rawResponse)
+            result.executor.status = normalized and normalized.StatusCode or nil
+            if normalized and normalized.Success and type(normalized.Body) == "string" then
+                local decoded, summary = State.AutoTrader.InspectServerListBody(normalized.Body)
+                for key, value in pairs(summary) do if result.executor[key] ~= nil then result.executor[key] = value end end
+                result.executor.ok = summary.ok == true
+                if decoded and not summary.degraded then
+                    result.selectedTransport = "executor_request"
+                    return decoded, result
+                end
+                if not fallbackDecoded and decoded then fallbackDecoded, fallbackSummary = decoded, summary end
+                if not decoded then result.executor.error = summary.decodeError end
+            else
+                result.executor.error = normalized and ("HTTP " .. tostring(normalized.StatusCode or "?")) or "unsupported response shape"
+            end
+        else
+            result.executor.error = tostring(rawResponse)
+        end
+    else
+        result.executor.error = "request(options) unavailable"
+    end
+
+    -- Preserve ordinary server hopping even if both transports return a degraded
+    -- tokenless representation. The caller may still use JobIds as UNKNOWN servers.
+    if fallbackDecoded then
+        result.selectedTransport = fallbackSummary and fallbackSummary.degraded and "degraded_unknown_fallback" or "fallback"
+        return fallbackDecoded, result
+    end
+    return nil, result
+end
+
 State.AutoTrader.FetchPublicServers = function(maxPages)
     State.AutoTrader.PruneRecentJobs()
     local rows = {}
@@ -7796,33 +7904,42 @@ State.AutoTrader.FetchPublicServers = function(maxPages)
         usableRows = 0,
         rowsWithPlayerTokens = 0,
         totalPlayerTokens = 0,
+        tokenlessActivePages = 0,
+        selectedGameHttpGetPages = 0,
+        selectedExecutorPages = 0,
+        selectedDegradedPages = 0,
+        transportPages = {},
         lastError = nil,
     }
-    for _ = 1, diagnostics.pagesRequested do
+    for pageIndex = 1, diagnostics.pagesRequested do
         diagnostics.pagesAttempted += 1
         local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId)
             .. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
         if cursor and cursor ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
-        local body = State.AutoTrader.HttpGetBody(url)
-        if not body then
-            diagnostics.lastError = "server list HTTP failed"
-            break
-        end
-        local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
-        if not ok or type(decoded) ~= "table" then
-            diagnostics.lastError = "server list JSON decode failed"
+        local decoded, transport = State.AutoTrader.FetchServerListPage(url)
+        transport.page = pageIndex
+        table.insert(diagnostics.transportPages, transport)
+        if not decoded then
+            diagnostics.lastError = "server list HTTP/JSON failed on both transports"
             break
         end
         diagnostics.pagesSucceeded += 1
+        if transport.selectedTransport == "game:HttpGet" then diagnostics.selectedGameHttpGetPages += 1
+        elseif transport.selectedTransport == "executor_request" then diagnostics.selectedExecutorPages += 1
+        else diagnostics.selectedDegradedPages += 1 end
+
         local data = type(decoded.data) == "table" and decoded.data or {}
         diagnostics.rawServerRows += #data
+        local pagePlayingRows, pageTokenRows = 0, 0
         for _, server in ipairs(data) do
             local playing = tonumber(server.playing)
             local maxPlayers = tonumber(server.maxPlayers)
             local jobId = server.id
             if type(jobId) == "string" and jobId ~= "" and playing and maxPlayers and maxPlayers > 0 then
+                if playing > 0 then pagePlayingRows += 1 end
                 local tokens = type(server.playerTokens) == "table" and server.playerTokens or {}
                 if #tokens > 0 then
+                    pageTokenRows += 1
                     diagnostics.rowsWithPlayerTokens += 1
                     diagnostics.totalPlayerTokens += #tokens
                 end
@@ -7838,6 +7955,7 @@ State.AutoTrader.FetchPublicServers = function(maxPages)
                 diagnostics.usableRows += 1
             end
         end
+        if pagePlayingRows > 0 and pageTokenRows == 0 then diagnostics.tokenlessActivePages += 1 end
         cursor = decoded.nextPageCursor
         if not cursor or cursor == "" then break end
     end
@@ -7912,7 +8030,7 @@ State.AutoTrader.AddSoftHumanIconEvidence = function()
     return false
 end
 State.AutoTrader.LearnHumanFingerprintForPlayer = function()
-    -- v20: trade/inventory behavior never modifies bot identity knowledge.
+    -- v21: trade/inventory behavior never modifies bot identity knowledge.
     return false
 end
 State.AutoTrader.GetPlayerBotRisk = function(player)
@@ -8073,8 +8191,10 @@ State.AutoTrader.ClassifyServerPreview = function(server, scanContext)
     local previewTrusted = sample >= CONFIG.AutoTraderGoldBotMinPreviewSamples
     local hardReject = previewTrusted and goldMatchRatio >= CONFIG.AutoTraderGoldBotRejectRatio
     local suspicious = previewTrusted and goldMatchRatio >= CONFIG.AutoTraderGoldBotWarnRatio
-    local safeEnough = previewTrusted and not hardReject
-    local safeConfidence = previewTrusted and (1 - goldMatchRatio) or 0
+    -- Unknown previews are neutral. The strict hash DB is an optimization for
+    -- server SELECTION, never a prerequisite for leaving an exhausted server.
+    local safeEnough = not hardReject
+    local safeConfidence = previewTrusted and (1 - goldMatchRatio) or nil
     local occupancy = tonumber(server.occupancy)
         or ((tonumber(server.playing) or 0) / math.max(1, tonumber(server.maxPlayers) or 1))
     local occupancyFit = 1 - math.min(1, math.abs(occupancy - 0.86) / 0.50)
@@ -8090,7 +8210,7 @@ State.AutoTrader.ClassifyServerPreview = function(server, scanContext)
         previewTrusted = previewTrusted, safeEnough = safeEnough,
         topTwoRatio = 0, uniqueFingerprints = 0,
         frequencies = frequencies, score = score, classes = classes,
-        filterSource = "gold_physical_bot_db_only",
+        filterSource = "strict_gold_hash_db_when_available_unknown_allowed",
     }
     return server.botPreview
 end
@@ -8179,7 +8299,12 @@ State.AutoTrader.NormalizeGoldAnimationId = function(value)
     if type(value) ~= "string" then value = tostring(value or "") end
     value = string.lower(value)
     local numeric = value:match("rbxassetid://(%d+)") or value:match("[?&]id=(%d+)") or value:match("(%d+)")
-    if numeric and numeric ~= "0" then return numeric end
+    -- Live support data exposed AnimationId "1" alongside a legitimate asset ID.
+    -- Treat only the known empty/placeholder ids as noise; do NOT broadly ignore
+    -- small IDs because missing a legitimate second animation is less safe than
+    -- conservatively disqualifying a training server.
+    if numeric == "0" or numeric == "1" then return nil end
+    if numeric and numeric ~= "" then return numeric end
     return nil
 end
 
@@ -8580,7 +8705,7 @@ State.AutoTrader.LearnCurrentServerBotIcons = function()
     return State.AutoTrader.LastBotLearning
 end
 State.AutoTrader.ShouldFastRejectInventoryBotLobby = function()
-    return false, {disabled = true, reason = "v20 bot identity learning never uses inventory/trade state"}
+    return false, {disabled = true, reason = "v21 bot identity learning never uses inventory/trade state"}
 end
 State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     if State.AutoTrader.CurrentServerAvatarScreenInFlight then return State.AutoTrader.CurrentServerAvatarScreen end
@@ -8655,7 +8780,7 @@ State.AutoTrader.BuildPublicServerQueue = function()
         at = os.clock(), thumbnailAvailable = thumbOK, thumbnailReason = thumbReason, thumbnail = thumbDiagnostics, fetch = fetchDiagnostics,
         rawRows = #rows, joinableRows = #allJoinable, freshRows = #fresh, recentFallbackRows = #recentFallback,
         usedRecentFallback = usedRecentFallback, filteredCurrent = filteredCurrent, filteredFull = filteredFull,
-        preclassifyPool = #candidates, candidates = {}, filterSource = "gold_physical_bot_db_only",
+        preclassifyPool = #candidates, candidates = {}, filterSource = "strict_gold_hash_db_when_available_unknown_allowed",
     }
     local queue = {}
     for _, server in ipairs(candidates) do
@@ -8676,7 +8801,10 @@ State.AutoTrader.BuildPublicServerQueue = function()
     end
     table.sort(queue, function(a, b)
         local ap, bp = a.botPreview or {}, b.botPreview or {}
-        if math.abs((ap.goldMatchRatio or 1) - (bp.goldMatchRatio or 1)) > 0.000001 then return (ap.goldMatchRatio or 1) < (bp.goldMatchRatio or 1) end
+        -- Prefer servers whose preview was actually resolved, but allow UNKNOWN
+        -- candidates whenever token/thumbnail transport is unavailable.
+        if (ap.previewTrusted == true) ~= (bp.previewTrusted == true) then return ap.previewTrusted == true end
+        if math.abs((ap.goldMatchRatio or 0) - (bp.goldMatchRatio or 0)) > 0.000001 then return (ap.goldMatchRatio or 0) < (bp.goldMatchRatio or 0) end
         local as, bs = ap.score or -math.huge, bp.score or -math.huge
         if math.abs(as - bs) > 0.000001 then return as > bs end
         if a.playing ~= b.playing then return a.playing > b.playing end
@@ -8693,6 +8821,12 @@ State.AutoTrader.BuildPublicServerQueue = function()
     scan.queueCount = #queue
     scan.safeThreshold = CONFIG.AutoTraderGoldBotRejectRatio
     scan.safeCandidateCount = #queue
+    scan.trustedCandidateCount = 0
+    scan.unknownCandidateCount = 0
+    for _, server in ipairs(queue) do
+        if server.botPreview and server.botPreview.previewTrusted then scan.trustedCandidateCount += 1
+        else scan.unknownCandidateCount += 1 end
+    end
     local best = scan.candidates[1]
     scan.bestScanned = best and {
         id = best.id, goldBotMatchRatio = best.goldBotMatchRatio, safeConfidence = best.safeConfidence,
@@ -8762,7 +8896,7 @@ State.AutoTrader.ServerHopStillAllowed = function()
     local exhausted = string.sub(tostring(currentDisposition), 1, 9) == "EXHAUSTED"
     local forcedReason = State.AutoTrader.FastBotHopReason
     local explicitNonBotHop = State.AutoTrader.FastBotHopActive == true
-        and (forcedReason == "MANUAL_SAFE_SERVER_SEARCH" or forcedReason == "EXHAUSTED_NO_PROGRESS")
+        and (forcedReason == "MANUAL_SERVER_SEARCH" or forcedReason == "EXHAUSTED_NO_PROGRESS")
     if forcedReason == "EXHAUSTED_NO_PROGRESS" and currentDisposition == "ACTIVE" and State.AutoTrader.SelectTarget then
         local revivedTarget = State.AutoTrader.SelectTarget()
         if revivedTarget then return false, "new trading opportunity appeared: " .. tostring(revivedTarget.Name) end
@@ -8796,7 +8930,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     if not server then
         local scan = State.AutoTrader.LastServerScan
         local best = scan and scan.bestScanned or nil
-        State.AutoTrader.Status = "SERVER HOP · WAITING FOR SAFE SERVER"
+        State.AutoTrader.Status = "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
         if best and best.previewTrusted then
             State.AutoTrader.StatusDetail = string.format(
                 "Best scanned server still has %.0f%% learned-gold bot-avatar matches / %.0f%% unmatched previews. Need gold matches below %.0f%%; rescanning in %.0fs.",
@@ -8807,7 +8941,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             )
         else
             State.AutoTrader.StatusDetail = string.format(
-                "No candidate had enough avatar preview data to apply the gold bot-hash filter. Rescanning in %.0fs.",
+                "No joinable candidate is currently available. Thumbnail-unresolved servers are allowed in v21, so this usually means the server list itself was empty/unusable or all trusted candidates matched the strict bot reject gate. Rescanning in %.0fs.",
                 CONFIG.AutoTraderServerRescanDelaySeconds
             )
         end
@@ -8837,7 +8971,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             State.AutoTrader.LastServerScan = scan
             if #queue == 0 then
                 local best = scan and scan.bestScanned or nil
-                State.AutoTrader.Status = "SERVER HOP · WAITING FOR SAFE SERVER"
+                State.AutoTrader.Status = "SERVER HOP · WAITING FOR ELIGIBLE SERVER"
                 State.AutoTrader.StatusDetail = best and best.previewTrusted
                     and string.format(
                         "Fresh scan still has no server below the %.0f%% learned-gold-avatar gate; best has %.0f%% gold matches. Rescanning in %.0fs.",
@@ -8846,7 +8980,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
                         CONFIG.AutoTraderServerRescanDelaySeconds
                     )
                     or string.format(
-                        "Fresh scan still lacks enough thumbnail data to apply the gold hash filter. Rescanning in %.0fs.",
+                        "Fresh scan still has no eligible server. Unknown thumbnail previews are allowed; waiting only because no usable candidate was returned or every trusted candidate hit the strict bot reject gate. Rescanning in %.0fs.",
                         CONFIG.AutoTraderServerRescanDelaySeconds
                     )
                 State.AutoTrader.Log("server_hop_rescan_empty", {scan = scan})
@@ -8884,13 +9018,20 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
         .. tostring(State.AutoTrader.ServerHopQueueIndex)
         .. "/"
         .. tostring(#State.AutoTrader.ServerHopQueue)
-    State.AutoTrader.StatusDetail = tostring(server.playing)
-        .. "/"
-        .. tostring(server.maxPlayers)
-        .. string.format(
-            " players · %.0f%% learned-gold bot-avatar matches · passed the pre-join hash filter.",
-            ((server.botPreview and server.botPreview.goldMatchRatio) or 0) * 100
-        )
+    if server.botPreview and server.botPreview.previewTrusted then
+        State.AutoTrader.StatusDetail = tostring(server.playing)
+            .. "/"
+            .. tostring(server.maxPlayers)
+            .. string.format(
+                " players · %.0f%% strict-gold bot-avatar matches · passed the pre-join hash filter.",
+                (server.botPreview.goldMatchRatio or 0) * 100
+            )
+    else
+        State.AutoTrader.StatusDetail = tostring(server.playing)
+            .. "/"
+            .. tostring(server.maxPlayers)
+            .. " players · avatar preview unavailable/insufficient, so this candidate is UNKNOWN and allowed."
+    end
     State.AutoTrader.Render()
 
     local queued, queueError = State.AutoTrader.QueueTeleportScript(
@@ -8999,7 +9140,7 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
     State.AutoTrader.Render()
 
     task.spawn(function()
-        -- v20: hopping never DECIDES bot identity. A staged strict-gold candidate may have been committed only after this ordinary hop decision was already made.
+        -- v21: hopping never DECIDES bot identity. A staged strict-gold candidate may have been committed only after this ordinary hop decision was already made.
         if Destroyed
             or not State.AutoTrader.ServerHopInProgress
             or queueGeneration ~= State.AutoTrader.ServerHopQueueGeneration then
@@ -11904,7 +12045,7 @@ State.AutoTrader.OnNoTrade = function()
             return
         end
     end
-    -- v20: current-server bot evidence cannot cause a hop. Only ordinary
+    -- v21: current-server bot evidence cannot cause a hop. Only ordinary
     -- target/discovery/exhaustion/liveness logic below decides when to leave.
     local target = State.AutoTrader.SelectTarget()
     if State.AutoTrader.Preferences.automation then
@@ -12068,7 +12209,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V20",
+        format = "SV_AUTO_TRADER_SUPPORT_V21",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -12117,7 +12258,7 @@ State.AutoTrader.BuildDebug = function()
             learnedHopOpportunityRate = State.AutoTrader.GetHopOpportunityRate(),
             hopOpportunityRetentionFactor = CONFIG.AutoTraderHopOpportunityRetentionFactor,
             goldBotLearning = {
-                source = "physical_only", observeSeconds = CONFIG.AutoTraderGoldObserveSeconds,
+                source = "strict_physical_plus_animation_disqualifier", observeSeconds = CONFIG.AutoTraderGoldObserveSeconds,
                 remoteSignal = "replicated_root_cframe_path_only",
                 orientationFuzzDegrees = CONFIG.AutoTraderGoldOrientationFuzzDegrees,
                 minPathTurnDegrees = CONFIG.AutoTraderGoldMinPathTurnDegrees,
@@ -12311,7 +12452,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V20\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V21\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -12619,7 +12760,7 @@ UI.AutoTraderTradeWhy.ZIndex = 1454
 -- SERVERS ----------------------------------------------------------------
 local serversPage = UI.AutoTraderPages.SERVERS
 UI.AutoTraderServerScanCard = uiCard(serversPage, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 112))
-uiSectionTitle(UI.AutoTraderServerScanCard, "SAFE SERVER SEARCH", 6)
+uiSectionTitle(UI.AutoTraderServerScanCard, "SERVER SELECTION", 6)
 UI.AutoTraderServerScanStatus = uiValueLabel(UI.AutoTraderServerScanCard, "No public-server scan yet.", 26, 11, THEME.blue, Enum.Font.GothamBold)
 UI.AutoTraderServerScanThreshold = uiValueLabel(UI.AutoTraderServerScanCard, "Filter: gold-certified bot avatar matches only", 49)
 UI.AutoTraderServerScanBest = uiValueLabel(UI.AutoTraderServerScanCard, "Best scanned: —", 69)
@@ -12639,7 +12780,7 @@ addCorner(UI.AutoTraderServerCandidateScroll, 9)
 UI.AutoTraderServerCandidateContent = create("Frame", {Size = UDim2.new(1, -7, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 1453}, UI.AutoTraderServerCandidateScroll)
 create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, UI.AutoTraderServerCandidateContent)
 create("UIPadding", {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)}, UI.AutoTraderServerCandidateContent)
-UI.AutoTraderForceServer = makeButton(serversPage, "FIND A NEW SAFE SERVER", UDim2.new(0.5, -4, 0, 36), THEME.panel2)
+UI.AutoTraderForceServer = makeButton(serversPage, "FIND A NEW SERVER", UDim2.new(0.5, -4, 0, 36), THEME.panel2)
 UI.AutoTraderForceServer.Position = UDim2.new(0, 0, 1, -38)
 UI.AutoTraderForceServer.TextColor3 = THEME.blue
 UI.AutoTraderForceServer.ZIndex = 1452
@@ -12951,9 +13092,15 @@ State.AutoTrader.RebuildServerDashboard = function()
         local short = #id > 12 and (string.sub(id, 1, 8) .. "…") or id
         local title = makeLabel(row, tostring(index) .. ". " .. short .. " · " .. tostring(candidate.playing or "?") .. "/" .. tostring(candidate.maxPlayers or "?"), 9, safe and THEME.green or THEME.text, Enum.Font.GothamBold)
         title.Position = UDim2.fromOffset(8, 3); title.Size = UDim2.new(0.42, -8, 0, 17); title.ZIndex = 1455
-        local confidence = makeLabel(row, "Gold matches " .. pct01(candidate.goldBotMatchRatio) .. " · unmatched " .. pct01(candidate.safeConfidence), 9, safe and THEME.green or THEME.yellow, Enum.Font.GothamBold)
+        local trusted = candidate.previewTrusted == true
+        local confidenceText = trusted
+            and ("Gold matches " .. pct01(candidate.goldBotMatchRatio) .. " · unmatched " .. pct01(candidate.safeConfidence))
+            or "Avatar preview UNKNOWN · allowed"
+        local confidence = makeLabel(row, confidenceText, 9, trusted and (safe and THEME.green or THEME.red) or THEME.yellow, Enum.Font.GothamBold)
         confidence.Position = UDim2.new(0.42, 2, 0, 3); confidence.Size = UDim2.new(0.36, -4, 0, 17); confidence.ZIndex = 1455
-        local result = makeLabel(row, safe and "ACCEPT" or "REJECT", 9, safe and THEME.green or THEME.red, Enum.Font.GothamBold)
+        local resultText = not safe and "REJECT" or trusted and "ACCEPT" or "UNKNOWN"
+        local resultColor = not safe and THEME.red or trusted and THEME.green or THEME.yellow
+        local result = makeLabel(row, resultText, 9, resultColor, Enum.Font.GothamBold)
         result.Position = UDim2.new(0.78, 2, 0, 3); result.Size = UDim2.new(0.22, -10, 0, 17); result.TextXAlignment = Enum.TextXAlignment.Right; result.ZIndex = 1455
         local sub = makeLabel(row, "samples " .. tostring(candidate.previewSample or 0) .. " · strict learned avatars " .. tostring(candidate.goldBotMatches or 0) .. " · only strict physical + whole-JobId-animation-gated hashes participate", 8, THEME.faint, Enum.Font.Gotham)
         sub.Position = UDim2.fromOffset(8, 22); sub.Size = UDim2.new(1, -16, 0, 15); sub.TextTruncate = Enum.TextTruncate.AtEnd; sub.ZIndex = 1455
@@ -12995,7 +13142,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         local goldJobs = tonumber(info and info.goldJobs) or 0
         local classColor = class == "confirmed_bot" and THEME.red or (class == "known_bot" or class == "observed_bot") and THEME.yellow or THEME.faint
         local name = makeLabel(row, player.Name, 10, THEME.text, Enum.Font.GothamBold); name.Position = UDim2.fromOffset(64, 6); name.Size = UDim2.new(1, -72, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
-        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict-v20 avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
+        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict-v21 avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
         local hash = makeLabel(row, info and tostring(info.fingerprint or "") or "Press REFRESH to resolve this player's avatar hash", 8, THEME.faint, Enum.Font.Code); hash.Position = UDim2.fromOffset(64, 42); hash.Size = UDim2.new(1, -72, 0, 13); hash.TextTruncate = Enum.TextTruncate.AtEnd; hash.ZIndex = 1455
     end
 
@@ -13014,7 +13161,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         return (tonumber(a.record.strictGoldBotSightings) or 0) > (tonumber(b.record.strictGoldBotSightings) or 0)
     end)
     if #learned == 0 then
-        local empty = makeLabel(UI.AutoTraderBotContent, "No strict v20 hashes learned yet. v18/v19 evidence is preserved locally but ignored by v20 filtering.", 9, THEME.faint, Enum.Font.Gotham)
+        local empty = makeLabel(UI.AutoTraderBotContent, "No strict v21 hashes learned yet. Legacy v18/v19/v20 evidence is preserved locally but only strict departure-committed evidence participates in v21 filtering.", 9, THEME.faint, Enum.Font.Gotham)
         empty.Size = UDim2.new(1, 0, 0, 36); empty.TextWrapped = true; empty.ZIndex = 1454
     end
     for index, info in ipairs(learned) do
@@ -13141,13 +13288,29 @@ State.AutoTrader.Render = function()
 
     local scan = State.AutoTrader.LastServerScan
     if scan then
-        UI.AutoTraderServerScanStatus.Text = State.AutoTrader.ServerHopInProgress and "Scanning / waiting for a safe candidate" or "Last safe-server scan"
-        UI.AutoTraderServerScanThreshold.Text = "Reject when learned-gold avatar matches ≥ " .. string.format("%.0f%%", (tonumber(scan.safeThreshold) or CONFIG.AutoTraderGoldBotRejectRatio) * 100) .. " · accepted candidates " .. tostring(scan.safeCandidateCount or 0)
+        UI.AutoTraderServerScanStatus.Text = State.AutoTrader.ServerHopInProgress and "Scanning server candidates" or "Last server-selection scan"
+        UI.AutoTraderServerScanThreshold.Text = "Reject trusted previews at strict-gold matches ≥ " .. string.format("%.0f%%", (tonumber(scan.safeThreshold) or CONFIG.AutoTraderGoldBotRejectRatio) * 100) .. " · trusted " .. tostring(scan.trustedCandidateCount or 0) .. " · unknown allowed " .. tostring(scan.unknownCandidateCount or 0)
         local best = scan.bestScanned
-        UI.AutoTraderServerScanBest.Text = best and ("Best: gold matches " .. pct01(best.goldBotMatchRatio) .. " · unmatched " .. pct01(best.safeConfidence) .. " · " .. tostring(best.playing or "?") .. "/" .. tostring(best.maxPlayers or "?")) or "Best scanned: —"
-        UI.AutoTraderServerScanReason.Text = scan.selected and ("Selected JobId " .. tostring(scan.selected) .. " using only gold-certified bot hashes.") or "No candidate cleared the gold-hash filter; rescanning instead of joining a known-bot-heavy preview."
+        UI.AutoTraderServerScanBest.Text = best and (best.previewTrusted
+            and ("Best: gold matches " .. pct01(best.goldBotMatchRatio) .. " · unmatched " .. pct01(best.safeConfidence) .. " · " .. tostring(best.playing or "?") .. "/" .. tostring(best.maxPlayers or "?"))
+            or ("Best: avatar preview UNKNOWN (allowed) · " .. tostring(best.playing or "?") .. "/" .. tostring(best.maxPlayers or "?"))) or "Best scanned: —"
+        local selectedRow = nil
+        for _, candidate in ipairs(scan.candidates or {}) do
+            if candidate.id == scan.selected then selectedRow = candidate; break end
+        end
+        local fetch = scan.fetch or {}
+        local transportText = "GET pages: game:HttpGet " .. tostring(fetch.selectedGameHttpGetPages or 0)
+            .. " · executor " .. tostring(fetch.selectedExecutorPages or 0)
+            .. " · degraded " .. tostring(fetch.selectedDegradedPages or 0)
+        if scan.selected then
+            UI.AutoTraderServerScanReason.Text = "Selected JobId " .. tostring(scan.selected)
+                .. ((selectedRow and selectedRow.previewTrusted) and " after strict-gold filtering. " or " as UNKNOWN because avatar preview was unavailable/insufficient. ")
+                .. transportText
+        else
+            UI.AutoTraderServerScanReason.Text = "No eligible candidate yet; UNKNOWN previews are allowed, so only an empty/unusable server list or trusted strict-gold rejects should block selection. " .. transportText
+        end
     else
-        UI.AutoTraderServerScanStatus.Text = "No public-server scan yet."; UI.AutoTraderServerScanThreshold.Text = "Filter source: gold physical bot hashes only"; UI.AutoTraderServerScanBest.Text = "Best scanned: —"; UI.AutoTraderServerScanReason.Text = ""
+        UI.AutoTraderServerScanStatus.Text = "No public-server scan yet."; UI.AutoTraderServerScanThreshold.Text = "Filter source: strict gold hashes when available; unknown previews are allowed"; UI.AutoTraderServerScanBest.Text = "Best scanned: —"; UI.AutoTraderServerScanReason.Text = ""
     end
 
     local dbCount = State.AutoTrader.GetBotIconDbCount()
@@ -13219,7 +13382,7 @@ end)
 connect(UI.AutoTraderRefreshServerScan.MouseButton1Click, function()
     if State.AutoTrader.ServerHopInProgress then
         State.AutoTrader.Status = "SERVER SCAN · ALREADY RUNNING"
-        State.AutoTrader.StatusDetail = "The gold-hash server search is already rescanning automatically; its liveness watchdog remains armed."
+        State.AutoTrader.StatusDetail = "The server search is already running; its liveness watchdog remains armed."
         State.AutoTrader.Render()
     else
         task.spawn(function()
@@ -13232,16 +13395,16 @@ end)
 connect(UI.AutoTraderForceServer.MouseButton1Click, function()
     if State.CurrentTrade or State.AutoTrader.PendingRequest or State.AutoTrader.PostTradeAuditPending then
         State.AutoTrader.Status = "WAIT · ACTIVE WORK"
-        State.AutoTrader.StatusDetail = "Safe-server search will not interrupt an active request/trade/audit."
+        State.AutoTrader.StatusDetail = "Server search will not interrupt an active request/trade/audit."
         State.AutoTrader.Render()
         return
     end
     State.AutoTrader.FastBotHopActive = true
-    State.AutoTrader.FastBotHopReason = "MANUAL_SAFE_SERVER_SEARCH"
+    State.AutoTrader.FastBotHopReason = "MANUAL_SERVER_SEARCH"
     State.AutoTrader.Status = "SERVER HOP · MANUAL SEARCH"
-    State.AutoTrader.StatusDetail = "Searching repeatedly until a server clears the gold-certified bot-avatar filter."
+    State.AutoTrader.StatusDetail = "Selecting another server; trusted previews are filtered by strict-gold hashes and UNKNOWN previews remain eligible."
     State.AutoTrader.Render()
-    State.AutoTrader.TryServerHop("MANUAL_SAFE_SERVER_SEARCH", select(2, State.AutoTrader.GetServerDisposition()))
+    State.AutoTrader.TryServerHop("MANUAL_SERVER_SEARCH", select(2, State.AutoTrader.GetServerDisposition()))
 end)
 
 end

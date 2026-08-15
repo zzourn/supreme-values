@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.56-public-auto-trader-v24-persistent-movedirection-learning",
+    version = "18.58-public-auto-trader-v26-cached-server-pool",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -82,6 +82,12 @@ local CONFIG = {
     AutoTraderServerListPages = 2,
     AutoTraderServerCandidateLimit = 180,
     AutoTraderServerQueueLimit = 30,
+    -- v26: successful scans feed a cross-teleport candidate pool. Entries are
+    -- deliberately short-lived: after three minutes the instance may be gone or
+    -- its population may have changed enough that the old preview is not useful.
+    AutoTraderServerCandidateCacheTtlSeconds = 180,
+    AutoTraderServerCandidateCacheLimit = 30,
+    AutoTraderServerFirstPageUsableTarget = 30,
     AutoTraderRecentServerFallbackMinAgeSeconds = 90,
     AutoTraderServerPreferredMinOccupancy = 0.60,
     AutoTraderServerPreferredMaxOccupancy = 0.96,
@@ -108,7 +114,7 @@ local CONFIG = {
     AutoTraderBootstrapBotDbJobsPerIcon = 12,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
     AutoTraderThumbnailBatchSize = 100,
-    -- v24 bot architecture: bot learning, current-server hop decisions, and
+    -- v26 bot architecture: bot learning, current-server hop decisions, and
     -- pre-join server selection are deliberately independent systems. Only a
     -- physically certified all-bot server may add hashes to the strict database.
     -- Server-list GETs prefer game:HttpGet and validate token-bearing rows before
@@ -123,10 +129,15 @@ local CONFIG = {
     AutoTraderGoldBotObservedMinJobs = 1,
     AutoTraderGoldBotKnownMinJobs = 2,
     AutoTraderGoldBotConfirmMinJobs = 3,
+    -- v26: 10s is now a hard cap/cold-start default, not an unconditional hold.
+    -- Once human servers have been observed, the bot hold becomes
+    -- min(10s, longest persisted human-detection latency + 1s).
     AutoTraderGoldObserveSeconds = 10,
+    AutoTraderGoldAdaptiveObservePaddingSeconds = 1,
+    AutoTraderGoldHumanTimingSampleLimit = 100,
     AutoTraderGoldSampleSeconds = 0.05,
     AutoTraderGoldMoveDirectionEpsilon = 0.05,
-    -- v24: transient remote movement is telemetry, not a whole-server verdict.
+    -- v26: transient remote movement is telemetry, not a whole-server verdict.
     -- After a short character settle period, only a sustained/repeated nonzero
     -- MoveDirection burst can permanently classify the JobId as regular.
     AutoTraderGoldCharacterSettleSeconds = 1.5,
@@ -6208,8 +6219,12 @@ State.AutoTrader = {
     TargetStatsFile = "SV_AutoTrader_TargetStats_v1.json",
     RecentJobsKey = "__SV_AUTO_TRADER_RECENT_JOBS_V1",
     RecentJobsFile = "SV_AutoTrader_RecentJobs_v1.json",
+    ServerCandidateCacheKey = "__SV_AUTO_TRADER_SERVER_CANDIDATE_CACHE_V1",
+    ServerCandidateCacheFile = "SV_AutoTrader_ServerCandidateCache_v1.json",
     BotIconDbKey = "__SV_AUTO_TRADER_BOT_HASHES_V2",
     BotIconDbFile = "SV_AutoTrader_BotHashes_v2.json",
+    HumanTimingKey = "__SV_AUTO_TRADER_HUMAN_TIMING_V1",
+    HumanTimingFile = "SV_AutoTrader_HumanDetectionTiming_v1.json",
     TeleportBootstrapKey = "__SV_AUTO_TRADER_TELEPORT_BOOTSTRAP_V1",
     FriendCache = {},
     FriendCacheMeta = {},
@@ -6303,6 +6318,9 @@ State.AutoTrader = {
     ServerHopLastProgressAt = 0,
     EmptyServerScanCount = 0,
     RecentJobs = {},
+    ServerCandidateCache = {version = 1, entries = {}},
+    ServerCandidateCacheSaveGeneration = 0,
+    LastServerCandidateCacheUse = nil,
     BotIconDb = {version = 4, icons = {}},
     BotIconDbSaveGeneration = 0,
     BotLearningDoneJobId = nil,
@@ -6317,6 +6335,8 @@ State.AutoTrader = {
         currentRemoteCount = 0, passedRemoteCount = 0, pendingRemoteCount = 0, trackableRemoteCount = 0,
     },
     GoldCertificationHistory = {},
+    HumanDetectionTiming = {version = 1, count = 0, totalSeconds = 0, maxSeconds = 0, samples = {}},
+    HumanTimingSaveGeneration = 0,
     ServerRateLimitBackoffSeconds = 0,
     LastServerScan = nil,
     CurrentServerAvatarScreen = nil,
@@ -6796,7 +6816,7 @@ State.AutoTrader.RecordTargetEvent = function(player, kind, data)
     end
     stats.lastEventUnix = os.time()
     State.AutoTrader.RecordStrategyEvent(player, kind, data)
-    -- v24 bot identity is intentionally isolated from all trade/inventory behavior.
+    -- v26 bot identity is intentionally isolated from all trade/inventory behavior.
     State.AutoTrader.SaveTargetStats()
 end
 State.AutoTrader.GetTargetProfile = function(player)
@@ -6990,7 +7010,7 @@ State.AutoTrader.GetTargetScore = function(player, verifiedTotal)
     local auditPenalty = 1 / (1 + (tonumber(stats.auditFailures) or 0) * 0.45)
     local declinePenalty = 1 / (1 + (tonumber(stats.declines) or 0) * 0.10)
 
-    -- v24: avatar/bot knowledge intentionally has ZERO influence on current-server
+    -- v26: avatar/bot knowledge intentionally has ZERO influence on current-server
     -- target economics. The bot database is only a pre-join server filter.
     return (
         expectedProfit
@@ -7385,6 +7405,147 @@ State.AutoTrader.LoadRecentJobs = function()
     end
     State.AutoTrader.SaveRecentJobs()
 end
+-- v26 short-lived public-server candidate cache. This is only a transport/cache
+-- optimization; it never changes current-server hop decisions or bot learning.
+State.AutoTrader.NormalizeServerCandidateCacheEntry = function(entry)
+    if type(entry) ~= "table" then return nil end
+    local jobId = entry.id or entry.jobId
+    local scannedAt = tonumber(entry.scannedAt) or 0
+    local playing = tonumber(entry.playing)
+    local maxPlayers = tonumber(entry.maxPlayers)
+    if type(jobId) ~= "string" or jobId == "" or scannedAt <= 0
+        or not playing or not maxPlayers or maxPlayers <= 0 then
+        return nil
+    end
+    local fingerprints, seen = {}, {}
+    for _, raw in ipairs(entry.previewFingerprints or entry.hashes or {}) do
+        local fingerprint = State.AutoTrader.ExtractAvatarHeadshotHash(raw) or raw
+        if type(fingerprint) == "string" and fingerprint ~= "" and not seen[fingerprint] then
+            seen[fingerprint] = true
+            table.insert(fingerprints, fingerprint)
+            if #fingerprints >= 10 then break end
+        end
+    end
+    return {
+        id = jobId,
+        scannedAt = scannedAt,
+        playing = math.max(0, playing),
+        maxPlayers = math.max(1, maxPlayers),
+        occupancy = tonumber(entry.occupancy) or (playing / math.max(1, maxPlayers)),
+        ping = tonumber(entry.ping),
+        fps = tonumber(entry.fps),
+        previewFingerprints = fingerprints,
+        previewTrustedAtScan = entry.previewTrustedAtScan == true,
+    }
+end
+State.AutoTrader.PruneServerCandidateCache = function()
+    local nowUnix = os.time()
+    local ttl = math.max(1, tonumber(CONFIG.AutoTraderServerCandidateCacheTtlSeconds) or 180)
+    local rows, seen = {}, {}
+    local cache = State.AutoTrader.ServerCandidateCache
+    for _, raw in ipairs(type(cache) == "table" and cache.entries or {}) do
+        local entry = State.AutoTrader.NormalizeServerCandidateCacheEntry(raw)
+        if entry and not seen[entry.id] then
+            local age = nowUnix - entry.scannedAt
+            local recentAt = tonumber(State.AutoTrader.RecentJobs and State.AutoTrader.RecentJobs[entry.id])
+            local recentlyAttempted = recentAt and nowUnix - recentAt < ttl
+            if age >= 0 and age < ttl
+                and entry.id ~= game.JobId
+                and not recentlyAttempted
+                and entry.playing < entry.maxPlayers then
+                seen[entry.id] = true
+                table.insert(rows, entry)
+            end
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.scannedAt ~= b.scannedAt then return a.scannedAt > b.scannedAt end
+        if a.playing ~= b.playing then return a.playing > b.playing end
+        return a.id < b.id
+    end)
+    while #rows > CONFIG.AutoTraderServerCandidateCacheLimit do table.remove(rows) end
+    State.AutoTrader.ServerCandidateCache = {version = 1, entries = rows}
+    return rows
+end
+State.AutoTrader.SaveServerCandidateCache = function()
+    local rows = State.AutoTrader.PruneServerCandidateCache()
+    local payload = {version = 1, savedAt = os.time(), entries = rows}
+    rawset(_G, State.AutoTrader.ServerCandidateCacheKey, payload)
+    rawset(ExecutorEnvironment, State.AutoTrader.ServerCandidateCacheKey, payload)
+    local writer = State.TryGetExecutorGlobal("writefile")
+    if type(writer) == "function" then
+        local okEncode, body = pcall(function() return HttpService:JSONEncode(payload) end)
+        if okEncode and type(body) == "string" then
+            runBoundedExternal("writefile server candidate cache", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                return writer(State.AutoTrader.ServerCandidateCacheFile, body)
+            end)
+        end
+    end
+    return #rows
+end
+State.AutoTrader.LoadServerCandidateCache = function()
+    local merged, byId = {}, {}
+    local function merge(value)
+        local entries = type(value) == "table" and (value.entries or value) or nil
+        if type(entries) ~= "table" then return end
+        for _, raw in ipairs(entries) do
+            local entry = State.AutoTrader.NormalizeServerCandidateCacheEntry(raw)
+            if entry then
+                local previous = byId[entry.id]
+                if not previous or entry.scannedAt > previous.scannedAt then byId[entry.id] = entry end
+            end
+        end
+    end
+    merge(rawget(_G, State.AutoTrader.ServerCandidateCacheKey))
+    merge(rawget(ExecutorEnvironment, State.AutoTrader.ServerCandidateCacheKey))
+    local isfileFunction = State.TryGetExecutorGlobal("isfile")
+    local reader = State.TryGetExecutorGlobal("readfile")
+    if type(isfileFunction) == "function" and type(reader) == "function" then
+        local okExists, exists = runBoundedExternal("isfile server candidate cache", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+            return isfileFunction(State.AutoTrader.ServerCandidateCacheFile)
+        end)
+        if okExists and exists then
+            local okRead, body = runBoundedExternal("readfile server candidate cache", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                return reader(State.AutoTrader.ServerCandidateCacheFile)
+            end)
+            if okRead and type(body) == "string" then
+                local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                if okDecode then merge(decoded) end
+            end
+        end
+    end
+    for _, entry in pairs(byId) do table.insert(merged, entry) end
+    State.AutoTrader.ServerCandidateCache = {version = 1, entries = merged}
+    State.AutoTrader.SaveServerCandidateCache()
+    return #State.AutoTrader.ServerCandidateCache.entries
+end
+State.AutoTrader.MergeServerCandidateCache = function(servers)
+    local byId = {}
+    for _, entry in ipairs(State.AutoTrader.PruneServerCandidateCache()) do byId[entry.id] = entry end
+    local nowUnix = os.time()
+    for _, server in ipairs(servers or {}) do
+        if type(server) == "table" and type(server.id) == "string" and server.id ~= ""
+            and server.id ~= game.JobId and (tonumber(server.playing) or 0) < (tonumber(server.maxPlayers) or 0) then
+            local preview = server.botPreview or State.AutoTrader.ClassifyServerPreview(server)
+            -- Store only candidates that are currently clear/unknown. Hard rejects are
+            -- intentionally omitted; cached fingerprints will be reclassified again later.
+            if preview and preview.safeEnough then
+                byId[server.id] = {
+                    id = server.id, scannedAt = nowUnix,
+                    playing = tonumber(server.playing) or 0, maxPlayers = tonumber(server.maxPlayers) or 1,
+                    occupancy = tonumber(server.occupancy), ping = tonumber(server.ping), fps = tonumber(server.fps),
+                    previewFingerprints = table.clone(server.previewFingerprints or {}),
+                    previewTrustedAtScan = preview.previewTrusted == true,
+                }
+            end
+        end
+    end
+    local rows = {}
+    for _, entry in pairs(byId) do table.insert(rows, entry) end
+    State.AutoTrader.ServerCandidateCache = {version = 1, entries = rows}
+    return State.AutoTrader.SaveServerCandidateCache()
+end
+
 State.AutoTrader.ExtractAvatarHeadshotHash = function(value)
     if type(value) ~= "string" or value == "" then return nil end
     local lower = string.lower(value)
@@ -7418,7 +7579,7 @@ State.AutoTrader.NormalizeBotIconDb = function(value)
                     -- Legacy fields are retained only so existing local files remain readable.
                     botEvidence = 0, humanEvidence = 0, botJobs = {}, humanJobs = {},
                     botPlayerSightings = 0, humanPlayerSightings = 0,
-                    -- v19/v20-era gold fields are preserved as legacy history only. v24 server
+                    -- v19/v20-era gold fields are preserved as legacy history only. v26 server
                     -- filtering uses ONLY strictGoldBotJobs, written only after the
                     -- strict MoveDirection + fixed-facing departure commit is validated.
                     goldBotJobs = {}, goldBotSightings = 0,
@@ -7614,7 +7775,7 @@ end
 State.AutoTrader.GetBotIconClass = function(fingerprint)
     local record = State.AutoTrader.GetBotIconRecord(fingerprint, false)
     if not record then return "unknown", 0, nil end
-    -- v24 intentionally ignores legacy v19 goldBotJobs. Only strictGoldBotJobs that
+    -- v26 intentionally ignores legacy v19 goldBotJobs. Only strictGoldBotJobs that
     -- passed remote MoveDirection + fixed-facing certification participate.
     local goldJobs = State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs)
     if goldJobs >= CONFIG.AutoTraderGoldBotConfirmMinJobs then return "confirmed_bot", 0.99, record end
@@ -7643,12 +7804,128 @@ State.AutoTrader.AddStrictGoldBotIconEvidence = function(fingerprint, jobId, pla
     record.lastSeen = now
     return true
 end
--- Compatibility shim: legacy reputation writers are disabled in v24. The strict
+-- Compatibility shim: legacy reputation writers are disabled in v26. The strict
 -- writer above is called only by ImportStrictGoldTeleportCommit from a validated departure payload.
 State.AutoTrader.AddBotIconEvidence = function()
     return false
 end
 State.AutoTrader.LoadBotIconDb()
+
+-- v26: learn how quickly real human-controlled MoveDirection exposes a regular server.
+-- This timing model is deliberately separate from bot identity. It only shortens the
+-- final "all bot-like players have passed" hold; it never causes a current server hop.
+State.AutoTrader.NormalizeHumanDetectionTiming = function(value)
+    if type(value) ~= "table" then value = {} end
+    value.version = 1
+    value.count = math.max(0, math.floor(tonumber(value.count) or 0))
+    value.totalSeconds = math.max(0, tonumber(value.totalSeconds) or 0)
+    value.maxSeconds = math.max(0, tonumber(value.maxSeconds) or 0)
+    if type(value.samples) ~= "table" then value.samples = {} end
+    local clean = {}
+    for _, row in ipairs(value.samples) do
+        if type(row) == "table" then
+            local seconds = tonumber(row.seconds)
+            if seconds and seconds >= 0 then
+                table.insert(clean, {
+                    seconds = seconds, jobId = type(row.jobId) == "string" and row.jobId or nil,
+                    userId = tonumber(row.userId), name = type(row.name) == "string" and row.name or nil,
+                    atUnix = tonumber(row.atUnix) or 0,
+                })
+            end
+        end
+    end
+    while #clean > CONFIG.AutoTraderGoldHumanTimingSampleLimit do table.remove(clean, 1) end
+    value.samples = clean
+    return value
+end
+State.AutoTrader.LoadHumanDetectionTiming = function()
+    local loaded = rawget(_G, State.AutoTrader.HumanTimingKey)
+        or rawget(ExecutorEnvironment, State.AutoTrader.HumanTimingKey)
+    if type(loaded) ~= "table" then
+        local isfileFunction = State.TryGetExecutorGlobal("isfile")
+        local readfileFunction = State.TryGetExecutorGlobal("readfile")
+        if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
+            local okExists, exists = runBoundedExternal("isfile human timing", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                return isfileFunction(State.AutoTrader.HumanTimingFile)
+            end)
+            if okExists and exists then
+                local okRead, body = runBoundedExternal("readfile human timing", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+                    return readfileFunction(State.AutoTrader.HumanTimingFile)
+                end)
+                if okRead and type(body) == "string" and body ~= "" then
+                    local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                    if okDecode and type(decoded) == "table" then loaded = decoded end
+                end
+            end
+        end
+    end
+    State.AutoTrader.HumanDetectionTiming = State.AutoTrader.NormalizeHumanDetectionTiming(loaded)
+    rawset(_G, State.AutoTrader.HumanTimingKey, State.AutoTrader.HumanDetectionTiming)
+    rawset(ExecutorEnvironment, State.AutoTrader.HumanTimingKey, State.AutoTrader.HumanDetectionTiming)
+end
+State.AutoTrader.FlushHumanDetectionTiming = function()
+    local model = State.AutoTrader.NormalizeHumanDetectionTiming(State.AutoTrader.HumanDetectionTiming)
+    State.AutoTrader.HumanDetectionTiming = model
+    rawset(_G, State.AutoTrader.HumanTimingKey, model)
+    rawset(ExecutorEnvironment, State.AutoTrader.HumanTimingKey, model)
+    local writer = State.TryGetExecutorGlobal("writefile")
+    if type(writer) ~= "function" then return false end
+    local okEncode, body = pcall(function() return HttpService:JSONEncode(model) end)
+    if not okEncode or type(body) ~= "string" then return false end
+    return runBoundedExternal("writefile human timing", CONFIG.AutoTraderExecutorFileTimeoutSeconds, function()
+        return writer(State.AutoTrader.HumanTimingFile, body)
+    end)
+end
+State.AutoTrader.SaveHumanDetectionTiming = function(immediate)
+    local model = State.AutoTrader.HumanDetectionTiming
+    rawset(_G, State.AutoTrader.HumanTimingKey, model)
+    rawset(ExecutorEnvironment, State.AutoTrader.HumanTimingKey, model)
+    State.AutoTrader.HumanTimingSaveGeneration += 1
+    local generation = State.AutoTrader.HumanTimingSaveGeneration
+    if immediate then return State.AutoTrader.FlushHumanDetectionTiming() end
+    task.delay(0.5, function()
+        if Destroyed or generation ~= State.AutoTrader.HumanTimingSaveGeneration then return end
+        State.AutoTrader.FlushHumanDetectionTiming()
+    end)
+    return true
+end
+State.AutoTrader.GetGoldAdaptiveObserveSeconds = function()
+    local cap = math.max(0, tonumber(CONFIG.AutoTraderGoldObserveSeconds) or 10)
+    local model = State.AutoTrader.HumanDetectionTiming or {}
+    local count = math.max(0, tonumber(model.count) or 0)
+    local longest = math.max(0, tonumber(model.maxSeconds) or 0)
+    if count <= 0 or longest <= 0 then return cap end
+    return math.min(cap, longest + math.max(0, tonumber(CONFIG.AutoTraderGoldAdaptiveObservePaddingSeconds) or 1))
+end
+State.AutoTrader.RecordHumanDetectionTiming = function(seconds, details)
+    seconds = tonumber(seconds)
+    if not seconds or seconds < 0 then return false end
+    local model = State.AutoTrader.NormalizeHumanDetectionTiming(State.AutoTrader.HumanDetectionTiming)
+    -- One timing sample per JobId. Script reinjection in the same human server must
+    -- not overweight the history or teach a later duplicate as a new server.
+    for _, row in ipairs(model.samples) do
+        if type(row) == "table" and row.jobId == game.JobId then return false end
+    end
+    model.count += 1
+    model.totalSeconds += seconds
+    model.maxSeconds = math.max(model.maxSeconds, seconds)
+    table.insert(model.samples, {
+        seconds = seconds, jobId = game.JobId, userId = type(details) == "table" and tonumber(details.userId) or nil,
+        name = type(details) == "table" and details.name or nil, atUnix = os.time(),
+    })
+    while #model.samples > CONFIG.AutoTraderGoldHumanTimingSampleLimit do table.remove(model.samples, 1) end
+    State.AutoTrader.HumanDetectionTiming = model
+    State.AutoTrader.SaveHumanDetectionTiming(true)
+    State.AutoTrader.Log("gold_human_detection_timing_learned", {
+        seconds = seconds, samples = model.count, longestSeconds = model.maxSeconds,
+        averageSeconds = model.count > 0 and (model.totalSeconds / model.count) or 0,
+        effectiveBotHoldSeconds = State.AutoTrader.GetGoldAdaptiveObserveSeconds(),
+        userId = type(details) == "table" and details.userId or nil,
+        name = type(details) == "table" and details.name or nil,
+    })
+    return true
+end
+State.AutoTrader.LoadHumanDetectionTiming()
 
 State.AutoTrader.GetQueueOnTeleport = function()
     for _, name in ipairs({"queue_on_teleport", "queueonteleport", "queue_on_tp", "queueteleport"}) do
@@ -7833,7 +8110,7 @@ State.AutoTrader.FetchServerListPage = function(url)
     local result = {
         selectedTransport = nil,
         gameHttpGet = {attempted = false, ok = false, rows = 0, playingRows = 0, tokenRows = 0, tokens = 0, tokenCoverage = 0, bodyBytes = 0, degraded = false, error = nil},
-        executor = {attempted = false, ok = false, status = nil, rows = 0, playingRows = 0, tokenRows = 0, tokens = 0, tokenCoverage = 0, bodyBytes = 0, degraded = false, error = nil},
+        executor = {attempted = false, ok = false, status = nil, rows = 0, playingRows = 0, tokenRows = 0, tokens = 0, tokenCoverage = 0, bodyBytes = 0, degraded = false, retryAfterSeconds = nil, error = nil},
     }
     local fallbackDecoded, fallbackSummary = nil, nil
 
@@ -7869,6 +8146,14 @@ State.AutoTrader.FetchServerListPage = function(url)
         if okReq then
             local normalized = normalizeHttpResponse(rawResponse)
             result.executor.status = normalized and normalized.StatusCode or nil
+            if normalized and type(normalized.Headers) == "table" then
+                for key, value in pairs(normalized.Headers) do
+                    if string.lower(tostring(key)) == "retry-after" then
+                        result.executor.retryAfterSeconds = tonumber(value)
+                        break
+                    end
+                end
+            end
             if normalized and normalized.Success and type(normalized.Body) == "string" then
                 local decoded, summary = State.AutoTrader.InspectServerListBody(normalized.Body)
                 for key, value in pairs(summary) do if result.executor[key] ~= nil then result.executor[key] = value end end
@@ -7964,6 +8249,15 @@ State.AutoTrader.FetchPublicServers = function(maxPages)
         if pagePlayingRows > 0 and pageTokenRows == 0 then diagnostics.tokenlessActivePages += 1 end
         cursor = decoded.nextPageCursor
         if not cursor or cursor == "" then break end
+        -- v26: page 1 normally contains far more candidates than one hop needs.
+        -- Do not spend another server-list request unless the first page was thin.
+        if pageIndex == 1
+            and diagnostics.usableRows >= CONFIG.AutoTraderServerFirstPageUsableTarget then
+            diagnostics.stoppedAfterFirstPage = true
+            diagnostics.stoppedAfterFirstPageReason = "page 1 supplied " .. tostring(diagnostics.usableRows)
+                .. " usable rows (target " .. tostring(CONFIG.AutoTraderServerFirstPageUsableTarget) .. ")"
+            break
+        end
     end
     return rows, diagnostics
 end
@@ -8318,6 +8612,18 @@ State.AutoTrader.MarkGoldCertificationRegular = function(reason, details)
         c.failedUserId = details.userId or c.failedUserId
         c.moveDirectionViolation = details.moveDirectionViolation or c.moveDirectionViolation
     end
+    -- Measure human-detection latency on the same time basis as the server hold, but
+    -- anchor late joiners to their own firstSeenAt so a 30s-late join detected in 2s
+    -- teaches ~2s, not ~32s.
+    local timingAnchor = tonumber(c.windowStartedAt) or 0
+    local failedTrack = c.players and c.players[tonumber(c.failedUserId)]
+    if type(failedTrack) == "table" then
+        timingAnchor = math.max(timingAnchor, tonumber(failedTrack.firstSeenAt) or 0)
+    end
+    if timingAnchor > 0 then
+        c.humanDetectionSeconds = math.max(0, c.failedAt - timingAnchor)
+        State.AutoTrader.RecordHumanDetectionTiming(c.humanDetectionSeconds, details)
+    end
     State.AutoTrader.Log("gold_bot_certification_regular", details or {reason = c.reason})
     return true
 end
@@ -8385,7 +8691,9 @@ State.AutoTrader.BuildStrictGoldTeleportCommitPayload = function()
         sourceJobId = game.JobId,
         certifiedPlayers = #c.certifiedUserIds,
         certifiedAt = c.certifiedAt,
-        observeSeconds = CONFIG.AutoTraderGoldObserveSeconds,
+        observeSeconds = tonumber(c.requiredObserveSeconds) or State.AutoTrader.GetGoldAdaptiveObserveSeconds(),
+        observeSecondsCap = CONFIG.AutoTraderGoldObserveSeconds,
+        humanTimingMaxSeconds = tonumber(State.AutoTrader.HumanDetectionTiming and State.AutoTrader.HumanDetectionTiming.maxSeconds) or 0,
         moveDirectionEpsilon = CONFIG.AutoTraderGoldMoveDirectionEpsilon,
         moveDirectionViolationMinSamples = CONFIG.AutoTraderGoldMoveDirectionViolationMinSamples,
         moveDirectionViolationMinSpanSeconds = CONFIG.AutoTraderGoldMoveDirectionViolationMinSpanSeconds,
@@ -8435,6 +8743,7 @@ State.AutoTrader.BuildGoldCertificationDepartureSummary = function()
         maxObservedMoveDirection = c.maxObservedMoveDirection, currentRemoteCount = c.currentRemoteCount,
         trackableRemoteCount = c.trackableRemoteCount, passedRemoteCount = c.passedRemoteCount,
         pendingRemoteCount = c.pendingRemoteCount, certifiedAt = c.certifiedAt, candidatePreparedAt = c.candidatePreparedAt,
+        humanDetectionSeconds = c.humanDetectionSeconds, requiredObserveSeconds = c.requiredObserveSeconds,
     }
 end
 
@@ -8747,7 +9056,9 @@ State.AutoTrader.SampleGoldBotCertification = function()
     end
 
     local allPassed = passed == #ids
-    local serverObservedLongEnough = c.windowStartedAt > 0 and c.windowAge >= CONFIG.AutoTraderGoldObserveSeconds
+    local requiredObserveSeconds = State.AutoTrader.GetGoldAdaptiveObserveSeconds()
+    c.requiredObserveSeconds = requiredObserveSeconds
+    local serverObservedLongEnough = c.windowStartedAt > 0 and c.windowAge >= requiredObserveSeconds
     if not allPassed or not serverObservedLongEnough then
         if c.status == "candidate" then State.AutoTrader.ClearStrictGoldCandidateStaging(c) end
         c.status = "observing"
@@ -8756,8 +9067,12 @@ State.AutoTrader.SampleGoldBotCertification = function()
                 .. " current remote players have passed. Deaths/respawns/untrackable states PAUSE only that player; joins add only a new pending track. "
                 .. table.concat(pending, "; ")
         else
-            c.reason = "Every current remote player has passed independently; holding until the non-resetting server observation age reaches "
-                .. string.format("%.1fs", CONFIG.AutoTraderGoldObserveSeconds) .. "."
+            local timing = State.AutoTrader.HumanDetectionTiming or {}
+            c.reason = "Every current remote player has passed independently; adaptive hold is "
+                .. string.format("%.2fs", requiredObserveSeconds)
+                .. " (longest learned human detection " .. string.format("%.2fs", tonumber(timing.maxSeconds) or 0)
+                .. " + " .. string.format("%.2fs", CONFIG.AutoTraderGoldAdaptiveObservePaddingSeconds)
+                .. " padding, capped at " .. string.format("%.1fs", CONFIG.AutoTraderGoldObserveSeconds) .. ")."
         end
         return true
     end
@@ -8773,6 +9088,7 @@ State.AutoTrader.SampleGoldBotCertification = function()
         c.reason = "STRICT GOLD CANDIDATE: every CURRENT remote player independently passed persistent zero-MoveDirection + fixed-facing movement evidence. Evidence survived deaths/respawns/membership churn; sustained MoveDirection monitoring continues until departure."
         State.AutoTrader.Log("strict_gold_candidate_staged", {
             players = #ids, passed = passed, maxObservedMoveDirection = tonumber(c.maxObservedMoveDirection) or 0,
+            requiredObserveSeconds = requiredObserveSeconds, humanTimingMaxSeconds = tonumber(State.AutoTrader.HumanDetectionTiming and State.AutoTrader.HumanDetectionTiming.maxSeconds) or 0,
         })
     end
     State.AutoTrader.PrepareStrictGoldCandidate(c)
@@ -8813,6 +9129,7 @@ State.AutoTrader.BuildGoldCertificationSupport = function()
         certifiedAt = c.certifiedAt, candidatePreparedAt = c.candidatePreparedAt,
         committedAt = c.committedAt, learnedHashes = c.learnedHashes,
         failedPlayer = c.failedPlayer, failedUserId = c.failedUserId, failedAt = c.failedAt,
+        humanDetectionSeconds = c.humanDetectionSeconds, requiredObserveSeconds = c.requiredObserveSeconds,
         moveDirectionViolation = c.moveDirectionViolation, maxObservedMoveDirection = c.maxObservedMoveDirection,
         currentRemoteCount = c.currentRemoteCount, trackableRemoteCount = c.trackableRemoteCount,
         passedRemoteCount = c.passedRemoteCount, pendingRemoteCount = c.pendingRemoteCount,
@@ -8825,7 +9142,7 @@ State.AutoTrader.LearnCurrentServerBotIcons = function()
     return State.AutoTrader.LastBotLearning
 end
 State.AutoTrader.ShouldFastRejectInventoryBotLobby = function()
-    return false, {disabled = true, reason = "v24 bot identity learning never uses inventory/trade/animation state"}
+    return false, {disabled = true, reason = "v26 bot identity learning never uses inventory/trade/animation state"}
 end
 State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     if State.AutoTrader.CurrentServerAvatarScreenInFlight then return State.AutoTrader.CurrentServerAvatarScreen end
@@ -8865,7 +9182,90 @@ State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     return result
 end
 
-State.AutoTrader.BuildPublicServerQueue = function()
+State.AutoTrader.BuildCachedServerQueue = function()
+    local nowUnix = os.time()
+    local ttl = math.max(1, tonumber(CONFIG.AutoTraderServerCandidateCacheTtlSeconds) or 180)
+    local entries = State.AutoTrader.PruneServerCandidateCache()
+    local queue, scanRows, kept = {}, {}, {}
+    local droppedStrict = 0
+    for _, entry in ipairs(entries) do
+        local server = {
+            id = entry.id, playing = entry.playing, maxPlayers = entry.maxPlayers,
+            occupancy = entry.occupancy, ping = entry.ping, fps = entry.fps,
+            previewFingerprints = table.clone(entry.previewFingerprints or {}),
+            previewTokenCount = #(entry.previewFingerprints or {}),
+            cacheScannedAt = entry.scannedAt,
+        }
+        local preview = State.AutoTrader.ClassifyServerPreview(server)
+        local age = math.max(0, nowUnix - entry.scannedAt)
+        table.insert(scanRows, {
+            id = server.id, playing = server.playing, maxPlayers = server.maxPlayers,
+            cacheAgeSeconds = age, previewSample = preview.sample,
+            goldBotMatches = preview.goldMatched, goldBotMatchRatio = preview.goldMatchRatio,
+            previewTrusted = preview.previewTrusted, safeEnough = preview.safeEnough,
+            hardReject = preview.hardReject, score = preview.score,
+            cacheState = preview.previewTrusted and "trusted_clear" or "unknown",
+        })
+        if preview.safeEnough then
+            table.insert(queue, server)
+            table.insert(kept, entry)
+        else
+            droppedStrict += 1
+        end
+    end
+    if droppedStrict > 0 then
+        State.AutoTrader.ServerCandidateCache = {version = 1, entries = kept}
+        State.AutoTrader.SaveServerCandidateCache()
+    end
+    table.sort(queue, function(a, b)
+        local ap, bp = a.botPreview or {}, b.botPreview or {}
+        if (ap.previewTrusted == true) ~= (bp.previewTrusted == true) then return ap.previewTrusted == true end
+        if (a.cacheScannedAt or 0) ~= (b.cacheScannedAt or 0) then return (a.cacheScannedAt or 0) > (b.cacheScannedAt or 0) end
+        if math.abs((ap.goldMatchRatio or 0) - (bp.goldMatchRatio or 0)) > 0.000001 then return (ap.goldMatchRatio or 0) < (bp.goldMatchRatio or 0) end
+        if a.playing ~= b.playing then return a.playing > b.playing end
+        return a.id < b.id
+    end)
+    while #queue > CONFIG.AutoTraderServerQueueLimit do table.remove(queue) end
+    local trusted, unknown, oldestAge = 0, 0, 0
+    for _, server in ipairs(queue) do
+        oldestAge = math.max(oldestAge, math.max(0, nowUnix - (server.cacheScannedAt or nowUnix)))
+        if server.botPreview and server.botPreview.previewTrusted then trusted += 1 else unknown += 1 end
+    end
+    local scan = {
+        at = os.clock(), source = "candidate_cache", cacheHit = #queue > 0,
+        cacheTtlSeconds = ttl, cacheEntriesAfterPrune = #entries, cacheDroppedStrict = droppedStrict,
+        cacheOldestSelectedAgeSeconds = oldestAge, queueCount = #queue,
+        safeCandidateCount = #queue, trustedCandidateCount = trusted, unknownCandidateCount = unknown,
+        candidates = scanRows, filterSource = "strict_gold_hash_db_rechecked_on_cached_fingerprints_unknown_allowed",
+        fetch = {cacheHit = #queue > 0, pagesRequested = 0, pagesAttempted = 0, pagesSucceeded = 0, transportPages = {},
+            selectedGameHttpGetPages = 0, selectedExecutorPages = 0, selectedDegradedPages = 0},
+    }
+    local best = queue[1]
+    scan.selected = best and best.id or nil
+    scan.bestScanned = best and {
+        id = best.id, goldBotMatchRatio = best.botPreview and best.botPreview.goldMatchRatio or 0,
+        safeConfidence = best.botPreview and best.botPreview.safeConfidence or nil,
+        previewTrusted = best.botPreview and best.botPreview.previewTrusted or false,
+        safeEnough = best.botPreview and best.botPreview.safeEnough or false,
+        playing = best.playing, maxPlayers = best.maxPlayers,
+        cacheAgeSeconds = math.max(0, nowUnix - (best.cacheScannedAt or nowUnix)),
+    } or nil
+    State.AutoTrader.LastServerCandidateCacheUse = {
+        at = os.clock(), queueCount = #queue, trusted = trusted, unknown = unknown,
+        droppedStrict = droppedStrict, ttlSeconds = ttl,
+    }
+    return queue, scan
+end
+
+State.AutoTrader.BuildPublicServerQueue = function(forceFresh)
+    if not forceFresh then
+        local cachedQueue, cachedScan = State.AutoTrader.BuildCachedServerQueue()
+        if #cachedQueue > 0 then
+            State.AutoTrader.LastServerScan = cachedScan
+            return cachedQueue, cachedScan
+        end
+    end
+
     local rows, fetchDiagnostics = State.AutoTrader.FetchPublicServers(CONFIG.AutoTraderServerListPages)
     local allJoinable, fresh, recentFallback = {}, {}, {}
     local nowUnix = os.time()
@@ -8897,7 +9297,8 @@ State.AutoTrader.BuildPublicServerQueue = function()
 
     local thumbOK, thumbReason, thumbDiagnostics = State.AutoTrader.ResolveServerPreviewFingerprints(candidates)
     local scan = {
-        at = os.clock(), thumbnailAvailable = thumbOK, thumbnailReason = thumbReason, thumbnail = thumbDiagnostics, fetch = fetchDiagnostics,
+        at = os.clock(), source = "fresh_http_scan", cacheHit = false,
+        thumbnailAvailable = thumbOK, thumbnailReason = thumbReason, thumbnail = thumbDiagnostics, fetch = fetchDiagnostics,
         rawRows = #rows, joinableRows = #allJoinable, freshRows = #fresh, recentFallbackRows = #recentFallback,
         usedRecentFallback = usedRecentFallback, filteredCurrent = filteredCurrent, filteredFull = filteredFull,
         preclassifyPool = #candidates, candidates = {}, filterSource = "strict_gold_hash_db_when_available_unknown_allowed",
@@ -8921,8 +9322,6 @@ State.AutoTrader.BuildPublicServerQueue = function()
     end
     table.sort(queue, function(a, b)
         local ap, bp = a.botPreview or {}, b.botPreview or {}
-        -- Prefer servers whose preview was actually resolved, but allow UNKNOWN
-        -- candidates whenever token/thumbnail transport is unavailable.
         if (ap.previewTrusted == true) ~= (bp.previewTrusted == true) then return ap.previewTrusted == true end
         if math.abs((ap.goldMatchRatio or 0) - (bp.goldMatchRatio or 0)) > 0.000001 then return (ap.goldMatchRatio or 0) < (bp.goldMatchRatio or 0) end
         local as, bs = ap.score or -math.huge, bp.score or -math.huge
@@ -8953,6 +9352,7 @@ State.AutoTrader.BuildPublicServerQueue = function()
         previewTrusted = best.previewTrusted, safeEnough = best.safeEnough, playing = best.playing, maxPlayers = best.maxPlayers,
     } or nil
     scan.selected = queue[1] and queue[1].id or nil
+    scan.cachedCandidateCount = State.AutoTrader.MergeServerCandidateCache(queue)
     State.AutoTrader.LastServerScan = scan
     return queue, scan
 end
@@ -9036,6 +9436,7 @@ State.AutoTrader.GetServerRescanDelay = function(scan)
     local maxDelay = math.max(base, tonumber(CONFIG.AutoTraderServerRateLimitMaxBackoffSeconds) or 16)
     local fetch = scan and scan.fetch
     local rateLimited = false
+    local retryAfterSeconds = 0
     for _, page in ipairs(fetch and fetch.transportPages or {}) do
         local gameInfo = type(page.gameHttpGet) == "table" and page.gameHttpGet or {}
         local execInfo = type(page.executor) == "table" and page.executor or {}
@@ -9043,11 +9444,17 @@ State.AutoTrader.GetServerRescanDelay = function(scan)
             if tonumber(info.status) == 429 then return true end
             return string.find(string.lower(tostring(info.error or "")), "429", 1, true) ~= nil
         end
-        if is429(gameInfo) or is429(execInfo) then rateLimited = true break end
+        if is429(gameInfo) or is429(execInfo) then
+            rateLimited = true
+            retryAfterSeconds = math.max(retryAfterSeconds, tonumber(execInfo.retryAfterSeconds) or 0)
+        end
     end
     if rateLimited then
         local previous = tonumber(State.AutoTrader.ServerRateLimitBackoffSeconds) or 0
-        local delay = previous > 0 and math.min(maxDelay, previous * 2) or math.min(maxDelay, base * 2)
+        local exponential = previous > 0 and math.min(maxDelay, previous * 2) or math.min(maxDelay, base * 2)
+        local delay = retryAfterSeconds > 0
+            and math.min(maxDelay, math.max(base, retryAfterSeconds))
+            or exponential
         State.AutoTrader.ServerRateLimitBackoffSeconds = delay
         return delay, true
     end
@@ -9089,7 +9496,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             )
         else
             State.AutoTrader.StatusDetail = string.format(
-                "No joinable candidate is currently available. Thumbnail-unresolved servers are allowed in v24, so this usually means the server list itself was empty/unusable or all trusted candidates matched the strict bot reject gate. Rescanning in %.0fs.",
+                "No joinable candidate is currently available. Cached UNKNOWN servers are allowed in v26; reaching this state means the <3-minute cache is exhausted and the fresh server list was empty/unusable or every trusted candidate hit the strict bot reject gate. Rescanning in %.0fs.",
                 rescanDelay
             )
         end
@@ -9151,6 +9558,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     State.AutoTrader.ServerHopLastProgressAt = os.clock()
     State.AutoTrader.RecentJobs[server.id] = os.time()
     State.AutoTrader.SaveRecentJobs()
+    State.AutoTrader.SaveServerCandidateCache()
     State.AutoTrader.Log("server_hop_candidate_attempt", {
         queueIndex = State.AutoTrader.ServerHopQueueIndex,
         queueCount = #State.AutoTrader.ServerHopQueue,
@@ -9167,6 +9575,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
         .. tostring(State.AutoTrader.ServerHopQueueIndex)
         .. "/"
         .. tostring(#State.AutoTrader.ServerHopQueue)
+    local cacheSuffix = server.cacheScannedAt and (" · cached " .. tostring(math.max(0, os.time() - server.cacheScannedAt)) .. "s ago") or " · fresh scan"
     if server.botPreview and server.botPreview.previewTrusted then
         State.AutoTrader.StatusDetail = tostring(server.playing)
             .. "/"
@@ -9174,12 +9583,13 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             .. string.format(
                 " players · %.0f%% strict-gold bot-avatar matches · passed the pre-join hash filter.",
                 (server.botPreview.goldMatchRatio or 0) * 100
-            )
+            ) .. cacheSuffix
     else
         State.AutoTrader.StatusDetail = tostring(server.playing)
             .. "/"
             .. tostring(server.maxPlayers)
             .. " players · avatar preview unavailable/insufficient, so this candidate is UNKNOWN and allowed."
+            .. cacheSuffix
     end
     State.AutoTrader.Render()
 
@@ -9286,11 +9696,11 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
     State.AutoTrader.ServerHopCurrentCandidate = nil
     State.AutoTrader.Status = "SERVER EXHAUSTED · HOPPING"
     State.AutoTrader.StatusDetail = tostring(disposition)
-        .. " · screening public-server avatar previews against gold-certified bot hashes and building a fallback queue."
+        .. " · using the fresh <3-minute candidate cache first, then scanning Roblox only if the cache cannot supply an eligible destination."
     State.AutoTrader.Render()
 
     task.spawn(function()
-        -- v24: hopping never DECIDES bot identity. A staged strict-gold candidate may be carried only after this ordinary hop decision was already made.
+        -- v26: hopping never DECIDES bot identity. A staged strict-gold candidate may be carried only after this ordinary hop decision was already made.
         if Destroyed
             or not State.AutoTrader.ServerHopInProgress
             or queueGeneration ~= State.AutoTrader.ServerHopQueueGeneration then
@@ -9364,6 +9774,7 @@ State.AutoTrader.SampleMovement = function()
     return true
 end
 State.AutoTrader.LoadRecentJobs()
+State.AutoTrader.LoadServerCandidateCache()
 for _, player in ipairs(Players:GetPlayers()) do
     if player ~= LocalPlayer then State.AutoTrader.EnsureServerPlayer(player) end
 end
@@ -12359,7 +12770,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V24",
+        format = "SV_AUTO_TRADER_SUPPORT_V26",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -12402,6 +12813,9 @@ State.AutoTrader.BuildDebug = function()
             serverGoldBotRejectRatio = CONFIG.AutoTraderGoldBotRejectRatio,
             serverRescanDelaySeconds = CONFIG.AutoTraderServerRescanDelaySeconds,
             serverRateLimitMaxBackoffSeconds = CONFIG.AutoTraderServerRateLimitMaxBackoffSeconds,
+            serverCandidateCacheTtlSeconds = CONFIG.AutoTraderServerCandidateCacheTtlSeconds,
+            serverCandidateCacheLimit = CONFIG.AutoTraderServerCandidateCacheLimit,
+            serverFirstPageUsableTarget = CONFIG.AutoTraderServerFirstPageUsableTarget,
             teleportHardTimeoutSeconds = CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds,
             noEligibleWorkTimeoutSeconds = CONFIG.AutoTraderNoEligibleWorkTimeoutSeconds,
             targetOpportunityFloor = CONFIG.AutoTraderTargetOpportunityFloor,
@@ -12409,7 +12823,12 @@ State.AutoTrader.BuildDebug = function()
             learnedHopOpportunityRate = State.AutoTrader.GetHopOpportunityRate(),
             hopOpportunityRetentionFactor = CONFIG.AutoTraderHopOpportunityRetentionFactor,
             goldBotLearning = {
-                source = "strict_persistent_remote_movedirection_plus_fixed_facing", observeSeconds = CONFIG.AutoTraderGoldObserveSeconds,
+                source = "strict_persistent_remote_movedirection_plus_fixed_facing_adaptive_human_latency",
+                observeSecondsCap = CONFIG.AutoTraderGoldObserveSeconds,
+                effectiveObserveSeconds = State.AutoTrader.GetGoldAdaptiveObserveSeconds(),
+                adaptivePaddingSeconds = CONFIG.AutoTraderGoldAdaptiveObservePaddingSeconds,
+                humanTimingSamples = tonumber(State.AutoTrader.HumanDetectionTiming and State.AutoTrader.HumanDetectionTiming.count) or 0,
+                humanTimingLongestSeconds = tonumber(State.AutoTrader.HumanDetectionTiming and State.AutoTrader.HumanDetectionTiming.maxSeconds) or 0,
                 remoteSignal = "persistent per-player Humanoid.MoveDirection + HumanoidRootPart.CFrame",
                 moveDirectionEpsilon = CONFIG.AutoTraderGoldMoveDirectionEpsilon,
                 characterSettleSeconds = CONFIG.AutoTraderGoldCharacterSettleSeconds,
@@ -12545,6 +12964,15 @@ State.AutoTrader.BuildDebug = function()
             currentServerAvatarScreen = State.AutoTrader.CurrentServerAvatarScreen,
             goldPhysicalCertification = State.AutoTrader.BuildGoldCertificationSupport(),
             goldCertificationHistory = State.AutoTrader.GoldCertificationHistory,
+            humanDetectionTiming = State.AutoTrader.HumanDetectionTiming,
+            humanTimingFile = State.AutoTrader.HumanTimingFile,
+            effectiveGoldObserveSeconds = State.AutoTrader.GetGoldAdaptiveObserveSeconds(),
+            serverCandidateCache = {
+                file = State.AutoTrader.ServerCandidateCacheFile,
+                ttlSeconds = CONFIG.AutoTraderServerCandidateCacheTtlSeconds,
+                entryCount = #(State.AutoTrader.ServerCandidateCache and State.AutoTrader.ServerCandidateCache.entries or {}),
+                lastUse = State.AutoTrader.LastServerCandidateCacheUse,
+            },
             botIconDbFile = State.AutoTrader.BotIconDbFile,
             botIconDbCount = State.AutoTrader.GetBotIconDbCount(),
             goldBotIconDbCount = State.AutoTrader.GetGoldBotIconDbCount(),
@@ -12609,7 +13037,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V24\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V26\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -13302,7 +13730,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         local goldJobs = tonumber(info and info.goldJobs) or 0
         local classColor = class == "confirmed_bot" and THEME.red or (class == "known_bot" or class == "observed_bot") and THEME.yellow or THEME.faint
         local name = makeLabel(row, player.Name, 10, THEME.text, Enum.Font.GothamBold); name.Position = UDim2.fromOffset(64, 6); name.Size = UDim2.new(1, -72, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
-        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict-v24 avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
+        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict-v26 avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
         local hash = makeLabel(row, info and tostring(info.fingerprint or "") or "Press REFRESH to resolve this player's avatar hash", 8, THEME.faint, Enum.Font.Code); hash.Position = UDim2.fromOffset(64, 42); hash.Size = UDim2.new(1, -72, 0, 13); hash.TextTruncate = Enum.TextTruncate.AtEnd; hash.ZIndex = 1455
     end
 
@@ -13321,7 +13749,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         return (tonumber(a.record.strictGoldBotSightings) or 0) > (tonumber(b.record.strictGoldBotSightings) or 0)
     end)
     if #learned == 0 then
-        local empty = makeLabel(UI.AutoTraderBotContent, "No strict v24 hashes learned yet. Legacy evidence is preserved locally, but server filtering uses only strict departure-committed persistent MoveDirection hashes.", 9, THEME.faint, Enum.Font.Gotham)
+        local empty = makeLabel(UI.AutoTraderBotContent, "No strict v26 hashes learned yet. Legacy evidence is preserved locally, but server filtering uses only strict departure-committed persistent MoveDirection hashes.", 9, THEME.faint, Enum.Font.Gotham)
         empty.Size = UDim2.new(1, 0, 0, 36); empty.TextWrapped = true; empty.ZIndex = 1454
     end
     for index, info in ipairs(learned) do
@@ -13545,7 +13973,7 @@ connect(UI.AutoTraderRefreshServerScan.MouseButton1Click, function()
         State.AutoTrader.Render()
     else
         task.spawn(function()
-            local _, scan = State.AutoTrader.BuildPublicServerQueue()
+            local _, scan = State.AutoTrader.BuildPublicServerQueue(true)
             State.AutoTrader.LastServerScan = scan
             if not Destroyed then State.AutoTrader.Render() end
         end)
@@ -18351,6 +18779,9 @@ function Controller.Destroy()
     end
     if State.AutoTrader and State.AutoTrader.SaveRecentJobs then
         pcall(State.AutoTrader.SaveRecentJobs)
+    end
+    if State.AutoTrader and State.AutoTrader.SaveServerCandidateCache then
+        pcall(State.AutoTrader.SaveServerCandidateCache)
     end
     if State.AutoTrader and State.AutoTrader.FlushBotIconDb then
         pcall(State.AutoTrader.FlushBotIconDb)

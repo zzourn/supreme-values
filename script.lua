@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.65-public-auto-trader-v33-unattended-hardening",
+    version = "18.65.1-public-auto-trader-v33-bootstrap-compat",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -230,7 +230,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V33",
-    distributionNormalizedSha256 = "ae33ba8848119ef494aad9d3ea7f0529203926ed956870a906f5437394c671df",
+    distributionNormalizedSha256 = "ba43cc1ffd91fb754b6572511b7d2baab761f6352bfc5d17904f315189a0a48b",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -8855,9 +8855,9 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
         "local U=" .. quotedUrl,
         "local function F() local q={d=false,o=false,b=nil}; task.spawn(function() local o,b=pcall(function() return game:HttpGet(U) end); q.o=o;q.b=b;q.d=true end); local x=os.clock()+" .. httpAttemptTimeout .. "; while not q.d and os.clock()<x do task.wait(.1) end; if q.d and q.o and C(q.b) then if WF then task.spawn(function() pcall(WF,L,q.b) end) end; return q.b end end",
         "local b=R(); local d=" .. initialRetry .. "; local i=0; while not b and i<" .. maxAttempts .. " do i=i+1; b=F(); if not b and i<" .. maxAttempts .. " then task.wait(d); d=math.min(" .. maxRetry .. ",d*2) end end; if not b then warn('[SV bootstrap] no verified script available for '..tostring(B.bootstrapId)); return end",
-        "local f,e=loadstring(b); if not f then warn('[SV bootstrap] verified script failed to compile:',e); return end",
+        "local LS=nil; if type(loadstring)=='function' then LS=loadstring elseif type(E.loadstring)=='function' then LS=E.loadstring elseif type(load)=='function' then LS=load elseif type(E.load)=='function' then LS=E.load end; if type(LS)~='function' then warn('[SV bootstrap] no compatible loadstring/load compiler is exposed after teleport; verified source was not executed'); return end; local f,e=LS(b); if not f then warn('[SV bootstrap] verified script failed to compile:',e); return end",
         "local q={d=false,o=false,e=nil}; task.spawn(function() local o,e=pcall(f); q.o=o;q.e=e;q.d=true end); local x=os.clock()+" .. executionTimeout .. "; while not q.d and os.clock()<x do task.wait(.2) end; if not q.d then warn('[SV bootstrap] verified controller execution exceeded startup deadline; not launching a duplicate'); return end; if not q.o then warn('[SV bootstrap] verified controller execution failed:',q.e) end",
-    }, ";")
+    }, ";\\n")
 end
 State.AutoTrader.QueueTeleportScript = function(reason)
     if State.AutoTrader.TeleportQueued then return true, State.AutoTrader.TeleportQueueOutcome end

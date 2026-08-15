@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.65.3-public-auto-trader-v33-startup-performance",
+    version = "18.65.4-public-auto-trader-v33-teleport-newline-fix",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -230,7 +230,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V33",
-    distributionNormalizedSha256 = "edca284cb5e2b69fa6123da5dd931fc000deb0ff1f39a6fb80055166a8d39fd6",
+    distributionNormalizedSha256 = "ea80afacce072381c25cc9db605757261cd55c0a572b18722c0376caaa9d080f",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -8955,7 +8955,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
         "local b=R(); local d=" .. initialRetry .. "; local i=0; while not b and i<" .. maxAttempts .. " do i=i+1; b=F(); if not b and i<" .. maxAttempts .. " then task.wait(d); d=math.min(" .. maxRetry .. ",d*2) end end; if not b then warn('[SV bootstrap] no verified script available for '..tostring(B.bootstrapId)); return end",
         "local LS=nil; if type(loadstring)=='function' then LS=loadstring elseif type(E.loadstring)=='function' then LS=E.loadstring elseif type(load)=='function' then LS=load elseif type(E.load)=='function' then LS=E.load end; if type(LS)~='function' then warn('[SV bootstrap] no compatible loadstring/load compiler is exposed after teleport; verified source was not executed'); return end; local f,e=LS(b); if not f then warn('[SV bootstrap] verified script failed to compile:',e); return end",
         "local q={d=false,o=false,e=nil}; task.spawn(function() local o,e=pcall(f); q.o=o;q.e=e;q.d=true end); local x=os.clock()+" .. executionTimeout .. "; while not q.d and os.clock()<x do task.wait(.2) end; if not q.d then warn('[SV bootstrap] verified controller execution exceeded startup deadline; not launching a duplicate'); return end; if not q.o then warn('[SV bootstrap] verified controller execution failed:',q.e) end",
-    }, ";\\n")
+    }, ";\n")
 end
 State.AutoTrader.QueueTeleportScript = function(reason)
     if State.AutoTrader.TeleportQueued then return true, State.AutoTrader.TeleportQueueOutcome end

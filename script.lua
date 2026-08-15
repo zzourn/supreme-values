@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.65.4-public-auto-trader-v33-teleport-newline-fix",
+    version = "18.65.5-public-auto-trader-v33-teleport-startup-wait",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -146,7 +146,7 @@ local CONFIG = {
     AutoTraderBootstrapInitialRetrySeconds = 2,
     AutoTraderBootstrapMaxRetrySeconds = 30,
     AutoTraderBootstrapHttpAttemptTimeoutSeconds = 10,
-    AutoTraderBootstrapExecutionTimeoutSeconds = 35,
+    AutoTraderBootstrapExecutionTimeoutSeconds = 60,
     AutoTraderPlannerBucketFrontier = 10000,
     AutoTraderPlannerYieldBudgetMs = 4,
     AutoTraderRecoverySameReasonCooldownSeconds = 8,
@@ -230,7 +230,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V33",
-    distributionNormalizedSha256 = "ea80afacce072381c25cc9db605757261cd55c0a572b18722c0376caaa9d080f",
+    distributionNormalizedSha256 = "43a1e6e450fb5073bfc8a11757e53a366c03e4c320ef75fa037749d2d6557728",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -277,7 +277,16 @@ pcall(function()
 end)
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
-    error("SupremeValues_PC_PublicHelper requires a LocalPlayer.")
+    -- queue_on_teleport may execute before Roblox has published Players.LocalPlayer.
+    -- Treat that as transient startup ordering, not a fatal controller error.
+    local deadline = os.clock() + math.max(1, tonumber(CONFIG.AutoTraderStartupPlayerGuiTimeoutSeconds) or 20)
+    while not LocalPlayer and os.clock() < deadline do
+        task.wait(0.05)
+        LocalPlayer = Players.LocalPlayer
+    end
+end
+if not LocalPlayer then
+    error("SupremeValues_PC_PublicHelper could not obtain LocalPlayer inside the bounded startup window.")
 end
 local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     or LocalPlayer:WaitForChild("PlayerGui", CONFIG.AutoTraderStartupPlayerGuiTimeoutSeconds)

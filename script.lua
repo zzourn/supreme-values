@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.48-public-auto-trader-v16-opportunity-learning",
+    version = "18.49-public-auto-trader-v17-safe-server-gate",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -83,7 +83,7 @@ local CONFIG = {
     AutoTraderDiscoveryRetryLimit = 3,
     AutoTraderServerHopGraceSeconds = 2.5,
     AutoTraderServerHopRetrySeconds = 5,
-    AutoTraderServerRescanDelaySeconds = 0.75,
+    AutoTraderServerRescanDelaySeconds = 2.0,
     AutoTraderServerTeleportAttemptTimeoutSeconds = 8,
     AutoTraderServerListPages = 2,
     AutoTraderServerCandidateLimit = 180,
@@ -100,6 +100,8 @@ local CONFIG = {
     AutoTraderStaleTradeGuiTimeoutSeconds = 12,
     AutoTraderAbsoluteTradeTimeoutSeconds = 90,
     AutoTraderServerHopHardTimeoutSeconds = 35,
+    AutoTraderServerSafeBotLikelihoodMax = 0.45,
+    AutoTraderServerSafeMinPreviewSamples = 5,
     AutoTraderTeleportStartedHardTimeoutSeconds = 22,
     AutoTraderOperationalRecoveryDelaySeconds = 2.5,
     AutoTraderRecoveryRetrySeconds = 4,
@@ -6299,6 +6301,7 @@ State.AutoTrader = {
     ServerHopAttemptGeneration = 0,
     ServerHopTeleportStarted = false,
     ServerHopStartedAt = 0,
+    ServerHopLastProgressAt = 0,
     EmptyServerScanCount = 0,
     RecentJobs = {},
     BotIconDb = {version = 2, icons = {}},
@@ -8096,6 +8099,30 @@ State.AutoTrader.ClassifyServerPreview = function(server, scanContext)
         and (suspectRatio >= CONFIG.AutoTraderBotSuspectRatio
             or scanFrequentRatio >= CONFIG.AutoTraderBotScanSuspiciousRatio
             or concentration.topTwoRatio >= 0.80)
+
+    -- Absolute pre-join confidence gate. Relative ranking alone can pick the
+    -- "least bad" server from an entirely bot-heavy scan, so estimate a pure
+    -- bot likelihood separately from occupancy/desirability. Unknown previews
+    -- are not considered safe enough to join; they are rescanned instead.
+    local suspectOnlyRatio = math.max(0, suspectRatio - confirmedRatio)
+    local concentrationRisk = math.clamp((concentration.topTwoRatio - 0.45) / 0.55, 0, 1)
+    local prevalenceRisk = math.clamp(maxScanRatio * 5, 0, 1)
+    local botLikelihood = math.clamp(
+        confirmedRatio * 0.78
+            + suspectOnlyRatio * 0.55
+            + scanFrequentRatio * 0.45
+            + prevalenceRisk * 0.25
+            + concentrationRisk * 0.20
+            + (structuralReject and 0.35 or 0),
+        0,
+        1
+    )
+    local previewTrusted = sample >= math.max(CONFIG.AutoTraderBotPreviewMinSamples, CONFIG.AutoTraderServerSafeMinPreviewSamples)
+    local safeEnough = previewTrusted
+        and not hardReject
+        and botLikelihood < CONFIG.AutoTraderServerSafeBotLikelihoodMax
+    local safeConfidence = previewTrusted and (1 - botLikelihood) or 0
+
     local occupancy = tonumber(server.occupancy)
         or ((tonumber(server.playing) or 0) / math.max(1, tonumber(server.maxPlayers) or 1))
     local occupancyFit = 1 - math.min(1, math.abs(occupancy - 0.86) / 0.50)
@@ -8114,6 +8141,8 @@ State.AutoTrader.ClassifyServerPreview = function(server, scanContext)
         maxScanJobs = maxScanJobs, maxScanRatio = maxScanRatio,
         hardReject = hardReject, suspicious = suspicious,
         structuralReject = structuralReject,
+        botLikelihood = botLikelihood, safeConfidence = safeConfidence,
+        previewTrusted = previewTrusted, safeEnough = safeEnough,
         topTwoRatio = concentration.topTwoRatio,
         uniqueFingerprints = concentration.unique,
         frequencies = frequencies, score = score, classes = classes,
@@ -8336,6 +8365,8 @@ State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     local result = {
         jobId = game.JobId, ok = true, sample = preview.sample,
         confirmedRatio = preview.confirmedRatio, suspectRatio = preview.suspectRatio,
+        botLikelihood = preview.botLikelihood, safeConfidence = preview.safeConfidence,
+        safeEnough = preview.safeEnough, previewTrusted = preview.previewTrusted,
         topTwoRatio = preview.topTwoRatio, uniqueFingerprints = preview.uniqueFingerprints,
         structuralReject = preview.structuralReject, hardReject = preview.hardReject,
         fastBot = fastBot, at = os.clock(), frequencies = preview.frequencies,
@@ -8425,16 +8456,23 @@ State.AutoTrader.BuildPublicServerQueue = function()
             structuralReject = botPreview.structuralReject,
             hardReject = botPreview.hardReject,
             suspicious = botPreview.suspicious,
+            botLikelihood = botPreview.botLikelihood,
+            safeConfidence = botPreview.safeConfidence,
+            previewTrusted = botPreview.previewTrusted,
+            safeEnough = botPreview.safeEnough,
             score = botPreview.score,
             hashes = server.previewFingerprints,
             recent = State.AutoTrader.RecentJobs[server.id] ~= nil,
             recentFallbackAge = server.recentFallbackAge,
         }
         table.insert(scan.candidates, row)
-        if not botPreview.hardReject then table.insert(queue, server) end
+        if botPreview.safeEnough then table.insert(queue, server) end
     end
     table.sort(queue, function(a, b)
         local ap, bp = a.botPreview or {}, b.botPreview or {}
+        if math.abs((ap.botLikelihood or 1) - (bp.botLikelihood or 1)) > 0.000001 then
+            return (ap.botLikelihood or 1) < (bp.botLikelihood or 1)
+        end
         if math.abs((ap.confirmedRatio or 0) - (bp.confirmedRatio or 0)) > 0.000001 then
             return (ap.confirmedRatio or 0) < (bp.confirmedRatio or 0)
         end
@@ -8454,6 +8492,11 @@ State.AutoTrader.BuildPublicServerQueue = function()
     end)
     while #queue > CONFIG.AutoTraderServerQueueLimit do table.remove(queue) end
     table.sort(scan.candidates, function(a, b)
+        if (a.safeEnough == true) ~= (b.safeEnough == true) then return a.safeEnough == true end
+        if (a.previewTrusted == true) ~= (b.previewTrusted == true) then return a.previewTrusted == true end
+        if math.abs((a.botLikelihood or 1) - (b.botLikelihood or 1)) > 0.000001 then
+            return (a.botLikelihood or 1) < (b.botLikelihood or 1)
+        end
         if (a.hardReject == true) ~= (b.hardReject == true) then return a.hardReject ~= true end
         if math.abs((a.score or -math.huge) - (b.score or -math.huge)) > 0.000001 then
             return (a.score or -math.huge) > (b.score or -math.huge)
@@ -8462,6 +8505,18 @@ State.AutoTrader.BuildPublicServerQueue = function()
     end)
     while #scan.candidates > 60 do table.remove(scan.candidates) end
     scan.queueCount = #queue
+    scan.safeThreshold = CONFIG.AutoTraderServerSafeBotLikelihoodMax
+    scan.safeCandidateCount = #queue
+    local bestScanned = scan.candidates[1]
+    scan.bestScanned = bestScanned and {
+        id = bestScanned.id,
+        botLikelihood = bestScanned.botLikelihood,
+        safeConfidence = bestScanned.safeConfidence,
+        previewTrusted = bestScanned.previewTrusted,
+        safeEnough = bestScanned.safeEnough,
+        playing = bestScanned.playing,
+        maxPlayers = bestScanned.maxPlayers,
+    } or nil
     scan.selected = queue[1] and queue[1].id or nil
     State.AutoTrader.LastServerScan = scan
     return queue, scan
@@ -8512,6 +8567,7 @@ State.AutoTrader.AbortServerHop = function(reason)
     State.AutoTrader.ServerHopCurrentDisposition = nil
     State.AutoTrader.ServerHopTeleportStarted = false
     State.AutoTrader.ServerHopStartedAt = 0
+    State.AutoTrader.ServerHopLastProgressAt = 0
     State.AutoTrader.TeleportInProgress = false
     State.AutoTrader.TeleportAttemptStartedAt = 0
     State.AutoTrader.TeleportAttemptOriginJobId = nil
@@ -8556,8 +8612,23 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     State.AutoTrader.ServerHopQueueIndex += 1
     local server = State.AutoTrader.ServerHopQueue[State.AutoTrader.ServerHopQueueIndex]
     if not server then
-        State.AutoTrader.Status = "SERVER HOP · RESCANNING"
-        State.AutoTrader.StatusDetail = "Every screened server filled/failed. Refreshing the Roblox public-server list and trying again."
+        local scan = State.AutoTrader.LastServerScan
+        local best = scan and scan.bestScanned or nil
+        State.AutoTrader.Status = "SERVER HOP · WAITING FOR SAFE SERVER"
+        if best and best.previewTrusted then
+            State.AutoTrader.StatusDetail = string.format(
+                "Best scanned server is still %.0f%% bot-likely / %.0f%% safe-confidence. Need bot likelihood below %.0f%%; rescanning in %.0fs instead of joining the least-bad bot candidate.",
+                (tonumber(best.botLikelihood) or 1) * 100,
+                (tonumber(best.safeConfidence) or 0) * 100,
+                CONFIG.AutoTraderServerSafeBotLikelihoodMax * 100,
+                CONFIG.AutoTraderServerRescanDelaySeconds
+            )
+        else
+            State.AutoTrader.StatusDetail = string.format(
+                "No candidate had enough trustworthy avatar preview data to be called more likely safe than bot. Rescanning in %.0fs.",
+                CONFIG.AutoTraderServerRescanDelaySeconds
+            )
+        end
         State.AutoTrader.Log("server_hop_queue_exhausted", {
             disposition = State.AutoTrader.ServerHopCurrentDisposition,
             tried = State.AutoTrader.ServerHopQueueIndex - 1,
@@ -8576,14 +8647,26 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             end
             local queue, scan = State.AutoTrader.BuildPublicServerQueue()
             if Destroyed or not State.AutoTrader.ServerHopInProgress then return end
+            State.AutoTrader.ServerHopLastProgressAt = os.clock()
             State.AutoTrader.ServerHopQueueGeneration += 1
             local nextGeneration = State.AutoTrader.ServerHopQueueGeneration
             State.AutoTrader.ServerHopQueue = queue
             State.AutoTrader.ServerHopQueueIndex = 0
             State.AutoTrader.LastServerScan = scan
             if #queue == 0 then
-                State.AutoTrader.Status = "SERVER HOP · NO SAFE CANDIDATE"
-                State.AutoTrader.StatusDetail = "No joinable non-bot candidate was found. Rescanning automatically."
+                local best = scan and scan.bestScanned or nil
+                State.AutoTrader.Status = "SERVER HOP · WAITING FOR SAFE SERVER"
+                State.AutoTrader.StatusDetail = best and best.previewTrusted
+                    and string.format(
+                        "Fresh scan still has no server below the %.0f%% bot-likelihood gate; best is %.0f%% bot-likely. Rescanning in %.0fs.",
+                        CONFIG.AutoTraderServerSafeBotLikelihoodMax * 100,
+                        (tonumber(best.botLikelihood) or 1) * 100,
+                        CONFIG.AutoTraderServerRescanDelaySeconds
+                    )
+                    or string.format(
+                        "Fresh scan still has no trustworthy safe candidate. Rescanning in %.0fs.",
+                        CONFIG.AutoTraderServerRescanDelaySeconds
+                    )
                 State.AutoTrader.Log("server_hop_rescan_empty", {scan = scan})
                 State.AutoTrader.Render()
                 task.delay(CONFIG.AutoTraderServerRescanDelaySeconds, function()
@@ -8600,6 +8683,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
 
     State.AutoTrader.ServerHopCurrentCandidate = server
     State.AutoTrader.ServerHopTeleportStarted = false
+    State.AutoTrader.ServerHopLastProgressAt = os.clock()
     State.AutoTrader.RecentJobs[server.id] = os.time()
     State.AutoTrader.SaveRecentJobs()
     State.AutoTrader.Log("server_hop_candidate_attempt", {
@@ -8609,6 +8693,8 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
         playing = server.playing,
         maxPlayers = server.maxPlayers,
         occupancy = server.occupancy,
+        botLikelihood = server.botPreview and server.botPreview.botLikelihood or nil,
+        safeConfidence = server.botPreview and server.botPreview.safeConfidence or nil,
         botPreview = server.botPreview,
         disposition = State.AutoTrader.ServerHopCurrentDisposition,
     })
@@ -8619,7 +8705,11 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     State.AutoTrader.StatusDetail = tostring(server.playing)
         .. "/"
         .. tostring(server.maxPlayers)
-        .. " players · attempting the highest-confidence remaining server."
+        .. string.format(
+            " players · %.0f%% bot-likely / %.0f%% safe-confidence · passed the absolute safety gate.",
+            ((server.botPreview and server.botPreview.botLikelihood) or 0) * 100,
+            ((server.botPreview and server.botPreview.safeConfidence) or 1) * 100
+        )
     State.AutoTrader.Render()
 
     local queued, queueError = State.AutoTrader.QueueTeleportScript(
@@ -8712,6 +8802,7 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
     State.AutoTrader.LastServerHopAttemptAt = os.clock()
     State.AutoTrader.ServerHopInProgress = true
     State.AutoTrader.ServerHopStartedAt = os.clock()
+    State.AutoTrader.ServerHopLastProgressAt = State.AutoTrader.ServerHopStartedAt
     State.AutoTrader.ServerHopCurrentDisposition = tostring(disposition)
     State.AutoTrader.ServerHopQueueGeneration += 1
     local queueGeneration = State.AutoTrader.ServerHopQueueGeneration
@@ -8736,6 +8827,9 @@ State.AutoTrader.TryServerHop = function(disposition, counts)
             return
         end
         local queue, scan = State.AutoTrader.BuildPublicServerQueue()
+        if not Destroyed and State.AutoTrader.ServerHopInProgress then
+            State.AutoTrader.ServerHopLastProgressAt = os.clock()
+        end
         if Destroyed
             or not State.AutoTrader.ServerHopInProgress
             or queueGeneration ~= State.AutoTrader.ServerHopQueueGeneration then
@@ -11855,7 +11949,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V16",
+        format = "SV_AUTO_TRADER_SUPPORT_V17",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -11895,6 +11989,8 @@ State.AutoTrader.BuildDebug = function()
             staleTradeGuiTimeoutSeconds = CONFIG.AutoTraderStaleTradeGuiTimeoutSeconds,
             absoluteTradeTimeoutSeconds = CONFIG.AutoTraderAbsoluteTradeTimeoutSeconds,
             serverHopHardTimeoutSeconds = CONFIG.AutoTraderServerHopHardTimeoutSeconds,
+            serverSafeBotLikelihoodMax = CONFIG.AutoTraderServerSafeBotLikelihoodMax,
+            serverRescanDelaySeconds = CONFIG.AutoTraderServerRescanDelaySeconds,
             teleportHardTimeoutSeconds = CONFIG.AutoTraderTeleportStartedHardTimeoutSeconds,
             noEligibleWorkTimeoutSeconds = CONFIG.AutoTraderNoEligibleWorkTimeoutSeconds,
             targetOpportunityFloor = CONFIG.AutoTraderTargetOpportunityFloor,
@@ -11985,6 +12081,10 @@ State.AutoTrader.BuildDebug = function()
                 maxPlayers = State.AutoTrader.ServerHopCurrentCandidate.maxPlayers,
                 score = State.AutoTrader.ServerHopCurrentCandidate.botPreview
                     and State.AutoTrader.ServerHopCurrentCandidate.botPreview.score or nil,
+                botLikelihood = State.AutoTrader.ServerHopCurrentCandidate.botPreview
+                    and State.AutoTrader.ServerHopCurrentCandidate.botPreview.botLikelihood or nil,
+                safeConfidence = State.AutoTrader.ServerHopCurrentCandidate.botPreview
+                    and State.AutoTrader.ServerHopCurrentCandidate.botPreview.safeConfidence or nil,
             } or nil,
             teleportInProgress = State.AutoTrader.TeleportInProgress,
             teleportAttemptStartedAt = State.AutoTrader.TeleportAttemptStartedAt,
@@ -11992,6 +12092,7 @@ State.AutoTrader.BuildDebug = function()
             teleportQueued = State.AutoTrader.TeleportQueued,
             lastTeleportReason = State.AutoTrader.LastTeleportReason,
             serverHopStartedAt = State.AutoTrader.ServerHopStartedAt,
+            serverHopLastProgressAt = State.AutoTrader.ServerHopLastProgressAt,
             staleTradeGuiSince = State.AutoTrader.StaleTradeGuiSince,
             noEligibleWorkSince = State.AutoTrader.NoEligibleWorkSince,
             serverMeaningfulProgressAt = State.AutoTrader.ServerMeaningfulProgressAt,
@@ -12086,7 +12187,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V16\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V17\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -12823,11 +12924,12 @@ State.AutoTrader.OvernightSupervisor = function()
     end
 
     if State.AutoTrader.ServerHopInProgress
-        and State.AutoTrader.ServerHopStartedAt > 0
-        and now - State.AutoTrader.ServerHopStartedAt >= CONFIG.AutoTraderServerHopHardTimeoutSeconds then
-        local reason = "server-hop pipeline exceeded its hard overnight deadline"
+        and State.AutoTrader.ServerHopLastProgressAt > 0
+        and now - State.AutoTrader.ServerHopLastProgressAt >= CONFIG.AutoTraderServerHopHardTimeoutSeconds then
+        local reason = "server-hop pipeline made no scan/teleport progress inside its hard overnight deadline"
         State.AutoTrader.Log("server_hop_hard_timeout", {
-            seconds = now - State.AutoTrader.ServerHopStartedAt,
+            seconds = now - State.AutoTrader.ServerHopLastProgressAt,
+            totalSeconds = State.AutoTrader.ServerHopStartedAt > 0 and (now - State.AutoTrader.ServerHopStartedAt) or nil,
             queueIndex = State.AutoTrader.ServerHopQueueIndex,
             queueCount = #(State.AutoTrader.ServerHopQueue or {}),
         })

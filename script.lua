@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.53-public-auto-trader-v21-httpget-strict-bot-learning",
+    version = "18.54-public-auto-trader-v22-httpget-startup-hotfix",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -7368,8 +7368,7 @@ State.AutoTrader.LoadRecentJobs = function()
                 return reader(State.AutoTrader.RecentJobsFile)
             end)
             if okRead and type(body) == "string" then
-                summary.bodyBytes = #body
-    local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
                 if okDecode then merge(decoded) end
             end
         end
@@ -7797,6 +7796,7 @@ State.AutoTrader.InspectServerListBody = function(body)
         summary.decodeError = "empty body"
         return nil, summary
     end
+    summary.bodyBytes = #body
     local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
     if not okDecode or type(decoded) ~= "table" then
         summary.decodeError = "JSON decode failed"
@@ -8705,7 +8705,7 @@ State.AutoTrader.LearnCurrentServerBotIcons = function()
     return State.AutoTrader.LastBotLearning
 end
 State.AutoTrader.ShouldFastRejectInventoryBotLobby = function()
-    return false, {disabled = true, reason = "v21 bot identity learning never uses inventory/trade state"}
+    return false, {disabled = true, reason = "v22 bot identity learning never uses inventory/trade state"}
 end
 State.AutoTrader.ScreenCurrentServerAvatars = function(force)
     if State.AutoTrader.CurrentServerAvatarScreenInFlight then return State.AutoTrader.CurrentServerAvatarScreen end
@@ -12209,7 +12209,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V21",
+        format = "SV_AUTO_TRADER_SUPPORT_V22",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -12452,7 +12452,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V21\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V22\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()

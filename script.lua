@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.59-public-auto-trader-v27-state-machine-audit-cleanup",
+    version = "18.60-public-auto-trader-v28-frutiger-aero-ui",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -378,20 +378,23 @@ do
     end
 end
 local THEME = {
-    bg = Color3.fromRGB(15, 17, 22),
-    panel = Color3.fromRGB(22, 25, 32),
-    panel2 = Color3.fromRGB(28, 32, 40),
-    panel3 = Color3.fromRGB(35, 40, 50),
-    border = Color3.fromRGB(57, 64, 78),
-    text = Color3.fromRGB(242, 245, 250),
-    muted = Color3.fromRGB(157, 166, 182),
-    faint = Color3.fromRGB(105, 115, 134),
-    green = Color3.fromRGB(83, 218, 142),
-    yellow = Color3.fromRGB(255, 210, 74),
-    red = Color3.fromRGB(245, 105, 118),
-    blue = Color3.fromRGB(101, 176, 255),
-    purple = Color3.fromRGB(128, 111, 255),
-    orange = Color3.fromRGB(255, 156, 86),
+    -- v28: Frutiger Aero / Windows 7-inspired global palette.
+    -- Still dark enough for executor overlays, but brighter aquatic blues,
+    -- glass-like borders, grassy success green, and higher information contrast.
+    bg = Color3.fromRGB(7, 43, 72),
+    panel = Color3.fromRGB(10, 55, 84),
+    panel2 = Color3.fromRGB(16, 68, 99),
+    panel3 = Color3.fromRGB(24, 82, 115),
+    border = Color3.fromRGB(79, 157, 199),
+    text = Color3.fromRGB(246, 252, 255),
+    muted = Color3.fromRGB(190, 222, 237),
+    faint = Color3.fromRGB(132, 180, 205),
+    green = Color3.fromRGB(133, 222, 88),
+    yellow = Color3.fromRGB(255, 218, 93),
+    red = Color3.fromRGB(255, 105, 112),
+    blue = Color3.fromRGB(105, 210, 255),
+    purple = Color3.fromRGB(171, 147, 255),
+    orange = Color3.fromRGB(255, 177, 84),
 }
 local Connections = {}
 local Destroyed = false
@@ -673,7 +676,7 @@ local function makeButton(parent, text, size, color)
         TextSize = 12,
         Font = Enum.Font.GothamMedium,
     }, parent)
-    addCorner(button, 7)
+    addCorner(button, 4)
     return button
 end
 local function setButtonHover(button, normalColor, hoverColor)
@@ -5128,8 +5131,16 @@ UI.Details = create("Frame", {
     Visible = false,
     ZIndex = 2001,
 }, UI.RootGui)
-addCorner(UI.Details, 14)
+addCorner(UI.Details, 6)
 addStroke(UI.Details, THEME.border, 1, 0.1)
+create("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(23, 103, 153)),
+        ColorSequenceKeypoint.new(0.16, Color3.fromRGB(10, 66, 102)),
+        ColorSequenceKeypoint.new(1, THEME.bg),
+    }),
+    Rotation = 90,
+}, UI.Details)
 UI.DetailsTitle = makeLabel(
     UI.Details,
     "Item",
@@ -6127,8 +6138,16 @@ local TradePanel = create("Frame", {
     Visible = false,
     ZIndex = 1000,
 }, UI.RootGui)
-addCorner(TradePanel, 13)
+addCorner(TradePanel, 6)
 addStroke(TradePanel, THEME.border, 1, 0.1)
+create("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(24, 105, 154)),
+        ColorSequenceKeypoint.new(0.18, Color3.fromRGB(11, 68, 104)),
+        ColorSequenceKeypoint.new(1, THEME.bg),
+    }),
+    Rotation = 90,
+}, TradePanel)
 UI.TradePanelScale = create("UIScale", {
     Scale = 1,
 }, TradePanel)
@@ -6396,7 +6415,7 @@ State.AutoTrader = {
         declines = 0, tradeDeclines = 0, ignored = 0, idle = 0,
         profit = 0,
     },
-    ActiveTab = "OVERVIEW",
+    ActiveTab = "HOME",
 }
 local function getExecutorEnvironment()
     local getter = rawget(_G, "getgenv")
@@ -9570,7 +9589,7 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
             )
         else
             State.AutoTrader.StatusDetail = string.format(
-                "No joinable candidate is currently available. Cached UNKNOWN servers are allowed in v27; reaching this state means the <3-minute cache is exhausted and the fresh server list was empty/unusable or every trusted candidate hit the strict bot reject gate. Rescanning in %.0fs.",
+                "No joinable candidate is currently available. Cached UNKNOWN servers are allowed; reaching this state means the <3-minute cache is exhausted and the fresh server list was empty/unusable or every trusted candidate hit the strict bot reject gate. Rescanning in %.0fs.",
                 rescanDelay
             )
         end
@@ -11231,7 +11250,7 @@ State.AutoTrader.ShowSuccessNotification = function(partner, plan, auditText)
         ZIndex = 1900,
     }, UI.RootGui)
     UI.AutoTraderSuccessNotification = frame
-    addCorner(frame, 11)
+    addCorner(frame, 5)
     addStroke(frame, THEME.green, 1, 0.05)
     local title = makeLabel(frame, "AUTO TRADE COMPLETE", 11, THEME.green, Enum.Font.GothamBold)
     title.Position = UDim2.fromOffset(12, 8)
@@ -13004,7 +13023,7 @@ State.AutoTrader.BuildDebug = function()
     local _, liveReceiving, liveIncomingTitle, liveIncomingUsername = State.AutoTrader.GetIncomingRequestUi()
     local _, liveSending, liveSendingUsername = State.AutoTrader.GetOutgoingRequestUi()
     local payload = {
-        format = "SV_AUTO_TRADER_SUPPORT_V27",
+        format = "SV_AUTO_TRADER_SUPPORT_V28",
         version = CONFIG.version,
         generatedUnix = os.time(),
         generatedClock = os.clock(),
@@ -13278,7 +13297,7 @@ State.AutoTrader.BuildDebug = function()
     if not ok then
         return nil, tostring(encoded)
     end
-    return "SV_AUTO_TRADER_SUPPORT_V27\n" .. encoded
+    return "SV_AUTO_TRADER_SUPPORT_V28\n" .. encoded
 end
 State.AutoTrader.CopyDebug = function()
     local text, err = State.AutoTrader.BuildDebug()
@@ -13305,26 +13324,99 @@ State.AutoTrader.CopyDebug = function()
     return ok
 end
 do
-UI.AutoTraderLauncher = makeButton(
+-- v28 AUTO TRADER UI ------------------------------------------------------
+-- Information architecture is intentionally simpler than the old seven-tab
+-- dashboard: HOME owns live status + performance, TRADE owns the active deal,
+-- PEOPLE owns target ranking, SERVERS owns both hopping + bot intelligence,
+-- and SETTINGS owns behavior controls + reserves. No diagnostics are removed.
+local AERO = {
+    shellTop = Color3.fromRGB(38, 139, 205),
+    shellMid = Color3.fromRGB(12, 91, 151),
+    shellBottom = Color3.fromRGB(5, 48, 87),
+    glassTop = Color3.fromRGB(67, 176, 229),
+    glassBottom = Color3.fromRGB(16, 89, 141),
+    sidebarTop = Color3.fromRGB(15, 84, 126),
+    sidebarBottom = Color3.fromRGB(7, 53, 88),
+    cardTop = Color3.fromRGB(21, 82, 112),
+    cardBottom = Color3.fromRGB(10, 52, 78),
+    cardAltTop = Color3.fromRGB(27, 94, 124),
+    cardAltBottom = Color3.fromRGB(13, 61, 87),
+    selectedTop = Color3.fromRGB(78, 166, 218),
+    selectedBottom = Color3.fromRGB(22, 104, 166),
+    selectedBorder = Color3.fromRGB(161, 225, 255),
+    greenTop = Color3.fromRGB(104, 185, 69),
+    greenBottom = Color3.fromRGB(49, 118, 46),
+    buttonTop = Color3.fromRGB(34, 104, 143),
+    buttonBottom = Color3.fromRGB(16, 66, 101),
+    buttonHoverTop = Color3.fromRGB(54, 132, 174),
+    buttonHoverBottom = Color3.fromRGB(24, 84, 122),
+    highlight = Color3.fromRGB(202, 244, 255),
+    shadow = Color3.fromRGB(3, 28, 48),
+}
+
+local function aeroGradient(parent, topColor, bottomColor, rotation)
+    return create("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, topColor),
+            ColorSequenceKeypoint.new(1, bottomColor),
+        }),
+        Rotation = rotation or 90,
+    }, parent)
+end
+
+local function aeroStroke(parent, color, transparency)
+    return addStroke(parent, color or THEME.border, 1, transparency or 0.1)
+end
+
+local function aeroButton(parent, text, size, accent)
+    local button = makeButton(parent, text, size, accent and AERO.greenBottom or AERO.buttonBottom)
+    button.TextSize = 10
+    button.Font = Enum.Font.GothamBold
+    button.AutoButtonColor = false
+    aeroStroke(button, accent and Color3.fromRGB(153, 225, 116) or AERO.selectedBorder, 0.28)
+    aeroGradient(
+        button,
+        accent and AERO.greenTop or AERO.buttonTop,
+        accent and AERO.greenBottom or AERO.buttonBottom,
+        90
+    )
+    connect(button.MouseEnter, function()
+        if button.Parent then
+            TweenService:Create(button, TweenInfo.new(0.1), {
+                BackgroundColor3 = accent and Color3.fromRGB(70, 144, 54) or AERO.buttonHoverBottom,
+            }):Play()
+        end
+    end)
+    connect(button.MouseLeave, function()
+        if button.Parent then
+            TweenService:Create(button, TweenInfo.new(0.1), {
+                BackgroundColor3 = accent and AERO.greenBottom or AERO.buttonBottom,
+            }):Play()
+        end
+    end)
+    return button
+end
+
+UI.AutoTraderLauncher = aeroButton(
     UI.RootGui,
-    "AUTO TRADER",
-    UDim2.fromOffset(154, 34),
-    THEME.panel2
+    "SV AUTO TRADER",
+    UDim2.fromOffset(176, 38),
+    false
 )
 UI.AutoTraderLauncher.Name = "SV_AutoTraderLauncher"
 UI.AutoTraderLauncher.AnchorPoint = Vector2.new(1, 1)
 UI.AutoTraderLauncher.Position = UDim2.new(1, -18, 1, -18)
 UI.AutoTraderLauncher.ZIndex = 1500
-UI.AutoTraderLauncher.TextColor3 = THEME.blue
-addStroke(UI.AutoTraderLauncher, THEME.border, 1, 0.15)
+UI.AutoTraderLauncher.TextColor3 = THEME.text
+UI.AutoTraderLauncher.TextSize = 10
 UI.AutoTraderLauncherScale = create("UIScale", {Scale = 1}, UI.AutoTraderLauncher)
 
 UI.AutoTraderPanel = create("Frame", {
     Name = "SV_AutoTraderPanel",
     AnchorPoint = Vector2.new(1, 0.5),
     Position = UDim2.new(1, -24, 0.5, 0),
-    Size = UDim2.fromOffset(700, 700),
-    BackgroundColor3 = THEME.bg,
+    Size = UDim2.fromOffset(820, 660),
+    BackgroundColor3 = AERO.shellBottom,
     BorderSizePixel = 0,
     Visible = false,
     ClipsDescendants = true,
@@ -13339,97 +13431,187 @@ if type(State.AutoTrader.Preferences.panelPosition) == "table" then
         tonumber(p.yo) or 0
     )
 end
-addCorner(UI.AutoTraderPanel, 13)
-addStroke(UI.AutoTraderPanel, THEME.border, 1, 0.1)
+addCorner(UI.AutoTraderPanel, 6)
+aeroStroke(UI.AutoTraderPanel, AERO.selectedBorder, 0.08)
+aeroGradient(UI.AutoTraderPanel, AERO.shellTop, AERO.shellBottom, 90)
 UI.AutoTraderScale = create("UIScale", {Scale = 1}, UI.AutoTraderPanel)
+
+-- A restrained glossy highlight instead of giant rounded "glass bubbles".
+UI.AutoTraderGloss = create("Frame", {
+    Position = UDim2.fromOffset(1, 1),
+    Size = UDim2.new(1, -2, 0, 31),
+    BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+    BackgroundTransparency = 0.91,
+    BorderSizePixel = 0,
+    ZIndex = 1451,
+}, UI.AutoTraderPanel)
 
 UI.AutoTraderHeader = create("Frame", {
     Position = UDim2.fromOffset(0, 0),
-    Size = UDim2.new(1, -52, 0, 50),
-    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 64),
+    BackgroundColor3 = AERO.glassBottom,
     BorderSizePixel = 0,
     Active = true,
-    ZIndex = 1451,
+    ZIndex = 1452,
 }, UI.AutoTraderPanel)
-UI.AutoTraderTitle = makeLabel(UI.AutoTraderHeader, "AUTO TRADER CONTROL CENTER", 13, THEME.text, Enum.Font.GothamBold)
-UI.AutoTraderTitle.Position = UDim2.fromOffset(14, 7)
-UI.AutoTraderTitle.Size = UDim2.new(1, -180, 0, 19)
-UI.AutoTraderTitle.ZIndex = 1452
-UI.AutoTraderSubtitle = makeLabel(UI.AutoTraderHeader, "SAFE · LIVE · VALUE/HOUR OPTIMIZED", 9, THEME.green, Enum.Font.GothamBold)
-UI.AutoTraderSubtitle.Position = UDim2.fromOffset(14, 27)
-UI.AutoTraderSubtitle.Size = UDim2.new(1, -180, 0, 15)
-UI.AutoTraderSubtitle.ZIndex = 1452
-UI.AutoTraderHeaderMetric = makeLabel(UI.AutoTraderHeader, "+0 · 0/hr", 10, THEME.blue, Enum.Font.GothamBold)
-UI.AutoTraderHeaderMetric.Position = UDim2.new(1, -170, 0, 10)
-UI.AutoTraderHeaderMetric.Size = UDim2.fromOffset(150, 22)
-UI.AutoTraderHeaderMetric.TextXAlignment = Enum.TextXAlignment.Right
-UI.AutoTraderHeaderMetric.ZIndex = 1452
-UI.AutoTraderClose = makeButton(UI.AutoTraderPanel, "×", UDim2.fromOffset(30, 26), THEME.panel2)
-UI.AutoTraderClose.Position = UDim2.new(1, -42, 0, 9)
-UI.AutoTraderClose.TextColor3 = THEME.red
-UI.AutoTraderClose.ZIndex = 1453
-
-UI.AutoTraderTabs = create("Frame", {
-    Position = UDim2.fromOffset(10, 50),
-    Size = UDim2.new(1, -20, 0, 34),
-    BackgroundColor3 = THEME.panel,
+aeroGradient(UI.AutoTraderHeader, AERO.glassTop, AERO.glassBottom, 90)
+create("Frame", {
+    Position = UDim2.new(0, 0, 1, -1),
+    Size = UDim2.new(1, 0, 0, 1),
+    BackgroundColor3 = AERO.selectedBorder,
+    BackgroundTransparency = 0.36,
     BorderSizePixel = 0,
-    ZIndex = 1451,
+    ZIndex = 1453,
+}, UI.AutoTraderHeader)
+
+UI.AutoTraderTitle = makeLabel(UI.AutoTraderHeader, "SUPREME AUTO TRADER", 15, THEME.text, Enum.Font.GothamBold)
+UI.AutoTraderTitle.Position = UDim2.fromOffset(16, 8)
+UI.AutoTraderTitle.Size = UDim2.new(1, -250, 0, 22)
+UI.AutoTraderTitle.ZIndex = 1454
+UI.AutoTraderSubtitle = makeLabel(
+    UI.AutoTraderHeader,
+    "OVERNIGHT CONTROL · LIVE AUDITS · AUTO RECOVERY",
+    9,
+    Color3.fromRGB(213, 242, 255),
+    Enum.Font.GothamMedium
+)
+UI.AutoTraderSubtitle.Position = UDim2.fromOffset(16, 31)
+UI.AutoTraderSubtitle.Size = UDim2.new(1, -260, 0, 16)
+UI.AutoTraderSubtitle.ZIndex = 1454
+UI.AutoTraderHeaderMetric = makeLabel(UI.AutoTraderHeader, "+0 · 0/hr", 11, THEME.green, Enum.Font.GothamBold)
+UI.AutoTraderHeaderMetric.Position = UDim2.new(1, -224, 0, 11)
+UI.AutoTraderHeaderMetric.Size = UDim2.fromOffset(176, 22)
+UI.AutoTraderHeaderMetric.TextXAlignment = Enum.TextXAlignment.Right
+UI.AutoTraderHeaderMetric.ZIndex = 1454
+UI.AutoTraderClose = aeroButton(UI.AutoTraderHeader, "×", UDim2.fromOffset(30, 26), false)
+UI.AutoTraderClose.Position = UDim2.new(1, -38, 0, 8)
+UI.AutoTraderClose.TextColor3 = Color3.fromRGB(255, 221, 221)
+UI.AutoTraderClose.TextSize = 16
+UI.AutoTraderClose.ZIndex = 1455
+
+-- Left navigation feels closer to Windows 7's task/control sidebars and keeps
+-- the main workspace free of tiny equal-width tabs.
+UI.AutoTraderTabs = create("Frame", {
+    Position = UDim2.fromOffset(8, 72),
+    Size = UDim2.fromOffset(126, 580),
+    BackgroundColor3 = AERO.sidebarBottom,
+    BorderSizePixel = 0,
+    ZIndex = 1452,
 }, UI.AutoTraderPanel)
-addCorner(UI.AutoTraderTabs, 8)
-local tabNames = {"OVERVIEW", "PLAYERS", "TRADE", "SERVERS", "BOTS", "STATS", "SETTINGS"}
+addCorner(UI.AutoTraderTabs, 4)
+aeroStroke(UI.AutoTraderTabs, THEME.border, 0.2)
+aeroGradient(UI.AutoTraderTabs, AERO.sidebarTop, AERO.sidebarBottom, 90)
+
+local navTitle = makeLabel(UI.AutoTraderTabs, "CONTROL CENTER", 8, Color3.fromRGB(175, 220, 239), Enum.Font.GothamBold)
+navTitle.Position = UDim2.fromOffset(10, 10)
+navTitle.Size = UDim2.new(1, -20, 0, 14)
+navTitle.ZIndex = 1454
+
+local tabNames = {"HOME", "TRADE", "PEOPLE", "SERVERS", "SETTINGS"}
+local tabDescriptions = {
+    HOME = "Status + stats",
+    TRADE = "Live deal",
+    PEOPLE = "Target queue",
+    SERVERS = "Hop + bot intel",
+    SETTINGS = "Controls + reserves",
+}
 UI.AutoTraderTabButtons = {}
 UI.AutoTraderPages = {}
-UI.AutoTraderPageHost = create("Frame", {
-    Position = UDim2.fromOffset(10, 90),
-    Size = UDim2.new(1, -20, 1, -100),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ZIndex = 1451,
-}, UI.AutoTraderPanel)
 for index, tabName in ipairs(tabNames) do
-    local button = makeButton(UI.AutoTraderTabs, tabName, UDim2.new(1 / #tabNames, -4, 1, -6), THEME.panel2)
-    button.Position = UDim2.new((index - 1) / #tabNames, 2, 0, 3)
-    button.TextSize = 9
-    button.ZIndex = 1453
+    local button = makeButton(UI.AutoTraderTabs, "  " .. tabName, UDim2.new(1, -12, 0, 47), Color3.fromRGB(11, 65, 99))
+    button.Position = UDim2.fromOffset(6, 31 + (index - 1) * 54)
+    button.TextXAlignment = Enum.TextXAlignment.Left
+    button.TextSize = 10
+    button.Font = Enum.Font.GothamBold
+    button.ZIndex = 1454
+    addStroke(button, THEME.border, 1, 0.45)
+    local desc = makeLabel(button, tabDescriptions[tabName], 8, THEME.faint, Enum.Font.Gotham)
+    desc.Position = UDim2.fromOffset(12, 25)
+    desc.Size = UDim2.new(1, -20, 0, 13)
+    desc.ZIndex = 1455
     UI.AutoTraderTabButtons[tabName] = button
+end
+
+local navLegend = makeLabel(
+    UI.AutoTraderTabs,
+    "GREEN = READY / GOOD\nAMBER = WAITING\nRED = NEEDS ATTENTION",
+    8,
+    Color3.fromRGB(170, 209, 226),
+    Enum.Font.GothamMedium
+)
+navLegend.Position = UDim2.new(0, 10, 1, -86)
+navLegend.Size = UDim2.new(1, -20, 0, 58)
+navLegend.TextWrapped = true
+navLegend.TextYAlignment = Enum.TextYAlignment.Top
+navLegend.ZIndex = 1454
+
+UI.AutoTraderPageHost = create("Frame", {
+    Position = UDim2.fromOffset(142, 72),
+    Size = UDim2.new(1, -150, 1, -80),
+    BackgroundColor3 = Color3.fromRGB(7, 43, 67),
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 1452,
+}, UI.AutoTraderPanel)
+addCorner(UI.AutoTraderPageHost, 4)
+aeroStroke(UI.AutoTraderPageHost, THEME.border, 0.16)
+for _, tabName in ipairs(tabNames) do
     local page = create("Frame", {
         Name = "Page_" .. tabName,
-        Size = UDim2.fromScale(1, 1),
+        Position = UDim2.fromOffset(8, 8),
+        Size = UDim2.new(1, -16, 1, -16),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
         Visible = false,
-        ZIndex = 1451,
+        ClipsDescendants = true,
+        ZIndex = 1453,
     }, UI.AutoTraderPageHost)
     UI.AutoTraderPages[tabName] = page
 end
 
-local function uiCard(parent, position, size)
+local function uiCard(parent, position, size, alternate)
     local card = create("Frame", {
         Position = position,
         Size = size,
-        BackgroundColor3 = THEME.panel,
+        BackgroundColor3 = alternate and AERO.cardAltBottom or AERO.cardBottom,
         BorderSizePixel = 0,
-        ZIndex = 1452,
+        ZIndex = 1454,
     }, parent)
-    addCorner(card, 9)
-    addStroke(card, THEME.border, 1, 0.55)
+    addCorner(card, 4)
+    aeroStroke(card, THEME.border, 0.34)
+    aeroGradient(
+        card,
+        alternate and AERO.cardAltTop or AERO.cardTop,
+        alternate and AERO.cardAltBottom or AERO.cardBottom,
+        90
+    )
+    local shine = create("Frame", {
+        Position = UDim2.fromOffset(1, 1),
+        Size = UDim2.new(1, -2, 0, 18),
+        BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+        BackgroundTransparency = 0.955,
+        BorderSizePixel = 0,
+        ZIndex = 1455,
+    }, card)
     return card
 end
+
 local function uiSectionTitle(parent, text, y)
-    local label = makeLabel(parent, text, 9, THEME.faint, Enum.Font.GothamBold)
+    local label = makeLabel(parent, text, 9, Color3.fromRGB(190, 228, 244), Enum.Font.GothamBold)
     label.Position = UDim2.fromOffset(10, y or 7)
     label.Size = UDim2.new(1, -20, 0, 15)
-    label.ZIndex = 1454
+    label.ZIndex = 1456
     return label
 end
+
 local function uiValueLabel(parent, text, y, size, color, font)
     local label = makeLabel(parent, text, size or 10, color or THEME.muted, font or Enum.Font.GothamMedium)
     label.Position = UDim2.fromOffset(10, y)
     label.Size = UDim2.new(1, -20, 0, 17)
-    label.ZIndex = 1454
+    label.ZIndex = 1456
     return label
 end
+
 local function clearDynamic(container)
     if not container then return end
     for _, child in ipairs(container:GetChildren()) do
@@ -13437,281 +13619,382 @@ local function clearDynamic(container)
     end
 end
 
--- OVERVIEW ---------------------------------------------------------------
-local overview = UI.AutoTraderPages.OVERVIEW
-UI.AutoTraderStageCard = uiCard(overview, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 68))
-uiSectionTitle(UI.AutoTraderStageCard, "LIVE PROCESS", 6)
-UI.AutoTraderPipeline = uiValueLabel(UI.AutoTraderStageCard, "SERVER > DISCOVERY > TARGET > REQUEST > TRADE > NEGOTIATE > AUDIT", 23, 9, THEME.muted, Enum.Font.GothamBold)
+-- HOME -------------------------------------------------------------------
+local home = UI.AutoTraderPages.HOME
+UI.AutoTraderHomeScroll = create("ScrollingFrame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    CanvasSize = UDim2.fromOffset(0, 1090),
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = Color3.fromRGB(91, 174, 214),
+    ZIndex = 1454,
+}, home)
+UI.AutoTraderHomeContent = create("Frame", {
+    Size = UDim2.new(1, -7, 0, 1082),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 1454,
+}, UI.AutoTraderHomeScroll)
+
+UI.AutoTraderStageCard = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 72), true)
+uiSectionTitle(UI.AutoTraderStageCard, "WHERE AM I?", 6)
+UI.AutoTraderPipeline = uiValueLabel(UI.AutoTraderStageCard, "SERVER  ›  DISCOVER  ›  TARGET  ›  REQUEST  ›  TRADE  ›  AUDIT", 25, 9, THEME.muted, Enum.Font.GothamBold)
 UI.AutoTraderPipeline.TextXAlignment = Enum.TextXAlignment.Center
-UI.AutoTraderPipeline.Size = UDim2.new(1, -20, 0, 17)
-UI.AutoTraderStage = uiValueLabel(UI.AutoTraderStageCard, "NOW: IDLE", 43, 10, THEME.blue, Enum.Font.GothamBold)
+UI.AutoTraderStage = uiValueLabel(UI.AutoTraderStageCard, "NOW: IDLE", 46, 11, THEME.blue, Enum.Font.GothamBold)
 UI.AutoTraderStage.TextXAlignment = Enum.TextXAlignment.Center
 
-UI.AutoTraderStatusBox = uiCard(overview, UDim2.fromOffset(0, 76), UDim2.new(1, 0, 0, 104))
-uiSectionTitle(UI.AutoTraderStatusBox, "WHAT THE BOT IS DOING", 6)
-UI.AutoTraderStatus = uiValueLabel(UI.AutoTraderStatusBox, "IDLE", 24, 12, THEME.blue, Enum.Font.GothamBold)
-UI.AutoTraderTarget = uiValueLabel(UI.AutoTraderStatusBox, "Target: —", 44, 10, THEME.muted, Enum.Font.GothamMedium)
-UI.AutoTraderTotals = uiValueLabel(UI.AutoTraderStatusBox, "Them: —   Plan: —   Win: —", 62, 10, THEME.muted, Enum.Font.GothamMedium)
+UI.AutoTraderStatusBox = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 80), UDim2.new(1, 0, 0, 112))
+uiSectionTitle(UI.AutoTraderStatusBox, "CURRENT ACTION", 6)
+UI.AutoTraderStatus = uiValueLabel(UI.AutoTraderStatusBox, "IDLE", 25, 13, THEME.blue, Enum.Font.GothamBold)
+UI.AutoTraderTarget = uiValueLabel(UI.AutoTraderStatusBox, "Target: —", 48, 10, THEME.muted, Enum.Font.GothamMedium)
+UI.AutoTraderTotals = uiValueLabel(UI.AutoTraderStatusBox, "Them: —   Plan: —   Win: —", 67, 10, THEME.muted, Enum.Font.GothamMedium)
 UI.AutoTraderSafety = makeLabel(UI.AutoTraderStatusBox, "Waiting.", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderSafety.Position = UDim2.fromOffset(10, 80)
+UI.AutoTraderSafety.Position = UDim2.fromOffset(10, 87)
 UI.AutoTraderSafety.Size = UDim2.new(1, -20, 0, 20)
 UI.AutoTraderSafety.TextWrapped = true
 UI.AutoTraderSafety.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderSafety.ZIndex = 1454
+UI.AutoTraderSafety.ZIndex = 1456
 
-UI.AutoTraderServerCard = uiCard(overview, UDim2.fromOffset(0, 188), UDim2.new(0.5, -4, 0, 122))
-uiSectionTitle(UI.AutoTraderServerCard, "CURRENT SERVER", 6)
-UI.AutoTraderServerRisk = uiValueLabel(UI.AutoTraderServerCard, "Bot learning: waiting", 25, 11, THEME.blue, Enum.Font.GothamBold)
-UI.AutoTraderServerPopulation = uiValueLabel(UI.AutoTraderServerCard, "Players: —", 47)
-UI.AutoTraderServerDisposition = uiValueLabel(UI.AutoTraderServerCard, "Disposition: —", 67)
-UI.AutoTraderServerDecision = makeLabel(UI.AutoTraderServerCard, "Decision: evaluating", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderServerDecision.Position = UDim2.fromOffset(10, 87)
-UI.AutoTraderServerDecision.Size = UDim2.new(1, -20, 0, 30)
+UI.AutoTraderServerCard = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 200), UDim2.new(0.5, -4, 0, 128))
+uiSectionTitle(UI.AutoTraderServerCard, "THIS SERVER", 6)
+UI.AutoTraderServerRisk = uiValueLabel(UI.AutoTraderServerCard, "Bot learning: waiting", 26, 11, THEME.blue, Enum.Font.GothamBold)
+UI.AutoTraderServerPopulation = uiValueLabel(UI.AutoTraderServerCard, "Players: —", 49)
+UI.AutoTraderServerDisposition = uiValueLabel(UI.AutoTraderServerCard, "Work state: —", 69)
+UI.AutoTraderServerDecision = makeLabel(UI.AutoTraderServerCard, "Evaluating whether there is useful trade work here.", 9, THEME.faint, Enum.Font.Gotham)
+UI.AutoTraderServerDecision.Position = UDim2.fromOffset(10, 89)
+UI.AutoTraderServerDecision.Size = UDim2.new(1, -20, 0, 34)
 UI.AutoTraderServerDecision.TextWrapped = true
 UI.AutoTraderServerDecision.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderServerDecision.ZIndex = 1454
+UI.AutoTraderServerDecision.ZIndex = 1456
 
-UI.AutoTraderOpportunityCard = uiCard(overview, UDim2.new(0.5, 4, 0, 188), UDim2.new(0.5, -4, 0, 122))
-uiSectionTitle(UI.AutoTraderOpportunityCard, "VALUE / HOUR DECISION", 6)
-UI.AutoTraderOpportunityBest = uiValueLabel(UI.AutoTraderOpportunityCard, "Best target: —", 25, 11, THEME.green, Enum.Font.GothamBold)
-UI.AutoTraderOpportunityRates = uiValueLabel(UI.AutoTraderOpportunityCard, "Target EV: —   Hop EV: —", 47)
-UI.AutoTraderOpportunityFloor = uiValueLabel(UI.AutoTraderOpportunityCard, "Stay floor: —", 67)
+UI.AutoTraderOpportunityCard = uiCard(UI.AutoTraderHomeContent, UDim2.new(0.5, 4, 0, 200), UDim2.new(0.5, -4, 0, 128), true)
+uiSectionTitle(UI.AutoTraderOpportunityCard, "IS IT WORTH STAYING?", 6)
+UI.AutoTraderOpportunityBest = uiValueLabel(UI.AutoTraderOpportunityCard, "Best target: —", 26, 11, THEME.green, Enum.Font.GothamBold)
+UI.AutoTraderOpportunityRates = uiValueLabel(UI.AutoTraderOpportunityCard, "Target EV: —   Hop EV: —", 49)
+UI.AutoTraderOpportunityFloor = uiValueLabel(UI.AutoTraderOpportunityCard, "Stay floor: —", 69)
 UI.AutoTraderOpportunityDecision = makeLabel(UI.AutoTraderOpportunityCard, "Waiting for verified opportunities.", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderOpportunityDecision.Position = UDim2.fromOffset(10, 87)
-UI.AutoTraderOpportunityDecision.Size = UDim2.new(1, -20, 0, 30)
+UI.AutoTraderOpportunityDecision.Position = UDim2.fromOffset(10, 89)
+UI.AutoTraderOpportunityDecision.Size = UDim2.new(1, -20, 0, 34)
 UI.AutoTraderOpportunityDecision.TextWrapped = true
 UI.AutoTraderOpportunityDecision.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderOpportunityDecision.ZIndex = 1454
+UI.AutoTraderOpportunityDecision.ZIndex = 1456
 
-UI.AutoTraderSafetyCard = uiCard(overview, UDim2.fromOffset(0, 318), UDim2.new(0.5, -4, 0, 126))
-uiSectionTitle(UI.AutoTraderSafetyCard, "SAFETY / LIVENESS", 6)
+UI.AutoTraderSafetyCard = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 336), UDim2.new(0.5, -4, 0, 132))
+uiSectionTitle(UI.AutoTraderSafetyCard, "HEALTH CHECKS", 6)
 UI.AutoTraderSafetyRows = {}
 for i = 1, 5 do
-    UI.AutoTraderSafetyRows[i] = uiValueLabel(UI.AutoTraderSafetyCard, "—", 24 + (i - 1) * 19, 9, THEME.muted, Enum.Font.GothamMedium)
+    UI.AutoTraderSafetyRows[i] = uiValueLabel(UI.AutoTraderSafetyCard, "—", 26 + (i - 1) * 20, 9, THEME.muted, Enum.Font.GothamMedium)
 end
 
-UI.AutoTraderEventCard = uiCard(overview, UDim2.new(0.5, 4, 0, 318), UDim2.new(0.5, -4, 1, -318))
-uiSectionTitle(UI.AutoTraderEventCard, "LIVE EVENT FEED", 6)
+UI.AutoTraderEventCard = uiCard(UI.AutoTraderHomeContent, UDim2.new(0.5, 4, 0, 336), UDim2.new(0.5, -4, 0, 228), true)
+uiSectionTitle(UI.AutoTraderEventCard, "RECENT ACTIVITY", 6)
 UI.AutoTraderEventRows = {}
 for i = 1, 8 do
     local row = makeLabel(UI.AutoTraderEventCard, "", 8, THEME.muted, Enum.Font.Gotham)
-    row.Position = UDim2.fromOffset(10, 24 + (i - 1) * 22)
-    row.Size = UDim2.new(1, -20, 0, 21)
+    row.Position = UDim2.fromOffset(10, 26 + (i - 1) * 24)
+    row.Size = UDim2.new(1, -20, 0, 22)
     row.TextWrapped = true
     row.TextYAlignment = Enum.TextYAlignment.Top
-    row.ZIndex = 1454
+    row.ZIndex = 1456
     UI.AutoTraderEventRows[i] = row
 end
 
--- PLAYERS ----------------------------------------------------------------
-local playersPage = UI.AutoTraderPages.PLAYERS
-UI.AutoTraderPlayerHeader = makeLabel(playersPage, "RANKED PLAYER QUEUE", 12, THEME.text, Enum.Font.GothamBold)
-UI.AutoTraderPlayerHeader.Position = UDim2.fromOffset(4, 2)
-UI.AutoTraderPlayerHeader.Size = UDim2.new(1, -8, 0, 20)
-UI.AutoTraderPlayerHeader.ZIndex = 1452
-UI.AutoTraderPlayerHint = makeLabel(playersPage, "Ranked only by trading economics. Avatar DB status is informational here and never changes target EV.", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderPlayerHint.Position = UDim2.fromOffset(4, 24)
-UI.AutoTraderPlayerHint.Size = UDim2.new(1, -8, 0, 18)
-UI.AutoTraderPlayerHint.ZIndex = 1452
-UI.AutoTraderPlayerDetail = uiCard(playersPage, UDim2.fromOffset(0, 48), UDim2.new(1, 0, 0, 76))
-uiSectionTitle(UI.AutoTraderPlayerDetail, "SELECTED / NEXT", 6)
-UI.AutoTraderPlayerDetailText = makeLabel(UI.AutoTraderPlayerDetail, "No ranked target yet.", 9, THEME.muted, Enum.Font.Gotham)
-UI.AutoTraderPlayerDetailText.Position = UDim2.fromOffset(10, 24)
-UI.AutoTraderPlayerDetailText.Size = UDim2.new(1, -20, 0, 46)
-UI.AutoTraderPlayerDetailText.TextWrapped = true
-UI.AutoTraderPlayerDetailText.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderPlayerDetailText.ZIndex = 1454
-UI.AutoTraderPlayerScroll = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(0, 132),
-    Size = UDim2.new(1, 0, 1, -132),
-    BackgroundColor3 = THEME.panel,
-    BorderSizePixel = 0,
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    CanvasSize = UDim2.fromOffset(0, 0),
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = THEME.border,
-    ZIndex = 1452,
-}, playersPage)
-addCorner(UI.AutoTraderPlayerScroll, 9)
-UI.AutoTraderPlayerContent = create("Frame", {Size = UDim2.new(1, -7, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 1453}, UI.AutoTraderPlayerScroll)
-create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, UI.AutoTraderPlayerContent)
-create("UIPadding", {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)}, UI.AutoTraderPlayerContent)
+-- Full statistics are still present, now directly below live status.
+UI.AutoTraderStatsSession = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 576), UDim2.new(0.5, -4, 0, 214))
+uiSectionTitle(UI.AutoTraderStatsSession, "THIS SESSION", 6)
+UI.AutoTraderSessionRows = {}
+for i = 1, 9 do
+    UI.AutoTraderSessionRows[i] = uiValueLabel(UI.AutoTraderStatsSession, "—", 25 + (i - 1) * 20, 10, THEME.muted, Enum.Font.GothamMedium)
+end
+
+UI.AutoTraderStatsLearned = uiCard(UI.AutoTraderHomeContent, UDim2.new(0.5, 4, 0, 576), UDim2.new(0.5, -4, 0, 214), true)
+uiSectionTitle(UI.AutoTraderStatsLearned, "LEARNED STRATEGY", 6)
+UI.AutoTraderLearnedRows = {}
+for i = 1, 9 do
+    UI.AutoTraderLearnedRows[i] = uiValueLabel(UI.AutoTraderStatsLearned, "—", 25 + (i - 1) * 20, 10, THEME.muted, Enum.Font.GothamMedium)
+end
+
+UI.AutoTraderStatsMargins = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 798), UDim2.new(1, 0, 0, 164))
+uiSectionTitle(UI.AutoTraderStatsMargins, "NEGOTIATION LEARNING", 6)
+UI.AutoTraderMarginRows = {}
+for i = 1, 4 do
+    UI.AutoTraderMarginRows[i] = uiValueLabel(UI.AutoTraderStatsMargins, "—", 28 + (i - 1) * 29, 10, THEME.muted, Enum.Font.GothamMedium)
+end
+
+UI.AutoTraderStatsNote = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 970), UDim2.new(1, 0, 0, 104), true)
+uiSectionTitle(UI.AutoTraderStatsNote, "WHAT THESE NUMBERS MEAN", 6)
+UI.AutoTraderStatsNoteText = makeLabel(
+    UI.AutoTraderStatsNote,
+    "Session profit/hour is wall-clock since startup. Learned rates are persisted, decayed observations across strangers; they influence opportunity ranking but never bypass exact trade safety checks.",
+    9,
+    THEME.faint,
+    Enum.Font.Gotham
+)
+UI.AutoTraderStatsNoteText.Position = UDim2.fromOffset(10, 29)
+UI.AutoTraderStatsNoteText.Size = UDim2.new(1, -20, 0, 62)
+UI.AutoTraderStatsNoteText.TextWrapped = true
+UI.AutoTraderStatsNoteText.TextYAlignment = Enum.TextYAlignment.Top
+UI.AutoTraderStatsNoteText.ZIndex = 1456
 
 -- TRADE ------------------------------------------------------------------
 local tradePage = UI.AutoTraderPages.TRADE
-UI.AutoTraderTradeStatusCard = uiCard(tradePage, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 112))
-uiSectionTitle(UI.AutoTraderTradeStatusCard, "ACTIVE TRADE", 6)
-UI.AutoTraderTradePartner = uiValueLabel(UI.AutoTraderTradeStatusCard, "Partner: —", 26, 12, THEME.text, Enum.Font.GothamBold)
-UI.AutoTraderTradeTotals = uiValueLabel(UI.AutoTraderTradeStatusCard, "Them: —   Us: —   Profit: —", 49, 11, THEME.green, Enum.Font.GothamBold)
+UI.AutoTraderTradeStatusCard = uiCard(tradePage, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 108), true)
+uiSectionTitle(UI.AutoTraderTradeStatusCard, "LIVE TRADE", 6)
+UI.AutoTraderTradePartner = uiValueLabel(UI.AutoTraderTradeStatusCard, "Partner: —", 27, 12, THEME.text, Enum.Font.GothamBold)
+UI.AutoTraderTradeTotals = uiValueLabel(UI.AutoTraderTradeStatusCard, "Them: —   Us: —   Profit: —", 50, 11, THEME.green, Enum.Font.GothamBold)
 UI.AutoTraderTradeState = makeLabel(UI.AutoTraderTradeStatusCard, "No active managed trade.", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderTradeState.Position = UDim2.fromOffset(10, 72)
-UI.AutoTraderTradeState.Size = UDim2.new(1, -20, 0, 34)
+UI.AutoTraderTradeState.Position = UDim2.fromOffset(10, 73)
+UI.AutoTraderTradeState.Size = UDim2.new(1, -20, 0, 30)
 UI.AutoTraderTradeState.TextWrapped = true
 UI.AutoTraderTradeState.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderTradeState.ZIndex = 1454
+UI.AutoTraderTradeState.ZIndex = 1456
 
-UI.AutoTraderNegotiationCard = uiCard(tradePage, UDim2.fromOffset(0, 120), UDim2.new(1, 0, 0, 116))
-uiSectionTitle(UI.AutoTraderNegotiationCard, "NEGOTIATION", 6)
+UI.AutoTraderNegotiationCard = uiCard(tradePage, UDim2.fromOffset(0, 116), UDim2.new(1, 0, 0, 110))
+uiSectionTitle(UI.AutoTraderNegotiationCard, "NEGOTIATION CLOCK", 6)
 UI.AutoTraderNegotiationStage = uiValueLabel(UI.AutoTraderNegotiationCard, "Stage: —", 26, 11, THEME.blue, Enum.Font.GothamBold)
-UI.AutoTraderNegotiationMargins = uiValueLabel(UI.AutoTraderNegotiationCard, "18%  >  11%  >  6%  >  FLOOR", 49, 10, THEME.muted, Enum.Font.GothamBold)
+UI.AutoTraderNegotiationMargins = uiValueLabel(UI.AutoTraderNegotiationCard, "18%  ›  11%  ›  6%  ›  HARD FLOOR", 49, 10, THEME.muted, Enum.Font.GothamBold)
 UI.AutoTraderNegotiationTimer = uiValueLabel(UI.AutoTraderNegotiationCard, "Waiting for their offer.", 70, 9, THEME.faint, Enum.Font.Gotham)
 UI.AutoTraderNegotiationSafety = uiValueLabel(UI.AutoTraderNegotiationCard, "Hard minimum: —", 89, 9, THEME.faint, Enum.Font.Gotham)
 
-UI.AutoTraderPlanCard = uiCard(tradePage, UDim2.fromOffset(0, 244), UDim2.new(0.55, -4, 1, -244))
-uiSectionTitle(UI.AutoTraderPlanCard, "CURRENT OFFER PLAN", 6)
+UI.AutoTraderPlanCard = uiCard(tradePage, UDim2.fromOffset(0, 234), UDim2.new(0.55, -4, 1, -234))
+uiSectionTitle(UI.AutoTraderPlanCard, "WHAT WE WILL OFFER", 6)
 UI.AutoTraderPlanRows = {}
 for index = 1, CONFIG.MaxOfferSlots do
     local row = makeLabel(UI.AutoTraderPlanCard, "—", 10, THEME.muted, Enum.Font.GothamMedium)
-    row.Position = UDim2.fromOffset(10, 26 + (index - 1) * 26)
+    row.Position = UDim2.fromOffset(10, 28 + (index - 1) * 27)
     row.Size = UDim2.new(1, -20, 0, 24)
-    row.ZIndex = 1454
+    row.ZIndex = 1456
     UI.AutoTraderPlanRows[index] = row
 end
 UI.AutoTraderAudit = makeLabel(UI.AutoTraderPlanCard, "Last audit: —", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderAudit.Position = UDim2.fromOffset(10, 140)
-UI.AutoTraderAudit.Size = UDim2.new(1, -20, 0, 60)
+UI.AutoTraderAudit.Position = UDim2.fromOffset(10, 145)
+UI.AutoTraderAudit.Size = UDim2.new(1, -20, 1, -155)
 UI.AutoTraderAudit.TextWrapped = true
 UI.AutoTraderAudit.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderAudit.ZIndex = 1454
+UI.AutoTraderAudit.ZIndex = 1456
 
-UI.AutoTraderTradeInfoCard = uiCard(tradePage, UDim2.new(0.55, 4, 0, 244), UDim2.new(0.45, -4, 1, -244))
-uiSectionTitle(UI.AutoTraderTradeInfoCard, "WHY THIS TRADE", 6)
-UI.AutoTraderTradeWhy = makeLabel(UI.AutoTraderTradeInfoCard, "The planner will explain its margin, market gate, and acceptance state here.", 9, THEME.muted, Enum.Font.Gotham)
-UI.AutoTraderTradeWhy.Position = UDim2.fromOffset(10, 26)
-UI.AutoTraderTradeWhy.Size = UDim2.new(1, -20, 1, -36)
+UI.AutoTraderTradeInfoCard = uiCard(tradePage, UDim2.new(0.55, 4, 0, 234), UDim2.new(0.45, -4, 1, -234), true)
+uiSectionTitle(UI.AutoTraderTradeInfoCard, "WHY THE BOT CHOSE THIS", 6)
+UI.AutoTraderTradeWhy = makeLabel(
+    UI.AutoTraderTradeInfoCard,
+    "The planner will explain margin, market safety, request state, and acceptance readiness here.",
+    9,
+    THEME.muted,
+    Enum.Font.Gotham
+)
+UI.AutoTraderTradeWhy.Position = UDim2.fromOffset(10, 28)
+UI.AutoTraderTradeWhy.Size = UDim2.new(1, -20, 1, -38)
 UI.AutoTraderTradeWhy.TextWrapped = true
 UI.AutoTraderTradeWhy.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderTradeWhy.ZIndex = 1454
+UI.AutoTraderTradeWhy.ZIndex = 1456
+
+-- PEOPLE -----------------------------------------------------------------
+local playersPage = UI.AutoTraderPages.PEOPLE
+UI.AutoTraderPlayerHeader = makeLabel(playersPage, "WHO SHOULD WE TRADE WITH NEXT?", 13, THEME.text, Enum.Font.GothamBold)
+UI.AutoTraderPlayerHeader.Position = UDim2.fromOffset(4, 0)
+UI.AutoTraderPlayerHeader.Size = UDim2.new(1, -8, 0, 22)
+UI.AutoTraderPlayerHeader.ZIndex = 1454
+UI.AutoTraderPlayerHint = makeLabel(
+    playersPage,
+    "Ranked by trading economics only. Bot-avatar labels are shown for diagnosis but never change current-server target EV.",
+    9,
+    THEME.faint,
+    Enum.Font.Gotham
+)
+UI.AutoTraderPlayerHint.Position = UDim2.fromOffset(4, 24)
+UI.AutoTraderPlayerHint.Size = UDim2.new(1, -8, 0, 20)
+UI.AutoTraderPlayerHint.TextWrapped = true
+UI.AutoTraderPlayerHint.ZIndex = 1454
+UI.AutoTraderPlayerDetail = uiCard(playersPage, UDim2.fromOffset(0, 50), UDim2.new(1, 0, 0, 82), true)
+uiSectionTitle(UI.AutoTraderPlayerDetail, "NEXT / SELECTED PLAYER", 6)
+UI.AutoTraderPlayerDetailText = makeLabel(UI.AutoTraderPlayerDetail, "No ranked target yet.", 9, THEME.muted, Enum.Font.Gotham)
+UI.AutoTraderPlayerDetailText.Position = UDim2.fromOffset(10, 25)
+UI.AutoTraderPlayerDetailText.Size = UDim2.new(1, -20, 0, 50)
+UI.AutoTraderPlayerDetailText.TextWrapped = true
+UI.AutoTraderPlayerDetailText.TextYAlignment = Enum.TextYAlignment.Top
+UI.AutoTraderPlayerDetailText.ZIndex = 1456
+UI.AutoTraderPlayerScroll = create("ScrollingFrame", {
+    Position = UDim2.fromOffset(0, 140),
+    Size = UDim2.new(1, 0, 1, -140),
+    BackgroundColor3 = Color3.fromRGB(8, 48, 74),
+    BorderSizePixel = 0,
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    CanvasSize = UDim2.fromOffset(0, 0),
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = Color3.fromRGB(91, 174, 214),
+    ZIndex = 1454,
+}, playersPage)
+addCorner(UI.AutoTraderPlayerScroll, 4)
+aeroStroke(UI.AutoTraderPlayerScroll, THEME.border, 0.3)
+UI.AutoTraderPlayerContent = create("Frame", {
+    Size = UDim2.new(1, -7, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 1455,
+}, UI.AutoTraderPlayerScroll)
+create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, UI.AutoTraderPlayerContent)
+create("UIPadding", {
+    PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5),
+    PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)
+}, UI.AutoTraderPlayerContent)
 
 -- SERVERS ----------------------------------------------------------------
 local serversPage = UI.AutoTraderPages.SERVERS
-UI.AutoTraderServerScanCard = uiCard(serversPage, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 112))
-uiSectionTitle(UI.AutoTraderServerScanCard, "SERVER SELECTION", 6)
+UI.AutoTraderServerScanCard = uiCard(serversPage, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 126), true)
+uiSectionTitle(UI.AutoTraderServerScanCard, "WHERE WE WILL GO NEXT", 6)
 UI.AutoTraderServerScanStatus = uiValueLabel(UI.AutoTraderServerScanCard, "No public-server scan yet.", 26, 11, THEME.blue, Enum.Font.GothamBold)
-UI.AutoTraderServerScanThreshold = uiValueLabel(UI.AutoTraderServerScanCard, "Filter: gold-certified bot avatar matches only", 49)
+UI.AutoTraderServerScanThreshold = uiValueLabel(UI.AutoTraderServerScanCard, "Filter: strict learned bot-avatar matches only", 49)
 UI.AutoTraderServerScanBest = uiValueLabel(UI.AutoTraderServerScanCard, "Best scanned: —", 69)
-UI.AutoTraderServerScanReason = uiValueLabel(UI.AutoTraderServerScanCard, "", 89, 9, THEME.faint, Enum.Font.Gotham)
+UI.AutoTraderServerScanReason = makeLabel(UI.AutoTraderServerScanCard, "", 9, THEME.faint, Enum.Font.Gotham)
+UI.AutoTraderServerScanReason.Position = UDim2.fromOffset(10, 89)
+UI.AutoTraderServerScanReason.Size = UDim2.new(1, -20, 0, 32)
+UI.AutoTraderServerScanReason.TextWrapped = true
+UI.AutoTraderServerScanReason.TextYAlignment = Enum.TextYAlignment.Top
+UI.AutoTraderServerScanReason.ZIndex = 1456
+
+UI.AutoTraderForceServer = aeroButton(serversPage, "FIND A NEW SERVER", UDim2.new(0.5, -4, 0, 36), true)
+UI.AutoTraderForceServer.Position = UDim2.fromOffset(0, 134)
+UI.AutoTraderForceServer.ZIndex = 1454
+UI.AutoTraderRefreshServerScan = aeroButton(serversPage, "REFRESH SERVER LIST", UDim2.new(0.5, -4, 0, 36), false)
+UI.AutoTraderRefreshServerScan.Position = UDim2.new(0.5, 4, 0, 134)
+UI.AutoTraderRefreshServerScan.TextColor3 = THEME.blue
+UI.AutoTraderRefreshServerScan.ZIndex = 1454
+
+local serverListTitle = makeLabel(serversPage, "RECENT ELIGIBLE SERVERS", 9, Color3.fromRGB(190, 228, 244), Enum.Font.GothamBold)
+serverListTitle.Position = UDim2.fromOffset(4, 178)
+serverListTitle.Size = UDim2.new(0.48, -8, 0, 18)
+serverListTitle.ZIndex = 1454
 UI.AutoTraderServerCandidateScroll = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(0, 120),
-    Size = UDim2.new(1, 0, 1, -166),
-    BackgroundColor3 = THEME.panel,
+    Position = UDim2.fromOffset(0, 200),
+    Size = UDim2.new(0.48, -4, 1, -200),
+    BackgroundColor3 = Color3.fromRGB(8, 48, 74),
     BorderSizePixel = 0,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
     CanvasSize = UDim2.fromOffset(0, 0),
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = THEME.border,
-    ZIndex = 1452,
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = Color3.fromRGB(91, 174, 214),
+    ZIndex = 1454,
 }, serversPage)
-addCorner(UI.AutoTraderServerCandidateScroll, 9)
-UI.AutoTraderServerCandidateContent = create("Frame", {Size = UDim2.new(1, -7, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 1453}, UI.AutoTraderServerCandidateScroll)
+addCorner(UI.AutoTraderServerCandidateScroll, 4)
+aeroStroke(UI.AutoTraderServerCandidateScroll, THEME.border, 0.3)
+UI.AutoTraderServerCandidateContent = create("Frame", {
+    Size = UDim2.new(1, -7, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 1455,
+}, UI.AutoTraderServerCandidateScroll)
 create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, UI.AutoTraderServerCandidateContent)
-create("UIPadding", {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)}, UI.AutoTraderServerCandidateContent)
-UI.AutoTraderForceServer = makeButton(serversPage, "FIND A NEW SERVER", UDim2.new(0.5, -4, 0, 36), THEME.panel2)
-UI.AutoTraderForceServer.Position = UDim2.new(0, 0, 1, -38)
-UI.AutoTraderForceServer.TextColor3 = THEME.blue
-UI.AutoTraderForceServer.ZIndex = 1452
-UI.AutoTraderRefreshServerScan = makeButton(serversPage, "REFRESH SCAN NOW", UDim2.new(0.5, -4, 0, 36), THEME.panel2)
-UI.AutoTraderRefreshServerScan.Position = UDim2.new(0.5, 4, 1, -38)
-UI.AutoTraderRefreshServerScan.TextColor3 = THEME.green
-UI.AutoTraderRefreshServerScan.ZIndex = 1452
+create("UIPadding", {
+    PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5),
+    PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)
+}, UI.AutoTraderServerCandidateContent)
 
--- BOTS -------------------------------------------------------------------
-local botsPage = UI.AutoTraderPages.BOTS
-UI.AutoTraderBotHeaderCard = uiCard(botsPage, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 92))
+UI.AutoTraderBotHeaderCard = uiCard(serversPage, UDim2.new(0.49, 4, 0, 178), UDim2.new(0.51, -4, 0, 116), true)
 uiSectionTitle(UI.AutoTraderBotHeaderCard, "BOT INTELLIGENCE", 6)
-UI.AutoTraderBotSummary = uiValueLabel(UI.AutoTraderBotHeaderCard, "Waiting for avatar evidence.", 26, 11, THEME.blue, Enum.Font.GothamBold)
-UI.AutoTraderBotDetail = makeLabel(UI.AutoTraderBotHeaderCard, "Only strict persistent per-player MoveDirection + RootPart movement/facing certification can teach hashes. Deaths/respawns pause a track instead of resetting the server; animation and inventory/value/trade behavior never change bot learning.", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderBotDetail.Position = UDim2.fromOffset(10, 49)
-UI.AutoTraderBotDetail.Size = UDim2.new(1, -125, 0, 36)
+UI.AutoTraderBotSummary = uiValueLabel(UI.AutoTraderBotHeaderCard, "Waiting for physical evidence.", 26, 10, THEME.blue, Enum.Font.GothamBold)
+UI.AutoTraderBotDetail = makeLabel(
+    UI.AutoTraderBotHeaderCard,
+    "Learns only from strict persistent MoveDirection + RootPart movement/facing evidence. Inventory, trade behavior, and animations never teach bot hashes.",
+    8,
+    THEME.faint,
+    Enum.Font.Gotham
+)
+UI.AutoTraderBotDetail.Position = UDim2.fromOffset(10, 48)
+UI.AutoTraderBotDetail.Size = UDim2.new(1, -102, 0, 58)
 UI.AutoTraderBotDetail.TextWrapped = true
 UI.AutoTraderBotDetail.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderBotDetail.ZIndex = 1454
-UI.AutoTraderRefreshBots = makeButton(UI.AutoTraderBotHeaderCard, "REFRESH", UDim2.fromOffset(96, 30), THEME.panel2)
-UI.AutoTraderRefreshBots.Position = UDim2.new(1, -106, 0, 48)
+UI.AutoTraderBotDetail.ZIndex = 1456
+UI.AutoTraderRefreshBots = aeroButton(UI.AutoTraderBotHeaderCard, "REFRESH", UDim2.fromOffset(82, 29), false)
+UI.AutoTraderRefreshBots.Position = UDim2.new(1, -92, 0, 50)
 UI.AutoTraderRefreshBots.TextColor3 = THEME.green
-UI.AutoTraderRefreshBots.ZIndex = 1454
+UI.AutoTraderRefreshBots.ZIndex = 1457
+
 UI.AutoTraderBotScroll = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(0, 100),
-    Size = UDim2.new(1, 0, 1, -100),
-    BackgroundColor3 = THEME.panel,
+    Position = UDim2.new(0.49, 4, 0, 302),
+    Size = UDim2.new(0.51, -4, 1, -302),
+    BackgroundColor3 = Color3.fromRGB(8, 48, 74),
     BorderSizePixel = 0,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
     CanvasSize = UDim2.fromOffset(0, 0),
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = THEME.border,
-    ZIndex = 1452,
-}, botsPage)
-addCorner(UI.AutoTraderBotScroll, 9)
-UI.AutoTraderBotContent = create("Frame", {Size = UDim2.new(1, -7, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 1453}, UI.AutoTraderBotScroll)
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = Color3.fromRGB(91, 174, 214),
+    ZIndex = 1454,
+}, serversPage)
+addCorner(UI.AutoTraderBotScroll, 4)
+aeroStroke(UI.AutoTraderBotScroll, THEME.border, 0.3)
+UI.AutoTraderBotContent = create("Frame", {
+    Size = UDim2.new(1, -7, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 1455,
+}, UI.AutoTraderBotScroll)
 create("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, UI.AutoTraderBotContent)
-create("UIPadding", {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)}, UI.AutoTraderBotContent)
-
--- STATS ------------------------------------------------------------------
-local statsPage = UI.AutoTraderPages.STATS
-UI.AutoTraderStatsSession = uiCard(statsPage, UDim2.fromOffset(0, 0), UDim2.new(0.5, -4, 0, 214))
-uiSectionTitle(UI.AutoTraderStatsSession, "THIS SESSION", 6)
-UI.AutoTraderSessionRows = {}
-for i = 1, 9 do UI.AutoTraderSessionRows[i] = uiValueLabel(UI.AutoTraderStatsSession, "—", 25 + (i - 1) * 20, 10, THEME.muted, Enum.Font.GothamMedium) end
-UI.AutoTraderStatsLearned = uiCard(statsPage, UDim2.new(0.5, 4, 0, 0), UDim2.new(0.5, -4, 0, 214))
-uiSectionTitle(UI.AutoTraderStatsLearned, "LEARNED STRATEGY", 6)
-UI.AutoTraderLearnedRows = {}
-for i = 1, 9 do UI.AutoTraderLearnedRows[i] = uiValueLabel(UI.AutoTraderStatsLearned, "—", 25 + (i - 1) * 20, 10, THEME.muted, Enum.Font.GothamMedium) end
-UI.AutoTraderStatsMargins = uiCard(statsPage, UDim2.fromOffset(0, 222), UDim2.new(1, 0, 0, 164))
-uiSectionTitle(UI.AutoTraderStatsMargins, "NEGOTIATION STAGE LEARNING", 6)
-UI.AutoTraderMarginRows = {}
-for i = 1, 4 do UI.AutoTraderMarginRows[i] = uiValueLabel(UI.AutoTraderStatsMargins, "—", 28 + (i - 1) * 29, 10, THEME.muted, Enum.Font.GothamMedium) end
-UI.AutoTraderStatsNote = uiCard(statsPage, UDim2.fromOffset(0, 394), UDim2.new(1, 0, 1, -394))
-uiSectionTitle(UI.AutoTraderStatsNote, "HOW TO READ THIS", 6)
-UI.AutoTraderStatsNoteText = makeLabel(UI.AutoTraderStatsNote, "Session profit/hour is wall-clock since this script started. Learned rates are smoothed priors accumulated across strangers and persisted in the existing target-stats file.", 9, THEME.faint, Enum.Font.Gotham)
-UI.AutoTraderStatsNoteText.Position = UDim2.fromOffset(10, 28)
-UI.AutoTraderStatsNoteText.Size = UDim2.new(1, -20, 1, -38)
-UI.AutoTraderStatsNoteText.TextWrapped = true
-UI.AutoTraderStatsNoteText.TextYAlignment = Enum.TextYAlignment.Top
-UI.AutoTraderStatsNoteText.ZIndex = 1454
+create("UIPadding", {
+    PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5),
+    PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)
+}, UI.AutoTraderBotContent)
 
 -- SETTINGS ---------------------------------------------------------------
 local settingsPage = UI.AutoTraderPages.SETTINGS
-UI.AutoTraderEnabled = makeButton(settingsPage, "", UDim2.new(1, 0, 0, 34), THEME.panel2)
-UI.AutoTraderEnabled.Position = UDim2.fromOffset(0, 0)
-UI.AutoTraderEnabled.ZIndex = 1452
-UI.AutoTraderIgnoreFriends = makeButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), THEME.panel2)
-UI.AutoTraderIgnoreFriends.Position = UDim2.fromOffset(0, 42)
-UI.AutoTraderIgnoreFriends.ZIndex = 1452
-UI.AutoTraderOpeningAnchor = makeButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), THEME.panel2)
-UI.AutoTraderOpeningAnchor.Position = UDim2.new(0.5, 4, 0, 42)
-UI.AutoTraderOpeningAnchor.ZIndex = 1452
-UI.AutoTraderUnknownTheir = makeButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), THEME.panel2)
-UI.AutoTraderUnknownTheir.Position = UDim2.fromOffset(0, 84)
-UI.AutoTraderUnknownTheir.ZIndex = 1452
-UI.AutoTraderPreferDuplicates = makeButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), THEME.panel2)
-UI.AutoTraderPreferDuplicates.Position = UDim2.new(0.5, 4, 0, 84)
-UI.AutoTraderPreferDuplicates.ZIndex = 1452
-UI.AutoTraderProfit = makeButton(settingsPage, "", UDim2.new(1, 0, 0, 34), THEME.panel2)
-UI.AutoTraderProfit.Position = UDim2.fromOffset(0, 126)
-UI.AutoTraderProfit.ZIndex = 1452
-UI.AutoTraderSkipTarget = makeButton(settingsPage, "SKIP CURRENT TARGET", UDim2.new(0.5, -4, 0, 34), THEME.panel2)
-UI.AutoTraderSkipTarget.Position = UDim2.fromOffset(0, 168)
+local settingsHint = makeLabel(
+    settingsPage,
+    "These are the controls that change behavior. Diagnostic/support export remains one click away.",
+    9,
+    THEME.faint,
+    Enum.Font.Gotham
+)
+settingsHint.Position = UDim2.fromOffset(4, 0)
+settingsHint.Size = UDim2.new(1, -8, 0, 20)
+settingsHint.ZIndex = 1454
+
+UI.AutoTraderEnabled = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 42), true)
+UI.AutoTraderEnabled.Position = UDim2.fromOffset(0, 28)
+UI.AutoTraderEnabled.TextSize = 11
+UI.AutoTraderEnabled.ZIndex = 1454
+UI.AutoTraderIgnoreFriends = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
+UI.AutoTraderIgnoreFriends.Position = UDim2.fromOffset(0, 78)
+UI.AutoTraderIgnoreFriends.ZIndex = 1454
+UI.AutoTraderOpeningAnchor = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
+UI.AutoTraderOpeningAnchor.Position = UDim2.new(0.5, 4, 0, 78)
+UI.AutoTraderOpeningAnchor.ZIndex = 1454
+UI.AutoTraderUnknownTheir = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
+UI.AutoTraderUnknownTheir.Position = UDim2.fromOffset(0, 120)
+UI.AutoTraderUnknownTheir.ZIndex = 1454
+UI.AutoTraderPreferDuplicates = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
+UI.AutoTraderPreferDuplicates.Position = UDim2.new(0.5, 4, 0, 120)
+UI.AutoTraderPreferDuplicates.ZIndex = 1454
+UI.AutoTraderProfit = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 36), false)
+UI.AutoTraderProfit.Position = UDim2.fromOffset(0, 162)
+UI.AutoTraderProfit.ZIndex = 1454
+UI.AutoTraderSkipTarget = aeroButton(settingsPage, "SKIP CURRENT TARGET", UDim2.new(0.5, -4, 0, 36), false)
+UI.AutoTraderSkipTarget.Position = UDim2.fromOffset(0, 206)
 UI.AutoTraderSkipTarget.TextColor3 = THEME.yellow
-UI.AutoTraderSkipTarget.ZIndex = 1452
-UI.AutoTraderCopyDebug = makeButton(settingsPage, "COPY SUPPORT SNAPSHOT", UDim2.new(0.5, -4, 0, 34), THEME.panel2)
-UI.AutoTraderCopyDebug.Position = UDim2.new(0.5, 4, 0, 168)
+UI.AutoTraderSkipTarget.ZIndex = 1454
+UI.AutoTraderCopyDebug = aeroButton(settingsPage, "COPY FULL SUPPORT SNAPSHOT", UDim2.new(0.5, -4, 0, 36), false)
+UI.AutoTraderCopyDebug.Position = UDim2.new(0.5, 4, 0, 206)
 UI.AutoTraderCopyDebug.TextColor3 = THEME.blue
-UI.AutoTraderCopyDebug.ZIndex = 1452
-UI.AutoTraderReserveTitle = makeLabel(settingsPage, "INVENTORY RESERVES", 9, THEME.faint, Enum.Font.GothamBold)
-UI.AutoTraderReserveTitle.Position = UDim2.fromOffset(0, 212)
-UI.AutoTraderReserveTitle.Size = UDim2.new(1, -110, 0, 18)
-UI.AutoTraderReserveTitle.ZIndex = 1452
+UI.AutoTraderCopyDebug.ZIndex = 1454
+
+UI.AutoTraderReserveTitle = makeLabel(settingsPage, "INVENTORY RESERVES", 10, Color3.fromRGB(190, 228, 244), Enum.Font.GothamBold)
+UI.AutoTraderReserveTitle.Position = UDim2.fromOffset(4, 254)
+UI.AutoTraderReserveTitle.Size = UDim2.new(1, -120, 0, 18)
+UI.AutoTraderReserveTitle.ZIndex = 1454
 UI.AutoTraderReserveCount = makeLabel(settingsPage, "0 reserves", 9, THEME.muted, Enum.Font.GothamMedium)
-UI.AutoTraderReserveCount.Position = UDim2.new(1, -110, 0, 212)
-UI.AutoTraderReserveCount.Size = UDim2.fromOffset(110, 18)
+UI.AutoTraderReserveCount.Position = UDim2.new(1, -116, 0, 254)
+UI.AutoTraderReserveCount.Size = UDim2.fromOffset(112, 18)
 UI.AutoTraderReserveCount.TextXAlignment = Enum.TextXAlignment.Right
-UI.AutoTraderReserveCount.ZIndex = 1452
+UI.AutoTraderReserveCount.ZIndex = 1454
+
 UI.AutoTraderSearch = create("TextBox", {
-    Position = UDim2.fromOffset(0, 235),
-    Size = UDim2.new(1, 0, 0, 31),
-    BackgroundColor3 = THEME.panel2,
+    Position = UDim2.fromOffset(0, 278),
+    Size = UDim2.new(1, 0, 0, 32),
+    BackgroundColor3 = Color3.fromRGB(14, 63, 91),
     BorderSizePixel = 0,
-    PlaceholderText = "Search inventory to set reserve counts...",
+    PlaceholderText = "Search your inventory and choose how many copies to keep...",
     PlaceholderColor3 = THEME.faint,
     Text = "",
     TextColor3 = THEME.text,
@@ -13719,47 +14002,89 @@ UI.AutoTraderSearch = create("TextBox", {
     Font = Enum.Font.Gotham,
     ClearTextOnFocus = false,
     TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 1452,
+    ZIndex = 1454,
 }, settingsPage)
-addCorner(UI.AutoTraderSearch, 7)
+addCorner(UI.AutoTraderSearch, 4)
+aeroStroke(UI.AutoTraderSearch, THEME.border, 0.3)
+
 UI.AutoTraderReserveScroll = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(0, 274),
-    Size = UDim2.new(1, 0, 1, -274),
-    BackgroundColor3 = THEME.panel,
+    Position = UDim2.fromOffset(0, 318),
+    Size = UDim2.new(1, 0, 1, -318),
+    BackgroundColor3 = Color3.fromRGB(8, 48, 74),
     BorderSizePixel = 0,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
     CanvasSize = UDim2.fromOffset(0, 0),
-    ScrollBarThickness = 3,
-    ScrollBarImageColor3 = THEME.border,
-    ZIndex = 1452,
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = Color3.fromRGB(91, 174, 214),
+    ZIndex = 1454,
 }, settingsPage)
-addCorner(UI.AutoTraderReserveScroll, 8)
-UI.AutoTraderReserveContent = create("Frame", {Size = UDim2.new(1, -7, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 1453}, UI.AutoTraderReserveScroll)
+addCorner(UI.AutoTraderReserveScroll, 4)
+aeroStroke(UI.AutoTraderReserveScroll, THEME.border, 0.3)
+UI.AutoTraderReserveContent = create("Frame", {
+    Size = UDim2.new(1, -7, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 1455,
+}, UI.AutoTraderReserveScroll)
 UI.AutoTraderReserveLayout = create("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder}, UI.AutoTraderReserveContent)
-UI.AutoTraderReservePadding = create("UIPadding", {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)}, UI.AutoTraderReserveContent)
+UI.AutoTraderReservePadding = create("UIPadding", {
+    PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5),
+    PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5)
+}, UI.AutoTraderReserveContent)
 
 local function setActiveAutoTraderTab(tabName)
-    tabName = UI.AutoTraderPages[tabName] and tabName or "OVERVIEW"
+    tabName = UI.AutoTraderPages[tabName] and tabName or "HOME"
     State.AutoTrader.ActiveTab = tabName
-    for name, page in pairs(UI.AutoTraderPages) do page.Visible = name == tabName end
+    for name, page in pairs(UI.AutoTraderPages) do
+        page.Visible = name == tabName
+    end
     for name, button in pairs(UI.AutoTraderTabButtons) do
         local active = name == tabName
-        button.BackgroundColor3 = active and Color3.fromRGB(35, 52, 70) or THEME.panel2
-        button.TextColor3 = active and THEME.blue or THEME.muted
+        button.BackgroundColor3 = active and AERO.selectedBottom or Color3.fromRGB(11, 65, 99)
+        button.TextColor3 = active and THEME.text or THEME.muted
+        local gradient = button:FindFirstChildOfClass("UIGradient")
+        if active then
+            if not gradient then
+                gradient = aeroGradient(button, AERO.selectedTop, AERO.selectedBottom, 90)
+            else
+                gradient.Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, AERO.selectedTop),
+                    ColorSequenceKeypoint.new(1, AERO.selectedBottom),
+                })
+            end
+        elseif gradient then
+            gradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(18, 78, 112)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(9, 55, 87)),
+            })
+        end
     end
     if State.AutoTrader.Render then State.AutoTrader.Render() end
 end
 for name, button in pairs(UI.AutoTraderTabButtons) do
     local tabName = name
-    connect(button.MouseButton1Click, function() setActiveAutoTraderTab(tabName) end)
+    connect(button.MouseButton1Click, function()
+        setActiveAutoTraderTab(tabName)
+    end)
 end
-setActiveAutoTraderTab(State.AutoTrader.ActiveTab or "OVERVIEW")
+setActiveAutoTraderTab(State.AutoTrader.ActiveTab or "HOME")
 
 State.AutoTrader.UpdateControls = function()
     local prefs = State.AutoTrader.Preferences
-    UI.AutoTraderEnabled.Text = prefs.automation and "FULL AUTO TRADING: ON" or "FULL AUTO TRADING: OFF"
+    UI.AutoTraderEnabled.Text = prefs.automation and "AUTOMATION IS RUNNING" or "AUTOMATION IS STOPPED"
     UI.AutoTraderEnabled.TextColor3 = prefs.automation and THEME.green or THEME.yellow
-    UI.AutoTraderEnabled.BackgroundColor3 = prefs.automation and Color3.fromRGB(30, 55, 43) or THEME.panel2
+    UI.AutoTraderEnabled.BackgroundColor3 = prefs.automation and Color3.fromRGB(48, 121, 57) or Color3.fromRGB(16, 68, 99)
+    local automationGradient = UI.AutoTraderEnabled:FindFirstChildOfClass("UIGradient")
+    if automationGradient then
+        automationGradient.Color = prefs.automation and ColorSequence.new({
+            ColorSequenceKeypoint.new(0, AERO.greenTop),
+            ColorSequenceKeypoint.new(1, AERO.greenBottom),
+        }) or ColorSequence.new({
+            ColorSequenceKeypoint.new(0, AERO.buttonTop),
+            ColorSequenceKeypoint.new(1, AERO.buttonBottom),
+        })
+    end
     UI.AutoTraderIgnoreFriends.Text = prefs.ignoreFriends and "Ignore Friends: ON" or "Ignore Friends: OFF"
     UI.AutoTraderIgnoreFriends.TextColor3 = prefs.ignoreFriends and THEME.green or THEME.muted
     UI.AutoTraderOpeningAnchor.Text = prefs.openingAnchor and "Opening Anchor: ON" or "Opening Anchor: OFF"
@@ -13796,7 +14121,7 @@ State.AutoTrader.RebuildReserveList = function()
             shown += 1
             local reserve = State.AutoTrader.GetReserve(entry.itemType, entry.itemId)
             local row = create("Frame", {Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = reserve > 0 and Color3.fromRGB(47, 37, 42) or THEME.panel2, BorderSizePixel = 0, ZIndex = 1453}, UI.AutoTraderReserveContent)
-            addCorner(row, 6)
+            addCorner(row, 4)
             local label = makeLabel(row, entry.name .. " x" .. tostring(entry.quantity) .. " · " .. formatCompact(entry.unitValue), 9, reserve > 0 and THEME.text or THEME.muted, Enum.Font.GothamMedium)
             label.Position = UDim2.fromOffset(8, 0); label.Size = UDim2.new(1, -122, 1, 0); label.TextTruncate = Enum.TextTruncate.AtEnd; label.ZIndex = 1454
             local minus = makeButton(row, "−", UDim2.fromOffset(25, 23), THEME.panel3); minus.Position = UDim2.new(1, -112, 0.5, -11); minus.TextColor3 = THEME.yellow; minus.ZIndex = 1454
@@ -13866,6 +14191,8 @@ State.AutoTrader.RebuildPlayerDashboard = function()
         local p = info.player
         local row = makeButton(UI.AutoTraderPlayerContent, "", UDim2.new(1, 0, 0, 44), THEME.panel2)
         row.LayoutOrder = index; row.ZIndex = 1454
+        aeroStroke(row, THEME.border, 0.5)
+        aeroGradient(row, AERO.cardAltTop, AERO.cardAltBottom, 90)
         local name = makeLabel(row, tostring(index) .. ". " .. p.Name, 10, p == State.AutoTrader.SelectedTarget and THEME.green or THEME.text, Enum.Font.GothamBold)
         name.Position = UDim2.fromOffset(8, 3); name.Size = UDim2.new(0.34, -8, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
         local value = makeLabel(row, "Value " .. (info.total ~= nil and formatCompact(info.total) or "?"), 9, THEME.muted, Enum.Font.GothamMedium)
@@ -13912,8 +14239,15 @@ State.AutoTrader.RebuildServerDashboard = function()
     for index, candidate in ipairs(scan.candidates) do
         if index > 24 then break end
         local safe = candidate.safeEnough == true
-        local row = create("Frame", {Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = safe and Color3.fromRGB(28, 48, 40) or THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderServerCandidateContent)
-        addCorner(row, 6)
+        local row = create("Frame", {Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = safe and Color3.fromRGB(31, 93, 67) or THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderServerCandidateContent)
+        addCorner(row, 4)
+        aeroStroke(row, safe and Color3.fromRGB(121, 207, 116) or THEME.border, 0.55)
+        aeroGradient(
+            row,
+            safe and Color3.fromRGB(39, 111, 79) or AERO.cardAltTop,
+            safe and Color3.fromRGB(20, 72, 53) or AERO.cardAltBottom,
+            90
+        )
         local id = tostring(candidate.id or "?")
         local short = #id > 12 and (string.sub(id, 1, 8) .. "…") or id
         local title = makeLabel(row, tostring(index) .. ". " .. short .. " · " .. tostring(candidate.playing or "?") .. "/" .. tostring(candidate.maxPlayers or "?"), 9, safe and THEME.green or THEME.text, Enum.Font.GothamBold)
@@ -13939,7 +14273,9 @@ State.AutoTrader.RebuildBotDashboard = function()
     local cert = State.AutoTrader.GoldBotCertification or {}
     local certTitle = makeLabel(UI.AutoTraderBotContent, "STRICT BOT CERTIFICATION", 9, THEME.faint, Enum.Font.GothamBold)
     certTitle.Size = UDim2.new(1, 0, 0, 20); certTitle.ZIndex = 1454
-    local certBox = create("Frame", {Size = UDim2.new(1, 0, 0, 62), BackgroundColor3 = THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderBotContent); addCorner(certBox, 7)
+    local certBox = create("Frame", {Size = UDim2.new(1, 0, 0, 62), BackgroundColor3 = THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderBotContent); addCorner(certBox, 4)
+    aeroStroke(certBox, THEME.border, 0.5)
+    aeroGradient(certBox, AERO.cardAltTop, AERO.cardAltBottom, 90)
     local age = cert.windowStartedAt and cert.windowStartedAt > 0 and (os.clock() - cert.windowStartedAt) or 0
     local certColor = (cert.status == "certified_learned" or cert.status == "candidate") and THEME.green or cert.status == "regular" and THEME.blue or THEME.yellow
     local headline = makeLabel(certBox, string.upper(tostring(cert.status or "waiting"))
@@ -13965,13 +14301,15 @@ State.AutoTrader.RebuildBotDashboard = function()
     end)
     for _, player in ipairs(players) do
         local _, info = State.AutoTrader.GetPlayerBotRisk(player)
-        local row = create("Frame", {Size = UDim2.new(1, 0, 0, 60), BackgroundColor3 = THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderBotContent); addCorner(row, 7)
-        local img = create("ImageLabel", {Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(player.UserId) .. "&w=150&h=150", ZIndex = 1455}, row); addCorner(img, 6)
+        local row = create("Frame", {Size = UDim2.new(1, 0, 0, 60), BackgroundColor3 = THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderBotContent); addCorner(row, 4)
+        aeroStroke(row, THEME.border, 0.55)
+        aeroGradient(row, AERO.cardAltTop, AERO.cardAltBottom, 90)
+        local img = create("ImageLabel", {Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(player.UserId) .. "&w=150&h=150", ZIndex = 1455}, row); addCorner(img, 4)
         local class = info and info.class or "unknown"
         local goldJobs = tonumber(info and info.goldJobs) or 0
         local classColor = class == "confirmed_bot" and THEME.red or (class == "known_bot" or class == "observed_bot") and THEME.yellow or THEME.faint
         local name = makeLabel(row, player.Name, 10, THEME.text, Enum.Font.GothamBold); name.Position = UDim2.fromOffset(64, 6); name.Size = UDim2.new(1, -72, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
-        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict-v26 avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
+        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict learned avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 9, classColor, Enum.Font.GothamBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
         local hash = makeLabel(row, info and tostring(info.fingerprint or "") or "Press REFRESH to resolve this player's avatar hash", 8, THEME.faint, Enum.Font.Code); hash.Position = UDim2.fromOffset(64, 42); hash.Size = UDim2.new(1, -72, 0, 13); hash.TextTruncate = Enum.TextTruncate.AtEnd; hash.ZIndex = 1455
     end
 
@@ -13990,15 +14328,17 @@ State.AutoTrader.RebuildBotDashboard = function()
         return (tonumber(a.record.strictGoldBotSightings) or 0) > (tonumber(b.record.strictGoldBotSightings) or 0)
     end)
     if #learned == 0 then
-        local empty = makeLabel(UI.AutoTraderBotContent, "No strict v26 hashes learned yet. Legacy evidence is preserved locally, but server filtering uses only strict departure-committed persistent MoveDirection hashes.", 9, THEME.faint, Enum.Font.Gotham)
+        local empty = makeLabel(UI.AutoTraderBotContent, "No strict learned hashes yet. Legacy evidence is preserved locally, but server filtering uses only strict departure-committed persistent MoveDirection hashes.", 9, THEME.faint, Enum.Font.Gotham)
         empty.Size = UDim2.new(1, 0, 0, 36); empty.TextWrapped = true; empty.ZIndex = 1454
     end
     for index, info in ipairs(learned) do
         if index > 30 then break end
         local r = info.record
-        local row = create("Frame", {Size = UDim2.new(1, 0, 0, 60), BackgroundColor3 = THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderBotContent); addCorner(row, 7)
+        local row = create("Frame", {Size = UDim2.new(1, 0, 0, 60), BackgroundColor3 = THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderBotContent); addCorner(row, 4)
+        aeroStroke(row, THEME.border, 0.55)
+        aeroGradient(row, AERO.cardAltTop, AERO.cardAltBottom, 90)
         if tonumber(r.sampleUserId) then
-            local img = create("ImageLabel", {Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(math.floor(r.sampleUserId)) .. "&w=150&h=150", ZIndex = 1455}, row); addCorner(img, 6)
+            local img = create("ImageLabel", {Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(math.floor(r.sampleUserId)) .. "&w=150&h=150", ZIndex = 1455}, row); addCorner(img, 4)
         end
         local classColor = info.class == "confirmed_bot" and THEME.red or THEME.yellow
         local title = makeLabel(row, (r.sampleName and (r.sampleName .. " · ") or "") .. string.upper(info.class), 9, classColor, Enum.Font.GothamBold); title.Position = UDim2.fromOffset(64, 6); title.Size = UDim2.new(1, -72, 0, 17); title.TextTruncate = Enum.TextTruncate.AtEnd; title.ZIndex = 1455
@@ -14182,10 +14522,16 @@ State.AutoTrader.Render = function()
     end
 
     if UI.AutoTraderPanel.Visible then
-        if State.AutoTrader.ActiveTab == "PLAYERS" then State.AutoTrader.RebuildPlayerDashboard()
-        elseif State.AutoTrader.ActiveTab == "SERVERS" then State.AutoTrader.RebuildServerDashboard()
-        elseif State.AutoTrader.ActiveTab == "BOTS" then State.AutoTrader.RebuildBotDashboard()
-        elseif State.AutoTrader.ActiveTab == "SETTINGS" and UI.AutoTraderReserveContent and #UI.AutoTraderReserveContent:GetChildren() <= 2 then State.AutoTrader.RebuildReserveList() end
+        if State.AutoTrader.ActiveTab == "PEOPLE" then
+            State.AutoTrader.RebuildPlayerDashboard()
+        elseif State.AutoTrader.ActiveTab == "SERVERS" then
+            State.AutoTrader.RebuildServerDashboard()
+            State.AutoTrader.RebuildBotDashboard()
+        elseif State.AutoTrader.ActiveTab == "SETTINGS"
+            and UI.AutoTraderReserveContent
+            and #UI.AutoTraderReserveContent:GetChildren() <= 2 then
+            State.AutoTrader.RebuildReserveList()
+        end
     end
 end
 

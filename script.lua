@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.65.5-public-auto-trader-v33-teleport-startup-wait",
+    version = "18.65.6-public-auto-trader-v33-teleport-handoff-fix",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -146,7 +146,7 @@ local CONFIG = {
     AutoTraderBootstrapInitialRetrySeconds = 2,
     AutoTraderBootstrapMaxRetrySeconds = 30,
     AutoTraderBootstrapHttpAttemptTimeoutSeconds = 10,
-    AutoTraderBootstrapExecutionTimeoutSeconds = 60,
+    AutoTraderBootstrapExecutionTimeoutSeconds = 75,
     AutoTraderPlannerBucketFrontier = 10000,
     AutoTraderPlannerYieldBudgetMs = 4,
     AutoTraderRecoverySameReasonCooldownSeconds = 8,
@@ -230,7 +230,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V33",
-    distributionNormalizedSha256 = "43a1e6e450fb5073bfc8a11757e53a366c03e4c320ef75fa037749d2d6557728",
+    distributionNormalizedSha256 = "9c8fd7d717a21d1350432f53d2de21d48bc7829268619f4630e9beb650c70c35",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -277,8 +277,9 @@ pcall(function()
 end)
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
-    -- queue_on_teleport may execute before Roblox has published Players.LocalPlayer.
-    -- Treat that as transient startup ordering, not a fatal controller error.
+    -- Direct execution can still happen before Roblox has published Players.LocalPlayer.
+    -- The teleport bootstrap now gates on game:IsLoaded()/LocalPlayer/PlayerGui first,
+    -- but keep this bounded fallback for executor-specific startup ordering.
     local deadline = os.clock() + math.max(1, tonumber(CONFIG.AutoTraderStartupPlayerGuiTimeoutSeconds) or 20)
     while not LocalPlayer and os.clock() < deadline do
         task.wait(0.05)
@@ -8892,13 +8893,14 @@ local function S(m)
  if type(m)~='string' or type(bit32)~='table' then return nil end
  local B,X,N,R,Q=bit32.band,bit32.bxor,bit32.bnot,bit32.rshift,bit32.rrotate
  local h0,h1,h2,h3,h4,h5,h6,h7=0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+ local bc=0;local yt=os.clock();local function Y()bc=bc+1;if bc>=64 and os.clock()-yt>=.003 then bc=0;task.wait();yt=os.clock() end end
  local function P(s,o)
   local w={}
   for i=0,15 do local j=o+i*4;local a,b,c,d=string.byte(s,j,j+3);if d==nil then return false end;w[i]=a*16777216+b*65536+c*256+d end
   for i=16,63 do local a=X(Q(w[i-15],7),Q(w[i-15],18),R(w[i-15],3));local z=X(Q(w[i-2],17),Q(w[i-2],19),R(w[i-2],10));w[i]=B(w[i-16]+a+w[i-7]+z,0xffffffff) end
   local a,b,c,d,e,f,g,h=h0,h1,h2,h3,h4,h5,h6,h7
   for i=0,63 do local s1=X(Q(e,6),Q(e,11),Q(e,25));local ch=X(B(e,f),B(N(e),g));local t1=B(h+s1+ch+K[i+1]+w[i],0xffffffff);local s0=X(Q(a,2),Q(a,13),Q(a,22));local maj=X(B(a,b),B(a,c),B(b,c));local t2=B(s0+maj,0xffffffff);h,g,f,e,d,c,b,a=g,f,e,B(d+t1,0xffffffff),c,b,a,B(t1+t2,0xffffffff) end
-  h0,h1,h2,h3,h4,h5,h6,h7=B(h0+a,0xffffffff),B(h1+b,0xffffffff),B(h2+c,0xffffffff),B(h3+d,0xffffffff),B(h4+e,0xffffffff),B(h5+f,0xffffffff),B(h6+g,0xffffffff),B(h7+h,0xffffffff);return true
+  h0,h1,h2,h3,h4,h5,h6,h7=B(h0+a,0xffffffff),B(h1+b,0xffffffff),B(h2+c,0xffffffff),B(h3+d,0xffffffff),B(h4+e,0xffffffff),B(h5+f,0xffffffff),B(h6+g,0xffffffff),B(h7+h,0xffffffff);Y();return true
  end
  local n=#m;local q=n-(n%64);for o=1,q,64 do if not P(m,o) then return nil end end
  local L=n*8;local hi=math.floor(L/4294967296);local lo=L%4294967296
@@ -8950,6 +8952,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
     return table.concat({
         "local H=game:GetService('HttpService')",
         "local E=(getgenv and getgenv()) or _G",
+        "local PLS=game:GetService('Players'); local D=os.clock()+60; while (not game:IsLoaded() or not PLS.LocalPlayer) and os.clock()<D do task.wait(.1) end; if not game:IsLoaded() or not PLS.LocalPlayer then warn('[SV bootstrap] destination did not finish loading inside startup window'); return end; local PG=PLS.LocalPlayer:FindFirstChildOfClass('PlayerGui') or PLS.LocalPlayer:WaitForChild('PlayerGui',20); if not PG then warn('[SV bootstrap] destination PlayerGui unavailable after load'); return end; task.wait(1.5)",
         "local B=H:JSONDecode(" .. quotedJson .. ")",
         "local T=E.__SV_AUTO_TRADER_BOOTSTRAP_IDS or {}; local A=T.latest; if type(A)=='table' and tonumber(A.order or 0)>tonumber(B.issuedOrder or 0) then return end; if type(A)=='table' and A.id==B.bootstrapId and A.started then return end; T.latest={id=B.bootstrapId,order=B.issuedOrder,issuedAt=B.issuedAtUnix,started=true}; E.__SV_AUTO_TRADER_BOOTSTRAP_IDS=T; _G.__SV_AUTO_TRADER_BOOTSTRAP_IDS=T",
         "E[" .. quotedKey .. "]=B; _G[" .. quotedKey .. "]=B",
@@ -8981,7 +8984,8 @@ State.AutoTrader.QueueTeleportScript = function(reason)
         State.AutoTrader.FlushTargetStats()
         State.AutoTrader.SavePreferences()
         State.AutoTrader.FlushDiskDebugLog()
-        State.AutoTrader.RefreshTeleportScriptLkg()
+        -- Do not fetch/hash the controller here. Teleport handoff is latency-sensitive,
+        -- and the destination bootstrap can use the already-verified LKG or fetch after load.
     end)
     local code, buildError = State.AutoTrader.BuildTeleportBootstrapCode(reason, true)
     if not code then return false, buildError end

@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.68.8-public-auto-trader-v36-rc8-async-supreme-publish",
+    version = "18.69.18-public-auto-trader-v37-round19-preflight-fixture-deploy-candidate",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -173,6 +173,13 @@ local CONFIG = {
     AutoTraderIncomingActionMaxRounds = 2,
     AutoTraderTradeTransportRecoveryFailures = 3,
     AutoTraderThumbnailBatchSize = 100,
+    -- v37 runtime: Roblox HTTPS thumbnail URLs are canonical evidence but may not
+    -- render directly in executor ImageLabels. Display transport falls back to the
+    -- exact same bytes through a bounded custom-asset cache without changing evidence.
+    AutoTraderUpcomingThumbnailRawWaitSeconds = 1.25,
+    AutoTraderUpcomingThumbnailRetrySeconds = 20,
+    AutoTraderUpcomingThumbnailMaxBytes = 4 * 1024 * 1024,
+    AutoTraderUpcomingThumbnailCacheLimit = 240,
     -- v34 bot architecture: current-server evidence MAY force a fast escape, but
     -- automated permanent learning remains stricter: only a physically certified
     -- 100%-of-current-remotes bot server may add automated trusted hashes.
@@ -223,6 +230,16 @@ local CONFIG = {
     AutoTraderBotDatabaseJobsPerIcon = 64,
     AutoTraderRecentServerTtlSeconds = 1200,
     AutoTraderRecentServerLimit = 30,
+    -- v37: owner-marked candidate JobIds are temporarily excluded independently of RecentJobs.
+    AutoTraderManualBotServerJobTtlSeconds = 3600,
+    AutoTraderUpcomingServerUiLimit = 12,
+    AutoTraderUpcomingServerPreviewIconLimit = 5,
+    AutoTraderUpcomingThumbnailPrefetchConcurrency = 5,
+    AutoTraderRequestedServerPreviewMaxJobIds = 30,
+    AutoTraderRequestedServerPreviewHintFreshSeconds = 120,
+    AutoTraderCompanionSelectorRowFreshSeconds = 90,
+    AutoTraderCompanionPrimaryPreclassifyLimit = 80,
+    AutoTraderUpcomingThumbnailDisplaySize = "48x48",
     AutoTraderMovementWatchdogEnabled = true,
     AutoTraderMovementTimeoutSeconds = 20,
     AutoTraderMovementJoinGraceSeconds = 25,
@@ -255,8 +272,8 @@ local CONFIG = {
 }
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
-    supportFormat = "SV_AUTO_TRADER_SUPPORT_V36",
-    distributionNormalizedSha256 = "d6260d0b419c39ced355392cf19933ab459261108dcaac0f7c01fc4809614e53",
+    supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
+    distributionNormalizedSha256 = "f5bc1e66834f83409f203c3c9cf2f7aebfe464d8a13919ebf31b1e5e91ebb043",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -280,7 +297,15 @@ local function validateConfigRelationships()
     need(CONFIG.AutoTraderSuspectedBotHopRatio > 0 and CONFIG.AutoTraderSuspectedBotHopRatio <= 1, "suspected bot-server hop ratio is invalid")
     need(CONFIG.AutoTraderSuspectedBotHopMinPassed >= CONFIG.AutoTraderGoldMinRemotePlayers, "suspected bot-server minimum evidence is too small")
     need(CONFIG.AutoTraderIncomingActionAckSeconds > 0 and CONFIG.AutoTraderIncomingActionMaxRounds >= 1, "incoming trade acknowledgement policy is invalid")
+    need(CONFIG.AutoTraderUpcomingThumbnailPrefetchConcurrency >= 1 and CONFIG.AutoTraderUpcomingThumbnailPrefetchConcurrency <= 6, "thumbnail prefetch concurrency must be between 1 and 6")
+    need(CONFIG.AutoTraderRequestedServerPreviewMaxJobIds >= 1 and CONFIG.AutoTraderRequestedServerPreviewMaxJobIds <= 30, "requested server preview hint limit must be between 1 and 30")
+    need(CONFIG.AutoTraderCompanionSelectorRowFreshSeconds >= 15 and CONFIG.AutoTraderCompanionSelectorRowFreshSeconds <= CONFIG.AutoTraderServerCandidateCacheTtlSeconds, "companion selector row freshness must be bounded by selector cache TTL")
+    need(CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit >= CONFIG.AutoTraderServerQueueLimit and CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit <= 100, "companion preclassification pool must cover the queue and remain bounded")
+    need(CONFIG.AutoTraderUpcomingThumbnailDisplaySize == "48x48", "Round-14 display thumbnail size must remain 48x48")
     need(CONFIG.AutoTraderTradeTransportRecoveryFailures >= 1, "trade transport recovery threshold is invalid")
+    need(CONFIG.AutoTraderManualBotServerJobTtlSeconds > 0, "manual bot-server JobId TTL must be positive")
+    need(CONFIG.AutoTraderUpcomingServerUiLimit >= 1 and CONFIG.AutoTraderUpcomingServerUiLimit <= 30, "upcoming server UI limit is invalid")
+    need(CONFIG.AutoTraderUpcomingServerPreviewIconLimit >= 1 and CONFIG.AutoTraderUpcomingServerPreviewIconLimit <= 8, "upcoming server icon limit is invalid")
     need(CONFIG.AutoTraderSessionHistoryLimit >= 1 and CONFIG.AutoTraderSessionEventLimit >= 8, "session history limits are invalid")
     need(CONFIG.RemoteTimeoutSeconds > 0 and CONFIG.AutoTraderHttpTimeoutSeconds > 0, "remote/http timeouts must be positive")
     need(CONFIG.AutoTraderBootstrapMaxAttempts > 0 and CONFIG.AutoTraderBootstrapInitialRetrySeconds > 0, "bootstrap retry policy is invalid")
@@ -419,7 +444,7 @@ HARDEN.sha256K = {
     0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
 }
-local function sha256Hex(message, cooperative)
+local function sha256Hex(message, cooperative, isCurrent)
     -- Large Supreme payloads are hashed cooperatively so pure-Luau SHA does not
     -- monopolize the VM for many seconds. Small integrity checks stay synchronous.
     if type(message) ~= "string" or type(bit32) ~= "table" then return nil, 0, 0 end
@@ -431,17 +456,19 @@ local function sha256Hex(message, cooperative)
     local band, bxor, bnot, rshift, rrotate = bit32.band, bit32.bxor, bit32.bnot, bit32.rshift, bit32.rrotate
     local h0,h1,h2,h3,h4,h5,h6,h7 = 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
     local function maybeYield()
-        if not yieldEnabled then return end
+        if type(isCurrent) == "function" and isCurrent() ~= true then return false end
+        if not yieldEnabled then return true end
         blocksSinceYield += 1
-        -- RC8: 64 blocks was only 4 KiB, which forced thousands of Heartbeat
-        -- waits on the ~13.7 MB Supreme JSON. Keep hashing cooperative without
-        -- turning verification into a minute-long scheduler delay.
+        -- v37: keep RC8's coarse cooperative cadence, but allow a superseded
+        -- database body to stop consuming CPU as soon as a newer revision wins.
         if blocksSinceYield >= 2048 and os.clock() - yieldStartedAt >= 0.003 then
             blocksSinceYield = 0
             yieldCount += 1
             RunService.Heartbeat:Wait()
             yieldStartedAt = os.clock()
+            if type(isCurrent) == "function" and isCurrent() ~= true then return false end
         end
+        return true
     end
     local function processBlock(source, offset)
         local w = {}
@@ -467,7 +494,7 @@ local function sha256Hex(message, cooperative)
             h,g,f,e,d,c,b,a = g,f,e,band(d + t1, 0xffffffff),c,b,a,band(t1 + t2, 0xffffffff)
         end
         h0,h1,h2,h3,h4,h5,h6,h7 = band(h0+a,0xffffffff),band(h1+b,0xffffffff),band(h2+c,0xffffffff),band(h3+d,0xffffffff),band(h4+e,0xffffffff),band(h5+f,0xffffffff),band(h6+g,0xffffffff),band(h7+h,0xffffffff)
-        maybeYield()
+        if maybeYield() == false then return false end
         return true
     end
     local byteLength = #message
@@ -1469,18 +1496,24 @@ local function validateSupremeCandidate(decoded, candidateCatalog, candidateDiag
     return true
 end
 local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix, verifiedDigest)
-    if type(body) ~= "string" or body == "" then return false, "empty Supreme Values body", false, nil end
-    if #body > CONFIG.SupremeJsonMaxBytes then return false, "Supreme Values JSON exceeded the configured body-size limit", false, nil end
+    HARDEN.supremePipelineStage = "BODY_RECEIVED"
+    HARDEN.supremePipelineSource = sourceLabel
+    if type(body) ~= "string" or body == "" then HARDEN.supremePipelineStage="BODY_REJECTED";return false, "empty Supreme Values body", false, nil end
+    if #body > CONFIG.SupremeJsonMaxBytes then HARDEN.supremePipelineStage="BODY_REJECTED";return false, "Supreme Values JSON exceeded the configured body-size limit", false, nil end
     if LastSupremeBody == body and SupremeDatabase then
         LastDatabaseLoad = os.time(); HARDEN.lastDatabaseVerifiedAt = tonumber(verifiedAtUnix) or HARDEN.lastDatabaseVerifiedAt or 0; DatabaseStatus = "Ready"; HARDEN.lastDatabaseSource = sourceLabel or HARDEN.lastDatabaseSource; HttpState.supremeUnchanged += 1
+        HARDEN.supremePipelineStage = HARDEN.supremeHashPending and "DATABASE_UNCHANGED_READY_HASH_PENDING" or "DATABASE_UNCHANGED_READY"
         return true, nil, false, HARDEN.supremeDataHash
     end
+    HARDEN.supremePipelineStage = "DECODING"
     local decodeOK, decoded = pcall(function() return HttpService:JSONDecode(body) end)
-    if not decodeOK then return false, "JSON decode failed: " .. tostring(decoded), false, nil end
+    if not decodeOK then HARDEN.supremePipelineStage="DECODE_FAILED";return false, "JSON decode failed: " .. tostring(decoded), false, nil end
+    HARDEN.supremePipelineStage = "INDEXING"
     local indexOK, candidateExact, candidateCanonical, candidateCatalog, candidateFast, candidateDiagnostics = pcall(buildSupremeIndex, decoded)
-    if not indexOK then return false, "The candidate database could not be indexed; keeping last-known-good values.", false, nil end
+    if not indexOK then HARDEN.supremePipelineStage="INDEX_FAILED";return false, "The candidate database could not be indexed; keeping last-known-good values.", false, nil end
+    HARDEN.supremePipelineStage = "SEMANTIC_VALIDATION"
     local valid, validationError = validateSupremeCandidate(decoded, candidateCatalog, candidateDiagnostics)
-    if not valid then return false, validationError, false, nil end
+    if not valid then HARDEN.supremePipelineStage="SEMANTIC_VALIDATION_FAILED";return false, validationError, false, nil end
 
     -- RC8: publishing the semantically validated catalog is the critical path.
     -- A live GitHub response has no externally supplied SHA to compare against,
@@ -1493,6 +1526,7 @@ local function loadSupremeFromBody(body, sourceLabel, verifiedAtUnix, verifiedDi
     HARDEN.supremeDataRevision += 1
     HARDEN.supremeDataHash = digest or ("pending:" .. tostring(HARDEN.supremeDataRevision) .. ":" .. tostring(#body))
     HARDEN.supremeHashPending = digest == nil
+    HARDEN.supremePipelineStage = digest and "DATABASE_PUBLISHED_VERIFIED" or "DATABASE_PUBLISHED_HASH_PENDING"
     if digest then
         HARDEN.lastSupremeHashYields = 0
         HARDEN.lastSupremeHashMilliseconds = 0
@@ -1515,7 +1549,8 @@ HARDEN.tryWarmStartSupremeLkg = function()
     end
     local loaded, err, changed = loadSupremeFromBody(cached.body, "disk_lkg_warm_start", cached.savedAtUnix, cached.sha256)
     HARDEN.supremeWarmStartUsed = loaded == true
-    HARDEN.supremeWarmStartError = loaded and nil or tostring(err or "disk LKG rejected")
+    HARDEN.supremeWarmStartError = nil
+    if not loaded then HARDEN.supremeWarmStartError = tostring(err or "disk LKG rejected") end
     HARDEN.supremeWarmStartAt = loaded and os.clock() or 0
     return loaded, err, changed
 end
@@ -1531,12 +1566,14 @@ local function fetchSupremeDatabase()
         return false, liveError, false
     end
 
+    HARDEN.supremeLiveRefreshStage = "DOWNLOAD_PENDING"
     local headers = {["Accept"] = "application/json", ["Cache-Control"] = "no-cache"}
     if HttpState.supremeETag then headers["If-None-Match"] = HttpState.supremeETag
     elseif HttpState.supremeLastModified then headers["If-Modified-Since"] = HttpState.supremeLastModified end
     local requestOK, response, source = fetchStaticTextCompat(CONFIG.JsonUrl, headers, CONFIG.AutoTraderHttpTimeoutSeconds)
     if not requestOK then
         HttpState.errorCount += 1
+        HARDEN.supremeLiveRefreshStage = "DOWNLOAD_FAILED"
         return tryDiskLkg("HTTP error: " .. tostring(response))
     end
     if source == "request" then HttpState.requestCount += 1 elseif source == "game:HttpGet" then HttpState.gameHttpGetCount += 1 end
@@ -1547,6 +1584,7 @@ local function fetchSupremeDatabase()
             LastDatabaseLoad = os.time()
             HARDEN.lastDatabaseVerifiedAt = os.time()
             DatabaseStatus = "Ready"
+            HARDEN.supremeLiveRefreshStage = HARDEN.supremeHashPending and "NOT_MODIFIED_HASH_PENDING" or "NOT_MODIFIED_READY"
             return true, nil, false
         end
         local loaded, err, changed = tryDiskLkg("HTTP 304 received before an initial database load.")
@@ -1555,60 +1593,64 @@ local function fetchSupremeDatabase()
         return false, err, false
     end
     if response.Success ~= true then
+        HARDEN.supremeLiveRefreshStage = "HTTP_FAILED"
         return tryDiskLkg(string.format("HTTP %s %s", tostring(response.StatusCode or "?"), tostring(response.StatusMessage or "request failed")))
     end
     local body = response.Body
-    if type(body) ~= "string" or body == "" then return tryDiskLkg("GitHub returned an empty response body; keeping last-known-good values.") end
-    if #body > CONFIG.SupremeJsonMaxBytes then return tryDiskLkg("Supreme Values JSON exceeded the configured body-size limit") end
+    HARDEN.supremeLiveRefreshStage = "BODY_RECEIVED"
+    if type(body) ~= "string" or body == "" then HARDEN.supremeLiveRefreshStage="BODY_INVALID";return tryDiskLkg("GitHub returned an empty response body; keeping last-known-good values.") end
+    if #body > CONFIG.SupremeJsonMaxBytes then HARDEN.supremeLiveRefreshStage="BODY_INVALID";return tryDiskLkg("Supreme Values JSON exceeded the configured body-size limit") end
     HttpState.fullDownloadCount += 1
     HttpState.downloadedBytes += #body
     local candidateETag = getResponseHeader(response, "etag")
     local candidateLastModified = getResponseHeader(response, "last-modified")
     local loaded, err, changed, digest = loadSupremeFromBody(body, "live_" .. tostring(source or "http"), os.time())
-    if not loaded then return tryDiskLkg(err) end
+    if not loaded then HARDEN.supremeLiveRefreshStage="CANDIDATE_REJECTED";return tryDiskLkg(err) end
+    HARDEN.supremeLiveRefreshStage = digest and "PUBLISHED_VERIFIED" or (changed and "PUBLISHED_HASH_PENDING" or "UNCHANGED")
     -- Commit validators only after decode/index/semantic validation succeeded.
     HttpState.supremeETag = candidateETag
     HttpState.supremeLastModified = candidateLastModified
     if changed then
         local publishedRevision = HARDEN.supremeDataRevision
-        if digest and HARDEN.writeLkgEnvelope then
-            task.spawn(function()
-                if Destroyed or LastSupremeBody ~= body or HARDEN.supremeDataRevision ~= publishedRevision then return end
-                local okWrite, writeErr = HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body, digest)
-                if not okWrite then warn("[SV Public] Supreme LKG write failed:", writeErr) end
-            end)
+        if digest and HARDEN.queueSupremeLkgPersistence then
+            HARDEN.queueSupremeLkgPersistence(body,digest,publishedRevision,"verified_publish")
         elseif not digest then
             -- Hash and persist after publication. The first yield occurs inside
             -- SHA, so inventory discovery can start from the validated catalog
             -- before the expensive pure-Luau digest finishes.
+            HARDEN.supremeBackgroundHashRevision = publishedRevision
             HARDEN.supremeBackgroundHashStartedAt = os.clock()
             HARDEN.supremeBackgroundHashFinishedAt = 0
             HARDEN.supremeBackgroundHashError = nil
+            HARDEN.supremeLiveRefreshStage = "BACKGROUND_HASH_PENDING"
             task.defer(function()
-                local computedDigest, hashYields, hashMilliseconds = sha256Hex(body, true)
+                local function bodyRevisionStillCurrent()
+                    return not Destroyed and LastSupremeBody == body and HARDEN.supremeDataRevision == publishedRevision
+                end
+                local function hashStillCurrent() return bodyRevisionStillCurrent() and HARDEN.supremeHashPending == true end
+                local computedDigest, hashYields, hashMilliseconds = sha256Hex(body, true, hashStillCurrent)
+                -- v37: a superseded task publishes nothing at all—not the digest, LKG,
+                -- timing counters, or an error that would be misattributed to body B.
+                if not hashStillCurrent() then return end
                 HARDEN.lastSupremeHashYields = tonumber(hashYields) or 0
                 HARDEN.lastSupremeHashMilliseconds = tonumber(hashMilliseconds) or 0
                 HARDEN.supremeBackgroundHashFinishedAt = os.clock()
                 if not computedDigest then
                     HARDEN.supremeBackgroundHashError = "SHA-256 unavailable for Supreme Values body"
-                    return
-                end
-                if Destroyed or LastSupremeBody ~= body or HARDEN.supremeDataRevision ~= publishedRevision then
+                    HARDEN.supremeLiveRefreshStage = "BACKGROUND_HASH_FAILED"
                     return
                 end
                 HARDEN.supremeDataHash = computedDigest
                 HARDEN.supremeHashPending = false
-                if HARDEN.writeLkgEnvelope then
-                    local okWrite, writeErr = HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile, body, computedDigest)
-                    if not okWrite then
-                        HARDEN.supremeBackgroundHashError = tostring(writeErr or "LKG write failed")
-                        warn("[SV Public] Supreme LKG write failed:", writeErr)
-                    end
+                HARDEN.supremePipelineStage = "DATABASE_READY_HASHED"
+                HARDEN.supremeLiveRefreshStage = "BACKGROUND_HASH_COMPLETE"
+                if HARDEN.queueSupremeLkgPersistence then
+                    HARDEN.queueSupremeLkgPersistence(body,computedDigest,publishedRevision,"background_hash")
                 end
                 -- The content did not change, but replacing the provisional
                 -- cache identity with its real digest invalidates any plan
                 -- captured while hashing was still pending.
-                if not Destroyed and HARDEN.refreshResolvedViews then
+                if bodyRevisionStillCurrent() and HARDEN.refreshResolvedViews then
                     HARDEN.refreshResolvedViews(false)
                 end
             end)
@@ -1633,7 +1675,8 @@ local function ensureSupremeDatabase(force)
                 HARDEN.supremeBackgroundRefreshStartedAt = os.clock()
                 local liveOK, liveError, liveChanged = fetchSupremeDatabase()
                 HARDEN.supremeBackgroundRefreshFinishedAt = os.clock()
-                HARDEN.supremeBackgroundRefreshError = liveOK and nil or tostring(liveError or "refresh failed")
+                HARDEN.supremeBackgroundRefreshError = nil
+                if not liveOK then HARDEN.supremeBackgroundRefreshError = tostring(liveError or "refresh failed") end
                 if liveChanged and not Destroyed and HARDEN.refreshResolvedViews then
                     HARDEN.refreshResolvedViews(false)
                 end
@@ -4782,10 +4825,7 @@ local function resolveGameItem(itemId, itemType, displayName, identityHint)
             second
             and second.score
             or nil,
-        margin =
-            margin == math.huge
-            and nil
-            or margin,
+        margin = margin,
         preferredCategory =
             preferredCategory,
         weaponKind =
@@ -4826,6 +4866,7 @@ local function resolveGameItem(itemId, itemType, displayName, identityHint)
         suggestedCategory =
             best.record.category,
     }
+    if meta.margin == math.huge then meta.margin = nil end
     if CONFIG.ConservativeResolution
         and not trusted then
         meta.reason =
@@ -7020,7 +7061,8 @@ local function notePersistence(fileName, ok, action, err)
     row.lastAction = action
     row.lastAtUnix = os.time()
     row.ok = ok == true
-    row.error = ok and nil or tostring(err or "unknown persistence error")
+    row.error = nil
+    if not ok then row.error = tostring(err or "unknown persistence error") end
     HARDEN.persistenceHealth.files[fileName] = row
     if ok then HARDEN.persistenceHealth.lastSaveUnix = os.time() else HARDEN.persistenceHealth.lastError = row.error end
 end
@@ -7227,28 +7269,100 @@ HARDEN.readLkgEnvelope = function(fileName)
     end
     return nil, validationError or readError or "invalid LKG envelope"
 end
-HARDEN.writeLkgEnvelope = function(fileName, body, knownDigest)
+HARDEN.supremeLkgWriteState = HARDEN.supremeLkgWriteState or {busy=false,serial=0}
+HARDEN.writeLkgEnvelope = function(fileName, body, knownDigest, stillCurrent)
     if type(body) ~= "string" then return false, "invalid LKG body" end
     local digest = type(knownDigest) == "string" and knownDigest or nil
     if not digest then digest = sha256Hex(body, fileName == HARDEN.supremeLkgFile) end
     if not digest then return false, "SHA-256 unavailable for LKG write" end
     if fileName == HARDEN.supremeLkgFile then
+        local state=HARDEN.supremeLkgWriteState
+        if state.busy then return false,"Supreme LKG transaction already in progress" end
+        state.busy=true;state.serial+=1;local serial=state.serial;state.startedAt=os.clock()
+        local function release() if state.serial==serial then state.busy=false;state.finishedAt=os.clock() end end
+        local function current()
+            if type(stillCurrent)~="function" then return true end
+            local ok,value=pcall(stillCurrent);return ok and value==true
+        end
+        local function finish(ok,err) release();return ok,err end
+        if not current() then return finish(false,"Supreme LKG write superseded before body commit") end
         -- Store the huge Supreme JSON as raw bytes and keep only tiny integrity metadata in JSON.
-        -- Body first, metadata second: metadata is the commit point, and the reader can pair backups
-        -- by digest if a shutdown interrupts between the two writes.
+        -- Body first, metadata second. The full transaction is serialized, and the caller's
+        -- body/revision predicate is rechecked immediately before the metadata commit point.
         local bodyOK, bodyErr = HARDEN.atomicWriteTextFileBestEffort(HARDEN.supremeLkgFile, body)
-        if not bodyOK then return false, bodyErr end
+        if not bodyOK then return finish(false,bodyErr) end
+        if not current() then return finish(false,"Supreme LKG write superseded before metadata commit") end
         local okMeta, encodedMeta = pcall(function() return HttpService:JSONEncode({
             version = 2, savedAtUnix = os.time(), sha256 = digest, controllerVersion = CONTROLLER_VERSION,
         }) end)
-        if not okMeta then return false, encodedMeta end
-        return HARDEN.atomicWriteTextFileBestEffort(HARDEN.supremeLkgMetaFile, encodedMeta)
+        if not okMeta then return finish(false,encodedMeta) end
+        if not current() then return finish(false,"Supreme LKG write superseded at metadata commit point") end
+        local metaOK,metaErr=HARDEN.atomicWriteTextFileBestEffort(HARDEN.supremeLkgMetaFile, encodedMeta)
+        if not metaOK then return finish(false,metaErr) end
+        if not current() then return finish(false,"Supreme LKG authority changed immediately after metadata commit") end
+        return finish(true,nil)
     end
     local ok, encoded = pcall(function() return HttpService:JSONEncode({
         version = 1, savedAtUnix = os.time(), sha256 = digest, body = body, controllerVersion = CONTROLLER_VERSION,
     }) end)
     if not ok then return false, encoded end
     return HARDEN.atomicWriteTextFileBestEffort(fileName, encoded)
+end
+-- v37 reviewer fix: all Supreme LKG persistence is funneled through one worker. If body A
+-- is superseded while its executor file operation is still completing, body B becomes the
+-- desired write and is persisted immediately after A releases the transaction.
+HARDEN.supremeLkgPersistenceState = HARDEN.supremeLkgPersistenceState or {generation=0,workerRunning=false}
+HARDEN.IsRetryableSupremeLkgPersistenceError = function(err)
+    local text = string.lower(tostring(err or ""))
+    return text:find("already in progress",1,true) ~= nil
+        or text:find("still unresolved",1,true) ~= nil
+        or text:find("transaction already in progress",1,true) ~= nil
+end
+HARDEN.queueSupremeLkgPersistence = function(body,digest,revision,source)
+    if type(body)~="string" or type(digest)~="string" or type(revision)~="number" then return false,"invalid Supreme LKG persistence request" end
+    local state=HARDEN.supremeLkgPersistenceState
+    state.generation+=1
+    state.desired={generation=state.generation,body=body,digest=digest,revision=revision,source=tostring(source or "unknown"),queuedAt=os.clock()}
+    if state.workerRunning then return true end
+    state.workerRunning=true
+    task.spawn(function()
+        while not Destroyed do
+            local request=state.desired
+            if not request then break end
+            state.desired=nil
+            local function current() return not Destroyed and LastSupremeBody==request.body and HARDEN.supremeDataRevision==request.revision end
+            if current() then
+                state.active={generation=request.generation,revision=request.revision,source=request.source,startedAt=os.clock()}
+                local okWrite,writeErr=HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile,request.body,request.digest,current)
+                if current() then
+                    local retryable = not okWrite and HARDEN.IsRetryableSupremeLkgPersistenceError(writeErr)
+                    state.lastFinished={generation=request.generation,revision=request.revision,source=request.source,ok=okWrite==true,error=nil,retryable=retryable,finishedAt=os.clock()}
+                    if not okWrite then state.lastFinished.error=tostring(writeErr) end
+                    if retryable then
+                        -- Keep the latest still-authoritative request alive while an earlier
+                        -- timed-out executor callback owns the per-file uncertainty lock.
+                        if not state.desired or (tonumber(state.desired.generation) or 0) < request.generation then
+                            state.desired=request
+                        end
+                        HARDEN.supremeLiveRefreshStage="DATABASE_READY_LKG_WRITE_RETRY_PENDING"
+                        task.wait(0.5)
+                    elseif not okWrite then
+                        HARDEN.supremeBackgroundHashError=tostring(writeErr or "LKG write failed")
+                        HARDEN.supremeLiveRefreshStage="DATABASE_READY_LKG_WRITE_FAILED"
+                        warn("[SV Public] Supreme LKG write failed:",writeErr)
+                    end
+                end
+                state.active=nil
+            end
+            -- A newer authoritative request can arrive while the previous executor write yields.
+            -- Retry only BUSY/UNRESOLVED persistence failures; newer authority supersedes immediately.
+        end
+        state.workerRunning=false
+        -- Close the small race where a request arrives after the loop observed nil but before
+        -- workerRunning flips. Re-arm exactly one worker for the latest desired body.
+        if not Destroyed and state.desired then HARDEN.queueSupremeLkgPersistence(state.desired.body,state.desired.digest,state.desired.revision,state.desired.source) end
+    end)
+    return true
 end
 State.AutoTrader.TeleportBootstrap = rawget(ExecutorEnvironment, State.AutoTrader.TeleportBootstrapKey)
     or rawget(_G, State.AutoTrader.TeleportBootstrapKey)
@@ -7722,7 +7836,9 @@ end
 State.AutoTrader.RunSelfTests = function()
     local tests = {}
     local function record(name, ok, detail)
-        table.insert(tests, {name=name, ok=ok == true, detail=ok and nil or tostring(detail or "failed")})
+        local row = {name=name, ok=ok == true, detail=nil}
+        if ok ~= true then row.detail = tostring(detail or "failed") end
+        table.insert(tests, row)
     end
     local function run(name, callback)
         local ok, passed, detail = pcall(callback)
@@ -7758,7 +7874,8 @@ State.AutoTrader.RunSelfTests = function()
     end)
     run("planner-market-pareto", function()
         local generation = State.AutoTrader.PlanGeneration
-        local incoming = {knownFloor=20,totalValue=20,unknownCount=0,demand=5,demandCoverage=1,flip=nil,flipCoverage=0,stability=nil,stabilityCoverage=0,stabilityShares={}}
+        local received = {key="selftest-received",itemId="selftest-received",itemType="Weapons",name="received-market",unitValue=20,maxQuantity=1,quantity=1,demand=5,reserve=0,record={name="received-market",data={value=20,demand=5}}}
+        local incoming = {knownFloor=20,totalValue=20,unknownCount=0,demand=5,demandCoverage=1,flip=nil,flipCoverage=0,stability=nil,stabilityCoverage=0,stabilityShares={},entries={received}}
         local high = {key="selftest-high",itemId="selftest-high",itemType="Weapons",name="high-market",unitValue=10,maxQuantity=1,quantity=1,demand=10,reserve=0,record={name="high-market",data={value=10,demand=10}}}
         local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=10,maxQuantity=1,quantity=1,demand=4,reserve=0,record={name="safe-market",data={value=10,demand=4}}}
         local plan = State.AutoTrader.FindPlan(incoming, {high,safe}, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
@@ -8765,7 +8882,20 @@ State.AutoTrader.NormalizeServerCandidateCacheEntry = function(entry)
             if #fingerprints >= 10 then break end
         end
     end
-    return {
+    local thumbnailUrls, seenUrls = {}, {}
+    for _, url in ipairs(entry.previewThumbnailUrls or {}) do
+        if type(url) == "string" and url ~= "" and not seenUrls[url] then
+            seenUrls[url] = true; table.insert(thumbnailUrls, url)
+            if #thumbnailUrls >= 10 then break end
+        end
+    end
+    -- Browser-companion samples have their own file/row freshness and may never
+    -- become selector-cache authority. Normalize defensively as well as sanitizing
+    -- at merge time so stale/legacy/inconsistent cache rows cannot retain them.
+    local companionRosterEvidence = (type(entry.previewTokenSource)=="string" and string.sub(entry.previewTokenSource,1,17)=="browser_companion")
+        or (type(entry.previewFingerprintSource)=="string" and string.sub(entry.previewFingerprintSource,1,17)=="browser_companion")
+        or entry.previewCoverage=="SAMPLED_NOT_FULL_ROSTER"
+    local normalized = {
         id = jobId,
         scannedAt = scannedAt,
         playing = math.max(0, playing),
@@ -8774,8 +8904,26 @@ State.AutoTrader.NormalizeServerCandidateCacheEntry = function(entry)
         ping = tonumber(entry.ping),
         fps = tonumber(entry.fps),
         previewFingerprints = fingerprints,
+        previewThumbnailUrls = thumbnailUrls,
+        previewTokenCount = math.max(0, tonumber(entry.previewTokenCount) or #fingerprints),
+        previewTokenSource = type(entry.previewTokenSource)=="string" and entry.previewTokenSource or nil,
+        previewCoverage = type(entry.previewCoverage)=="string" and entry.previewCoverage or nil,
+        previewFingerprintSource = type(entry.previewFingerprintSource)=="string" and entry.previewFingerprintSource or nil,
+        companionRowAgeSeconds = tonumber(entry.companionRowAgeSeconds),
+        companionSamplePlaying = tonumber(entry.companionSamplePlaying),
         previewTrustedAtScan = entry.previewTrustedAtScan == true,
     }
+    if companionRosterEvidence then
+        normalized.previewFingerprints = {}
+        normalized.previewThumbnailUrls = {}
+        normalized.previewTokenCount = 0
+        normalized.previewTokenSource = nil
+        normalized.previewCoverage = nil
+        normalized.previewFingerprintSource = nil
+        normalized.companionRowAgeSeconds = nil
+        normalized.companionSamplePlaying = nil
+    end
+    return normalized
 end
 State.AutoTrader.PruneServerCandidateCache = function()
     local nowUnix = os.time()
@@ -8843,18 +8991,40 @@ State.AutoTrader.MergeServerCandidateCache = function(servers)
     local nowUnix = os.time()
     for _, server in ipairs(servers or {}) do
         if type(server) == "table" and type(server.id) == "string" and server.id ~= ""
-            and server.id ~= game.JobId and (tonumber(server.playing) or 0) < (tonumber(server.maxPlayers) or 0) then
+            and server.id ~= game.JobId and not (State.AutoTrader.IsManualBotServerJob and State.AutoTrader.IsManualBotServerJob(server.id))
+            and (tonumber(server.playing) or 0) < (tonumber(server.maxPlayers) or 0) then
             local preview = server.botPreview or State.AutoTrader.ClassifyServerPreview(server)
             -- Store only candidates that are currently clear/unknown. Hard rejects are
             -- intentionally omitted; cached fingerprints will be reclassified again later.
             if preview and preview.safeEnough then
-                byId[server.id] = {
+                local companionRosterEvidence = (type(server.previewTokenSource)=="string" and string.sub(server.previewTokenSource,1,17)=="browser_companion")
+                    or (type(server.previewFingerprintSource)=="string" and string.sub(server.previewFingerprintSource,1,17)=="browser_companion")
+                    or server.previewCoverage=="SAMPLED_NOT_FULL_ROSTER"
+                local cachedEntry = {
                     id = server.id, scannedAt = nowUnix,
                     playing = tonumber(server.playing) or 0, maxPlayers = tonumber(server.maxPlayers) or 1,
                     occupancy = tonumber(server.occupancy), ping = tonumber(server.ping), fps = tonumber(server.fps),
                     previewFingerprints = table.clone(server.previewFingerprints or {}),
+                    previewThumbnailUrls = table.clone(server.previewThumbnailUrls or {}),
+                    previewTokenCount = math.max(0, tonumber(server.previewTokenCount) or #(server.playerTokens or {})),
+                    previewTokenSource = type(server.previewTokenSource)=="string" and server.previewTokenSource or nil,
+                    previewCoverage = type(server.previewCoverage)=="string" and server.previewCoverage or nil,
+                    previewFingerprintSource = type(server.previewFingerprintSource)=="string" and server.previewFingerprintSource or nil,
+                    companionRowAgeSeconds = tonumber(server.companionRowAgeSeconds),
+                    companionSamplePlaying = tonumber(server.companionSamplePlaying),
                     previewTrustedAtScan = preview.previewTrusted == true,
                 }
+                if companionRosterEvidence then
+                    cachedEntry.previewFingerprints = {}
+                    cachedEntry.previewThumbnailUrls = {}
+                    cachedEntry.previewTokenCount = 0
+                    cachedEntry.previewTokenSource = nil
+                    cachedEntry.previewCoverage = nil
+                    cachedEntry.previewFingerprintSource = nil
+                    cachedEntry.companionRowAgeSeconds = nil
+                    cachedEntry.companionSamplePlaying = nil
+                end
+                byId[server.id] = cachedEntry
             end
         end
     end
@@ -9132,9 +9302,9 @@ end
 State.AutoTrader.GetBotIconClass = function(fingerprint)
     local record = State.AutoTrader.GetBotIconRecord(fingerprint, false)
     if not record then return "unknown", 0, nil end
-    -- v34 trusts only two high-confidence provenance classes: automated full-server
-    -- physical certification and explicit two-step user certification. Legacy
-    -- heuristic evidence remains diagnostic-only and never filters a server.
+    -- Trusted detection consumes two distinguishable provenance classes: automated
+    -- full-server physical certification and explicit owner-manual certification
+    -- (including v37 candidate-server labeling). Legacy heuristics remain diagnostic-only.
     local goldJobs = State.AutoTrader.GetTrustedBotIconJobCount(record)
     if goldJobs >= CONFIG.AutoTraderGoldBotConfirmMinJobs then return "confirmed_bot", 0.99, record end
     if goldJobs >= CONFIG.AutoTraderGoldBotKnownMinJobs then return "known_bot", 0.93, record end
@@ -9404,8 +9574,11 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
             panelPosition = State.AutoTrader.Preferences.panelPosition,
         },
         recentJobs = State.AutoTrader.RecentJobs,
-        botDb = includeBotDb == false and nil or State.AutoTrader.BuildCompactTeleportBotDb(),
+        botDb = nil,
     }
+    if includeBotDb ~= false then
+        payload.botDb = State.AutoTrader.BuildCompactTeleportBotDb()
+    end
     local ok, encoded = pcall(function() return HttpService:JSONEncode(payload) end)
     if not ok then return nil, tostring(encoded) end
     local quotedJson = string.format("%q", encoded)
@@ -9759,7 +9932,8 @@ State.AutoTrader.ResolveCurrentPlayerFingerprints = function()
         end
     end
     for _, player in ipairs(players) do result.playerNameByUserId[player.UserId] = player.Name end
-    return completed > 0, result, completed > 0 and nil or "current-player headshot lookup returned no completed thumbnails"
+    if completed > 0 then return true, result, nil end
+    return false, result, "current-player headshot lookup returned no completed thumbnails"
 end
 
 State.AutoTrader.AddSoftHumanIconEvidence = function()
@@ -9788,6 +9962,8 @@ State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
     for _, server in ipairs(servers or {}) do
         server.previewFingerprints = {}
         server.previewThumbnailUrls = {}
+        server.previewFingerprintByTokenIndex = {}
+        server.previewThumbnailUrlByTokenIndex = {}
         server.previewTokenCount = 0
         for tokenIndex, token in ipairs(server.playerTokens or {}) do
             if type(token) == "string" and token ~= "" then
@@ -9799,7 +9975,7 @@ State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
                     targetId = 0,
                     token = token,
                     format = "Png",
-                    size = "150x150",
+                    size = State.AutoTrader.CanonicalServerPreviewThumbnailSize or "150x150",
                 })
                 server.previewTokenCount += 1
                 diagnostics.tokens += 1
@@ -9850,8 +10026,8 @@ State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
                     local completedState = item.state == nil or string.lower(tostring(item.state)) == "completed"
                     if mapping and fingerprint and completedState then
                         local server = mapping.server
-                        table.insert(server.previewFingerprints, fingerprint)
-                        table.insert(server.previewThumbnailUrls, imageUrl)
+                        server.previewFingerprintByTokenIndex[mapping.tokenIndex] = fingerprint
+                        server.previewThumbnailUrlByTokenIndex[mapping.tokenIndex] = imageUrl
                         diagnostics.completed += 1
                     elseif not mapping then
                         diagnostics.unmapped += 1
@@ -9873,9 +10049,22 @@ State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
         end
         if first + CONFIG.AutoTraderThumbnailBatchSize <= #payload then task.wait(0.05) end
     end
+    for _, server in ipairs(servers or {}) do
+        server.previewFingerprints = {}
+        server.previewThumbnailUrls = {}
+        for tokenIndex=1,#(server.playerTokens or {}) do
+            local fingerprint=server.previewFingerprintByTokenIndex and server.previewFingerprintByTokenIndex[tokenIndex] or nil
+            local imageUrl=server.previewThumbnailUrlByTokenIndex and server.previewThumbnailUrlByTokenIndex[tokenIndex] or nil
+            if fingerprint and imageUrl then
+                table.insert(server.previewFingerprints,fingerprint)
+                table.insert(server.previewThumbnailUrls,imageUrl)
+            end
+        end
+    end
     diagnostics.completed = diagnostics.completed
     local ok = diagnostics.completed > 0
-    return ok, ok and nil or (diagnostics.lastError or "thumbnail batch returned no completed previews"), diagnostics
+    if ok then return true, nil, diagnostics end
+    return false, diagnostics.lastError or "thumbnail batch returned no completed previews", diagnostics
 end
 State.AutoTrader.BuildPreviewScanContext = function(servers)
     local context = {serverCount = 0, hashJobCounts = {}, hashSightings = {}, topHashes = {}}
@@ -9946,7 +10135,7 @@ State.AutoTrader.ClassifyServerPreview = function(server, scanContext)
         previewTrusted = previewTrusted, safeEnough = safeEnough,
         topTwoRatio = 0, uniqueFingerprints = 0,
         frequencies = frequencies, score = score, classes = classes,
-        filterSource = "strict_gold_hash_db_when_available_unknown_allowed",
+        filterSource = "trusted_strict_or_manual_bot_hash_db_when_available_unknown_allowed",
     }
     return server.botPreview
 end
@@ -10028,7 +10217,8 @@ State.AutoTrader.ResolveUserIdsFingerprints = function(userIds)
             end
         end
     end
-    return completed == #userIds, result, completed == #userIds and nil or ("resolved " .. tostring(completed) .. "/" .. tostring(#userIds) .. " certified headshots")
+    if completed == #userIds then return true, result, nil end
+    return false, result, "resolved " .. tostring(completed) .. "/" .. tostring(#userIds) .. " certified headshots"
 end
 
 State.AutoTrader.MarkGoldCertificationRegular = function(reason, details)
@@ -10988,14 +11178,22 @@ State.AutoTrader.BuildCachedServerQueue = function()
             id = entry.id, playing = entry.playing, maxPlayers = entry.maxPlayers,
             occupancy = entry.occupancy, ping = entry.ping, fps = entry.fps,
             previewFingerprints = table.clone(entry.previewFingerprints or {}),
-            previewTokenCount = #(entry.previewFingerprints or {}),
+            previewThumbnailUrls = table.clone(entry.previewThumbnailUrls or {}),
+            previewTokenCount = math.max(0, tonumber(entry.previewTokenCount) or #(entry.previewFingerprints or {})),
+            previewTokenSource = entry.previewTokenSource,
+            previewCoverage = entry.previewCoverage,
+            previewFingerprintSource = entry.previewFingerprintSource,
+            companionRowAgeSeconds = tonumber(entry.companionRowAgeSeconds),
+            companionSamplePlaying = tonumber(entry.companionSamplePlaying),
             cacheScannedAt = entry.scannedAt,
         }
         local preview = State.AutoTrader.ClassifyServerPreview(server)
         local age = math.max(0, nowUnix - entry.scannedAt)
         table.insert(scanRows, {
             id = server.id, playing = server.playing, maxPlayers = server.maxPlayers,
-            cacheAgeSeconds = age, previewSample = preview.sample,
+            cacheAgeSeconds = age, previewSample = preview.sample, previewTokenCount = server.previewTokenCount, previewThumbnailUrls = table.clone(server.previewThumbnailUrls or {}),
+            previewTokenSource=server.previewTokenSource,previewCoverage=server.previewCoverage,previewFingerprintSource=server.previewFingerprintSource,
+            companionRowAgeSeconds=tonumber(server.companionRowAgeSeconds),companionSamplePlaying=tonumber(server.companionSamplePlaying),
             goldBotMatches = preview.goldMatched, goldBotMatchRatio = preview.goldMatchRatio,
             previewTrusted = preview.previewTrusted, safeEnough = preview.safeEnough,
             hardReject = preview.hardReject, score = preview.score,
@@ -11031,7 +11229,7 @@ State.AutoTrader.BuildCachedServerQueue = function()
         cacheTtlSeconds = ttl, cacheEntriesAfterPrune = #entries, cacheDroppedStrict = droppedStrict,
         cacheOldestSelectedAgeSeconds = oldestAge, queueCount = #queue,
         safeCandidateCount = #queue, trustedCandidateCount = trusted, unknownCandidateCount = unknown,
-        candidates = scanRows, filterSource = "strict_gold_hash_db_rechecked_on_cached_fingerprints_unknown_allowed",
+        candidates = scanRows, filterSource = "trusted_strict_or_manual_hash_db_rechecked_on_cached_fingerprints_unknown_allowed",
         fetch = {cacheHit = #queue > 0, pagesRequested = 0, pagesAttempted = 0, pagesSucceeded = 0, transportPages = {},
             selectedGameHttpGetPages = 0, selectedExecutorPages = 0, selectedDegradedPages = 0},
     }
@@ -11064,9 +11262,10 @@ State.AutoTrader.BuildPublicServerQueue = function(forceFresh)
     local rows, fetchDiagnostics = State.AutoTrader.FetchPublicServers(CONFIG.AutoTraderServerListPages)
     local allJoinable, fresh, recentFallback = {}, {}, {}
     local nowUnix = os.time()
-    local filteredCurrent, filteredFull = 0, 0
+    local filteredCurrent, filteredFull, filteredManual = 0, 0, 0
     for _, server in ipairs(rows) do
         if server.id == game.JobId then filteredCurrent += 1
+        elseif State.AutoTrader.IsManualBotServerJob and State.AutoTrader.IsManualBotServerJob(server.id) then filteredManual += 1
         elseif server.playing >= server.maxPlayers then filteredFull += 1
         else
             table.insert(allJoinable, server)
@@ -11095,8 +11294,8 @@ State.AutoTrader.BuildPublicServerQueue = function(forceFresh)
         at = os.clock(), source = "fresh_http_scan", cacheHit = false,
         thumbnailAvailable = thumbOK, thumbnailReason = thumbReason, thumbnail = thumbDiagnostics, fetch = fetchDiagnostics,
         rawRows = #rows, joinableRows = #allJoinable, freshRows = #fresh, recentFallbackRows = #recentFallback,
-        usedRecentFallback = usedRecentFallback, filteredCurrent = filteredCurrent, filteredFull = filteredFull,
-        preclassifyPool = #candidates, candidates = {}, filterSource = "strict_gold_hash_db_when_available_unknown_allowed",
+        usedRecentFallback = usedRecentFallback, filteredCurrent = filteredCurrent, filteredFull = filteredFull, filteredManual = filteredManual,
+        preclassifyPool = #candidates, candidates = {}, filterSource = "trusted_strict_or_manual_hash_db_when_available_unknown_allowed",
     }
     local queue = {}
     for _, server in ipairs(candidates) do
@@ -11109,8 +11308,10 @@ State.AutoTrader.BuildPublicServerQueue = function(forceFresh)
             botLikelihood = preview.goldMatchRatio, safeConfidence = preview.safeConfidence,
             previewTrusted = preview.previewTrusted, safeEnough = preview.safeEnough,
             hardReject = preview.hardReject, suspicious = preview.suspicious, score = preview.score,
-            hashes = server.previewFingerprints, recent = State.AutoTrader.RecentJobs[server.id] ~= nil,
-            recentFallbackAge = server.recentFallbackAge,
+            hashes = server.previewFingerprints, previewThumbnailUrls = table.clone(server.previewThumbnailUrls or {}), recent = State.AutoTrader.RecentJobs[server.id] ~= nil,
+            previewTokenSource = server.previewTokenSource, previewCoverage = server.previewCoverage,
+            previewFingerprintSource = server.previewFingerprintSource, companionRowAgeSeconds = tonumber(server.companionRowAgeSeconds),
+            companionSamplePlaying = tonumber(server.companionSamplePlaying), recentFallbackAge = server.recentFallbackAge,
         }
         table.insert(scan.candidates, row)
         if preview.safeEnough then table.insert(queue, server) end
@@ -13496,13 +13697,16 @@ State.AutoTrader.DecisionDataFresh = function()
     local age = HARDEN.lastDatabaseVerifiedAt > 0 and (now - HARDEN.lastDatabaseVerifiedAt) or math.huge
     if not SupremeDatabase then
         State.AutoTrader.DataDegradedReason = "Supreme value database unavailable"
-        return false, State.AutoTrader.DataDegradedReason
+        State.AutoTrader.LastDecisionDataFreshness = {fresh=false,reasonCode="VALUE_DB_UNAVAILABLE",reason=State.AutoTrader.DataDegradedReason,ageSeconds=age,liveRefreshStage=HARDEN.supremeLiveRefreshStage,at=os.clock()}
+        return false, State.AutoTrader.DataDegradedReason, age
     end
     if age > CONFIG.DecisionDataMaxAgeSeconds then
         State.AutoTrader.DataDegradedReason = "Supreme value data has not been authoritatively refreshed for " .. tostring(math.floor(age)) .. "s"
+        State.AutoTrader.LastDecisionDataFreshness = {fresh=false,reasonCode="VALUE_DB_STALE",reason=State.AutoTrader.DataDegradedReason,ageSeconds=age,liveRefreshStage=HARDEN.supremeLiveRefreshStage,at=os.clock()}
         return false, State.AutoTrader.DataDegradedReason, age
     end
     State.AutoTrader.DataDegradedReason = nil
+    State.AutoTrader.LastDecisionDataFreshness = {fresh=true,reasonCode="VALUE_DB_FRESH",reason=nil,ageSeconds=age,liveRefreshStage=HARDEN.supremeLiveRefreshStage,at=os.clock()}
     return true, nil, age
 end
 State.AutoTrader.ActionContextValid = function(context)
@@ -14752,7 +14956,8 @@ State.AutoTrader.FireCancelRequest = function()
     local remote = tradeFolder and tradeFolder:FindFirstChild("CancelRequest")
     if not remote or not remote:IsA("RemoteEvent") then return false, "Trade.CancelRequest unavailable" end
     local ok, err = pcall(function() remote:FireServer() end)
-    return ok, ok and nil or tostring(err)
+    if ok then return true, nil end
+    return false, tostring(err)
 end
 State.AutoTrader.FinalizePendingCancellation = function(pending)
     if not pending or State.AutoTrader.PendingRequest ~= pending then return false end
@@ -15289,6 +15494,12 @@ State.AutoTrader.TrySendRequest = function()
     if Destroyed then return blocked("destroyed") end
     if not State.AutoTrader.Preferences.automation then return blocked("automation off") end
     if State.AutoTrader.SessionFrozen then return blocked("session frozen") end
+    local decisionFresh, decisionReason = State.AutoTrader.DecisionDataFresh()
+    if not decisionFresh then
+        local freshness=State.AutoTrader.LastDecisionDataFreshness or {}
+        State.AutoTrader.Log("request_blocked_decision_data",{reasonCode=freshness.reasonCode or "VALUE_DB_STALE",reason=decisionReason,ageSeconds=freshness.ageSeconds,liveRefreshStage=HARDEN.supremeLiveRefreshStage})
+        return blocked((freshness.reasonCode or "VALUE_DB_STALE") .. " · " .. tostring(decisionReason or "decision data unavailable"))
+    end
     if State.AutoTrader.RecoveryTeleportRequired then return blocked("recovery rejoin pending") end
     if State.AutoTrader.IsBotEscapeActive and State.AutoTrader.IsBotEscapeActive() then
         return blocked("bot-heavy server escape pending")
@@ -15324,6 +15535,14 @@ State.AutoTrader.TrySendRequest = function()
         return blocked("Trade.SendRequest unavailable; recovery rejoin requested")
     end
 
+    -- Defense in depth: queue/planner work may yield. Recheck authority immediately
+    -- before changing contact state or invoking Trade.SendRequest.
+    decisionFresh, decisionReason = State.AutoTrader.DecisionDataFresh()
+    if not decisionFresh then
+        local freshness=State.AutoTrader.LastDecisionDataFreshness or {}
+        State.AutoTrader.Log("request_blocked_decision_data_preinvoke",{userId=target.UserId,name=target.Name,reasonCode=freshness.reasonCode or "VALUE_DB_STALE",reason=decisionReason,ageSeconds=freshness.ageSeconds,liveRefreshStage=HARDEN.supremeLiveRefreshStage})
+        return blocked((freshness.reasonCode or "VALUE_DB_STALE") .. " · " .. tostring(decisionReason or "decision data became stale before contact"))
+    end
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
     if State.AutoTrader.SetContactState then
         State.AutoTrader.SetContactState(target, "TRANSPORT_ATTEMPTING", "local SendRequest invocation started; awaiting correlated MM2 acknowledgement")
@@ -17757,11 +17976,11 @@ State.AutoTrader.RebuildBotDashboard = function()
         local goldJobs = tonumber(info and info.goldJobs) or 0
         local classColor = class == "confirmed_bot" and THEME.red or (class == "known_bot" or class == "observed_bot") and THEME.yellow or THEME.faint
         local name = makeLabel(row, player.Name, 10, THEME.text, Enum.Font.ArialBold); name.Position = UDim2.fromOffset(64, 6); name.Size = UDim2.new(1, -72, 0, 18); name.TextTruncate = Enum.TextTruncate.AtEnd; name.ZIndex = 1455
-        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no strict learned avatar match" or (string.upper(class) .. " · strict gold servers " .. tostring(goldJobs)), 10, classColor, Enum.Font.ArialBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
+        local detail = makeLabel(row, class == "unknown" and "UNKNOWN · no trusted avatar match" or (string.upper(class) .. " · trusted bot jobs " .. tostring(goldJobs) .. " (strict + owner-manual)"), 10, classColor, Enum.Font.ArialBold); detail.Position = UDim2.fromOffset(64, 25); detail.Size = UDim2.new(1, -72, 0, 16); detail.ZIndex = 1455
         local hash = makeLabel(row, info and tostring(info.fingerprint or "") or "Press REFRESH to resolve this player's avatar hash", 10, THEME.faint, Enum.Font.Code); hash.Position = UDim2.fromOffset(64, 42); hash.Size = UDim2.new(1, -72, 0, 13); hash.TextTruncate = Enum.TextTruncate.AtEnd; hash.ZIndex = 1455
     end
 
-    local learnedTitle = makeLabel(UI.AutoTraderBotContent, "STRICT GOLD LEARNED HASHES", 10, THEME.faint, Enum.Font.ArialBold)
+    local learnedTitle = makeLabel(UI.AutoTraderBotContent, "TRUSTED BOT HASHES · STRICT + OWNER-MANUAL", 10, THEME.faint, Enum.Font.ArialBold)
     learnedTitle.Size = UDim2.new(1, 0, 0, 24); learnedTitle.ZIndex = 1454
     local learned = {}
     for fingerprint, record in pairs(State.AutoTrader.BotIconDb.icons or {}) do
@@ -17790,7 +18009,9 @@ State.AutoTrader.RebuildBotDashboard = function()
         end
         local classColor = info.class == "confirmed_bot" and THEME.red or THEME.yellow
         local title = makeLabel(row, (r.sampleName and (r.sampleName .. " · ") or "") .. string.upper(info.class), 10, classColor, Enum.Font.ArialBold); title.Position = UDim2.fromOffset(64, 6); title.Size = UDim2.new(1, -72, 0, 17); title.TextTruncate = Enum.TextTruncate.AtEnd; title.ZIndex = 1455
-        local evidence = makeLabel(row, "strict gold servers " .. tostring(info.goldJobs) .. " · strict sightings " .. tostring(math.floor(tonumber(r.strictGoldBotSightings) or 0)), 10, THEME.muted, Enum.Font.Arial); evidence.Position = UDim2.fromOffset(64, 24); evidence.Size = UDim2.new(1, -72, 0, 16); evidence.ZIndex = 1455
+        local strictJobs = State.AutoTrader.BotIconJobCount(r.strictGoldBotJobs)
+        local manualJobs = State.AutoTrader.BotIconJobCount(r.manualGoldBotJobs)
+        local evidence = makeLabel(row, "strict jobs " .. tostring(strictJobs) .. " · manual jobs " .. tostring(manualJobs) .. " · sightings " .. tostring(math.floor(tonumber(r.strictGoldBotSightings) or 0)) .. "/" .. tostring(math.floor(tonumber(r.manualGoldBotSightings) or 0)), 10, THEME.muted, Enum.Font.Arial); evidence.Position = UDim2.fromOffset(64, 24); evidence.Size = UDim2.new(1, -72, 0, 16); evidence.ZIndex = 1455
         local hash = makeLabel(row, info.fingerprint, 10, THEME.faint, Enum.Font.Code); hash.Position = UDim2.fromOffset(64, 42); hash.Size = UDim2.new(1, -72, 0, 13); hash.TextTruncate = Enum.TextTruncate.AtEnd; hash.ZIndex = 1455
     end
 end
@@ -18134,6 +18355,18 @@ connect(UI.AutoTraderForceServer.MouseButton1Click, function()
     State.AutoTrader.Render()
     State.AutoTrader.TryServerHop("MANUAL_SERVER_SEARCH", select(2, State.AutoTrader.GetServerDisposition()))
 end)
+
+-- v37 extends this UI much later in the chunk. Preserve the already-created
+-- v30 helper closures/palette through the existing UI table instead of relying
+-- on out-of-scope bare names (which compile as nil global lookups).
+UI.AutoTraderV37UiHelpers = {
+    button = aeroButton,
+    gradient = aeroGradient,
+    stroke = aeroStroke,
+    clearDynamic = clearDynamic,
+    pct01 = pct01,
+    palette = AERO,
+}
 
 end
 State.AutoTrader.BindLocalDeclineObserver = function()
@@ -22291,6 +22524,8 @@ State.Profile.CalculateRemoteSection = function(
         resolvedUnits = 0,
         unresolvedLeaves = 0,
         nonNumericUnits = 0,
+        ignoredMetadataLeaves = 0,
+        ignoredMetadataExamples = {},
         samples = {},
         numericContributions = {},
         cardHints = {},
@@ -22478,6 +22713,72 @@ State.Profile.CalculateRemoteSection = function(
         end
         return true
     end
+    local function joinAncestryPath(parentPath, key)
+        local segment = tostring(key)
+        return parentPath and parentPath ~= "" and (tostring(parentPath) .. ">" .. segment) or segment
+    end
+    local function isVerifiedNonItemContainerRoot(key, parentPath)
+        if parentPath ~= nil and parentPath ~= "" then return false end
+        local normalizedKey = normalize(key)
+        return normalizedKey == "claimedrewards"
+            or normalizedKey == "quests"
+            or normalizedKey == "santaslist"
+    end
+    local function isVerifiedNonItemScalarMetadata(key, parentPath)
+        -- Runtime has verified these as scalar metadata at the root of an MM2
+        -- item section. Do not suppress the same words inside Owned/future item
+        -- containers, where an unknown identity must still fail closed.
+        if parentPath ~= nil and parentPath ~= "" then return false end
+        local normalizedKey = normalize(key)
+        return normalizedKey == "survivals"
+            or normalizedKey == "eliminations"
+            or normalizedKey == "victories"
+            or normalizedKey == "currenttier"
+            or normalizedKey == "leaderboardpoints"
+            or normalizedKey == "candiesfixed"
+            or normalizedKey == "planttime"
+            or normalizedKey == "totalcandies"
+    end
+    local function noteIgnoredMetadata(key, value, ancestryPath, reason)
+        result.ignoredMetadataLeaves += 1
+        if #result.ignoredMetadataExamples < 12 then
+            table.insert(result.ignoredMetadataExamples, {
+                key = tostring(key),
+                normalizedKey = normalize(key),
+                value = value,
+                valueType = type(value),
+                ancestryPath = ancestryPath and tostring(ancestryPath) or tostring(key),
+                reason = tostring(reason or "VERIFIED_NON_ITEM_METADATA"),
+            })
+        end
+    end
+    local ignoredVisited = setmetatable({}, {__mode = "k"})
+    local function noteIgnoredMetadataSubtree(node, ancestryPath, depth)
+        if depth > 7 then
+            noteIgnoredMetadata(ancestryPath or "metadata", "<depth-limit>", ancestryPath, "VERIFIED_METADATA_CONTAINER_DEPTH_LIMIT")
+            return
+        end
+        if type(node) ~= "table" then
+            noteIgnoredMetadata(ancestryPath or "metadata", node, ancestryPath, "VERIFIED_METADATA_CONTAINER_LEAF")
+            return
+        end
+        if ignoredVisited[node] then return end
+        ignoredVisited[node] = true
+        local sawLeaf = false
+        for childKey, childValue in pairs(node) do
+            local childPath = joinAncestryPath(ancestryPath, childKey)
+            if type(childValue) == "table" then
+                noteIgnoredMetadataSubtree(childValue, childPath, depth + 1)
+            else
+                sawLeaf = true
+                noteIgnoredMetadata(childKey, childValue, childPath, "VERIFIED_METADATA_CONTAINER_LEAF")
+            end
+        end
+        if not sawLeaf and next(node) == nil then
+            noteIgnoredMetadata(ancestryPath or "metadata", "<empty-table>", ancestryPath, "VERIFIED_METADATA_CONTAINER_EMPTY")
+        end
+        ignoredVisited[node] = nil
+    end
     local function walk(
         node,
         depth,
@@ -22528,43 +22829,64 @@ State.Profile.CalculateRemoteSection = function(
             end
         end
         for key, value in pairs(node) do
+            local childPath = joinAncestryPath(parentKey, key)
             if type(key) == "string"
                 and type(value) == "number" then
-                addResult(key, value, State.BuildInventoryIdentityHint(nil, parentKey))
+                if isVerifiedNonItemScalarMetadata(key, parentKey) then
+                    noteIgnoredMetadata(key, value, childPath, "VERIFIED_ROOT_SCALAR_METADATA")
+                else
+                    addResult(key, value, State.BuildInventoryIdentityHint(nil, parentKey))
+                end
             elseif type(key) == "string"
                 and type(value) == "boolean" then
-                if value then
+                if isVerifiedNonItemScalarMetadata(key, parentKey) then
+                    noteIgnoredMetadata(key, value, childPath, "VERIFIED_ROOT_SCALAR_METADATA")
+                elseif value then
                     addResult(key, 1, State.BuildInventoryIdentityHint(nil, parentKey))
                 end
             elseif type(value) == "string"
                 and type(key) == "number" then
                 addResult(value, 1, State.BuildInventoryIdentityHint(nil, parentKey))
             elseif type(value) == "table" then
-                local nestedQuantity =
-                    value.Amount
-                    or value.amount
-                    or value.Quantity
-                    or value.quantity
-                    or value.Count
-                    or value.count
-                    or value.Owned
-                    or value.owned
-                local handled = false
-                if type(key) == "string"
-                    and tonumber(nestedQuantity) then
-                    handled =
-                        addResult(
+                if isVerifiedNonItemContainerRoot(key, parentKey) then
+                    noteIgnoredMetadataSubtree(value, childPath, 0)
+                else
+                    local nestedQuantity =
+                        value.Amount
+                        or value.amount
+                        or value.Quantity
+                        or value.quantity
+                        or value.Count
+                        or value.count
+                        or value.Owned
+                        or value.owned
+                    local explicitObjectId =
+                        value.ItemId
+                        or value.ItemID
+                        or value.itemId
+                        or value.itemID
+                        or value.ID
+                        or value.Id
+                        or value.id
+                    local handled = false
+                    if type(explicitObjectId) == "string"
+                        and tonumber(nestedQuantity) then
+                        handled = addResult(
+                            explicitObjectId,
+                            nestedQuantity,
+                            State.BuildInventoryIdentityHint(value, childPath)
+                        )
+                    elseif type(key) == "string"
+                        and tonumber(nestedQuantity) then
+                        handled = addResult(
                             key,
                             nestedQuantity,
-                            State.BuildInventoryIdentityHint(value, (parentKey and parentKey ~= "" and (tostring(parentKey) .. ">" .. tostring(key)) or tostring(key)))
+                            State.BuildInventoryIdentityHint(value, childPath)
                         )
-                end
-                if not handled then
-                    walk(
-                        value,
-                        depth + 1,
-                        (parentKey and parentKey ~= "" and (tostring(parentKey) .. ">" .. tostring(key)) or tostring(key))
-                    )
+                    end
+                    if not handled then
+                        walk(value, depth + 1, childPath)
+                    end
                 end
             end
         end
@@ -22606,6 +22928,9 @@ State.Profile.CalculateRemoteInventory = function(data)
         achievements = true,
         badges = true,
         titles = true,
+        claimedrewards = true,
+        quests = true,
+        santaslist = true,
         crafting = true,
         recipes = true,
         materials = true,
@@ -22794,6 +23119,8 @@ State.Profile.CalculateRemoteInventory = function(data)
             resolvedUnits = 0,
             unresolvedLeaves = 0,
             nonNumericUnits = 0,
+            ignoredMetadataLeaves = 0,
+            ignoredMetadataExamples = {},
             samples = {},
             numericContributions = {},
             cardHints = {},
@@ -22807,6 +23134,11 @@ State.Profile.CalculateRemoteInventory = function(data)
         target.resolvedUnits = target.resolvedUnits + (source.resolvedUnits or 0)
         target.unresolvedLeaves = target.unresolvedLeaves + (source.unresolvedLeaves or 0)
         target.nonNumericUnits = target.nonNumericUnits + (source.nonNumericUnits or 0)
+        target.ignoredMetadataLeaves = target.ignoredMetadataLeaves + (source.ignoredMetadataLeaves or 0)
+        for _, ignored in ipairs(source.ignoredMetadataExamples or {}) do
+            if #target.ignoredMetadataExamples >= 12 then break end
+            table.insert(target.ignoredMetadataExamples, ignored)
+        end
         for _, value in ipairs(source.numericContributions or {}) do
             table.insert(target.numericContributions, value)
         end
@@ -23385,7 +23717,8 @@ HARDEN.safeCallNamed = function(name, callback)
     end
     local ok,result,detail=packed[1],packed[2],packed[3]
     local healthy=ok and result~=false
-    local err=healthy and nil or (ok and (detail or result) or result)
+    local err=nil
+    if not healthy then err=ok and (detail or result) or result end
     local row=HARDEN.recordSubsystem(name,healthy,os.clock()-started,err)
     if not healthy then warn("[SV Public] subsystem error ["..tostring(name).."]:",err) end
     return healthy,result,row,detail
@@ -24322,6 +24655,15 @@ do
         end
         if entry.outcome=="request_pending" then return {state="active_request",contactState="CONTACT_ACKNOWLEDGED",feasibilityState=entry.feasibilityState,player=player,entry=entry,actionable=false,reason=entry.reason} end
         if entry.outcome=="trading" then return {state="active_trade",contactState="CONTACT_ACKNOWLEDGED",feasibilityState=entry.feasibilityState,player=player,entry=entry,actionable=false,reason=entry.reason} end
+        -- v37 reviewer round 3: TRANSPORT_DEFERRED is a bounded presence/liveness
+        -- promise created by an unacknowledged transport failure. Mutable inventory,
+        -- friend, and Supreme-authority prerequisites must not hide that promise from
+        -- whole-server liveness. The defer itself never authorizes contact: after it
+        -- expires GetContactState returns NOT_CONTACTED and every normal gate applies.
+        if contactState=="TRANSPORT_DEFERRED" then
+            return {state="transport_deferred",feasibilityState=entry.feasibilityState or "SEARCH_INCONCLUSIVE",contactState=contactState,player=player,entry=entry,actionable=false,
+                retryIn=math.max(0,(entry.transportDeferredUntil or now)-now),reason=entry.contactReason or "client transport deferred"}
+        end
         local total,verified,valueReason=State.AutoTrader.GetVerifiedPlayerValue(player)
         if State.AutoTrader.Preferences.ignoreFriends then
             local friend=State.AutoTrader.GetFriendStatus(player)
@@ -24341,10 +24683,14 @@ do
             return {state=age>=CONFIG.AutoTraderUnresolvedMaxWaitSeconds and "unresolvable" or "discovery_pending",feasibilityState=age>=CONFIG.AutoTraderUnresolvedMaxWaitSeconds and "SEARCH_INCONCLUSIVE" or "DISCOVERY_PENDING",contactState=contactState,
                 player=player,entry=entry,actionable=false,reason=valueReason or "inventory unresolved"}
         end
-        if total<=0 then entry.feasibilityState="PROVEN_IMPOSSIBLE";return {state="zero",feasibilityState="PROVEN_IMPOSSIBLE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=total,reason="verified zero"} end
-        if contactState=="TRANSPORT_DEFERRED" then
-            return {state="transport_deferred",feasibilityState=entry.feasibilityState or "FEASIBLE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=total,retryIn=math.max(0,(entry.transportDeferredUntil or now)-now),reason=entry.contactReason or "client transport deferred"}
+        local decisionFresh,decisionReason,decisionAge=State.AutoTrader.DecisionDataFresh()
+        if not decisionFresh then
+            entry.feasibilityState="SEARCH_INCONCLUSIVE"
+            local freshness=State.AutoTrader.LastDecisionDataFreshness or {}
+            return {state="decision_data_stale",feasibilityState="SEARCH_INCONCLUSIVE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=total,
+                reason=(freshness.reasonCode or "VALUE_DB_STALE").." · "..tostring(decisionReason or "live Supreme refresh pending"),decisionDataAgeSeconds=decisionAge,liveRefreshStage=HARDEN.supremeLiveRefreshStage}
         end
+        if total<=0 then entry.feasibilityState="PROVEN_IMPOSSIBLE";return {state="zero",feasibilityState="PROVEN_IMPOSSIBLE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=total,reason="verified zero"} end
         local cooldown=State.AutoTrader.CooldownRemaining(player)
         if cooldown>0 then return {state="retry_later",feasibilityState=entry.feasibilityState,contactState=contactState,player=player,entry=entry,actionable=false,retryIn=cooldown,verifiedTotal=total,reason=State.AutoTrader.Cooldowns[player.UserId] and State.AutoTrader.Cooldowns[player.UserId].reason or "cooldown"} end
         local lastRequest=State.AutoTrader.RequestHistory[player.UserId] or 0
@@ -24362,12 +24708,13 @@ do
             player=player,entry=entry,actionable=false,verifiedTotal=total,score=score,reason=reason,feasibility=meta}
     end
 
-    State.AutoTrader.BuildEligibilitySnapshot = function()
-        local context=State.AutoTrader.BuildEligibilityContext()
+    State.AutoTrader.BuildEligibilitySnapshot = function(playersOverride, contextOverride)
+        local context=contextOverride or State.AutoTrader.BuildEligibilityContext()
+        local snapshotPlayers=type(playersOverride)=="table" and playersOverride or Players:GetPlayers()
         local counts={total=0,valued=0,zero=0,unknown=0,unresolvable=0,friend=0,exhausted=0,active=0,verifiedPositive=0,verifiedZero=0,verifiedCount=0,
-            actionable=0,retryLater=0,friendPending=0,discoveryPending=0,provenImpossible=0,searchInconclusive=0,deepSearchPending=0,transportDeferred=0}
+            actionable=0,retryLater=0,friendPending=0,discoveryPending=0,decisionDataStale=0,provenImpossible=0,searchInconclusive=0,deepSearchPending=0,transportDeferred=0}
         local rows={}; local earliestRetry=math.huge
-        for _,player in ipairs(Players:GetPlayers()) do
+        for _,player in ipairs(snapshotPlayers) do
             if player~=LocalPlayer and player.Parent then
                 counts.total+=1; local row=State.AutoTrader.EvaluatePlayerEligibility(player,context);table.insert(rows,row)
                 if row.verifiedTotal~=nil then counts.verifiedCount+=1;if row.verifiedTotal>0 then counts.verifiedPositive+=1;counts.valued+=1 else counts.verifiedZero+=1 end end
@@ -24376,6 +24723,7 @@ do
                 elseif row.state=="transport_deferred" then counts.transportDeferred+=1;counts.retryLater+=1;earliestRetry=math.min(earliestRetry,tonumber(row.retryIn) or math.huge)
                 elseif row.state=="friend_pending" then counts.friendPending+=1;counts.unknown+=1
                 elseif row.state=="discovery_pending" then counts.discoveryPending+=1;counts.unknown+=1
+                elseif row.state=="decision_data_stale" then counts.decisionDataStale+=1;counts.discoveryPending+=1;counts.unknown+=1
                 elseif row.state=="search_inconclusive" then counts.searchInconclusive+=1;local d=State.AutoTrader.FeasibilityDeepSearch[player.UserId];if d and d.inFlight then counts.deepSearchPending+=1 end
                 elseif row.state=="proven_impossible" then counts.provenImpossible+=1
                 elseif row.state=="unresolvable" then counts.unresolvable+=1
@@ -24785,11 +25133,18 @@ do
     State.AutoTrader.RunSelfTests = function()
         local base=State.AutoTrader.V35RunSelfTests();local tests={};for _,row in ipairs(base.tests or {}) do table.insert(tests,row) end
         local function add(name,callback)
-            local ok,passed,detail=pcall(callback);table.insert(tests,{name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+            local ok,passed,detail=pcall(callback)
+            local row={name=name,ok=ok and passed==true,detail=nil}
+            if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
         end
         add("feasibility-pruned-failure-inconclusive",function()
-            local item={itemId="x",itemType="Weapons",name="X",unitValue=1,maxQuantity=CONFIG.AutoTraderExactQuantityLimit+5,quantity=CONFIG.AutoTraderExactQuantityLimit+5,record={name="X",data={value=1,demand=5}}}
-            local _,diag=State.AutoTrader.BuildParetoOfferFrontier({item},20,{stateLimit=4,inventoryComplete=true});return diag.solverComplete==false,"pruned/sampled frontier was incorrectly called complete"
+            local entries={}
+            for i=1,4 do
+                table.insert(entries,{itemId="cap"..tostring(i),itemType="Weapons",name="Cap"..tostring(i),unitValue=1,maxQuantity=10,quantity=10,record={name="Cap"..tostring(i),data={value=1,demand=5}}})
+            end
+            local _,diag=State.AutoTrader.BuildParetoOfferFrontier(entries,40,{stateLimit=100,inventoryComplete=true})
+            return diag.frontierPruned==true and diag.stateCapHit==true and diag.solverComplete==false,"production-valid state-cap pruning was incorrectly called complete"
         end)
         add("feasibility-cancelled-never-impossible",function()
             local item={itemId="x",itemType="Weapons",name="X",unitValue=1,maxQuantity=1,quantity=1,record={name="X",data={value=1,demand=5}}}
@@ -24876,6 +25231,436 @@ do
         add("manual-bot-roster-atomic",function()
             return State.AutoTrader.RosterKeyMatches("1,2,3","1,2,3") and not State.AutoTrader.RosterKeyMatches("1,2,3","1,2,4"),"manual certification roster equality invariant failed"
         end)
+
+        add("v37-round14-a-c-healthy-companion-is-primary-and-can-fill-30-token-rows",function()
+            local saved={cache=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,classify=State.AutoTrader.ClassifyServerPreview,merge=State.AutoTrader.MergeServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.IsManualBotServerJob}
+            local index={}
+            for i=1,40 do
+                local id="r14-primary-"..string.format("%03d",i);local tokens={}
+                for t=1,5 do table.insert(tokens,string.rep(string.format("%x",((i+t-2)%15)+1),32)) end
+                index[id]={jobId=id,playing=11,maxPlayers=12,rowAgeSeconds=i%5,playerTokenCount=5,playerTokens=tokens,rosterEvidenceAvailable=true,fresh=true}
+            end
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot={usable=true,selectorUsable=true,index=index,ambiguousJobIds={},diagnostics={selectorEligible=true,status="HEALTHY",loggedIn=true,runtimeSourceSha256=string.rep("a",64),placeId=142823291,pollIntervalSeconds=20}},diagnostics={selectorEligible=true}}
+            State.AutoTrader.RecentJobs={};State.AutoTrader.IsManualBotServerJob=function() return false end
+            State.AutoTrader.ResolveServerPreviewFingerprints=function(servers)
+                for _,server in ipairs(servers) do
+                    server.previewFingerprints={};server.previewThumbnailUrls={};server.previewFingerprintByTokenIndex={};server.previewThumbnailUrlByTokenIndex={}
+                    for i=1,#server.playerTokens do local fp=string.rep(string.format("%x",(i%15)+1),32);server.previewFingerprintByTokenIndex[i]=fp;server.previewThumbnailUrlByTokenIndex[i]="https://t.example/150-"..tostring(i)..".png";table.insert(server.previewFingerprints,fp);table.insert(server.previewThumbnailUrls,server.previewThumbnailUrlByTokenIndex[i]) end
+                end
+                return true,nil,{completed=#servers*5}
+            end
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=function(servers)
+                for _,server in ipairs(servers) do server.previewDisplayThumbnailUrls={};server.previewDisplayCanonicalFingerprints={}
+                    for i,fp in ipairs(server.previewFingerprints) do table.insert(server.previewDisplayThumbnailUrls,"https://t.example/48-"..tostring(i)..".png");table.insert(server.previewDisplayCanonicalFingerprints,fp) end end
+                return true,nil,{completed=#servers*5,sizeIdentityMismatch=0}
+            end
+            State.AutoTrader.ClassifyServerPreview=function(server) local p={previewTrusted=false,goldMatchRatio=0,score=1,safeEnough=true,sample=#(server.previewFingerprints or {}),goldMatched=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,hardReject=false,suspicious=false};server.botPreview=p;return p end
+            State.AutoTrader.MergeServerCandidateCache=function() return 0 end
+            local ok,queue,scan,eligible=pcall(State.AutoTrader.BuildCompanionPrimaryServerQueue)
+            State.AutoTrader.ServerPreviewCompanionCache=saved.cache;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.IsManualBotServerJob=saved.manual
+            local tokenBearing=true;for _,server in ipairs(ok and queue or {}) do if server.previewTokenSource~="browser_companion_authenticated" or #(server.playerTokens or {})~=5 then tokenBearing=false end end
+            return ok and eligible==true and #queue==30 and scan.source=="browser_companion_authenticated" and scan.preclassifyPool<=80 and tokenBearing,
+                "healthy authenticated companion did not become the bounded primary discovery source with 30 genuine token-bearing rows"
+        end)
+
+        add("v37-round14-b-primary-jobids-come-only-from-companion-index",function()
+            local oldCache=State.AutoTrader.ServerPreviewCompanionCache
+            local snapshot={usable=true,selectorUsable=true,index={["real-a"]={jobId="real-a",playing=5,maxPlayers=12,rowAgeSeconds=1,playerTokenCount=1,playerTokens={string.rep("a",32)},rosterEvidenceAvailable=true,fresh=true}},diagnostics={selectorEligible=true}}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            local refreshed=State.AutoTrader.RefreshServerPreviewCompanion(false)
+            State.AutoTrader.ServerPreviewCompanionCache=oldCache
+            return refreshed.index["real-a"]~=nil and refreshed.index["hint-only"]==nil,
+                "primary discovery exposed a JobId that was not present in the parsed companion index"
+        end)
+
+        add("v37-round14-d-h-selector-filters-current-manual-recent-full-and-stale",function()
+            local saved={cache=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,classify=State.AutoTrader.ClassifyServerPreview,merge=State.AutoTrader.MergeServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.IsManualBotServerJob}
+            local tok=string.rep("b",32);local index={
+                [game.JobId]={jobId=game.JobId,playing=5,maxPlayers=12,rowAgeSeconds=1,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true},
+                ["manual-r14"]={jobId="manual-r14",playing=5,maxPlayers=12,rowAgeSeconds=1,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true},
+                ["recent-r14"]={jobId="recent-r14",playing=5,maxPlayers=12,rowAgeSeconds=1,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true},
+                ["full-r14"]={jobId="full-r14",playing=12,maxPlayers=12,rowAgeSeconds=1,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true},
+                ["stale-r14"]={jobId="stale-r14",playing=5,maxPlayers=12,lastSeenUnix=os.time()-91,rowAgeSeconds=91,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true},
+                ["allowed-r14"]={jobId="allowed-r14",playing=5,maxPlayers=12,rowAgeSeconds=1,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true},
+            }
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot={usable=true,selectorUsable=true,index=index,diagnostics={selectorEligible=true}},diagnostics={selectorEligible=true}}
+            State.AutoTrader.RecentJobs={["recent-r14"]=os.time()};State.AutoTrader.IsManualBotServerJob=function(id) return id=="manual-r14" end
+            State.AutoTrader.ResolveServerPreviewFingerprints=function(servers) for _,server in ipairs(servers) do server.previewFingerprints={string.rep("c",32)};server.previewThumbnailUrls={"https://t.example/a.png"};server.previewFingerprintByTokenIndex={[1]=server.previewFingerprints[1]};server.previewThumbnailUrlByTokenIndex={[1]=server.previewThumbnailUrls[1]} end;return true,nil,{completed=#servers} end
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=function() return true,nil,{completed=1,sizeIdentityMismatch=0} end
+            State.AutoTrader.ClassifyServerPreview=function(server) local p={previewTrusted=false,goldMatchRatio=0,score=1,safeEnough=true,sample=1,goldMatched=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,hardReject=false,suspicious=false};server.botPreview=p;return p end
+            State.AutoTrader.MergeServerCandidateCache=function() return 0 end
+            local ok,queue,scan=pcall(State.AutoTrader.BuildCompanionPrimaryServerQueue)
+            State.AutoTrader.ServerPreviewCompanionCache=saved.cache;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.IsManualBotServerJob=saved.manual
+            return ok and #queue==1 and queue[1].id=="allowed-r14" and scan.filteredCurrent==1 and scan.filteredManual==1 and scan.filteredRecent==1 and scan.filteredFull==1 and scan.filteredStale==1,
+                "companion-primary discovery bypassed current/manual/recent/full/stale selector safety filters"
+        end)
+
+        add("v37-round15-companion-primary-blocks-still-valid-recentjobs-after-90-seconds",function()
+            local saved={cache=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,classify=State.AutoTrader.ClassifyServerPreview,merge=State.AutoTrader.MergeServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.IsManualBotServerJob}
+            local tok=string.rep("d",32);local now=os.time();local jobId="recent-hard-block-r15"
+            local row={jobId=jobId,playing=5,maxPlayers=12,lastSeenUnix=now,rowAgeSeconds=0,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot={usable=true,selectorUsable=true,index={[jobId]=row},diagnostics={selectorEligible=true}},diagnostics={selectorEligible=true}}
+            State.AutoTrader.IsManualBotServerJob=function() return false end;State.AutoTrader.ResolveServerPreviewFingerprints=function() return true,nil,{completed=0} end;State.AutoTrader.ResolveServerDisplayThumbnailUrls=function() return true,nil,{completed=0,sizeIdentityMismatch=0} end;State.AutoTrader.ClassifyServerPreview=function(server) local p={previewTrusted=false,goldMatchRatio=0,score=1,safeEnough=true,sample=0,goldMatched=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,hardReject=false,suspicious=false};server.botPreview=p;return p end;State.AutoTrader.MergeServerCandidateCache=function() return 0 end
+            local blocked=true;local details={}
+            for _,age in ipairs({91,1199}) do State.AutoTrader.RecentJobs={[jobId]=os.time()-age};local ok,queue,scan,eligible=pcall(State.AutoTrader.BuildCompanionPrimaryServerQueue);details[age]={ok=ok,count=ok and #queue or -1,filtered=ok and scan.filteredRecent or -1,eligible=eligible};if not (ok and eligible==true and #queue==0 and scan.filteredRecent==1 and State.AutoTrader.RecentJobs[jobId]~=nil) then blocked=false end end
+            State.AutoTrader.ServerPreviewCompanionCache=saved.cache;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.IsManualBotServerJob=saved.manual
+            return blocked,"companion-primary reused a still-valid RecentJobs destination after the historical 90-second direct-selector fallback age"
+        end)
+
+        add("v37-round15-companion-primary-allows-genuinely-expired-recentjobs-after-prune",function()
+            local saved={cache=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,classify=State.AutoTrader.ClassifyServerPreview,merge=State.AutoTrader.MergeServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.IsManualBotServerJob}
+            local tok=string.rep("e",32);local now=os.time();local jobId="recent-expired-r15";local fp=string.rep("f",32)
+            local row={jobId=jobId,playing=5,maxPlayers=12,lastSeenUnix=now,rowAgeSeconds=0,playerTokenCount=1,playerTokens={tok},rosterEvidenceAvailable=true,fresh=true}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot={usable=true,selectorUsable=true,index={[jobId]=row},diagnostics={selectorEligible=true}},diagnostics={selectorEligible=true}}
+            State.AutoTrader.RecentJobs={[jobId]=os.time()-math.max(1,CONFIG.AutoTraderRecentServerTtlSeconds)-2};State.AutoTrader.IsManualBotServerJob=function() return false end
+            State.AutoTrader.ResolveServerPreviewFingerprints=function(servers) for _,server in ipairs(servers) do server.previewFingerprints={fp};server.previewThumbnailUrls={"https://t.example/r15.png"};server.previewFingerprintByTokenIndex={[1]=fp};server.previewThumbnailUrlByTokenIndex={[1]=server.previewThumbnailUrls[1]} end;return true,nil,{completed=#servers} end
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=function() return true,nil,{completed=1,sizeIdentityMismatch=0} end;State.AutoTrader.ClassifyServerPreview=function(server) local p={previewTrusted=false,goldMatchRatio=0,score=1,safeEnough=true,sample=1,goldMatched=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,hardReject=false,suspicious=false};server.botPreview=p;return p end;State.AutoTrader.MergeServerCandidateCache=function() return 0 end
+            local ok,queue,scan,eligible=pcall(State.AutoTrader.BuildCompanionPrimaryServerQueue);local pruned=State.AutoTrader.RecentJobs[jobId]==nil
+            State.AutoTrader.ServerPreviewCompanionCache=saved.cache;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.IsManualBotServerJob=saved.manual
+            return ok and eligible==true and pruned and #queue==1 and queue[1].id==jobId and scan.filteredRecent==0,
+                "genuinely expired RecentJobs entry remained suppressed after the authoritative prune"
+        end)
+
+        add("v37-round14-i-j-invalid-companion-falls-back-to-direct-tokenless-selector",function()
+            local oldPrimary,oldDirect,oldSet,oldManual=State.AutoTrader.BuildCompanionPrimaryServerQueue,State.AutoTrader.V37BuildPublicServerQueue,State.AutoTrader.SetUpcomingServerQueue,State.AutoTrader.FilterManualBotServerQueue
+            State.AutoTrader.BuildCompanionPrimaryServerQueue=function() return {},{source="browser_companion_authenticated",companion={selectorLastError="RUNTIME_SOURCE_SHA_MISSING_OR_INVALID"}},false end
+            State.AutoTrader.V37BuildPublicServerQueue=function() return {{id="direct-tokenless",playing=5,maxPlayers=12,playerTokens={},previewTokenCount=0}}, {source="fresh_http_scan",candidates={{id="direct-tokenless"}}} end
+            State.AutoTrader.FilterManualBotServerQueue=function(q) return q end;State.AutoTrader.SetUpcomingServerQueue=function() end
+            local ok,queue,scan=pcall(State.AutoTrader.BuildPublicServerQueue,true)
+            State.AutoTrader.BuildCompanionPrimaryServerQueue=oldPrimary;State.AutoTrader.V37BuildPublicServerQueue=oldDirect;State.AutoTrader.SetUpcomingServerQueue=oldSet;State.AutoTrader.FilterManualBotServerQueue=oldManual
+            return ok and #queue==1 and queue[1].id=="direct-tokenless" and #(queue[1].playerTokens or {})==0 and scan.source=="direct_public_api" and scan.discoverySource=="direct_public_api",
+                "invalid companion snapshot blocked direct fallback or fabricated roster evidence"
+        end)
+
+        add("v37-round14-k-companion-preview-does-not-increment-strict-certification",function()
+            local before=State.AutoTrader.GetBotEvidenceProvenanceSummary()
+            local server={id="r14-preview-only",playing=11,maxPlayers=12,previewTokenSource="browser_companion_authenticated",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints={string.rep("d",32)}}
+            pcall(State.AutoTrader.ClassifyServerPreview,server)
+            local after=State.AutoTrader.GetBotEvidenceProvenanceSummary()
+            return before.strictIcons==after.strictIcons and before.strictJobs==after.strictJobs and before.strictSightings==after.strictSightings,
+                "pre-join companion-primary preview contaminated automated strict certification counters"
+        end)
+
+        add("v37-round14-l-primary-five-of-eleven-remains-sampled",function()
+            local hashes,urls={},{};for i=1,5 do table.insert(hashes,string.rep(string.format("%x",i),32));table.insert(urls,"https://t.example/r14-"..tostring(i)..".png") end
+            local ui=State.AutoTrader.GetUpcomingServerPreviewUiState({id="r14-sampled",playing=11,maxPlayers=12,previewTokenCount=5,previewTokenSource="browser_companion_authenticated",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints=hashes,previewThumbnailUrls=urls})
+            return ui.tokenCount==5 and ui.previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and ui.detail:find("5 avatar samples · 11 players",1,true)==1 and ui.canPromoteFingerprintEvidence==true,
+                "companion-primary UI implied a complete roster instead of explicit 5-of-11 sampled evidence"
+        end)
+
+        add("v37-round14-m-final-comparator-is-deterministic-with-jobid-tiebreak",function()
+            local a={id="a-job",playing=10,botPreview={previewTrusted=false,goldMatchRatio=0.1,score=5}}
+            local b={id="b-job",playing=10,botPreview={previewTrusted=false,goldMatchRatio=0.1,score=5}}
+            local t={b,a};table.sort(t,State.AutoTrader.CompareFreshServerCandidates)
+            local trusted={id="z-job",playing=1,botPreview={previewTrusted=true,goldMatchRatio=0.9,score=-5}}
+            local u={a,trusted};table.sort(u,State.AutoTrader.CompareFreshServerCandidates)
+            return t[1]==a and u[1]==trusted,"Round-14 companion comparator lost canonical trusted ordering or deterministic JobId final tie-break"
+        end)
+
+        add("v37-round14-n-preclassification-pool-bounds-thumbnail-work",function()
+            local saved={cache=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,classify=State.AutoTrader.ClassifyServerPreview,merge=State.AutoTrader.MergeServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.IsManualBotServerJob}
+            local index={};for i=1,200 do local id="r14-bound-"..string.format("%03d",i);index[id]={jobId=id,playing=8,maxPlayers=12,rowAgeSeconds=i%10,playerTokenCount=1,playerTokens={string.rep("e",32)},rosterEvidenceAvailable=true,fresh=true} end
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot={usable=true,selectorUsable=true,index=index,diagnostics={selectorEligible=true}},diagnostics={selectorEligible=true}}
+            State.AutoTrader.RecentJobs={};State.AutoTrader.IsManualBotServerJob=function() return false end
+            local seen=0;State.AutoTrader.ResolveServerPreviewFingerprints=function(servers) seen=#servers;for _,server in ipairs(servers) do server.previewFingerprints={string.rep("f",32)};server.previewThumbnailUrls={"https://t.example/f.png"} end;return true,nil,{completed=#servers} end
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=function() return true,nil,{completed=30,sizeIdentityMismatch=0} end
+            State.AutoTrader.ClassifyServerPreview=function(server) local p={previewTrusted=false,goldMatchRatio=0,score=1,safeEnough=true,sample=1,goldMatched=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,hardReject=false,suspicious=false};server.botPreview=p;return p end
+            State.AutoTrader.MergeServerCandidateCache=function() return 0 end
+            local ok,queue,scan=pcall(State.AutoTrader.BuildCompanionPrimaryServerQueue)
+            State.AutoTrader.ServerPreviewCompanionCache=saved.cache;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.IsManualBotServerJob=saved.manual
+            return ok and seen==math.min(200,CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit) and seen<=80 and #queue==30 and scan.preclassifyPool==seen,
+                "companion-primary path attempted thumbnail resolution across an unbounded cache instead of the bounded preclassification pool"
+        end)
+
+        add("v37-round14-p-48-display-binds-back-to-150-canonical-identity",function()
+            local oldHooks=State.AutoTrader.ServerDisplayThumbnailTestHooks
+            local canonical=string.rep("1",32)
+            local canonicalUrl="https://tr.rbxcdn.com/30DAY-AvatarHeadshot-"..string.upper(canonical).."-Png/150/150/AvatarHeadshot/Png/noFilter"
+            local displayUrl="https://tr.rbxcdn.com/30DAY-AvatarHeadshot-"..string.upper(canonical).."-Png/48/48/AvatarHeadshot/Png/noFilter"
+            local server={id="r14-display-same",playerTokens={string.rep("a",32)},previewFingerprints={canonical},previewThumbnailUrls={canonicalUrl},previewFingerprintByTokenIndex={[1]=canonical},previewThumbnailUrlByTokenIndex={[1]=canonicalUrl}}
+            State.AutoTrader.ServerDisplayThumbnailTestHooks={batch=function(chunk)
+                return {StatusCode=200,Body=HttpService:JSONEncode({data={{requestId=chunk[1].requestId,state="Completed",imageUrl=displayUrl}}})}
+            end}
+            local ok,reason,diag=State.AutoTrader.ResolveServerDisplayThumbnailUrls({server})
+            local displayKey=State.AutoTrader.GetUpcomingThumbnailDisplayKey(server.previewDisplayThumbnailUrls and server.previewDisplayThumbnailUrls[1],server.previewDisplayCanonicalFingerprints and server.previewDisplayCanonicalFingerprints[1])
+            State.AutoTrader.ServerDisplayThumbnailTestHooks=oldHooks
+            local checks={
+                A=ok==true,
+                B=reason==nil,
+                C=diag.size=="48x48",
+                D=diag.sizeIdentityMismatch==0,
+                E=server.previewFingerprints[1]==canonical,
+                F=server.previewThumbnailUrls[1]==canonicalUrl,
+                G=server.previewDisplayFingerprintByTokenIndex[1]==canonical,
+                H=server.previewDisplayCanonicalFingerprints[1]==canonical,
+                I=server.previewDisplayThumbnailUrls[1]==displayUrl,
+                J=displayKey=="fp:"..canonical,
+            }
+            local failed={}
+            for _,key in ipairs({"A","B","C","D","E","F","G","H","I","J"}) do if not checks[key] then table.insert(failed,key) end end
+            if #failed==0 then return true end
+            return false,"failed="..table.concat(failed,",")
+                .."; ok="..tostring(ok)
+                .."; reason="..tostring(reason)
+                .."; size="..tostring(diag.size)
+                .."; mismatch="..tostring(diag.sizeIdentityMismatch)
+                .."; canonicalExtract="..tostring(State.AutoTrader.CanonicalThumbnailFingerprint(canonicalUrl))
+                .."; displayExtract="..tostring(State.AutoTrader.CanonicalThumbnailFingerprint(displayUrl))
+                .."; displayKey="..tostring(displayKey)
+        end)
+        add("v37-round14-q-size-mismatch-never-rekeys-canonical-identity",function()
+            local oldHooks,oldCanonical=State.AutoTrader.ServerDisplayThumbnailTestHooks,State.AutoTrader.CanonicalThumbnailFingerprint
+            local canonical=string.rep("2",32);local displayFp=string.rep("3",32);local server={id="r14-display-mismatch",playerTokens={string.rep("b",32)},previewFingerprints={canonical},previewFingerprintByTokenIndex={[1]=canonical}}
+            State.AutoTrader.CanonicalThumbnailFingerprint=function() return displayFp end
+            State.AutoTrader.ServerDisplayThumbnailTestHooks={batch=function(chunk) return {StatusCode=200,Body=HttpService:JSONEncode({data={{requestId=chunk[1].requestId,state="Completed",imageUrl="https://t.example/display-mismatch.png"}}})} end}
+            local ok,_,diag=State.AutoTrader.ResolveServerDisplayThumbnailUrls({server})
+            State.AutoTrader.ServerDisplayThumbnailTestHooks,State.AutoTrader.CanonicalThumbnailFingerprint=oldHooks,oldCanonical
+            return ok and diag.sizeIdentityMismatch==1 and server.previewFingerprints[1]==canonical and server.previewDisplayCanonicalFingerprints[1]==canonical and server.previewDisplayFingerprintByTokenIndex[1]==displayFp,
+                "48x48 fingerprint mismatch rewrote or aliased canonical 150x150 bot identity"
+        end)
+
+        add("v37-round14-r-prefetch-prefers-48-display-url-and-stays-bounded",function()
+            local oldState,oldHooks=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            local workers,fetched={},{}
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0,prefetchQueue={},prefetchQueued={},prefetchActive=0,prefetchStarts=0,prefetchedReady=0,cacheHits=0,maxObservedConcurrency=0}
+            State.AutoTrader.UpcomingThumbnailDisplayTestHooks={
+                spawn=function(fn) table.insert(workers,fn) end,
+                fetchBytes=function(url) table.insert(fetched,url);return url:find("/48-",1,true) and "PNG48" or nil,"image/png" end,
+                writefile=function() return true end,
+                assetFunction=function() return "rbxasset://48" end,
+            }
+            local servers={}
+            for i=1,8 do
+                local digit=string.sub("12345678",i,i)
+                local fp=string.rep(digit,32)
+                table.insert(servers,{previewThumbnailUrls={"https://t.example/150-"..i..".png"},previewFingerprints={fp},previewDisplayThumbnailUrls={"https://t.example/48-"..i..".png"},previewDisplayCanonicalFingerprints={fp}})
+            end
+            local queued=State.AutoTrader.QueueUpcomingThumbnailPrefetch(servers,true)
+            local initial=#workers
+            local cursor=1
+            while cursor<=#workers do local fn=workers[cursor];cursor+=1;fn() end
+            local summary=State.AutoTrader.GetUpcomingThumbnailDisplaySummary()
+            local only48=#fetched==8
+            for _,url in ipairs(fetched) do if not tostring(url):find("/48-",1,true) then only48=false end end
+            for _,entry in pairs(State.AutoTrader.UpcomingThumbnailDisplay.cache) do if tostring(entry.url):find("/150-",1,true) then only48=false end end
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks=oldState,oldHooks
+            return queued==8 and initial==5 and only48 and summary.downloadStarts==8 and summary.prefetchStarts==8 and summary.prefetchedReady==8 and summary.maxObservedConcurrency<=5,
+                "background display prefetch downloaded canonical 150 pixels, collapsed distinct canonical identities, or exceeded the configured 48x48 concurrency bound"
+        end)
+        add("v37-round14-s-primary-companion-evidence-is-sanitized-from-selector-cache",function()
+            local fp=string.rep("5",32)
+            local row=State.AutoTrader.NormalizeServerCandidateCacheEntry({id="r14-cache",scannedAt=os.time(),playing=11,maxPlayers=12,occupancy=11/12,
+                previewTokenSource="browser_companion_authenticated",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprintSource="browser_companion_authenticated",
+                previewFingerprints={fp},previewThumbnailUrls={"https://t.example/150.png"},previewTokenCount=5,companionRowAgeSeconds=1,companionSamplePlaying=11})
+            return row and row.previewTokenSource==nil and row.previewFingerprintSource==nil and row.previewCoverage==nil and #(row.previewFingerprints or {})==0 and #(row.previewThumbnailUrls or {})==0 and row.previewTokenCount==0 and row.companionRowAgeSeconds==nil and row.companionSamplePlaying==nil,
+                "new browser_companion_authenticated roster evidence escaped the existing explicit cache-sanitization boundary"
+        end)
+
+        add("v37-round14-source-identity-gates-primary-without-breaking-preview-enrichment",function()
+            local now=2000000000;local token=string.rep("6",32);local policy=State.AutoTrader.ServerPreviewCompanionPolicy
+            local healthy={schemaVersion=1,collectorVersion=policy.expectedCollectorVersion,runtimeSourceSha256=policy.expectedRuntimeSourceSha256,placeId=142823291,pollIntervalSeconds=20,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="identity-ok",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}
+            local good=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(healthy),nil,now)
+            healthy.runtimeSourceSha256=nil
+            local legacy=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(healthy),nil,now)
+            return good.usable==true and good.selectorUsable==true and good.diagnostics.selectorEligible==true and legacy.usable==true and legacy.selectorUsable~=true and legacy.diagnostics.selectorLastError=="RUNTIME_SOURCE_SHA_MISSING_OR_INVALID",
+                "exact reviewed runtime source identity was not required for primary discovery or incorrectly disabled conservative exact-JobId preview enrichment"
+        end)
+
+        add("v37-round15-source-pin-one-nibble-mismatch-is-not-primary",function()
+            local now=2000000000;local token=string.rep("9",32);local policy=State.AutoTrader.ServerPreviewCompanionPolicy
+            local bad=string.sub(policy.expectedRuntimeSourceSha256,1,63)..(string.sub(policy.expectedRuntimeSourceSha256,64,64)=="0" and "1" or "0")
+            local payload={schemaVersion=1,collectorVersion=policy.expectedCollectorVersion,runtimeSourceSha256=bad,placeId=policy.expectedPlaceId,pollIntervalSeconds=policy.requiredHealthyPollSeconds,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="pin-nibble",playing=5,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}
+            local parsed=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(payload),nil,now)
+            return parsed.usable==true and parsed.selectorUsable~=true and parsed.diagnostics.selectorEligible==false and parsed.diagnostics.selectorLastError=="RUNTIME_SOURCE_SHA_MISMATCH",
+                "one-nibble runtime source mismatch acquired companion-primary discovery authority"
+        end)
+
+        add("v37-round15-source-pin-unrelated-valid-sha-is-not-primary",function()
+            local now=2000000000;local token=string.rep("a",32);local policy=State.AutoTrader.ServerPreviewCompanionPolicy
+            local payload={schemaVersion=1,collectorVersion=policy.expectedCollectorVersion,runtimeSourceSha256=string.rep("f",64),placeId=policy.expectedPlaceId,pollIntervalSeconds=policy.requiredHealthyPollSeconds,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="pin-unrelated",playing=5,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}
+            local parsed=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(payload),nil,now)
+            return parsed.usable==true and parsed.selectorUsable~=true and parsed.diagnostics.selectorEligible==false and parsed.diagnostics.selectorLastError=="RUNTIME_SOURCE_SHA_MISMATCH",
+                "unrelated syntactically valid runtime SHA acquired companion-primary discovery authority"
+        end)
+
+        add("v37-round15-source-pin-wrong-collector-version-is-not-primary",function()
+            local now=2000000000;local token=string.rep("b",32);local policy=State.AutoTrader.ServerPreviewCompanionPolicy
+            local payload={schemaVersion=1,collectorVersion=policy.expectedCollectorVersion.."-wrong",runtimeSourceSha256=policy.expectedRuntimeSourceSha256,placeId=policy.expectedPlaceId,pollIntervalSeconds=policy.requiredHealthyPollSeconds,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="pin-version",playing=5,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}
+            local parsed=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(payload),nil,now)
+            return parsed.usable==true and parsed.selectorUsable~=true and parsed.diagnostics.selectorEligible==false and parsed.diagnostics.selectorLastError=="COLLECTOR_VERSION_MISMATCH",
+                "wrong collectorVersion acquired companion-primary discovery authority"
+        end)
+
+        add("v37-round15-source-pin-mismatch-falls-back-to-direct-public",function()
+            local saved={cache=State.AutoTrader.ServerPreviewCompanionCache,direct=State.AutoTrader.V37BuildPublicServerQueue,set=State.AutoTrader.SetUpcomingServerQueue,manual=State.AutoTrader.FilterManualBotServerQueue}
+            local now=os.time();local token=string.rep("c",32);local policy=State.AutoTrader.ServerPreviewCompanionPolicy
+            local payload={schemaVersion=1,collectorVersion=policy.expectedCollectorVersion,runtimeSourceSha256=string.rep("e",64),placeId=policy.expectedPlaceId,pollIntervalSeconds=policy.requiredHealthyPollSeconds,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="source-mismatch-companion",playing=5,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}
+            local parsed=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(payload),nil,now)
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=parsed,diagnostics=parsed.diagnostics}
+            State.AutoTrader.V37BuildPublicServerQueue=function() return {{id="source-pin-direct",playing=5,maxPlayers=12,playerTokens={}}},{source="fresh_http_scan",candidates={{id="source-pin-direct"}}} end
+            State.AutoTrader.FilterManualBotServerQueue=function(q) return q end;State.AutoTrader.SetUpcomingServerQueue=function() end
+            local ok,queue,scan=pcall(State.AutoTrader.BuildPublicServerQueue,true)
+            State.AutoTrader.ServerPreviewCompanionCache=saved.cache;State.AutoTrader.V37BuildPublicServerQueue=saved.direct;State.AutoTrader.SetUpcomingServerQueue=saved.set;State.AutoTrader.FilterManualBotServerQueue=saved.manual
+            return ok and parsed.usable==true and parsed.selectorUsable~=true and #queue==1 and queue[1].id=="source-pin-direct" and scan.source=="direct_public_api" and scan.discoverySource=="direct_public_api",
+                "runtime source mismatch did not fail over to the direct public selector"
+        end)
+        add("v37-round14-duplicate-jobid-ambiguity-disables-primary-source",function()
+            local now=2000000000;local token=string.rep("7",32)
+            local payload={schemaVersion=1,collectorVersion="server-updater-v3-round14-companion-primary-candidate",runtimeSourceSha256=string.rep("b",64),placeId=142823291,pollIntervalSeconds=20,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={
+                {jobId="duplicate-primary",playing=5,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true},
+                {jobId="duplicate-primary",playing=6,maxPlayers=12,lastSeenUnix=now,playerTokens={string.rep("8",32)},playerTokenCount=1,rosterEvidenceAvailable=true},
+            }}
+            local parsed=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(payload),nil,now)
+            return parsed.usable==true and parsed.selectorUsable~=true and parsed.index["duplicate-primary"]==nil and parsed.ambiguousJobIds["duplicate-primary"]==true and parsed.diagnostics.selectorEligible==false and parsed.diagnostics.selectorLastError=="DUPLICATE_JOBID_AMBIGUITY",
+                "duplicate JobId ambiguity remained eligible as a companion-primary discovery snapshot"
+        end)
+
+        add("v37-round14-support-bounds-primary-rejection-categories",function()
+            local old=State.AutoTrader.LastServerScan
+            State.AutoTrader.LastServerScan={source="browser_companion_authenticated",discoverySource="browser_companion_authenticated",rawRows=100,joinableRows=71,preclassifyPool=60,preclassifyLimit=80,queueCount=23,filteredCurrent=1,filteredFull=3,filteredManual=4,filteredRecent=5,filteredStale=6,filteredTokenless=7,filteredInvalid=2,filteredBotPreview=8,thumbnail={tokens=300,completed=295},displayThumbnail={completed=115,sizeIdentityMismatch=2}}
+            local summary=State.AutoTrader.GetServerDiscoverySupportSummary()
+            State.AutoTrader.LastServerScan=old
+            return summary.source=="browser_companion_authenticated" and summary.queueCount==23 and summary.filteredManual==4 and summary.filteredStale==6 and summary.filteredTokenless==7 and summary.filteredBotPreview==8 and summary.canonicalThumbnailCompleted==295 and summary.displayThumbnailCompleted==115 and summary.sizeIdentityMismatch==2,
+                "support did not expose bounded scalar rejection/thumbnail diagnostics for a low-coverage companion-primary queue"
+        end)
+
+
+
+        add("v37-round18-teleport-bootstrap-includes-botdb-when-enabled",function()
+            local oldBuilder=State.AutoTrader.BuildCompactTeleportBotDb;local calls=0;local marker="18181818181818181818181818181818"
+            State.AutoTrader.BuildCompactTeleportBotDb=function() calls+=1;return {version=5,icons={[marker]={strictGoldBotSightings=1}}} end
+            local ok,code=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"round18-include",true)
+            State.AutoTrader.BuildCompactTeleportBotDb=oldBuilder
+            return ok and type(code)=="string" and calls==1 and code:find("botDb",1,true)~=nil and code:find(marker,1,true)~=nil,
+                "includeBotDb=true did not serialize the available compact bot DB"
+        end)
+
+        add("v37-round18-teleport-bootstrap-omits-botdb-when-disabled",function()
+            local oldBuilder=State.AutoTrader.BuildCompactTeleportBotDb;local calls=0;local marker="28282828282828282828282828282828"
+            State.AutoTrader.BuildCompactTeleportBotDb=function() calls+=1;return {version=5,icons={[marker]={manualGoldBotSightings=1}}} end
+            local ok,code=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"round18-minimal",false)
+            State.AutoTrader.BuildCompactTeleportBotDb=oldBuilder
+            return ok and type(code)=="string" and calls==0 and code:find("botDb",1,true)==nil and code:find(marker,1,true)==nil,
+                "includeBotDb=false still invoked/serialized the compact bot DB"
+        end)
+
+        add("v37-round18-oversized-bootstrap-uses-true-minimal-fallback",function()
+            local saved={
+                getQueue=State.AutoTrader.GetQueueOnTeleport,build=State.AutoTrader.BuildTeleportBootstrapCode,saveHistory=State.AutoTrader.SaveSessionHistory,
+                saveRecent=State.AutoTrader.SaveRecentJobs,saveBot=State.AutoTrader.SaveBotIconDb,flushStats=State.AutoTrader.FlushTargetStats,
+                savePrefs=State.AutoTrader.SavePreferences,flushLog=State.AutoTrader.FlushDiskDebugLog,teleportQueued=State.AutoTrader.TeleportQueued,
+                queueOutcome=State.AutoTrader.TeleportQueueOutcome,lastReason=State.AutoTrader.LastTeleportReason,
+            }
+            local calls={};local queuedCode=nil
+            State.AutoTrader.TeleportQueued=false;State.AutoTrader.TeleportQueueOutcome=nil
+            State.AutoTrader.GetQueueOnTeleport=function() return function(code) queuedCode=code;return true end end
+            State.AutoTrader.BuildTeleportBootstrapCode=function(_,includeBotDb)
+                table.insert(calls,includeBotDb)
+                if includeBotDb==false then return "ROUND18_MINIMAL_BOOTSTRAP" end
+                return string.rep("X",180001)
+            end
+            State.AutoTrader.SaveSessionHistory=function() return true end;State.AutoTrader.SaveRecentJobs=function() return true end
+            State.AutoTrader.SaveBotIconDb=function() return true end;State.AutoTrader.FlushTargetStats=function() return true end
+            State.AutoTrader.SavePreferences=function() return true end;State.AutoTrader.FlushDiskDebugLog=function() return true end
+            local callOk,queued,reason=pcall(State.AutoTrader.QueueTeleportScript,"round18-oversized")
+            task.wait()
+            State.AutoTrader.GetQueueOnTeleport=saved.getQueue;State.AutoTrader.BuildTeleportBootstrapCode=saved.build;State.AutoTrader.SaveSessionHistory=saved.saveHistory
+            State.AutoTrader.SaveRecentJobs=saved.saveRecent;State.AutoTrader.SaveBotIconDb=saved.saveBot;State.AutoTrader.FlushTargetStats=saved.flushStats
+            State.AutoTrader.SavePreferences=saved.savePrefs;State.AutoTrader.FlushDiskDebugLog=saved.flushLog;State.AutoTrader.TeleportQueued=saved.teleportQueued
+            State.AutoTrader.TeleportQueueOutcome=saved.queueOutcome;State.AutoTrader.LastTeleportReason=saved.lastReason
+            return callOk and queued==true and reason=="confirmed" and #calls==2 and calls[1]==true and calls[2]==false and queuedCode=="ROUND18_MINIMAL_BOOTSTRAP",
+                "oversized primary bootstrap did not rebuild/queue the true includeBotDb=false fallback"
+        end)
+
+        add("v37-round18-minimal-bootstrap-is-smaller-with-nonempty-botdb",function()
+            local oldBuilder=State.AutoTrader.BuildCompactTeleportBotDb
+            State.AutoTrader.BuildCompactTeleportBotDb=function() return {version=5,icons={round18={payload=string.rep("B",4096)}}} end
+            local okFull,full=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"round18-size",true)
+            local okMinimal,minimal=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"round18-size",false)
+            State.AutoTrader.BuildCompactTeleportBotDb=oldBuilder
+            return okFull and okMinimal and type(full)=="string" and type(minimal)=="string" and #minimal<#full and minimal:find("botDb",1,true)==nil,
+                "minimal teleport bootstrap was not strictly smaller after omitting a nonempty bot DB"
+        end)
+
+        add("v37-round18-minimal-bootstrap-retains-required-nonbot-state",function()
+            local oldBuilder=State.AutoTrader.BuildCompactTeleportBotDb;local calls=0
+            State.AutoTrader.BuildCompactTeleportBotDb=function() calls+=1;return {version=5,icons={}} end
+            local ok,code=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"round18-safe-continuation",false)
+            State.AutoTrader.BuildCompactTeleportBotDb=oldBuilder
+            return ok and calls==0 and type(code)=="string"
+                and code:find("round18-safe-continuation",1,true)~=nil and code:find("preferences",1,true)~=nil
+                and code:find("recentJobs",1,true)~=nil and code:find(HARDEN.distributionNormalizedSha256,1,true)~=nil,
+                "minimal teleport fallback dropped required non-bot continuation/integrity state"
+        end)
+
+        add("v37-round18-bootstrap-serialization-does-not-promote-bot-evidence",function()
+            local oldCommit,oldBuilder,oldDb=State.AutoTrader.CommitTrustedBotDbCandidate,State.AutoTrader.BuildCompactTeleportBotDb,State.AutoTrader.BotIconDb
+            local commits=0;local builderCalls=0
+            State.AutoTrader.CommitTrustedBotDbCandidate=function(...) commits+=1;return true end
+            State.AutoTrader.BuildCompactTeleportBotDb=function() builderCalls+=1;return {version=5,icons={round18={manualGoldBotSightings=3}}} end
+            local okFull=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"round18-no-promote-full",true)
+            local okMinimal=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"round18-no-promote-minimal",false)
+            local unchanged=State.AutoTrader.BotIconDb==oldDb
+            State.AutoTrader.CommitTrustedBotDbCandidate=oldCommit;State.AutoTrader.BuildCompactTeleportBotDb=oldBuilder;State.AutoTrader.BotIconDb=oldDb
+            return okFull and okMinimal and builderCalls==1 and commits==0 and unchanged,
+                "bootstrap serialization fabricated/promoted bot evidence or invoked compact bot DB during minimal mode"
+        end)
+
+        add("v37-round18-persistence-success-error-is-nil",function()
+            local key="__round18_persistence_success__";local oldRow=HARDEN.persistenceHealth.files[key];local oldLastSave=HARDEN.persistenceHealth.lastSaveUnix;local oldLastError=HARDEN.persistenceHealth.lastError
+            notePersistence(key,true,"self_test","must_not_survive_success")
+            local row=HARDEN.persistenceHealth.files[key];local passed=row and row.ok==true and row.error==nil
+            HARDEN.persistenceHealth.files[key]=oldRow;HARDEN.persistenceHealth.lastSaveUnix=oldLastSave;HARDEN.persistenceHealth.lastError=oldLastError
+            return passed,"successful persistence telemetry retained a failure-looking error"
+        end)
+
+        add("v37-round18-canonical-preview-success-reason-is-nil",function()
+            local oldHttp=httpRequest;local hash="38383838383838383838383838383838"
+            httpRequest=function(options)
+                local requestRows=HttpService:JSONDecode(options.Body or "[]");local data={}
+                for _,requestRow in ipairs(requestRows) do
+                    table.insert(data,{requestId=requestRow.requestId,state="Completed",imageUrl="https://tr.rbxcdn.com/30DAY-AvatarHeadshot-"..string.upper(hash).."-Png/150/150/AvatarHeadshot/Png/noFilter"})
+                end
+                return {Success=true,StatusCode=200,Body=HttpService:JSONEncode({data=data})}
+            end
+            local server={id="round18-preview",playerTokens={"abababababababababababababababab"}}
+            local callOk,ok,reason,diag=pcall(State.AutoTrader.ResolveServerPreviewFingerprints,{server})
+            httpRequest=oldHttp
+            return callOk and ok==true and reason==nil and diag and diag.completed==1 and server.previewFingerprints[1]==hash,
+                "successful canonical server-preview resolution retained a failure-looking reason"
+        end)
+
+        add("v37-round18-certified-headshot-success-reason-is-nil",function()
+            local oldGet=State.AutoTrader.HttpGetBody;local hash="48484848484848484848484848484848"
+            State.AutoTrader.HttpGetBody=function()
+                return HttpService:JSONEncode({data={{targetId=424242,state="Completed",imageUrl="https://tr.rbxcdn.com/30DAY-AvatarHeadshot-"..string.upper(hash).."-Png/150/150/AvatarHeadshot/Png/noFilter"}}})
+            end
+            local callOk,ok,result,reason=pcall(State.AutoTrader.ResolveUserIdsFingerprints,{424242})
+            State.AutoTrader.HttpGetBody=oldGet
+            return callOk and ok==true and reason==nil and result and result.fingerprintByUserId[424242]==hash,
+                "successful certified-headshot resolution retained a failure-looking reason"
+        end)
+
+        add("v37-round18-manual-bot-success-errors-are-nil",function()
+            local fp="58585858585858585858585858585858";local server={id="round18-manual",playing=6,maxPlayers=12,previewFingerprints={fp},previewThumbnailUrls={"https://t.example/r18.png"}}
+            local saved={botDb=State.AutoTrader.BotIconDb,manual=State.AutoTrader.ManualBotServerJobs,hop=State.AutoTrader.ServerHopQueue,upcoming=State.AutoTrader.UpcomingServerQueue,cache=State.AutoTrader.ServerCandidateCache,scan=State.AutoTrader.LastServerScan,recent=State.AutoTrader.RecentJobs,index=State.AutoTrader.ServerHopQueueIndex,inProgress=State.AutoTrader.ServerHopInProgress,commit=State.AutoTrader.CommitTrustedBotDbCandidate,saveManual=State.AutoTrader.SaveManualBotServerJobs,saveRecent=State.AutoTrader.SaveRecentJobs,saveCache=State.AutoTrader.SaveServerCandidateCache,log=State.AutoTrader.Log,render=State.AutoTrader.Render,status=State.AutoTrader.Status,detail=State.AutoTrader.StatusDetail,last=State.AutoTrader.LastManualBotServerClassification,rev=State.AutoTrader.UpcomingServerQueueRevision}
+            State.AutoTrader.BotIconDb={version=5,trustedRevision=1,icons={[fp]={strictGoldBotJobs={},strictGoldBotSightings=0,manualGoldBotJobs={},manualGoldBotSightings=0}}};State.AutoTrader.ManualBotServerJobs={};State.AutoTrader.ServerHopInProgress=false;State.AutoTrader.ServerHopQueue={server};State.AutoTrader.ServerHopQueueIndex=0;State.AutoTrader.UpcomingServerQueue={server};State.AutoTrader.ServerCandidateCache={version=1,entries={server}};State.AutoTrader.LastServerScan={candidates={server}};State.AutoTrader.RecentJobs={}
+            State.AutoTrader.CommitTrustedBotDbCandidate=function(candidate) State.AutoTrader.BotIconDb=candidate;return true end;State.AutoTrader.SaveManualBotServerJobs=function() return true end;State.AutoTrader.SaveRecentJobs=function() return true end;State.AutoTrader.SaveServerCandidateCache=function() return 0 end;State.AutoTrader.Log=function() end;State.AutoTrader.Render=function() end
+            local callOk,ok,class=pcall(State.AutoTrader.MarkUpcomingServerBot,"round18-manual")
+            local passed=callOk and ok==true and class and class.jobMarkPersistence=="saved" and class.jobMarkPersistenceError==nil and class.evidenceState=="TRUSTED_MANUAL_EVIDENCE" and class.evidenceError==nil
+            State.AutoTrader.BotIconDb=saved.botDb;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerHopQueue=saved.hop;State.AutoTrader.UpcomingServerQueue=saved.upcoming;State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.LastServerScan=saved.scan;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ServerHopQueueIndex=saved.index;State.AutoTrader.ServerHopInProgress=saved.inProgress;State.AutoTrader.CommitTrustedBotDbCandidate=saved.commit;State.AutoTrader.SaveManualBotServerJobs=saved.saveManual;State.AutoTrader.SaveRecentJobs=saved.saveRecent;State.AutoTrader.SaveServerCandidateCache=saved.saveCache;State.AutoTrader.Log=saved.log;State.AutoTrader.Render=saved.render;State.AutoTrader.Status=saved.status;State.AutoTrader.StatusDetail=saved.detail;State.AutoTrader.LastManualBotServerClassification=saved.last;State.AutoTrader.UpcomingServerQueueRevision=saved.rev
+            return passed,"successful manual BOT SERVER persistence retained a failure-looking error"
+        end)
+
+        add("v37-round18-passing-selftest-details-are-nil",function()
+            for _,row in ipairs(tests) do
+                if row.ok==true and row.detail~=nil then
+                    return false,"passing self-test retained failure-looking detail: "..tostring(row.name)
+                end
+            end
+            return true,"passing self-test detail rows are clean"
+        end)
+
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
         local result={passed=passed,total=#tests,ok=passed==#tests,tests=tests,atUnix=os.time(),controllerVersion=CONTROLLER_VERSION};State.AutoTrader.SelfTest=result;State.AutoTrader.Log("self_test_v36",{passed=passed,total=#tests,ok=result.ok,tests=tests});return result
     end
@@ -25144,24 +25929,94 @@ do
     end
 
     State.AutoTrader.V36AuditCommitTrustedBotDbCandidate=State.AutoTrader.CommitTrustedBotDbCandidate
+    State.AutoTrader.V37CommitTrustedBotDbCandidateUnserialized=State.AutoTrader.V36AuditCommitTrustedBotDbCandidate
+    State.AutoTrader.BotTrustWriteArbiter=State.AutoTrader.BotTrustWriteArbiter or {busy=false,serial=0}
+    State.AutoTrader.GetUnresolvedBotTrustFileWrite=function()
+        for _,fileName in ipairs({State.AutoTrader.BotTrustStageFile,State.AutoTrader.BotIconDbFile,State.AutoTrader.BotTrustMarkerFile}) do
+            local lock=HARDEN.fileWriteState and HARDEN.fileWriteState.byFile and HARDEN.fileWriteState.byFile[fileName]
+            if lock and lock.busy and lock.uncertain then return fileName,lock end
+        end
+        return nil,nil
+    end
+    State.AutoTrader.HoldBotTrustArbiterUntilFileWritesResolve=function(arbiter,serial,kind)
+        if type(arbiter)~="table" or arbiter.activeSerial~=serial then return end
+        arbiter.unresolvedHold=true;arbiter.kind=tostring(kind or arbiter.kind or "unresolved_file_write")
+        task.spawn(function()
+            while not Destroyed and arbiter.activeSerial==serial do
+                local fileName=State.AutoTrader.GetUnresolvedBotTrustFileWrite()
+                if not fileName then break end
+                arbiter.unresolvedFile=fileName
+                task.wait(0.1)
+            end
+            if arbiter.activeSerial==serial then
+                arbiter.busy=false;arbiter.kind=nil;arbiter.unresolvedHold=nil;arbiter.unresolvedFile=nil;arbiter.finishedAt=os.clock();arbiter.activeSerial=nil
+            end
+        end)
+    end
+    State.AutoTrader.WithBotTrustWriteArbiter=function(kind,callback)
+        local arbiter=State.AutoTrader.BotTrustWriteArbiter
+        if arbiter.busy then
+            State.AutoTrader.LastBotTrustWriteReject={reasonCode="BOT_TRUST_WRITE_BUSY",kind=tostring(kind),activeKind=arbiter.kind,activeSerial=arbiter.activeSerial,unresolvedFile=arbiter.unresolvedFile,at=os.clock()}
+            return false,"trusted bot DB transaction busy ("..tostring(arbiter.kind or "unknown")..")"
+        end
+        local priorUnresolved=State.AutoTrader.GetUnresolvedBotTrustFileWrite()
+        if priorUnresolved then
+            arbiter.busy=true;arbiter.serial+=1;arbiter.activeSerial=arbiter.serial;arbiter.kind="unresolved_prior_file_write";arbiter.startedAt=os.clock();arbiter.unresolvedFile=priorUnresolved
+            local serial=arbiter.activeSerial
+            State.AutoTrader.HoldBotTrustArbiterUntilFileWritesResolve(arbiter,serial,arbiter.kind)
+            State.AutoTrader.LastBotTrustWriteReject={reasonCode="BOT_TRUST_FILE_WRITE_UNRESOLVED",kind=tostring(kind),fileName=priorUnresolved,activeSerial=serial,at=os.clock()}
+            return false,"trusted bot persistence is waiting for unresolved executor file callback: "..tostring(priorUnresolved)
+        end
+        arbiter.busy=true;arbiter.serial+=1;arbiter.activeSerial=arbiter.serial;arbiter.kind=tostring(kind or "unknown");arbiter.startedAt=os.clock()
+        local serial=arbiter.activeSerial
+        local ok,a,b,c=pcall(callback,serial)
+        local unresolvedFile=State.AutoTrader.GetUnresolvedBotTrustFileWrite()
+        if unresolvedFile and arbiter.activeSerial==serial then
+            arbiter.unresolvedFile=unresolvedFile
+            State.AutoTrader.HoldBotTrustArbiterUntilFileWritesResolve(arbiter,serial,kind)
+        elseif arbiter.activeSerial==serial then
+            arbiter.busy=false;arbiter.kind=nil;arbiter.finishedAt=os.clock();arbiter.activeSerial=nil
+        end
+        if not ok then
+            State.AutoTrader.LastBotTrustWriteReject={reasonCode="BOT_TRUST_WRITE_EXCEPTION",kind=tostring(kind),error=tostring(a),unresolvedFile=unresolvedFile,at=os.clock()}
+            return false,"trusted bot DB transaction crashed: "..tostring(a)
+        end
+        return a,b,c
+    end
     State.AutoTrader.CommitTrustedBotDbCandidate=function(candidate,provenance)
-        return State.AutoTrader.V36AuditCommitTrustedBotDbCandidate(State.AutoTrader.PruneBotDbCandidate(candidate),provenance)
+        if type(candidate)~="table" or type(candidate.icons)~="table" then return false,"invalid candidate bot DB" end
+        local requestedBase=tonumber(candidate.trustedRevision) or 0
+        return State.AutoTrader.WithBotTrustWriteArbiter("trusted_commit",function()
+            local currentRevision=tonumber(State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.trustedRevision) or 0
+            if requestedBase~=currentRevision then
+                State.AutoTrader.LastBotTrustWriteReject={reasonCode="BOT_TRUST_STALE_BASE",candidateBaseRevision=requestedBase,currentRevision=currentRevision,provenance=provenance,at=os.clock()}
+                State.AutoTrader.Log("bot_trust_stale_candidate_rejected",State.AutoTrader.LastBotTrustWriteReject)
+                return false,"stale trusted bot DB candidate base revision "..tostring(requestedBase).."; current revision is "..tostring(currentRevision)
+            end
+            local bounded=State.AutoTrader.PruneBotDbCandidate(candidate)
+            bounded.trustedRevision=currentRevision
+            return State.AutoTrader.V37CommitTrustedBotDbCandidateUnserialized(bounded,provenance)
+        end)
     end
 
     State.AutoTrader.SaveBotIconDb=function(immediate)
         State.AutoTrader.BotIconDbSaveGeneration+=1;local generation=State.AutoTrader.BotIconDbSaveGeneration
         local function saveTrusted()
-            local candidate=State.AutoTrader.PruneBotDbCandidate(State.AutoTrader.BotIconDb)
-            local okBody,body=pcall(function() return HttpService:JSONEncode(candidate) end);if not okBody then return false,tostring(body) end
-            local digest=sha256Hex(body);if not digest then return false,"trusted bot DB SHA unavailable" end
-            local ok,err=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotIconDbFile,body);if not ok then return false,err end
-            local readback=HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile);if type(readback)~="string" or sha256Hex(readback)~=digest then return false,"trusted bot DB read-back mismatch" end
-            if (tonumber(candidate.trustedRevision) or 0)>0 then
-                local markerBody=HttpService:JSONEncode({schema=1,revision=candidate.trustedRevision,sha256=digest,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()})
-                local okMarker,markerErr=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustMarkerFile,markerBody);if not okMarker then return false,"trusted bot marker write failed/uncertain: "..tostring(markerErr) end
-                local marker=HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile);if type(marker)~="table" or tonumber(marker.revision)~=tonumber(candidate.trustedRevision) or marker.sha256~=digest then return false,"trusted bot marker read-back mismatch" end
-            end
-            State.AutoTrader.BotIconDb=candidate;rawset(_G,State.AutoTrader.BotIconDbKey,candidate);rawset(ExecutorEnvironment,State.AutoTrader.BotIconDbKey,candidate);return true
+            return State.AutoTrader.WithBotTrustWriteArbiter("snapshot_save",function()
+                local currentRevision=tonumber(State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.trustedRevision) or 0
+                local candidate=State.AutoTrader.PruneBotDbCandidate(State.AutoTrader.BotIconDb);candidate.trustedRevision=currentRevision
+                local okBody,body=pcall(function() return HttpService:JSONEncode(candidate) end);if not okBody then return false,tostring(body) end
+                local digest=sha256Hex(body);if not digest then return false,"trusted bot DB SHA unavailable" end
+                local ok,err=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotIconDbFile,body);if not ok then return false,err end
+                local readback=HARDEN.readTextFileBestEffort(State.AutoTrader.BotIconDbFile);if type(readback)~="string" or sha256Hex(readback)~=digest then return false,"trusted bot DB read-back mismatch" end
+                if (tonumber(candidate.trustedRevision) or 0)>0 then
+                    local markerBody=HttpService:JSONEncode({schema=1,revision=candidate.trustedRevision,sha256=digest,writtenByVersion=CONTROLLER_VERSION,atUnix=os.time()})
+                    local okMarker,markerErr=HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.BotTrustMarkerFile,markerBody);if not okMarker then return false,"trusted bot marker write failed/uncertain: "..tostring(markerErr) end
+                    local marker=HARDEN.readJsonFileBestEffort(State.AutoTrader.BotTrustMarkerFile);if type(marker)~="table" or tonumber(marker.revision)~=tonumber(candidate.trustedRevision) or marker.sha256~=digest then return false,"trusted bot marker read-back mismatch" end
+                end
+                if currentRevision~=(tonumber(State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.trustedRevision) or 0) then return false,"trusted bot DB changed during serialized snapshot save" end
+                rawset(_G,State.AutoTrader.BotIconDbKey,State.AutoTrader.BotIconDb);rawset(ExecutorEnvironment,State.AutoTrader.BotIconDbKey,State.AutoTrader.BotIconDb);return true
+            end)
         end
         if immediate then return saveTrusted() end
         task.delay(0.75,function() if not Destroyed and generation==State.AutoTrader.BotIconDbSaveGeneration then saveTrusted() end end);return true
@@ -25172,7 +26027,10 @@ do
     State.AutoTrader.RunSelfTests=function()
         local result=State.AutoTrader.V36AuditRunSelfTests();local tests=result.tests or {}
         local function add(name,callback)
-            local ok,passed,detail=pcall(callback);table.insert(tests,{name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+            local ok,passed,detail=pcall(callback)
+            local row={name=name,ok=ok and passed==true,detail=nil}
+            if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
         end
         add("manual-mapping-native-evidence-sparse-hint",function()
             local key=State.Mapping.MakeItemKey("Weapons","BonebladeChroma");local oldLink=State.Mapping.ItemLinks[key];local oldResolve=State.Mapping.ResolveLinkRecord;local oldV35=State.AutoTrader.V35ResolveGameItem
@@ -25229,7 +26087,9 @@ do
         local tests = result.tests or {}
         local function add(name, callback)
             local ok, passed, detail = pcall(callback)
-            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+            local row={name=name,ok=ok and passed==true,detail=nil}
+            if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
         end
         add("no-progress-supervisor-holds-transport-retry", function()
             local oldSelect, oldDisposition, oldHop = State.AutoTrader.SelectTarget, State.AutoTrader.GetServerDisposition, State.AutoTrader.TryServerHop
@@ -25275,26 +26135,26 @@ do
             return a~=b and a:find("nativeId=123",1,true)~=nil and a:find("|ancestry=",1,true)~=nil, "canonical value identity omitted native numeric ID or ancestry"
         end)
         add("startup-strict-commit-prunes-before-late-overrides", function()
-            local earlyCommit = State.AutoTrader.V36AuditCommitTrustedBotDbCandidate
-            if type(earlyCommit) ~= "function" then return false, "captured pre-late commit function unavailable" end
             local oldWrite, oldReadText, oldReadJson = HARDEN.atomicWriteTextFileBestEffort, HARDEN.readTextFileBestEffort, HARDEN.readJsonFileBestEffort
             local oldDb, oldPending, oldSerial = State.AutoTrader.BotIconDb, State.AutoTrader.BotIconDbPending, State.AutoTrader.BotTrustCommitSerial
+            local oldArbiter = State.AutoTrader.BotTrustWriteArbiter
             local key=State.AutoTrader.BotIconDbKey;local oldG=rawget(_G,key);local oldE=rawget(ExecutorEnvironment,key)
             local mem={}
             HARDEN.atomicWriteTextFileBestEffort=function(name,body) mem[name]=body;return true end
             HARDEN.readTextFileBestEffort=function(name) return mem[name] end
             HARDEN.readJsonFileBestEffort=function(name) local body=mem[name];if type(body)~="string" then return nil end;local ok,v=pcall(function() return HttpService:JSONDecode(body) end);return ok and v or nil end
             State.AutoTrader.BotIconDb={version=5,trustedRevision=1,icons={}}
+            State.AutoTrader.BotTrustWriteArbiter={busy=false,serial=0}
             local jobs={};for i=1,CONFIG.AutoTraderBotDatabaseJobsPerIcon+3 do jobs["job"..tostring(i)]=i end
-            local candidate={version=5,icons={bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb={strictGoldBotJobs=jobs,manualGoldBotJobs={},botJobs={},humanJobs={},goldBotJobs={},lastSeen=1}}}
-            local callOk, okCommit, err = pcall(earlyCommit,candidate,{source="self_test_startup_strict"})
+            local candidate={version=5,trustedRevision=1,icons={bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb={strictGoldBotJobs=jobs,manualGoldBotJobs={},botJobs={},humanJobs={},goldBotJobs={},lastSeen=1}}}
+            local callOk, okCommit, err = pcall(State.AutoTrader.CommitTrustedBotDbCandidate,candidate,{source="self_test_public_commit"})
             local committed=State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.icons and State.AutoTrader.BotIconDb.icons.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             local bounded=callOk and okCommit==true and committed and State.AutoTrader.BotIconJobCount(committed.strictGoldBotJobs)<=CONFIG.AutoTraderBotDatabaseJobsPerIcon
             local inputUntouched=State.AutoTrader.BotIconJobCount(candidate.icons.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.strictGoldBotJobs)>CONFIG.AutoTraderBotDatabaseJobsPerIcon
             HARDEN.atomicWriteTextFileBestEffort, HARDEN.readTextFileBestEffort, HARDEN.readJsonFileBestEffort = oldWrite, oldReadText, oldReadJson
-            State.AutoTrader.BotIconDb, State.AutoTrader.BotIconDbPending, State.AutoTrader.BotTrustCommitSerial = oldDb, oldPending, oldSerial
+            State.AutoTrader.BotIconDb, State.AutoTrader.BotIconDbPending, State.AutoTrader.BotTrustCommitSerial, State.AutoTrader.BotTrustWriteArbiter = oldDb, oldPending, oldSerial, oldArbiter
             rawset(_G,key,oldG);rawset(ExecutorEnvironment,key,oldE)
-            return bounded and inputUntouched, tostring(err or "pre-late strict commit did not transactionally prune")
+            return bounded and inputUntouched, tostring(err or "final public trusted commit did not transactionally prune")
         end)
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
         result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
@@ -25310,7 +26170,9 @@ do
         local tests = result.tests or {}
         local function add(name, callback)
             local ok, passed, detail = pcall(callback)
-            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+            local row={name=name,ok=ok and passed==true,detail=nil}
+            if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
         end
         add("local-canonical-aggregation-preserves-collision", function()
             local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
@@ -25350,7 +26212,9 @@ do
         local tests = result.tests or {}
         local function add(name, callback)
             local ok, passed, detail = pcall(callback)
-            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+            local row={name=name,ok=ok and passed==true,detail=nil}
+            if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
         end
         add("mutation-gate-operational-key-compatible-with-canonical-local-identity", function()
             local record={category="godlies",key="A",name="A",data={value=5,year=2018,event="Halloween",demand=5}}
@@ -25421,7 +26285,9 @@ do
         local tests = result.tests or {}
         local function add(name, callback)
             local ok, passed, detail = pcall(callback)
-            table.insert(tests, {name=name, ok=ok and passed==true, detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+            local row={name=name,ok=ok and passed==true,detail=nil}
+            if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
         end
         add("database-bootstrap-does-not-consume-player-discovery-window", function()
             local entry={firstSeenAt=10,inventoryDiscoveryReadyAt=nil}
@@ -25438,6 +26304,2630 @@ do
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
         result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
         State.AutoTrader.Log("self_test_v36_rc8",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end
+
+
+-- v37: conservative relative-value handling, upcoming-server browser, and manual candidate bot provenance.
+do
+    State.AutoTrader.V37 = State.AutoTrader.V37 or {}
+    State.AutoTrader.V37.contract = "relative Supreme values remain UNKNOWN; upcoming UI mirrors selector candidates; exact-JobId browser samples enrich only; manual bot evidence stays manual"
+
+    State.Profile.remoteTotals.discoveryByUserId = State.Profile.remoteTotals.discoveryByUserId or {}
+    State.Profile.V37InventoryDiagnosticsByUserId = State.Profile.V37InventoryDiagnosticsByUserId or {}
+
+    State.Profile.DescribeSupremeRecordValue = function(record)
+        local data = type(record) == "table" and record.data or nil
+        if type(data) ~= "table" then
+            return {status="UNRESOLVED_ITEM_IDENTITY", numeric=nil, rawValue=nil, rawValueType="nil"}
+        end
+        local value = numericValue(data)
+        if value ~= nil then
+            return {
+                status = "NUMERIC_ABSOLUTE_VALUE",
+                numeric = value,
+                rawValue = data.raw_value ~= nil and data.raw_value or data.value,
+                rawValueType = type(data.raw_value ~= nil and data.raw_value or data.value),
+            }
+        end
+        local raw = data.value
+        local text = tostring(raw == nil and "" or raw)
+        if #text > 160 then text = string.sub(text, 1, 160) .. "…" end
+        return {
+            status = "NON_NUMERIC_SUPREME_VALUE",
+            numeric = nil,
+            rawValue = text,
+            rawValueType = type(raw),
+            rawNumeric = data.raw_value,
+        }
+    end
+
+    State.Profile.V37ResolveRemoteInventoryItem = State.Profile.ResolveRemoteInventoryItem
+    State.Profile.ResolveRemoteInventoryItem = function(itemId, itemType, quantity, identityHint)
+        local resolved = State.Profile.V37ResolveRemoteInventoryItem(itemId, itemType, quantity, identityHint)
+        if type(resolved) ~= "table" or not resolved.resolved or not resolved.record then return resolved end
+        local classification = State.Profile.DescribeSupremeRecordValue(resolved.record)
+        resolved.valueStatus = classification.status
+        resolved.valueReason = classification.status ~= "NUMERIC_ABSOLUTE_VALUE" and classification.status or nil
+        resolved.rawValueExpression = classification.rawValue
+        -- Fail closed even if a future lower layer accidentally becomes permissive.
+        resolved.unitValue = classification.numeric
+        return resolved
+    end
+
+    State.Profile.BuildV37InventoryDiagnostics = function(calculated)
+        local diagnostics = {reasonCode="COMPLETE", nonNumeric={}, unresolved={}, ignoredMetadata={}, nonNumericUnits=0, unresolvedUnits=0, ignoredMetadataLeaves=0, partial=calculated and calculated.partial==true or false}
+        for _, section in ipairs({calculated and calculated.weapons, calculated and calculated.pets}) do
+            if type(section) == "table" then
+                diagnostics.nonNumericUnits += math.max(0, tonumber(section.nonNumericUnits) or 0)
+                diagnostics.ignoredMetadataLeaves += math.max(0, tonumber(section.ignoredMetadataLeaves) or 0)
+                for _, ignored in ipairs(type(section.ignoredMetadataExamples)=="table" and section.ignoredMetadataExamples or {}) do
+                    if #diagnostics.ignoredMetadata < 12 then table.insert(diagnostics.ignoredMetadata, ignored) end
+                end
+                for _, hint in ipairs(type(section.cardHints)=="table" and section.cardHints or {}) do
+                    local record = hint.record
+                    if record then
+                        local classification = State.Profile.DescribeSupremeRecordValue(record)
+                        if classification.status == "NON_NUMERIC_SUPREME_VALUE" and #diagnostics.nonNumeric < 12 then
+                            table.insert(diagnostics.nonNumeric, {
+                                itemId=hint.itemId, itemType=hint.itemType, quantity=math.max(1, tonumber(hint.quantity) or 1),
+                                name=record.name, recordKey=record.key, category=record.category,
+                                valueExpression=classification.rawValue, rawValueType=classification.rawValueType,
+                            })
+                        end
+                    end
+                end
+                for _, miss in ipairs(type(section.unresolvedAll)=="table" and section.unresolvedAll or {}) do
+                    diagnostics.unresolvedUnits += math.max(1, tonumber(miss.quantity) or 1)
+                    if #diagnostics.unresolved < 12 then
+                        table.insert(diagnostics.unresolved, {
+                            itemId=miss.itemId, itemType=miss.itemType, quantity=math.max(1, tonumber(miss.quantity) or 1),
+                            reason=miss.reason, suggested=miss.suggested, identityHint=miss.identityHint,
+                        })
+                    end
+                end
+            end
+        end
+        if diagnostics.nonNumericUnits > 0 then diagnostics.reasonCode = "NON_NUMERIC_SUPREME_VALUE"
+        elseif diagnostics.unresolvedUnits > 0 then diagnostics.reasonCode = "UNRESOLVED_ITEM_IDENTITY"
+        elseif diagnostics.partial then diagnostics.reasonCode = "STRUCTURAL_PARTIAL"
+        end
+        return diagnostics
+    end
+
+    State.Profile.V37CalculateRemoteInventory = State.Profile.CalculateRemoteInventory
+    State.Profile.CalculateRemoteInventory = function(data)
+        local userId = State.Profile.ExtractReturnedUserId and State.Profile.ExtractReturnedUserId(data) or nil
+        if userId and State.AutoTrader.SetInventoryDiscoveryStage then
+            State.AutoTrader.SetInventoryDiscoveryStage(userId, "INVENTORY_PARSING", "mapping inventory leaves to Supreme identities and numeric values")
+        end
+        local calculated, reason = State.Profile.V37CalculateRemoteInventory(data)
+        if type(calculated) == "table" then
+            local diagnostics = State.Profile.BuildV37InventoryDiagnostics(calculated)
+            calculated.v37ValueDiagnostics = diagnostics
+            if userId then State.Profile.V37InventoryDiagnosticsByUserId[userId] = diagnostics end
+        end
+        return calculated, reason
+    end
+
+    State.AutoTrader.SetInventoryDiscoveryStage = function(playerOrUserId, stage, detail)
+        local userId = type(playerOrUserId)=="table" and tonumber(playerOrUserId.UserId) or tonumber(playerOrUserId)
+        if not userId then return end
+        local state = State.Profile.remoteTotals.discoveryByUserId
+        local previous = state[userId]
+        local history = type(previous)=="table" and type(previous.history)=="table" and table.clone(previous.history) or {}
+        if type(previous)=="table" and previous.stage then
+            table.insert(history, {stage=previous.stage,detail=previous.detail,at=previous.at,atUnix=previous.atUnix})
+            while #history > 12 do table.remove(history,1) end
+        end
+        state[userId] = {stage=tostring(stage or "UNKNOWN"), detail=detail and tostring(detail) or nil, at=os.clock(), atUnix=os.time(), history=history}
+    end
+
+    State.AutoTrader.GetInventoryDiscoveryDiagnostic = function(player)
+        if not player then return {stage="PLAYER_UNAVAILABLE"} end
+        local remote = State.Profile.remoteTotals
+        local saved = remote.discoveryByUserId[player.UserId]
+        if not SupremeDatabase then
+            return {stage="VALUE_DB_UNAVAILABLE",detail=tostring(DatabaseStatus).." · "..tostring(HARDEN.supremePipelineStage or "NOT_STARTED"),history=type(saved)=="table" and saved.history or nil}
+        end
+        local decisionFresh,decisionReason,decisionAge=State.AutoTrader.DecisionDataFresh()
+        if not decisionFresh then
+            return {stage="VALUE_DB_STALE",detail=tostring(decisionReason or "live Supreme refresh pending").." · live="..tostring(HARDEN.supremeLiveRefreshStage or "NOT_STARTED"),ageSeconds=decisionAge,history=type(saved)=="table" and saved.history or nil}
+        end
+        if remote.hungByUserId[player.UserId] then return {stage="INVENTORY_REMOTE_HUNG_IN_FLIGHT",detail="GetFullInventory exceeded its bounded wait",history=type(saved)=="table" and saved.history or nil} end
+        if remote.inFlightByUserId[player.UserId] then return {stage="INVENTORY_REMOTE_IN_FLIGHT",detail="GetFullInventory invocation is active",history=type(saved)=="table" and saved.history or nil} end
+        local info=State.Profile.totalsByName[player.Name]
+        if type(info)=="table" and info.source=="GetFullInventoryVerified" and not info.stale then
+            if (tonumber(info.nonNumericUnits) or 0)>0 then return {stage="UNKNOWN_NON_NUMERIC_SUPREME_VALUE",detail=info.valueReasonCode or "NON_NUMERIC_SUPREME_VALUE",history=type(saved)=="table" and saved.history or nil} end
+            if (tonumber(info.unresolvedUnits) or 0)>0 then return {stage="UNKNOWN_ITEM_IDENTITY",detail=info.valueReasonCode or "UNRESOLVED_ITEM_IDENTITY",history=type(saved)=="table" and saved.history or nil} end
+            return {stage="COMPLETE",detail="verified inventory snapshot available",history=type(saved)=="table" and saved.history or nil}
+        end
+        local retryAfter=remote.retryAfterByUserId[player.UserId]
+        if retryAfter and retryAfter>os.clock() then return {stage="INVENTORY_RETRY_COOLDOWN",detail=string.format("retry in %.1fs",retryAfter-os.clock()),history=type(saved)=="table" and saved.history or nil} end
+        if type(saved)=="table" and saved.stage then return saved end
+        return {stage="INVENTORY_REMOTE_QUEUED",detail="awaiting next GetFullInventory sweep"}
+    end
+
+    State.Profile.V37ApplyRemoteInventoryData = State.Profile.ApplyRemoteInventoryData
+    State.Profile.ApplyRemoteInventoryData = function(player, data, freshRemote)
+        if player then State.AutoTrader.SetInventoryDiscoveryStage(player, "INVENTORY_RESPONSE_RETURNED", freshRemote and "fresh GetFullInventory response" or "cached inventory replay") end
+        local ok, reason = State.Profile.V37ApplyRemoteInventoryData(player, data, freshRemote)
+        if ok and player then
+            local info = State.Profile.totalsByName[player.Name]
+            local diagnostics = State.Profile.V37InventoryDiagnosticsByUserId[player.UserId]
+            if type(info)=="table" and type(diagnostics)=="table" then
+                info.valueState = diagnostics.reasonCode == "COMPLETE" and "COMPLETE" or "UNKNOWN"
+                info.valueReasonCode = diagnostics.reasonCode
+                info.nonNumericExamples = diagnostics.nonNumeric
+                info.unresolvedExamples = diagnostics.unresolved
+                info.ignoredMetadataLeaves = diagnostics.ignoredMetadataLeaves
+                info.ignoredMetadataExamples = diagnostics.ignoredMetadata
+            end
+            if diagnostics and diagnostics.nonNumericUnits > 0 then
+                State.AutoTrader.SetInventoryDiscoveryStage(player, "UNKNOWN_NON_NUMERIC_SUPREME_VALUE", diagnostics.nonNumeric[1] and diagnostics.nonNumeric[1].name)
+            elseif diagnostics and diagnostics.unresolvedUnits > 0 then
+                State.AutoTrader.SetInventoryDiscoveryStage(player, "UNKNOWN_ITEM_IDENTITY", diagnostics.unresolved[1] and diagnostics.unresolved[1].itemId)
+            elseif diagnostics and diagnostics.partial then
+                State.AutoTrader.SetInventoryDiscoveryStage(player, "INVENTORY_PARTIAL", diagnostics.reasonCode)
+            else
+                State.AutoTrader.SetInventoryDiscoveryStage(player, "COMPLETE", "numeric valuation complete")
+            end
+        elseif player then
+            State.AutoTrader.SetInventoryDiscoveryStage(player, "INVENTORY_APPLY_FAILED", reason)
+        end
+        return ok, reason
+    end
+
+    State.Profile.V37QueueRemoteLeaderboardSweep = State.Profile.QueueRemoteLeaderboardSweep
+    State.Profile.QueueRemoteLeaderboardSweep = function(forceAll)
+        if not SupremeDatabase then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and player.Parent then State.AutoTrader.SetInventoryDiscoveryStage(player, "VALUE_DB_UNAVAILABLE", DatabaseStatus) end
+            end
+        else
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and player.Parent and not State.Profile.remoteTotals.lastSuccessByUserId[player.UserId]
+                    and not State.Profile.remoteTotals.hungByUserId[player.UserId] and not State.Profile.remoteTotals.inFlightByUserId[player.UserId] then
+                    local saved=State.Profile.remoteTotals.discoveryByUserId[player.UserId]
+                    if not (type(saved)=="table" and (saved.stage=="INVENTORY_REMOTE_HUNG_IN_FLIGHT" or saved.stage=="INVENTORY_REMOTE_IN_FLIGHT")) then
+                        State.AutoTrader.SetInventoryDiscoveryStage(player, "INVENTORY_REMOTE_QUEUED", "waiting for GetFullInventory sweep")
+                    end
+                end
+            end
+        end
+        return State.Profile.V37QueueRemoteLeaderboardSweep(forceAll)
+    end
+
+    State.Profile.V37FetchRemoteTotalForPlayer = State.Profile.FetchRemoteTotalForPlayer
+    State.Profile.FetchRemoteTotalForPlayer = function(player, force)
+        if player then
+            State.AutoTrader.SetInventoryDiscoveryStage(player, SupremeDatabase and "INVENTORY_DISCOVERY_ATTEMPT" or "VALUE_DB_UNAVAILABLE", DatabaseStatus)
+        end
+        local ok, reason = State.Profile.V37FetchRemoteTotalForPlayer(player, force)
+        if player and ok and reason=="fresh" then
+            State.AutoTrader.SetInventoryDiscoveryStage(player, "INVENTORY_CACHE_FRESH", "existing verified GetFullInventory snapshot is still fresh")
+        elseif player and not ok then
+            local stageByReason = {
+                timeout_hung="INVENTORY_REMOTE_TIMEOUT", request_failed="INVENTORY_TRANSPORT_FAILURE",
+                remote_missing="INVENTORY_REMOTE_MISSING", global_in_flight="INVENTORY_REMOTE_WAITING_GLOBAL_SLOT",
+                in_flight="INVENTORY_REMOTE_IN_FLIGHT", hung_in_flight="INVENTORY_REMOTE_HUNG_IN_FLIGHT",
+                cooldown="INVENTORY_RETRY_COOLDOWN", unavailable="VALUE_DB_UNAVAILABLE",
+            }
+            State.AutoTrader.SetInventoryDiscoveryStage(player, stageByReason[tostring(reason)] or "INVENTORY_DISCOVERY_DEFERRED", reason)
+        end
+        return ok, reason
+    end
+
+    -- v37 completeness gate: mixed positive numeric value + any trade-relevant unknown value is still UNKNOWN.
+    State.AutoTrader.GetVerifiedPlayerValue = function(player)
+        if not player then return nil, false, "player unavailable", nil end
+        local info = State.Profile.totalsByName[player.Name]
+        local verified = type(info)=="table" and info.source=="GetFullInventoryVerified" and not info.stale
+        if not verified then return nil, false, "inventory unresolved", info end
+        local total = tonumber(info.total)
+        if total == nil then return nil, false, "inventory total missing", info end
+        local unresolvedUnits = tonumber(info.unresolvedUnits)
+        local nonNumericUnits = tonumber(info.nonNumericUnits)
+        if unresolvedUnits == nil or nonNumericUnits == nil then
+            local profile = State.AutoTrader.GetTargetProfile(player)
+            unresolvedUnits = unresolvedUnits or (profile and tonumber(profile.unresolvedUnits))
+            nonNumericUnits = nonNumericUnits or (profile and tonumber(profile.nonNumericUnits))
+        end
+        unresolvedUnits = math.max(0, unresolvedUnits or 0)
+        nonNumericUnits = math.max(0, nonNumericUnits or 0)
+        if nonNumericUnits > 0 then
+            local example = type(info.nonNumericExamples)=="table" and info.nonNumericExamples[1] or nil
+            local suffix = example and (" · "..tostring(example.name or example.itemId or "item").." = "..tostring(example.valueExpression or "?")) or ""
+            return nil, false, "NON_NUMERIC_SUPREME_VALUE" .. suffix, info
+        end
+        if unresolvedUnits > 0 then
+            local example = type(info.unresolvedExamples)=="table" and info.unresolvedExamples[1] or nil
+            local suffix = example and (" · "..tostring(example.itemId or "item").." ("..tostring(example.reason or "unresolved")..")") or ""
+            return nil, false, "UNRESOLVED_ITEM_IDENTITY" .. suffix, info
+        end
+        if total > 0 then return total, true, "verified positive", info end
+        return 0, true, "verified zero", info
+    end
+
+    -- Upcoming-server/manual classification state. Job marks are deliberately separate from fingerprint evidence.
+    State.AutoTrader.ManualBotServerJobsKey = "__SV_AUTO_TRADER_MANUAL_BOT_SERVERS_V37"
+    State.AutoTrader.ManualBotServerJobsFile = "SV_AutoTrader_ManualBotServers_v37.json"
+    State.AutoTrader.ManualBotServerJobs = State.AutoTrader.ManualBotServerJobs or {}
+    State.AutoTrader.UpcomingServerQueue = State.AutoTrader.UpcomingServerQueue or {}
+    State.AutoTrader.UpcomingServerQueueRevision = tonumber(State.AutoTrader.UpcomingServerQueueRevision) or 0
+    State.AutoTrader.UpcomingServerBrowserOpen = State.AutoTrader.UpcomingServerBrowserOpen ~= false
+
+    -- Optional authenticated browser-companion discovery. The companion may supply genuine
+    -- candidate JobIds/roster samples when its snapshot passes the strict source gate, but Lua
+    -- remains authoritative for eligibility, suppression, bot preview classification, ranking,
+    -- and final queue order. Sampled tokens never constitute full-roster certification.
+    State.AutoTrader.ServerRosterPolicy = "AUTHENTICATED_COMPANION_DISCOVERY_LUA_POLICY_DIRECT_PUBLIC_FALLBACK"
+    State.AutoTrader.CanonicalServerPreviewThumbnailSize = "150x150"
+    State.AutoTrader.ServerPreviewCompanionPolicy = {
+        filePath = "SV/ListOfServers.json",
+        maxBytes = 2 * 1024 * 1024,
+        maxRows = 1000,
+        maxTokensPerRow = 100,
+        refreshSeconds = 5,
+        heartbeatFreshSeconds = 90,
+        rowFreshSeconds = 180,
+        selectorRowFreshSeconds = math.max(15,tonumber(CONFIG.AutoTraderCompanionSelectorRowFreshSeconds) or 90),
+        expectedPlaceId = 142823291,
+        requiredHealthyPollSeconds = 20,
+        expectedCollectorVersion = "server-updater-v3-round14-companion-primary-candidate",
+        expectedRuntimeSourceSha256 = "c40dda8b3cb3b730e400c5bf6b55d8c2f5a9a05abd44c1290f4bc371e7f01ecb",
+        futureToleranceSeconds = 15,
+    }
+    State.AutoTrader.ServerPreviewCompanionCache = State.AutoTrader.ServerPreviewCompanionCache or {
+        lastAttemptClock = 0,
+        snapshot = nil,
+        diagnostics = nil,
+    }
+
+    State.AutoTrader.RequestedServerPreviewHintPolicy = {
+        filePath = "SV/RequestedServerPreviews.json",
+        schemaVersion = 1,
+        maxJobIds = math.max(1, math.min(30, tonumber(CONFIG.AutoTraderRequestedServerPreviewMaxJobIds) or 30)),
+        freshSeconds = math.max(10, tonumber(CONFIG.AutoTraderRequestedServerPreviewHintFreshSeconds) or 120),
+    }
+    State.AutoTrader.RequestedServerPreviewHintState = State.AutoTrader.RequestedServerPreviewHintState or {
+        writes = 0, failures = 0, lastCount = 0, lastWrittenAtUnix = 0, lastError = nil,
+        nextGeneration = 0, desired = nil, workerRunning = false,
+    }
+
+    State.AutoTrader.BuildRequestedServerPreviewHint = function(servers, nowUnix)
+        local policy=State.AutoTrader.RequestedServerPreviewHintPolicy
+        local ids,seen={},{}
+        for _,server in ipairs(type(servers)=="table" and servers or {}) do
+            local jobId=type(server)=="table" and server.id or nil
+            if type(jobId)=="string" and jobId~="" and #jobId<=128 and jobId~=game.JobId
+                and not seen[jobId] and not (State.AutoTrader.IsManualBotServerJob and State.AutoTrader.IsManualBotServerJob(jobId)) then
+                seen[jobId]=true
+                table.insert(ids,jobId)
+                if #ids>=policy.maxJobIds then break end
+            end
+        end
+        return {schemaVersion=policy.schemaVersion,generatedAtUnix=tonumber(nowUnix) or os.time(),placeId=game.PlaceId,requestedJobIds=ids}
+    end
+
+    State.AutoTrader.WriteRequestedServerPreviewHintPayload = function(payload)
+        local policy=State.AutoTrader.RequestedServerPreviewHintPolicy
+        local state=State.AutoTrader.RequestedServerPreviewHintState
+        local hooks=State.AutoTrader.RequestedServerPreviewHintTestHooks
+        local okEncode,body=pcall(function() return HttpService:JSONEncode(payload) end)
+        if not okEncode or type(body)~="string" then
+            state.failures=(tonumber(state.failures) or 0)+1;state.lastError="ENCODE_FAILED";return false,state.lastError
+        end
+        local ok,err
+        if type(hooks)=="table" and type(hooks.write)=="function" then
+            ok,err=pcall(hooks.write,policy.filePath,body)
+            if ok and err==false then ok=false;err="TEST_WRITE_REJECTED" end
+        else
+            ok,err=HARDEN.atomicWriteTextFileBestEffort(policy.filePath,body)
+        end
+        if ok then
+            state.writes=(tonumber(state.writes) or 0)+1;state.lastCount=#(payload.requestedJobIds or {});state.lastWrittenAtUnix=payload.generatedAtUnix;state.lastError=nil
+            return true,payload
+        end
+        state.failures=(tonumber(state.failures) or 0)+1;state.lastCount=#(payload.requestedJobIds or {});state.lastError=tostring(err or "WRITE_FAILED")
+        return false,state.lastError
+    end
+
+    State.AutoTrader.WriteRequestedServerPreviewHint = function(servers)
+        local hooks=State.AutoTrader.RequestedServerPreviewHintTestHooks
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 and not (type(hooks)=="table" and type(hooks.write)=="function") then
+            return false,"SELF_TEST_HINT_WRITE_SUPPRESSED"
+        end
+        return State.AutoTrader.WriteRequestedServerPreviewHintPayload(State.AutoTrader.BuildRequestedServerPreviewHint(servers,os.time()))
+    end
+
+    State.AutoTrader.QueueRequestedServerPreviewHintWrite = function(servers)
+        local state=State.AutoTrader.RequestedServerPreviewHintState
+        local hooks=State.AutoTrader.RequestedServerPreviewHintTestHooks
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 then
+            if type(hooks)=="table" and type(hooks.write)=="function" then return State.AutoTrader.WriteRequestedServerPreviewHint(servers) end
+            return false,"SELF_TEST_HINT_WRITE_SUPPRESSED"
+        end
+        state.nextGeneration=(tonumber(state.nextGeneration) or 0)+1
+        state.desired={generation=state.nextGeneration,payload=State.AutoTrader.BuildRequestedServerPreviewHint(servers,os.time())}
+        if state.workerRunning then return true,state.desired.generation end
+        state.workerRunning=true
+        task.spawn(function()
+            while not Destroyed and type(state.desired)=="table" do
+                local desired=state.desired
+                State.AutoTrader.WriteRequestedServerPreviewHintPayload(desired.payload)
+                if state.desired==desired then state.desired=nil end
+            end
+            state.workerRunning=false
+        end)
+        return true,state.nextGeneration
+    end
+
+    State.AutoTrader.GetRequestedServerPreviewHintSupportSummary = function()
+        local state=State.AutoTrader.RequestedServerPreviewHintState
+        local policy=State.AutoTrader.RequestedServerPreviewHintPolicy
+        return {
+            filePath=policy.filePath,maxJobIds=policy.maxJobIds,freshSeconds=policy.freshSeconds,
+            writes=tonumber(state.writes) or 0,failures=tonumber(state.failures) or 0,lastCount=tonumber(state.lastCount) or 0,
+            lastWrittenAgeSeconds=(tonumber(state.lastWrittenAtUnix) or 0)>0 and math.max(0,os.time()-state.lastWrittenAtUnix) or nil,
+            workerRunning=state.workerRunning==true,pendingCount=type(state.desired)=="table" and #(state.desired.payload and state.desired.payload.requestedJobIds or {}) or 0,
+            lastError=state.lastError,
+        }
+    end
+
+    State.AutoTrader.IsDenseBoundedArray = function(value, maximum)
+        if type(value) ~= "table" then return false, 0 end
+        maximum = math.max(0, math.floor(tonumber(maximum) or 0))
+        local count, maxIndex = 0, 0
+        for key in pairs(value) do
+            if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or key > maximum then return false, count end
+            count += 1
+            if key > maxIndex then maxIndex = key end
+            if count > maximum then return false, count end
+        end
+        return maxIndex == count, count
+    end
+
+    State.AutoTrader.IsValidCompanionPlayerToken = function(value)
+        return type(value) == "string" and #value == 32 and value:match("^[0-9a-fA-F]+$") ~= nil
+    end
+
+    State.AutoTrader.GetServerPreviewCompanionNowUnix = function()
+        local hooks = State.AutoTrader.ServerPreviewCompanionTestHooks
+        if type(hooks) == "table" and type(hooks.nowUnix) == "function" then
+            local ok, value = pcall(hooks.nowUnix)
+            if ok and tonumber(value) then return tonumber(value) end
+        end
+        return os.time()
+    end
+
+    State.AutoTrader.ReadServerPreviewCompanionFile = function()
+        local policy = State.AutoTrader.ServerPreviewCompanionPolicy
+        local path = tostring(policy.filePath)
+        local hooks = State.AutoTrader.ServerPreviewCompanionTestHooks
+        local readfileFunction = type(hooks) == "table" and hooks.readfile or State.TryGetExecutorGlobal("readfile")
+        local isfileFunction = type(hooks) == "table" and hooks.isfile or State.TryGetExecutorGlobal("isfile")
+        local diagnostics = {
+            filePath=path, readAvailable=type(readfileFunction)=="function", filePresent=false,
+            parsed=false, schemaVersion=nil, collectorVersion=nil, runtimeSourceSha256=nil, placeId=nil,
+            pollIntervalSeconds=nil, status=nil, loggedIn=nil, heartbeatAgeSeconds=nil,
+            selectorEligible=false, selectorLastError=nil, acceptedRows=0, duplicateRows=0, invalidRows=0, staleRows=0,
+            tokenBearingRows=0, acceptedTokenCount=0, matchedSelectorRows=0, tokenBearingMatches=0,
+            directPrecedenceMatches=0, directCompanionMismatches=0,
+            requestedCount=0, requestedFound=0, requestedMissing=0, requestedSweepPages=0,
+            requestedLastUpdatedUnix=nil, requestedHintAgeSeconds=nil, requestedSweepComplete=nil, lastError=nil,
+        }
+        if type(readfileFunction) ~= "function" then
+            diagnostics.lastError = "READFILE_UNAVAILABLE"
+            return nil, diagnostics
+        end
+        if type(isfileFunction) == "function" then
+            local okExists, exists
+            if type(hooks) == "table" and hooks.isfile == isfileFunction then
+                okExists, exists = pcall(isfileFunction, path)
+            else
+                okExists, exists = waitForExternalWithDeadline("isfile " .. path, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return isfileFunction(path) end)
+            end
+            if okExists and exists ~= true then
+                diagnostics.lastError = "FILE_MISSING"
+                return nil, diagnostics
+            elseif not okExists then
+                diagnostics.lastError = "ISFILE_FAILED"
+                return nil, diagnostics
+            end
+        end
+        local okRead, body
+        if type(hooks) == "table" and hooks.readfile == readfileFunction then
+            okRead, body = pcall(readfileFunction, path)
+        else
+            okRead, body = waitForExternalWithDeadline("readfile " .. path, CONFIG.AutoTraderExecutorFileTimeoutSeconds, function() return readfileFunction(path) end)
+        end
+        if not okRead or type(body) ~= "string" then
+            diagnostics.lastError = "READ_FAILED"
+            return nil, diagnostics
+        end
+        diagnostics.filePresent = true
+        if #body <= 0 then
+            diagnostics.lastError = "EMPTY_FILE"
+            return nil, diagnostics
+        end
+        if #body > math.max(1024, tonumber(policy.maxBytes) or 2097152) then
+            diagnostics.lastError = "FILE_TOO_LARGE"
+            return nil, diagnostics
+        end
+        return body, diagnostics
+    end
+
+    State.AutoTrader.ParseServerPreviewCompanionBody = function(body, diagnostics, nowUnix)
+        local policy = State.AutoTrader.ServerPreviewCompanionPolicy
+        diagnostics = type(diagnostics)=="table" and diagnostics or {
+            filePath=tostring(policy.filePath),readAvailable=true,filePresent=true,
+            parsed=false,runtimeSourceSha256=nil,placeId=nil,pollIntervalSeconds=nil,selectorEligible=false,selectorLastError=nil,
+            acceptedRows=0,duplicateRows=0,invalidRows=0,staleRows=0,tokenBearingRows=0,
+            acceptedTokenCount=0,matchedSelectorRows=0,tokenBearingMatches=0,directPrecedenceMatches=0,directCompanionMismatches=0,
+            requestedCount=0,requestedFound=0,requestedMissing=0,requestedSweepPages=0,requestedLastUpdatedUnix=nil,requestedHintAgeSeconds=nil,requestedSweepComplete=nil,
+        }
+        nowUnix = tonumber(nowUnix) or State.AutoTrader.GetServerPreviewCompanionNowUnix()
+        if type(body) ~= "string" or body == "" then diagnostics.lastError="EMPTY_FILE"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        if #body > math.max(1024, tonumber(policy.maxBytes) or 2097152) then diagnostics.lastError="FILE_TOO_LARGE"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        local okDecode, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+        if not okDecode or type(decoded) ~= "table" then diagnostics.lastError="MALFORMED_JSON"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        diagnostics.parsed = true
+        diagnostics.schemaVersion = decoded.schemaVersion
+        diagnostics.collectorVersion = type(decoded.collectorVersion)=="string" and decoded.collectorVersion or nil
+        diagnostics.runtimeSourceSha256 = type(decoded.runtimeSourceSha256)=="string" and string.lower(decoded.runtimeSourceSha256) or nil
+        diagnostics.placeId = tonumber(decoded.placeId)
+        diagnostics.pollIntervalSeconds = tonumber(decoded.pollIntervalSeconds)
+        diagnostics.status = decoded.status
+        diagnostics.loggedIn = decoded.loggedIn == true
+        diagnostics.requestedCount = math.max(0,math.floor(tonumber(decoded.requestedCount) or 0))
+        diagnostics.requestedFound = math.max(0,math.floor(tonumber(decoded.requestedFound) or 0))
+        diagnostics.requestedMissing = math.max(0,math.floor(tonumber(decoded.requestedMissing) or 0))
+        diagnostics.requestedSweepPages = math.max(0,math.floor(tonumber(decoded.requestedSweepPages) or 0))
+        diagnostics.requestedLastUpdatedUnix = tonumber(decoded.requestedLastUpdatedUnix)
+        diagnostics.requestedSweepComplete = decoded.requestedSweepComplete == true
+        diagnostics.requestedHintAgeSeconds = diagnostics.requestedLastUpdatedUnix and math.max(0,nowUnix-diagnostics.requestedLastUpdatedUnix) or nil
+        if tonumber(decoded.schemaVersion) ~= 1 then diagnostics.lastError="UNSUPPORTED_SCHEMA"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        local runtimeHashOK = type(diagnostics.runtimeSourceSha256)=="string" and #diagnostics.runtimeSourceSha256==64
+            and diagnostics.runtimeSourceSha256:match("^[0-9a-f]+$")~=nil
+        local runtimeHashMatches = runtimeHashOK and diagnostics.runtimeSourceSha256 == string.lower(tostring(policy.expectedRuntimeSourceSha256 or ""))
+        local collectorVersionOK = type(diagnostics.collectorVersion)=="string" and diagnostics.collectorVersion == tostring(policy.expectedCollectorVersion or "")
+        local placeOK = diagnostics.placeId == tonumber(policy.expectedPlaceId or 142823291)
+        local pollOK = diagnostics.pollIntervalSeconds == tonumber(policy.requiredHealthyPollSeconds or 20)
+        diagnostics.selectorEligible = runtimeHashOK and runtimeHashMatches and collectorVersionOK and placeOK and pollOK
+        if not runtimeHashOK then diagnostics.selectorLastError="RUNTIME_SOURCE_SHA_MISSING_OR_INVALID"
+        elseif not runtimeHashMatches then diagnostics.selectorLastError="RUNTIME_SOURCE_SHA_MISMATCH"
+        elseif not collectorVersionOK then diagnostics.selectorLastError="COLLECTOR_VERSION_MISMATCH"
+        elseif not placeOK then diagnostics.selectorLastError="WRONG_PLACE"
+        elseif not pollOK then diagnostics.selectorLastError="POLL_INTERVAL_MISMATCH"
+        else diagnostics.selectorLastError=nil end
+        local denseServers, serverCount = State.AutoTrader.IsDenseBoundedArray(decoded.servers, math.max(1, tonumber(policy.maxRows) or 1000))
+        if not denseServers then diagnostics.lastError="SERVERS_NOT_DENSE_OR_BOUNDED"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        local heartbeat = tonumber(decoded.lastSuccessfulPollUnix)
+        if not heartbeat then diagnostics.selectorEligible=false;diagnostics.selectorLastError="HEARTBEAT_MISSING";diagnostics.lastError="HEARTBEAT_MISSING"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        local heartbeatAge = nowUnix - heartbeat
+        diagnostics.heartbeatAgeSeconds = heartbeatAge
+        if decoded.status ~= "HEALTHY" then diagnostics.selectorEligible=false;diagnostics.selectorLastError="COLLECTOR_NOT_HEALTHY";diagnostics.lastError="COLLECTOR_NOT_HEALTHY"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        if decoded.loggedIn ~= true then diagnostics.selectorEligible=false;diagnostics.selectorLastError="COLLECTOR_LOGGED_OUT";diagnostics.lastError="COLLECTOR_LOGGED_OUT"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        if heartbeatAge < -math.max(0, tonumber(policy.futureToleranceSeconds) or 15) then diagnostics.selectorEligible=false;diagnostics.selectorLastError="HEARTBEAT_FUTURE";diagnostics.lastError="HEARTBEAT_FUTURE"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+        if heartbeatAge > math.max(1, tonumber(policy.heartbeatFreshSeconds) or 90) then diagnostics.selectorEligible=false;diagnostics.selectorLastError="HEARTBEAT_STALE";diagnostics.lastError="HEARTBEAT_STALE"; return {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics} end
+
+        local index, ambiguous, seenJobIds = {}, {}, {}
+        for rowIndex=1,serverCount do
+            local raw = decoded.servers[rowIndex]
+            local valid = type(raw)=="table"
+            local jobId = valid and raw.jobId or nil
+            local admissibleJobId = type(jobId)=="string" and jobId~="" and #jobId<=128
+            if admissibleJobId then
+                if seenJobIds[jobId] then
+                    diagnostics.duplicateRows += 1
+                    ambiguous[jobId] = true
+                    index[jobId] = nil
+                else
+                    seenJobIds[jobId] = true
+                end
+            end
+            local playing = valid and tonumber(raw.playing) or nil
+            local maxPlayers = valid and tonumber(raw.maxPlayers) or nil
+            local lastSeenUnix = valid and tonumber(raw.lastSeenUnix) or nil
+            local playerTokenCount = valid and tonumber(raw.playerTokenCount) or nil
+            local denseTokens, tokenCount = false, 0
+            if valid then denseTokens, tokenCount = State.AutoTrader.IsDenseBoundedArray(raw.playerTokens, math.max(1, tonumber(policy.maxTokensPerRow) or 100)) end
+            if not admissibleJobId then valid=false end
+            if not playing or playing<0 or playing%1~=0 or not maxPlayers or maxPlayers<1 or maxPlayers%1~=0 or playing>maxPlayers then valid=false end
+            if not lastSeenUnix or not playerTokenCount or playerTokenCount<=0 or playerTokenCount%1~=0 or not denseTokens or playerTokenCount~=tokenCount then valid=false end
+            if valid and raw.rosterEvidenceAvailable~=true then valid=false end
+            local tokenSeen = {}
+            if valid then
+                for tokenIndex=1,tokenCount do
+                    local token = raw.playerTokens[tokenIndex]
+                    if not State.AutoTrader.IsValidCompanionPlayerToken(token) or tokenSeen[token] then valid=false;break end
+                    tokenSeen[token]=true
+                end
+            end
+            if valid then
+                local rowAge = nowUnix - lastSeenUnix
+                if rowAge < -math.max(0, tonumber(policy.futureToleranceSeconds) or 15) then
+                    valid=false
+                else
+                    diagnostics.acceptedRows += 1
+                    if tokenCount>0 then diagnostics.tokenBearingRows += 1 end
+                    local row = {
+                        jobId=jobId, playing=playing, maxPlayers=maxPlayers, lastSeenUnix=lastSeenUnix,
+                        rowAgeSeconds=rowAge, playerTokenCount=tokenCount, playerTokens=table.clone(raw.playerTokens),
+                        rosterEvidenceAvailable=raw.rosterEvidenceAvailable==true,
+                        fresh=rowAge<=math.max(1,tonumber(policy.rowFreshSeconds) or 180),
+                    }
+                    if not row.fresh then diagnostics.staleRows += 1 end
+                    if not ambiguous[jobId] then
+                        index[jobId]=row
+                    end
+                end
+            end
+            if not valid then diagnostics.invalidRows += 1 end
+        end
+        diagnostics.acceptedTokenCount = 0
+        for _,row in pairs(index) do
+            if row.fresh and row.playerTokenCount>0 then diagnostics.acceptedTokenCount += row.playerTokenCount end
+        end
+        if next(ambiguous)~=nil then
+            diagnostics.selectorEligible=false
+            diagnostics.selectorLastError="DUPLICATE_JOBID_AMBIGUITY"
+        end
+        diagnostics.lastError = nil
+        return {
+            usable=true, selectorUsable=diagnostics.selectorEligible==true,
+            index=index, ambiguousJobIds=ambiguous, diagnostics=diagnostics, loadedAtUnix=nowUnix,
+            runtimeSourceSha256=diagnostics.runtimeSourceSha256, placeId=diagnostics.placeId,
+            pollIntervalSeconds=diagnostics.pollIntervalSeconds,
+        }
+    end
+
+    State.AutoTrader.RefreshServerPreviewCompanion = function(force)
+        local cache = State.AutoTrader.ServerPreviewCompanionCache
+        local policy = State.AutoTrader.ServerPreviewCompanionPolicy
+        local nowClock = os.clock()
+        if force ~= true and type(cache.snapshot)=="table"
+            and nowClock-(tonumber(cache.lastAttemptClock) or 0)<math.max(1,tonumber(policy.refreshSeconds) or 5) then
+            return cache.snapshot
+        end
+        cache.lastAttemptClock = nowClock
+        local body, diagnostics = State.AutoTrader.ReadServerPreviewCompanionFile()
+        local snapshot
+        if type(body)=="string" then
+            snapshot = State.AutoTrader.ParseServerPreviewCompanionBody(body, diagnostics, State.AutoTrader.GetServerPreviewCompanionNowUnix())
+        else
+            snapshot = {usable=false,index={},ambiguousJobIds={},diagnostics=diagnostics}
+        end
+        cache.snapshot = snapshot
+        cache.diagnostics = snapshot.diagnostics
+        return snapshot
+    end
+
+    State.AutoTrader.GetServerPreviewCompanionSupportSummary = function()
+        local cache = State.AutoTrader.ServerPreviewCompanionCache
+        local source = type(cache)=="table" and cache.diagnostics or nil
+        local policy = State.AutoTrader.ServerPreviewCompanionPolicy
+        local out = {filePath=tostring(policy.filePath)}
+        for _, key in ipairs({
+            "readAvailable","filePresent","parsed","schemaVersion","collectorVersion","runtimeSourceSha256","placeId","pollIntervalSeconds","status","loggedIn","heartbeatAgeSeconds","selectorEligible","selectorLastError",
+            "acceptedRows","duplicateRows","invalidRows","staleRows","tokenBearingRows","matchedSelectorRows","tokenBearingMatches",
+            "acceptedTokenCount","directPrecedenceMatches","directCompanionMismatches",
+            "requestedCount","requestedFound","requestedMissing","requestedSweepPages","requestedLastUpdatedUnix","requestedHintAgeSeconds","requestedSweepComplete","lastError",
+        }) do
+            if type(source)=="table" and source[key]~=nil then out[key]=source[key] end
+        end
+        return out
+    end
+
+    State.AutoTrader.CompanionTokenArraysEqualExact = function(a,b)
+        if type(a)~="table" or type(b)~="table" or #a~=#b then return false end
+        local seen={}
+        for _,token in ipairs(a) do seen[token]=(seen[token] or 0)+1 end
+        for _,token in ipairs(b) do
+            if not seen[token] or seen[token]<=0 then return false end
+            seen[token]-=1
+        end
+        return true
+    end
+
+    State.AutoTrader.EnrichExistingServerCandidatesFromCompanion = function(servers, sourceLabel)
+        local snapshot = State.AutoTrader.RefreshServerPreviewCompanion(false)
+        local diagnostics = type(snapshot)=="table" and snapshot.diagnostics or nil
+        if type(diagnostics)=="table" then
+            diagnostics.matchedSelectorRows=0
+            diagnostics.tokenBearingMatches=0
+            diagnostics.directPrecedenceMatches=0
+            diagnostics.directCompanionMismatches=0
+        end
+        local enriched, changed = {}, 0
+        for _, server in ipairs(type(servers)=="table" and servers or {}) do
+            if type(server)=="table" and type(server.id)=="string" and server.id~="" then
+                if server.previewTokenSource=="browser_companion_exact_jobid" then
+                    server.playerTokens={}
+                    server.previewTokenCount=0
+                    server.previewTokenSource=nil
+                    server.previewCoverage=nil
+                    server.companionRowAgeSeconds=nil
+                    server.companionSamplePlaying=nil
+                    server.companionPreviewState=nil
+                    if server.previewFingerprintSource=="browser_companion_exact_jobid" then
+                        server.previewFingerprints={}
+                        server.previewThumbnailUrls={}
+                        server.previewFingerprintSource=nil
+                        server.botPreview=nil
+                    end
+                    changed += 1
+                end
+                local directTokens = type(server.playerTokens)=="table" and server.playerTokens or {}
+                local directPresent = #directTokens>0
+                local companionRow = type(snapshot)=="table" and snapshot.usable==true and type(snapshot.index)=="table" and snapshot.index[server.id] or nil
+                if companionRow and type(diagnostics)=="table" then diagnostics.matchedSelectorRows += 1 end
+                if directPresent then
+                    server.previewTokenSource="direct_public_api"
+                    server.previewCoverage=server.previewCoverage or "DIRECT_PUBLIC_API_EVIDENCE"
+                    server.previewTokenCount=#directTokens
+                    if companionRow then
+                        server.companionRowAgeSeconds=companionRow.rowAgeSeconds
+                        server.companionSamplePlaying=companionRow.playing
+                        server.companionPreviewState=companionRow.fresh and (companionRow.playerTokenCount>0 and "DIRECT_PRECEDENCE" or "TOKENLESS_ROW") or "ROW_STALE"
+                        if companionRow.fresh and companionRow.playerTokenCount>0 and type(diagnostics)=="table" then
+                            diagnostics.tokenBearingMatches += 1
+                            diagnostics.directPrecedenceMatches += 1
+                            if not State.AutoTrader.CompanionTokenArraysEqualExact(directTokens,companionRow.playerTokens) then diagnostics.directCompanionMismatches += 1 end
+                        end
+                    end
+                elseif companionRow then
+                    server.companionRowAgeSeconds=companionRow.rowAgeSeconds
+                    server.companionSamplePlaying=companionRow.playing
+                    if not companionRow.fresh then
+                        server.companionPreviewState="ROW_STALE"
+                    elseif companionRow.playerTokenCount<=0 or companionRow.rosterEvidenceAvailable~=true then
+                        server.companionPreviewState="TOKENLESS_ROW"
+                    else
+                        server.playerTokens=table.clone(companionRow.playerTokens)
+                        server.previewTokenCount=companionRow.playerTokenCount
+                        server.previewTokenSource="browser_companion_exact_jobid"
+                        server.previewCoverage="SAMPLED_NOT_FULL_ROSTER"
+                        server.companionPreviewState="SAMPLED_TOKEN_EVIDENCE"
+                        table.insert(enriched,server)
+                        changed += 1
+                        if type(diagnostics)=="table" then diagnostics.tokenBearingMatches += 1 end
+                    end
+                end
+                server.previewPlaying=tonumber(server.playing)
+                server.previewSourceLabel=tostring(sourceLabel or "selector")
+            end
+        end
+        return enriched, changed, diagnostics
+    end
+
+    State.AutoTrader.V37CompanionFetchPublicServers = State.AutoTrader.FetchPublicServers
+    State.AutoTrader.FetchPublicServers = function(maxPages)
+        local rows, diagnostics = State.AutoTrader.V37CompanionFetchPublicServers(maxPages)
+        State.AutoTrader.EnrichExistingServerCandidatesFromCompanion(rows, "fresh_public_server_rows")
+        if type(diagnostics)=="table" then diagnostics.companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary() end
+        return rows, diagnostics
+    end
+
+    State.AutoTrader.V37CompanionResolveServerPreviewFingerprints = State.AutoTrader.ResolveServerPreviewFingerprints
+    State.AutoTrader.ResolveServerPreviewFingerprints = function(servers)
+        local ok, reason, diagnostics = State.AutoTrader.V37CompanionResolveServerPreviewFingerprints(servers)
+        for _,server in ipairs(type(servers)=="table" and servers or {}) do
+            if type(server)=="table" and type(server.previewFingerprints)=="table" and #server.previewFingerprints>0 then
+                server.previewFingerprintSource=server.previewTokenSource or server.previewFingerprintSource or "direct_public_api"
+            end
+        end
+        return ok, reason, diagnostics
+    end
+
+    State.AutoTrader.ResolveServerDisplayThumbnailUrls = function(servers)
+        local hooks=State.AutoTrader.ServerDisplayThumbnailTestHooks
+        local diagnostics={size=tostring(CONFIG.AutoTraderUpcomingThumbnailDisplaySize or "48x48"),tokens=0,batches=0,batchesSucceeded=0,completed=0,sizeIdentityMismatch=0,unmapped=0,failedStates=0,lastError=nil}
+        for _,server in ipairs(type(servers)=="table" and servers or {}) do
+            server.previewDisplayThumbnailUrls={}
+            server.previewDisplayCanonicalFingerprints={}
+            server.previewDisplayThumbnailUrlByTokenIndex={}
+            server.previewDisplayFingerprintByTokenIndex={}
+            server.previewDisplaySameSizeFingerprintByTokenIndex={}
+        end
+        if type(httpRequest)~="function" and not (type(hooks)=="table" and type(hooks.batch)=="function") then diagnostics.lastError="request(options) unavailable";return false,diagnostics.lastError,diagnostics end
+        local payload,requestMap={},{}
+        for _,server in ipairs(type(servers)=="table" and servers or {}) do
+            for tokenIndex,token in ipairs(type(server.playerTokens)=="table" and server.playerTokens or {}) do
+                local canonical=server.previewFingerprintByTokenIndex and server.previewFingerprintByTokenIndex[tokenIndex] or nil
+                if type(token)=="string" and token~="" and type(canonical)=="string" and canonical~="" then
+                    local requestId=tostring(server.id).."|display|"..tostring(tokenIndex)
+                    requestMap[requestId]={server=server,tokenIndex=tokenIndex,canonicalFingerprint=canonical}
+                    table.insert(payload,{requestId=requestId,type="AvatarHeadShot",targetId=0,token=token,format="Png",size=CONFIG.AutoTraderUpcomingThumbnailDisplaySize or "48x48"})
+                    diagnostics.tokens+=1
+                end
+            end
+        end
+        for first=1,#payload,CONFIG.AutoTraderThumbnailBatchSize do
+            diagnostics.batches+=1
+            local chunk={}
+            for index=first,math.min(#payload,first+CONFIG.AutoTraderThumbnailBatchSize-1) do table.insert(chunk,payload[index]) end
+            local okBody,encoded=pcall(function() return HttpService:JSONEncode(chunk) end)
+            if not okBody then diagnostics.lastError=tostring(encoded);break end
+            local okRequest,response
+            if type(hooks)=="table" and type(hooks.batch)=="function" then
+                okRequest,response=pcall(hooks.batch,chunk,encoded)
+            else
+                okRequest,response=boundedHttpRequest({Url="https://thumbnails.roblox.com/v1/batch",Method="POST",Headers={["Content-Type"]="application/json",["Accept"]="application/json"},Body=encoded},CONFIG.AutoTraderHttpTimeoutSeconds)
+            end
+            if okRequest and type(response)=="table" and tonumber(response.StatusCode or response.Status)==200 then
+                diagnostics.batchesSucceeded+=1
+                local okDecode,decoded=pcall(function() return HttpService:JSONDecode(response.Body or response.body or "") end)
+                if okDecode and type(decoded)=="table" and type(decoded.data)=="table" then
+                    for itemIndex,item in ipairs(decoded.data) do
+                        local mapping=requestMap[tostring(item.requestId)]
+                        if not mapping then local original=chunk[itemIndex];mapping=original and requestMap[tostring(original.requestId)] or nil end
+                        local imageUrl=item.imageUrl or item.imageURL
+                        local displayFingerprint=State.AutoTrader.CanonicalThumbnailFingerprint(imageUrl)
+                        local completedState=item.state==nil or string.lower(tostring(item.state))=="completed"
+                        if mapping and type(imageUrl)=="string" and imageUrl~="" and completedState then
+                            mapping.server.previewDisplayThumbnailUrlByTokenIndex[mapping.tokenIndex]=imageUrl
+                            mapping.server.previewDisplayFingerprintByTokenIndex[mapping.tokenIndex]=displayFingerprint
+                            local same=displayFingerprint~=nil and displayFingerprint==mapping.canonicalFingerprint
+                            mapping.server.previewDisplaySameSizeFingerprintByTokenIndex[mapping.tokenIndex]=same
+                            if displayFingerprint and not same then diagnostics.sizeIdentityMismatch+=1 end
+                            diagnostics.completed+=1
+                        elseif not mapping then diagnostics.unmapped+=1 else diagnostics.failedStates+=1 end
+                    end
+                else diagnostics.lastError="display thumbnail batch JSON decode failed" end
+            else
+                diagnostics.lastError=okRequest and ("display thumbnail HTTP "..tostring(response and (response.StatusCode or response.Status))) or ("display thumbnail request failed: "..tostring(response))
+                break
+            end
+            if first+CONFIG.AutoTraderThumbnailBatchSize<=#payload then task.wait(0.05) end
+        end
+        for _,server in ipairs(type(servers)=="table" and servers or {}) do
+            server.previewDisplayThumbnailUrls={}
+            server.previewDisplayCanonicalFingerprints={}
+            for tokenIndex=1,#(server.playerTokens or {}) do
+                local displayUrl=server.previewDisplayThumbnailUrlByTokenIndex and server.previewDisplayThumbnailUrlByTokenIndex[tokenIndex] or nil
+                local canonical=server.previewFingerprintByTokenIndex and server.previewFingerprintByTokenIndex[tokenIndex] or nil
+                if type(displayUrl)=="string" and displayUrl~="" and type(canonical)=="string" and canonical~="" then
+                    table.insert(server.previewDisplayThumbnailUrls,displayUrl)
+                    table.insert(server.previewDisplayCanonicalFingerprints,canonical)
+                end
+            end
+        end
+        if diagnostics.completed>0 then return true,nil,diagnostics end
+        return false,diagnostics.lastError or "display thumbnail batch returned no completed previews",diagnostics
+    end
+
+    State.AutoTrader.CompareFreshServerCandidates = function(a,b)
+        local ap,bp=a.botPreview or {},b.botPreview or {}
+        if (ap.previewTrusted==true)~=(bp.previewTrusted==true) then return ap.previewTrusted==true end
+        if math.abs((ap.goldMatchRatio or 0)-(bp.goldMatchRatio or 0))>0.000001 then return (ap.goldMatchRatio or 0)<(bp.goldMatchRatio or 0) end
+        local as,bs=ap.score or -math.huge,bp.score or -math.huge
+        if math.abs(as-bs)>0.000001 then return as>bs end
+        if a.playing~=b.playing then return a.playing>b.playing end
+        return tostring(a.id)<tostring(b.id)
+    end
+
+    State.AutoTrader.BuildCompanionPrimaryServerQueue = function()
+        local snapshot=State.AutoTrader.RefreshServerPreviewCompanion(false)
+        local diagnostics=type(snapshot)=="table" and snapshot.diagnostics or nil
+        local scan={
+            at=os.clock(),source="browser_companion_authenticated",discoverySource="browser_companion_authenticated",cacheHit=false,
+            companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary(),candidates={},queueCount=0,
+            rawRows=0,joinableRows=0,freshRows=0,recentFallbackRows=0,usedRecentFallback=false,
+            filteredCurrent=0,filteredFull=0,filteredManual=0,filteredRecent=0,filteredStale=0,filteredTokenless=0,
+            filteredInvalid=0,filteredBotPreview=0,preclassifyPool=0,preclassifyLimit=math.max(CONFIG.AutoTraderServerQueueLimit,math.min(100,tonumber(CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit) or 80)),
+            selectorRowFreshSeconds=math.max(15,tonumber(CONFIG.AutoTraderCompanionSelectorRowFreshSeconds) or 90),
+            filterSource="companion_discovery_then_existing_lua_suppression_and_bot_preview",
+        }
+        if type(snapshot)~="table" or snapshot.usable~=true or snapshot.selectorUsable~=true or type(snapshot.index)~="table" then
+            scan.unavailableReason=type(diagnostics)=="table" and (diagnostics.selectorLastError or diagnostics.lastError) or "COMPANION_UNAVAILABLE"
+            return {},scan,false
+        end
+        local nowUnix=os.time()
+        State.AutoTrader.PruneRecentJobs()
+        local candidates={}
+        for jobId,row in pairs(snapshot.index) do
+            scan.rawRows+=1
+            local valid=type(jobId)=="string" and jobId~="" and type(row)=="table"
+            if not valid then scan.filteredInvalid+=1
+            elseif jobId==game.JobId then scan.filteredCurrent+=1
+            elseif State.AutoTrader.IsManualBotServerJob and State.AutoTrader.IsManualBotServerJob(jobId) then scan.filteredManual+=1
+            elseif not tonumber(row.playing) or not tonumber(row.maxPlayers) or row.playing<0 or row.maxPlayers<=0 or row.playing>row.maxPlayers then scan.filteredInvalid+=1
+            elseif row.playing>=row.maxPlayers then scan.filteredFull+=1
+            else
+                local liveRowAge=nowUnix-(tonumber(row.lastSeenUnix) or nowUnix)
+                if liveRowAge<0 or liveRowAge>scan.selectorRowFreshSeconds then scan.filteredStale+=1
+                elseif row.rosterEvidenceAvailable~=true or math.max(0,tonumber(row.playerTokenCount) or 0)<=0 or type(row.playerTokens)~="table" or #row.playerTokens<=0 then scan.filteredTokenless+=1
+                else
+                    scan.joinableRows+=1
+                    local server={
+                    id=jobId,playing=row.playing,maxPlayers=row.maxPlayers,occupancy=row.playing/math.max(1,row.maxPlayers),
+                    ping=nil,fps=nil,playerTokens=table.clone(row.playerTokens),previewTokenCount=#row.playerTokens,
+                    previewTokenSource="browser_companion_authenticated",previewCoverage="SAMPLED_NOT_FULL_ROSTER",
+                    previewFingerprintSource=nil,companionRowAgeSeconds=liveRowAge,companionSamplePlaying=row.playing,
+                    companionPreviewState="PRIMARY_DISCOVERY",discoverySource="browser_companion_authenticated",
+                }
+                if State.AutoTrader.RecentJobs[jobId]~=nil then scan.filteredRecent+=1
+                else table.insert(candidates,server);scan.freshRows+=1 end
+                end
+            end
+        end
+        table.sort(candidates,function(a,b)
+            local ap=a.occupancy>=CONFIG.AutoTraderServerPreferredMinOccupancy and a.occupancy<=CONFIG.AutoTraderServerPreferredMaxOccupancy
+            local bp=b.occupancy>=CONFIG.AutoTraderServerPreferredMinOccupancy and b.occupancy<=CONFIG.AutoTraderServerPreferredMaxOccupancy
+            if ap~=bp then return ap end
+            if (a.companionRowAgeSeconds or math.huge)~=(b.companionRowAgeSeconds or math.huge) then return (a.companionRowAgeSeconds or math.huge)<(b.companionRowAgeSeconds or math.huge) end
+            if a.playing~=b.playing then return a.playing>b.playing end
+            return a.id<b.id
+        end)
+        while #candidates>scan.preclassifyLimit do table.remove(candidates) end
+        scan.preclassifyPool=#candidates
+        local thumbOK,thumbReason,thumbDiagnostics=State.AutoTrader.ResolveServerPreviewFingerprints(candidates)
+        scan.thumbnailAvailable=thumbOK;scan.thumbnailReason=thumbReason;scan.thumbnail=thumbDiagnostics
+        local queue={}
+        for _,server in ipairs(candidates) do
+            local preview=State.AutoTrader.ClassifyServerPreview(server)
+            table.insert(scan.candidates,{
+                id=server.id,playing=server.playing,maxPlayers=server.maxPlayers,occupancy=server.occupancy,
+                previewSample=preview.sample,previewTokenCount=server.previewTokenCount,goldBotMatches=preview.goldMatched,goldBotMatchRatio=preview.goldMatchRatio,
+                confirmedBotRatio=preview.confirmedRatio,suspectBotRatio=preview.suspectRatio,botLikelihood=preview.goldMatchRatio,safeConfidence=preview.safeConfidence,
+                previewTrusted=preview.previewTrusted,safeEnough=preview.safeEnough,hardReject=preview.hardReject,suspicious=preview.suspicious,score=preview.score,
+                hashes=server.previewFingerprints,previewThumbnailUrls=table.clone(server.previewThumbnailUrls or {}),recent=State.AutoTrader.RecentJobs[server.id]~=nil,
+                previewTokenSource=server.previewTokenSource,previewCoverage=server.previewCoverage,previewFingerprintSource=server.previewFingerprintSource,
+                companionRowAgeSeconds=server.companionRowAgeSeconds,companionSamplePlaying=server.companionSamplePlaying,discoverySource=server.discoverySource,
+            })
+            if preview.safeEnough then table.insert(queue,server) else scan.filteredBotPreview+=1 end
+        end
+        table.sort(queue,State.AutoTrader.CompareFreshServerCandidates)
+        while #queue>CONFIG.AutoTraderServerQueueLimit do table.remove(queue) end
+        local displayOK,displayReason,displayDiagnostics=State.AutoTrader.ResolveServerDisplayThumbnailUrls(queue)
+        scan.displayThumbnailAvailable=displayOK;scan.displayThumbnailReason=displayReason;scan.displayThumbnail=displayDiagnostics
+        scan.queueCount=#queue;scan.safeCandidateCount=#queue;scan.trustedCandidateCount=0;scan.unknownCandidateCount=0
+        for _,server in ipairs(queue) do if server.botPreview and server.botPreview.previewTrusted then scan.trustedCandidateCount+=1 else scan.unknownCandidateCount+=1 end end
+        scan.selected=queue[1] and queue[1].id or nil
+        local bestServer=queue[1]
+        local bestPreview=bestServer and bestServer.botPreview or nil
+        scan.bestScanned=bestServer and {id=bestServer.id,goldBotMatchRatio=bestPreview and bestPreview.goldMatchRatio or 0,safeConfidence=bestPreview and bestPreview.safeConfidence or 0,previewTrusted=bestPreview and bestPreview.previewTrusted==true,safeEnough=bestPreview and bestPreview.safeEnough==true,playing=bestServer.playing,maxPlayers=bestServer.maxPlayers} or nil
+        scan.cachedCandidateCount=State.AutoTrader.MergeServerCandidateCache(queue)
+        State.AutoTrader.LastServerDiscoverySource="browser_companion_authenticated"
+        State.AutoTrader.LastServerScan=scan
+        return queue,scan,true
+    end
+
+
+    State.AutoTrader.PruneManualBotServerJobs = function()
+        local now = os.time()
+        local ttl = math.max(60, tonumber(CONFIG.AutoTraderManualBotServerJobTtlSeconds) or 3600)
+        local clean = {}
+        for jobId, raw in pairs(State.AutoTrader.ManualBotServerJobs or {}) do
+            local row = type(raw)=="table" and raw or {atUnix=tonumber(raw)}
+            local stamp = tonumber(row.atUnix) or 0
+            if type(jobId)=="string" and jobId~="" and stamp>0 and stamp<=now+60 and now-stamp<ttl then
+                if type(row.provenance) ~= "string" or row.provenance == "" then row.provenance = "manual_bot_server" end
+                clean[jobId] = row
+            end
+        end
+        State.AutoTrader.ManualBotServerJobs = clean
+        return clean
+    end
+    State.AutoTrader.IsManualBotServerJob = function(jobId)
+        State.AutoTrader.PruneManualBotServerJobs()
+        return type(jobId)=="string" and State.AutoTrader.ManualBotServerJobs[jobId] ~= nil
+    end
+    State.AutoTrader.SaveManualBotServerJobs = function()
+        local jobs = State.AutoTrader.PruneManualBotServerJobs()
+        local payload = {version=1, savedAtUnix=os.time(), jobs=jobs}
+        rawset(_G, State.AutoTrader.ManualBotServerJobsKey, payload)
+        rawset(ExecutorEnvironment, State.AutoTrader.ManualBotServerJobsKey, payload)
+        local okBody, body = pcall(function() return HttpService:JSONEncode(payload) end)
+        if not okBody then return false, tostring(body) end
+        return HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.ManualBotServerJobsFile, body)
+    end
+    State.AutoTrader.LoadManualBotServerJobs = function()
+        local merged = {}
+        local function merge(value)
+            local jobs = type(value)=="table" and (value.jobs or value) or nil
+            if type(jobs)~="table" then return end
+            for jobId, row in pairs(jobs) do
+                if type(jobId)=="string" and jobId~="" then
+                    local stamp = type(row)=="table" and tonumber(row.atUnix) or tonumber(row)
+                    if stamp and stamp > (type(merged[jobId])=="table" and tonumber(merged[jobId].atUnix) or 0) then
+                        merged[jobId] = type(row)=="table" and row or {atUnix=stamp,provenance="manual_bot_server"}
+                    end
+                end
+            end
+        end
+        merge(rawget(_G, State.AutoTrader.ManualBotServerJobsKey))
+        merge(rawget(ExecutorEnvironment, State.AutoTrader.ManualBotServerJobsKey))
+        merge(HARDEN.readJsonFileBestEffort(State.AutoTrader.ManualBotServerJobsFile))
+        State.AutoTrader.ManualBotServerJobs = merged
+        State.AutoTrader.PruneManualBotServerJobs()
+        return State.AutoTrader.SaveManualBotServerJobs()
+    end
+    State.AutoTrader.LoadManualBotServerJobs()
+
+    State.AutoTrader.FilterManualBotServerQueue = function(queue)
+        local filtered = {}
+        local manual = State.AutoTrader.PruneManualBotServerJobs()
+        for _, server in ipairs(type(queue)=="table" and queue or {}) do
+            if type(server)=="table" and not manual[server.id] then table.insert(filtered, server) end
+        end
+        return filtered
+    end
+
+    State.AutoTrader.V37BuildCachedServerQueue = State.AutoTrader.BuildCachedServerQueue
+    State.AutoTrader.BuildCachedServerQueue = function()
+        local queue, scan = State.AutoTrader.V37BuildCachedServerQueue()
+        local enriched = State.AutoTrader.EnrichExistingServerCandidatesFromCompanion(queue, "candidate_cache")
+        if #enriched > 0 then
+            local _, _, companionThumb = State.AutoTrader.ResolveServerPreviewFingerprints(enriched)
+            if type(scan)=="table" then scan.companionThumbnail=companionThumb end
+        end
+        local safeQueue={}
+        for _,server in ipairs(queue) do
+            local preview=State.AutoTrader.ClassifyServerPreview(server)
+            if preview and preview.safeEnough then table.insert(safeQueue,server) end
+        end
+        queue = State.AutoTrader.FilterManualBotServerQueue(safeQueue)
+        -- Companion evidence on a cached selector row is intentionally ephemeral.
+        -- Never merge it back here: MergeServerCandidateCache stamps os.time() and would
+        -- incorrectly renew genuine Roblox selector authority without a fresh server scan.
+        if type(scan)=="table" then
+            local manual=State.AutoTrader.PruneManualBotServerJobs();local rows={}
+            for _,row in ipairs(type(scan.candidates)=="table" and scan.candidates or {}) do if not manual[row.id] then table.insert(rows,row) end end
+            scan.candidates=rows;scan.queueCount=#queue;scan.safeCandidateCount=#queue;scan.selected=queue[1] and queue[1].id or nil
+            scan.companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary()
+        end
+        return queue, scan
+    end
+
+    State.AutoTrader.SetUpcomingServerQueue = function(queue, source)
+        State.AutoTrader.UpcomingServerQueue = State.AutoTrader.FilterManualBotServerQueue(queue)
+        State.AutoTrader.UpcomingServerQueueRevision += 1
+        State.AutoTrader.UpcomingServerQueueSource = tostring(source or "selector")
+        State.AutoTrader.UpcomingServerQueueAt = os.clock()
+        State.AutoTrader.QueueRequestedServerPreviewHintWrite(State.AutoTrader.UpcomingServerQueue)
+        if type(State.AutoTrader.QueueUpcomingThumbnailPrefetch)=="function" then
+            local prefetchHooks=State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0
+                or (type(prefetchHooks)=="table" and prefetchHooks.allowDuringSelfTest==true) then
+                State.AutoTrader.QueueUpcomingThumbnailPrefetch(State.AutoTrader.UpcomingServerQueue,true)
+            end
+        end
+    end
+
+    State.AutoTrader.V37BuildPublicServerQueue = State.AutoTrader.BuildPublicServerQueue
+    State.AutoTrader.BuildPublicServerQueue = function(forceFresh)
+        local queue,scan,companionEligible=State.AutoTrader.BuildCompanionPrimaryServerQueue()
+        if not companionEligible or #queue==0 then
+            local directQueue,directScan=State.AutoTrader.V37BuildPublicServerQueue(true)
+            if #directQueue>0 then
+                queue,scan=directQueue,directScan
+                if type(scan)=="table" then scan.source="direct_public_api";scan.discoverySource="direct_public_api";scan.companionPrimaryUnavailableReason=companionEligible and "NO_SAFE_COMPANION_CANDIDATES" or (scan.companion and (scan.companion.selectorLastError or scan.companion.lastError) or "COMPANION_UNAVAILABLE") end
+                State.AutoTrader.LastServerDiscoverySource="direct_public_api"
+            elseif forceFresh~=true then
+                local cachedQueue,cachedScan=State.AutoTrader.BuildCachedServerQueue()
+                queue,scan=cachedQueue,cachedScan
+                if type(scan)=="table" then scan.source="cached_selector";scan.discoverySource="cached_selector" end
+                State.AutoTrader.LastServerDiscoverySource="cached_selector"
+            else
+                queue,scan=directQueue,directScan
+                if type(scan)=="table" then scan.source="direct_public_api";scan.discoverySource="direct_public_api" end
+                State.AutoTrader.LastServerDiscoverySource="direct_public_api"
+            end
+        end
+        queue=State.AutoTrader.FilterManualBotServerQueue(queue)
+        if type(scan)=="table" then
+            local manual=State.AutoTrader.PruneManualBotServerJobs();local rows={}
+            for _,row in ipairs(type(scan.candidates)=="table" and scan.candidates or {}) do if not manual[row.id] then table.insert(rows,row) end end
+            scan.candidates=rows;scan.queueCount=#queue;scan.safeCandidateCount=#queue;scan.selected=queue[1] and queue[1].id or nil
+            scan.finalDiscoverySource=scan.discoverySource or scan.source
+            State.AutoTrader.LastServerScan=scan
+        end
+        State.AutoTrader.SetUpcomingServerQueue(queue,scan and (scan.discoverySource or scan.source) or "selector")
+        if type(State.AutoTrader.QueueUpcomingThumbnailPrefetch)=="function" and type(scan)=="table" and type(scan.candidates)=="table"
+            and scan.discoverySource~="browser_companion_authenticated" then
+            local prefetchHooks=State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0
+                or (type(prefetchHooks)=="table" and prefetchHooks.allowDuringSelfTest==true) then
+                State.AutoTrader.QueueUpcomingThumbnailPrefetch(scan.candidates,false)
+            end
+        end
+        return queue,scan
+    end
+
+    State.AutoTrader.GetUpcomingServerCandidates = function()
+        local source = State.AutoTrader.ServerHopInProgress and State.AutoTrader.ServerHopQueue or State.AutoTrader.UpcomingServerQueue
+        local first = 1
+        if State.AutoTrader.ServerHopInProgress then
+            first = math.max(1, (tonumber(State.AutoTrader.ServerHopQueueIndex) or 0) + 1)
+        end
+        local result = {}
+        local manual=State.AutoTrader.PruneManualBotServerJobs()
+        for index=first,#(source or {}) do
+            local server=source[index]
+            if type(server)=="table" and not manual[server.id] then table.insert(result,server) end
+        end
+        return result
+    end
+
+    State.AutoTrader.FindServerCandidateByJobId = function(jobId)
+        for _, list in ipairs({State.AutoTrader.ServerHopQueue,State.AutoTrader.UpcomingServerQueue,State.AutoTrader.ServerCandidateCache and State.AutoTrader.ServerCandidateCache.entries}) do
+            for _, server in ipairs(type(list)=="table" and list or {}) do if server.id==jobId then return server end end
+        end
+        local scan=State.AutoTrader.LastServerScan
+        for _, row in ipairs(scan and type(scan.candidates)=="table" and scan.candidates or {}) do
+            if row.id==jobId then
+                return {id=row.id,playing=row.playing,maxPlayers=row.maxPlayers,occupancy=row.occupancy,previewFingerprints=table.clone(row.hashes or {}),previewThumbnailUrls=table.clone(row.previewThumbnailUrls or {}),previewTokenCount=math.max(0,tonumber(row.previewTokenCount) or 0),previewTokenSource=row.previewTokenSource,previewCoverage=row.previewCoverage,previewFingerprintSource=row.previewFingerprintSource,companionRowAgeSeconds=tonumber(row.companionRowAgeSeconds),companionSamplePlaying=tonumber(row.companionSamplePlaying)}
+            end
+        end
+        return nil
+    end
+
+    State.AutoTrader.RemoveManualMarkedServerFromSelectorState = function(jobId, suppressPersistence)
+        local removed = 0
+        local function removeFrom(list, adjustIndex)
+            if type(list)~="table" then return end
+            for i=#list,1,-1 do
+                if list[i] and list[i].id==jobId then
+                    table.remove(list,i);removed+=1
+                    if adjustIndex and i <= (tonumber(State.AutoTrader.ServerHopQueueIndex) or 0) then State.AutoTrader.ServerHopQueueIndex=math.max(0,State.AutoTrader.ServerHopQueueIndex-1) end
+                end
+            end
+        end
+        removeFrom(State.AutoTrader.ServerHopQueue,true)
+        removeFrom(State.AutoTrader.UpcomingServerQueue,false)
+        if State.AutoTrader.ServerCandidateCache then removeFrom(State.AutoTrader.ServerCandidateCache.entries,false) end
+        local scan=State.AutoTrader.LastServerScan
+        if scan and type(scan.candidates)=="table" then
+            removeFrom(scan.candidates,false);scan.queueCount=math.max(0,tonumber(scan.queueCount) or 0);scan.selected=nil
+            local upcoming=State.AutoTrader.GetUpcomingServerCandidates();scan.queueCount=#upcoming;scan.safeCandidateCount=#upcoming;scan.selected=upcoming[1] and upcoming[1].id or nil
+        end
+        State.AutoTrader.UpcomingServerQueueRevision += 1
+        if not suppressPersistence then
+            State.AutoTrader.RecentJobs[jobId]=os.time();State.AutoTrader.SaveRecentJobs();State.AutoTrader.SaveServerCandidateCache()
+        end
+        return removed
+    end
+
+    State.AutoTrader.ApplyManualServerClassificationEvidence = function(db, server, jobId)
+        if type(db)~="table" then return 0,0,{} end
+        db.icons=type(db.icons)=="table" and db.icons or {}
+        local grouped, canonical = {}, {}
+        for _, raw in ipairs(type(server)=="table" and (server.previewFingerprints or server.hashes or {}) or {}) do
+            local fingerprint=State.AutoTrader.ExtractAvatarHeadshotHash(raw) or raw
+            if type(fingerprint)=="string" and fingerprint:match("^[0-9a-fA-F]+$") and #fingerprint==32 then
+                fingerprint=string.lower(fingerprint);grouped[fingerprint]=(grouped[fingerprint] or 0)+1
+            end
+        end
+        local learned=0
+        for fingerprint,count in pairs(grouped) do
+            table.insert(canonical,fingerprint)
+            if State.AutoTrader.ApplyBotEvidenceToDb(db,"manual",fingerprint,tostring(jobId),count,nil,nil) then learned+=1 end
+        end
+        table.sort(canonical)
+        return learned,#canonical,canonical
+    end
+
+    State.AutoTrader.GetUpcomingServerPreviewUiState = function(server)
+        local fingerprints = type(server)=="table" and type(server.previewFingerprints)=="table" and server.previewFingerprints or {}
+        local urls = type(server)=="table" and type(server.previewThumbnailUrls)=="table" and server.previewThumbnailUrls or {}
+        local tokenCount = type(server)=="table" and math.max(0, tonumber(server.previewTokenCount) or #(server.playerTokens or {})) or 0
+        local source = type(server)=="table" and server.previewTokenSource or nil
+        local coverage = type(server)=="table" and server.previewCoverage or nil
+        local players = type(server)=="table" and tonumber(server.playing) or nil
+        local companionSample = type(source)=="string" and string.sub(source,1,17)=="browser_companion"
+        local samplePrefix = companionSample and (tostring(tokenCount).." avatar sample"..(tokenCount==1 and "" or "s").." · "..tostring(players or "?").." players · ") or ""
+        if #fingerprints <= 0 then
+            if tokenCount <= 0 then
+                local detail="ROBLOX SERVER API PROVIDED NO ROSTER TOKENS"
+                if type(server)=="table" and server.companionPreviewState=="ROW_STALE" then detail="BROWSER COMPANION ROW IS STALE; PUBLIC SELECTOR PROVIDED NO ROSTER TOKENS"
+                elseif type(server)=="table" and server.companionPreviewState=="TOKENLESS_ROW" then detail="BROWSER COMPANION MATCH HAD NO USABLE ROSTER SAMPLE; PUBLIC SELECTOR PROVIDED NO ROSTER TOKENS" end
+                return {
+                    state="NO_ROSTER_TOKENS",
+                    title="AVATAR PREVIEW UNAVAILABLE",
+                    detail=detail,
+                    actionText="SKIP SERVER",
+                    actionMode="JOB_ID_ONLY_SKIP",
+                    canPromoteFingerprintEvidence=false,
+                    tokenCount=0, fingerprintCount=0, thumbnailCount=#urls,
+                    previewTokenSource=source, previewCoverage=coverage, companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
+                    disclosure="SKIP SERVER suppresses only this JobId; zero avatar fingerprints or bot-icon counters will be learned.",
+                }
+            end
+            return {
+                state="TOKEN_PREVIEW_FAILED",
+                title=companionSample and "AVATAR SAMPLE PREVIEW UNAVAILABLE" or "AVATAR PREVIEW UNAVAILABLE",
+                detail=samplePrefix.."ROSTER TOKENS WERE PRESENT, BUT NO CANONICAL THUMBNAIL FINGERPRINT COMPLETED",
+                actionText="SKIP SERVER",
+                actionMode="JOB_ID_ONLY_SKIP",
+                canPromoteFingerprintEvidence=false,
+                tokenCount=tokenCount, fingerprintCount=0, thumbnailCount=#urls,
+                previewTokenSource=source, previewCoverage=coverage, companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
+                disclosure=companionSample
+                    and "These are browser-companion samples, not a complete roster. SKIP SERVER suppresses only this JobId; no fingerprint evidence exists to promote."
+                    or "SKIP SERVER suppresses only this JobId; no fingerprint evidence exists to promote.",
+            }
+        end
+        return {
+            state="CANONICAL_AVATAR_EVIDENCE",
+            title=companionSample and "AVATAR SAMPLES AVAILABLE" or "AVATAR PREVIEW AVAILABLE",
+            detail=samplePrefix..tostring(#fingerprints).." canonical avatar fingerprint(s) captured from "..tostring(tokenCount).." roster token(s)",
+            actionText="BOT SERVER",
+            actionMode="MANUAL_BOT_WITH_FINGERPRINT_EVIDENCE",
+            canPromoteFingerprintEvidence=true,
+            tokenCount=tokenCount, fingerprintCount=#fingerprints, thumbnailCount=#urls,
+            previewTokenSource=source, previewCoverage=coverage, companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
+            disclosure=companionSample
+                and "These avatars are SAMPLES; unseen players remain unknown. BOT SERVER is an explicit manual whole-server label, and all captured fingerprint(s) become manual evidence only."
+                or "BOT SERVER labels the whole candidate; all "..tostring(#fingerprints).." captured fingerprint(s) become explicit manual evidence.",
+        }
+    end
+
+    State.AutoTrader.GetServerPreviewAvailabilitySummary = function()
+        local scan = State.AutoTrader.LastServerScan
+        local queue = State.AutoTrader.GetUpcomingServerCandidates()
+        local summary = {
+            source=scan and scan.source or State.AutoTrader.UpcomingServerQueueSource,
+            upcomingRows=#queue, tokenlessUpcomingRows=0, tokenBearingUpcomingRows=0,
+            fingerprintRows=0, thumbnailRows=0, companionSampleRows=0,
+            fetch={usableRows=0,rowsWithPlayerTokens=0,totalPlayerTokens=0,tokenlessActivePages=0,selectedDegradedPages=0},
+            thumbnail={tokens=0,batches=0,completed=0,lastError=nil},
+            companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary(),
+        }
+        for _, server in ipairs(queue) do
+            local state = State.AutoTrader.GetUpcomingServerPreviewUiState(server)
+            if state.tokenCount > 0 then summary.tokenBearingUpcomingRows += 1 else summary.tokenlessUpcomingRows += 1 end
+            if state.fingerprintCount > 0 then summary.fingerprintRows += 1 end
+            if state.thumbnailCount > 0 then summary.thumbnailRows += 1 end
+            if type(state.previewTokenSource)=="string" and string.sub(state.previewTokenSource,1,17)=="browser_companion" then summary.companionSampleRows += 1 end
+        end
+        local fetch = scan and scan.fetch
+        if type(fetch)=="table" then
+            for _, key in ipairs({"usableRows","rowsWithPlayerTokens","totalPlayerTokens","tokenlessActivePages","selectedDegradedPages"}) do summary.fetch[key]=math.max(0,tonumber(fetch[key]) or 0) end
+        end
+        local thumb = scan and scan.thumbnail
+        if type(thumb)=="table" then
+            summary.thumbnail.tokens=math.max(0,tonumber(thumb.tokens) or 0)
+            summary.thumbnail.batches=math.max(0,tonumber(thumb.batches) or 0)
+            summary.thumbnail.completed=math.max(0,tonumber(thumb.completed) or 0)
+            summary.thumbnail.lastError=thumb.lastError
+        end
+        summary.degraded = summary.tokenlessUpcomingRows > 0 or summary.fetch.selectedDegradedPages > 0
+        return summary
+    end
+
+    State.AutoTrader.MarkUpcomingServerBot = function(jobId)
+        if Destroyed then return false,"controller destroyed" end
+        if type(jobId)~="string" or jobId=="" or jobId==game.JobId then return false,"invalid candidate JobId" end
+        local server=State.AutoTrader.FindServerCandidateByJobId(jobId)
+        if not server then return false,"candidate no longer exists in selector state" end
+        local now=os.time()
+        local previewState=State.AutoTrader.GetUpcomingServerPreviewUiState(server)
+        local hasCanonicalEvidence=previewState.canPromoteFingerprintEvidence==true
+        local classification={
+            atUnix=now,
+            provenance=hasCanonicalEvidence and "manual_bot_server" or (previewState.state=="NO_ROSTER_TOKENS" and "manual_server_skip_tokenless" or "manual_server_skip_no_fingerprint"),
+            action=hasCanonicalEvidence and "BOT_SERVER" or "SKIP_SERVER",
+            jobId=jobId,playing=tonumber(server.playing),maxPlayers=tonumber(server.maxPlayers),
+            rosterTokenCount=previewState.tokenCount,thumbnailCount=#(server.previewThumbnailUrls or {}),
+            previewTokenSource=previewState.previewTokenSource,previewCoverage=previewState.previewCoverage,
+            companionRowAgeSeconds=previewState.companionRowAgeSeconds,
+            browserVisibleThumbnailLimit=math.max(1,tonumber(CONFIG.AutoTraderUpcomingServerPreviewIconLimit) or 4),
+            evidenceScope=hasCanonicalEvidence and ((type(previewState.previewTokenSource)=="string" and string.sub(previewState.previewTokenSource,1,17)=="browser_companion") and "manual_whole_server_label_based_on_sampled_avatar_evidence" or "whole_server_all_captured_fingerprints") or "job_id_only_no_fingerprint_learning",
+            previewAvailability=previewState.state,
+            evidenceState=hasCanonicalEvidence and "pending" or "JOB_ONLY_SUPPRESSION_NO_FINGERPRINT_EVIDENCE",
+        }
+        State.AutoTrader.ManualBotServerJobs[jobId]=classification
+        State.AutoTrader.RemoveManualMarkedServerFromSelectorState(jobId,false)
+        local markSaved,markSaveError=State.AutoTrader.SaveManualBotServerJobs()
+        classification.jobMarkPersistence=markSaved and "saved" or "failed"
+        classification.jobMarkPersistenceError=nil
+        if not markSaved then classification.jobMarkPersistenceError=tostring(markSaveError) end
+        local learned,canonicalCount,canonical=0,0,{}
+        if hasCanonicalEvidence then
+            local candidate=State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb)
+            learned,canonicalCount,canonical=State.AutoTrader.ApplyManualServerClassificationEvidence(candidate,server,jobId)
+            classification.canonicalFingerprintCount=canonicalCount
+            classification.fingerprints=canonical
+            if learned>0 then
+                candidate=State.AutoTrader.PruneBotDbCandidate(candidate)
+                local saved,err=State.AutoTrader.CommitTrustedBotDbCandidate(candidate,{source="manual_bot_server_browser",provenance="manual_bot_server",evidenceSource=(type(classification.previewTokenSource)=="string" and string.sub(classification.previewTokenSource,1,17)=="browser_companion") and "browser_companion_samples" or "selector_preview",previewCoverage=classification.previewCoverage,jobId=jobId,classifiedAtUnix=now,fingerprintCount=canonicalCount,thumbnailCount=classification.thumbnailCount,rosterTokenCount=classification.rosterTokenCount})
+                classification.evidenceState=saved and "TRUSTED_MANUAL_EVIDENCE" or "MANUAL_EVIDENCE_PERSISTENCE_FAILED"
+                classification.evidenceError=nil
+                if not saved then classification.evidenceError=tostring(err) end
+            else
+                classification.evidenceState="JOB_ONLY_SUPPRESSION_NO_CANONICAL_FINGERPRINT"
+            end
+        else
+            classification.canonicalFingerprintCount=0
+            classification.fingerprints={}
+        end
+        State.AutoTrader.ManualBotServerJobs[jobId]=classification
+        State.AutoTrader.SaveManualBotServerJobs()
+        State.AutoTrader.LastManualBotServerClassification=classification
+        State.AutoTrader.Log(hasCanonicalEvidence and "manual_upcoming_bot_server_marked" or "manual_upcoming_server_skipped",classification)
+        State.AutoTrader.Status=hasCanonicalEvidence and "UPCOMING SERVER · MARKED BOT" or "UPCOMING SERVER · SKIPPED"
+        if hasCanonicalEvidence then
+            State.AutoTrader.StatusDetail="Removed "..string.sub(jobId,1,8).."… from the real selector queue. Manual evidence promotion: "..tostring(classification.evidenceState).." ("..tostring(learned).." captured fingerprint(s)); automated strict-certification counters were not touched."
+        else
+            State.AutoTrader.StatusDetail="Removed "..string.sub(jobId,1,8).."… from the real selector queue as a JobId-only manual skip. "..tostring(previewState.detail).."; zero avatar fingerprints and zero bot-icon counters were learned."
+        end
+        State.AutoTrader.Render()
+        return true,classification
+    end
+
+    State.AutoTrader.V37TryNextServerHopCandidate = State.AutoTrader.TryNextServerHopCandidate
+    State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
+        local pending = State.AutoTrader.ServerHopQueue
+        local manual=State.AutoTrader.PruneManualBotServerJobs()
+        if type(pending)=="table" then
+            for i=#pending,1,-1 do
+                local server=pending[i]
+                if server and manual[server.id] then
+                    table.remove(pending,i)
+                    if i <= (tonumber(State.AutoTrader.ServerHopQueueIndex) or 0) then State.AutoTrader.ServerHopQueueIndex=math.max(0,State.AutoTrader.ServerHopQueueIndex-1) end
+                end
+            end
+        end
+        return State.AutoTrader.V37TryNextServerHopCandidate(queueGeneration)
+    end
+
+    -- Canonical thumbnail URLs/fingerprints remain evidence. This cache changes only
+    -- display transport for executors that cannot render Roblox HTTPS URLs in ImageLabel.
+    State.AutoTrader.UpcomingThumbnailDisplay = State.AutoTrader.UpcomingThumbnailDisplay or {cache={},generation=0,downloadStarts=0,prefetchQueue={},prefetchQueued={},prefetchActive=0,prefetchStarts=0,prefetchedReady=0,cacheHits=0,maxObservedConcurrency=0}
+    State.AutoTrader.UpcomingThumbnailDisplayPathVersion = "raw_https_then_exact_bytes_custom_asset_v1"
+    State.AutoTrader.GetUpcomingThumbnailDisplayKey = function(url,fingerprint)
+        local canonical=State.AutoTrader.ExtractAvatarHeadshotHash(fingerprint) or State.AutoTrader.ExtractAvatarHeadshotHash(url)
+        if canonical then return "fp:"..string.lower(canonical) end
+        if type(url)~="string" or url=="" then return nil end
+        local digest=sha256Hex(url)
+        return digest and ("url:"..digest) or ("url:"..url)
+    end
+    State.AutoTrader.PruneUpcomingThumbnailDisplayCache = function()
+        local state=State.AutoTrader.UpcomingThumbnailDisplay;local rows={}
+        for key,entry in pairs(state.cache or {}) do table.insert(rows,{key=key,at=tonumber(entry.lastUsedAt) or tonumber(entry.startedAt) or 0,pending=entry.state=="pending"}) end
+        table.sort(rows,function(a,b) return a.at>b.at end)
+        local kept=0
+        for _,row in ipairs(rows) do
+            if row.pending then kept+=1
+            elseif kept<(tonumber(CONFIG.AutoTraderUpcomingThumbnailCacheLimit) or 240) then kept+=1
+            else state.cache[row.key]=nil end
+        end
+    end
+    State.AutoTrader.FetchUpcomingThumbnailDisplayBytes = function(url)
+        local ok,response=fetchStaticTextCompat(url,{["Cache-Control"]="max-age=3600"},math.min(4,tonumber(CONFIG.AutoTraderHttpTimeoutSeconds) or 4))
+        if not ok or type(response)~="table" or response.Success~=true or type(response.Body)~="string" or response.Body=="" then return nil,"thumbnail HTTP failed" end
+        if #response.Body>(tonumber(CONFIG.AutoTraderUpcomingThumbnailMaxBytes) or 4194304) then return nil,"thumbnail body exceeded display limit" end
+        return response.Body,getResponseHeader(response,"content-type")
+    end
+    State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset = function(url,fingerprint,callback)
+        if type(url)~="string" or url=="" then if type(callback)=="function" then pcall(callback,nil,"thumbnail URL unavailable") end;return nil,"invalid_url" end
+        local state=State.AutoTrader.UpcomingThumbnailDisplay;local key=State.AutoTrader.GetUpcomingThumbnailDisplayKey(url,fingerprint);if not key then return nil,"invalid_key" end
+        local now=os.clock();local entry=state.cache[key]
+        if entry and entry.url~=url then
+            -- Canonical fingerprint is identity; a refreshed signed/CDN URL may change transport.
+            entry.url=url
+        end
+        if entry and entry.state=="ready" and type(entry.asset)=="string" and entry.asset~="" then
+            entry.lastUsedAt=now;if type(callback)=="function" then pcall(callback,entry.asset,nil,entry) end;return entry,"ready"
+        end
+        if entry and entry.state=="pending" then
+            entry.lastUsedAt=now;entry.waiters=type(entry.waiters)=="table" and entry.waiters or {};if type(callback)=="function" then table.insert(entry.waiters,callback) end;return entry,"pending"
+        end
+        if entry and entry.state=="failed" and now<(tonumber(entry.retryAfter) or 0) then
+            entry.lastUsedAt=now;if type(callback)=="function" then pcall(callback,nil,entry.error,entry) end;return entry,"failed_backoff"
+        end
+        entry=entry or {key=key,attempts=0}
+        entry.url=url;entry.fingerprint=fingerprint;entry.state="pending";entry.startedAt=now;entry.lastUsedAt=now;entry.attempts=(tonumber(entry.attempts) or 0)+1;entry.waiters={}
+        if type(callback)=="function" then table.insert(entry.waiters,callback) end
+        state.cache[key]=entry;state.downloadStarts=(tonumber(state.downloadStarts) or 0)+1
+        State.AutoTrader.PruneUpcomingThumbnailDisplayCache()
+        local function finish(asset,err,transport)
+            if state.cache[key]~=entry then return end
+            entry.finishedAt=os.clock();entry.lastUsedAt=entry.finishedAt;entry.transport=transport
+            if type(asset)=="string" and asset~="" then entry.state="ready";entry.asset=asset;entry.error=nil;entry.retryAfter=nil
+            else entry.state="failed";entry.asset=nil;entry.error=tostring(err or "thumbnail display unavailable");entry.retryAfter=os.clock()+math.max(1,tonumber(CONFIG.AutoTraderUpcomingThumbnailRetrySeconds) or 20) end
+            local waiters=entry.waiters or {};entry.waiters={}
+            for _,waiter in ipairs(waiters) do pcall(waiter,entry.asset,entry.error,entry) end
+        end
+        local function worker()
+            local hooks=State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            local writefileFunction,assetFunction
+            if hooks then
+                writefileFunction=hooks.writefile;assetFunction=hooks.assetFunction
+            else
+                writefileFunction=State.TryGetExecutorGlobal("writefile")
+                assetFunction=State.TryGetExecutorGlobal("getcustomasset") or State.TryGetExecutorGlobal("getsynasset")
+            end
+            if type(writefileFunction)~="function" or type(assetFunction)~="function" then finish(nil,"writefile/getcustomasset unavailable","unavailable");return end
+            local body,contentType
+            if hooks and type(hooks.fetchBytes)=="function" then body,contentType=hooks.fetchBytes(url) else body,contentType=State.AutoTrader.FetchUpcomingThumbnailDisplayBytes(url) end
+            if type(body)~="string" or body=="" then finish(nil,contentType or "thumbnail download failed","http_failed");return end
+            if #body>(tonumber(CONFIG.AutoTraderUpcomingThumbnailMaxBytes) or 4194304) then finish(nil,"thumbnail body exceeded display limit","http_failed");return end
+            local extension=".png";local content=string.lower(tostring(contentType or ""))
+            if content:find("jpeg",1,true) or content:find("jpg",1,true) then extension=".jpg" elseif content:find("webp",1,true) then extension=".webp" end
+            local path="SV_AutoTrader_thumbnail_"..string.sub((sha256Hex(url) or key):gsub("[^%w]",""),1,32)..extension
+            local okWrite,writeErr
+            if hooks then okWrite,writeErr=pcall(writefileFunction,path,body) else okWrite,writeErr=waitForExternalWithDeadline("thumbnail writefile",CONFIG.AutoTraderExecutorFileTimeoutSeconds,function() return writefileFunction(path,body) end) end
+            if not okWrite then finish(nil,tostring(writeErr or "thumbnail writefile failed"),"write_failed");return end
+            local okAsset,asset
+            if hooks then okAsset,asset=pcall(assetFunction,path) else okAsset,asset=waitForExternalWithDeadline("thumbnail getcustomasset",CONFIG.AutoTraderExecutorFileTimeoutSeconds,function() return assetFunction(path) end) end
+            if not okAsset or type(asset)~="string" or asset=="" then finish(nil,tostring(asset or "getcustomasset failed"),"asset_failed");return end
+            finish(asset,nil,"custom_asset_exact_bytes")
+        end
+        local hooks=State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+        if hooks and type(hooks.spawn)=="function" then hooks.spawn(worker) else task.spawn(worker) end
+        return entry,"started"
+    end
+    State.AutoTrader.GetUpcomingThumbnailDisplaySummary = function()
+        local state=State.AutoTrader.UpcomingThumbnailDisplay
+        local summary={
+            pathVersion=State.AutoTrader.UpcomingThumbnailDisplayPathVersion,downloadStarts=tonumber(state and state.downloadStarts) or 0,
+            pending=0,ready=0,failed=0,rawReady=0,customAssetReady=0,failures={},
+            queued=type(state and state.prefetchQueue)=="table" and #state.prefetchQueue or 0,
+            active=math.max(0,tonumber(state and state.prefetchActive) or 0),
+            prefetchedReady=math.max(0,tonumber(state and state.prefetchedReady) or 0),
+            cacheHits=math.max(0,tonumber(state and state.cacheHits) or 0),
+            prefetchStarts=math.max(0,tonumber(state and state.prefetchStarts) or 0),
+            concurrencyLimit=math.max(1,math.min(6,tonumber(CONFIG.AutoTraderUpcomingThumbnailPrefetchConcurrency) or 5)),
+            maxObservedConcurrency=math.max(0,tonumber(state and state.maxObservedConcurrency) or 0),
+        }
+        for key,entry in pairs(state and state.cache or {}) do
+            if entry.state=="pending" then summary.pending+=1 elseif entry.state=="ready" then summary.ready+=1 else summary.failed+=1 end
+            if entry.transport=="raw_https" then summary.rawReady+=1 elseif entry.transport=="custom_asset_exact_bytes" then summary.customAssetReady+=1 end
+            if entry.state=="failed" and #summary.failures<10 then table.insert(summary.failures,{key=key,error=entry.error,retryAfter=entry.retryAfter,attempts=entry.attempts}) end
+        end
+        return summary
+    end
+
+    State.AutoTrader.PumpUpcomingThumbnailPrefetch = function()
+        local state=State.AutoTrader.UpcomingThumbnailDisplay
+        state.prefetchQueue=type(state.prefetchQueue)=="table" and state.prefetchQueue or {}
+        if Destroyed then
+            state.prefetchQueue={}
+            state.prefetchQueued={}
+            return
+        end
+        state.prefetchQueued=type(state.prefetchQueued)=="table" and state.prefetchQueued or {}
+        state.prefetchActive=math.max(0,tonumber(state.prefetchActive) or 0)
+        local limit=math.max(1,math.min(6,tonumber(CONFIG.AutoTraderUpcomingThumbnailPrefetchConcurrency) or 5))
+        while state.prefetchActive<limit and #state.prefetchQueue>0 do
+            local request=table.remove(state.prefetchQueue,1)
+            if type(request)=="table" and type(request.key)=="string" then state.prefetchQueued[request.key]=nil end
+            local entry=type(request)=="table" and state.cache[request.key] or nil
+            if entry and (entry.state=="ready" or entry.state=="pending") then
+                state.cacheHits=(tonumber(state.cacheHits) or 0)+1
+            elseif type(request)=="table" and type(request.url)=="string" and request.url~="" then
+                state.prefetchActive+=1
+                state.prefetchStarts=(tonumber(state.prefetchStarts) or 0)+1
+                state.maxObservedConcurrency=math.max(tonumber(state.maxObservedConcurrency) or 0,state.prefetchActive)
+                local finished=false
+                local function onFinished(asset,_,resolvedEntry)
+                    if finished then return end
+                    finished=true
+                    state.prefetchActive=math.max(0,(tonumber(state.prefetchActive) or 1)-1)
+                    if type(asset)=="string" and asset~="" and type(resolvedEntry)=="table" and resolvedEntry.transport=="custom_asset_exact_bytes" then
+                        state.prefetchedReady=(tonumber(state.prefetchedReady) or 0)+1
+                    end
+                    State.AutoTrader.PumpUpcomingThumbnailPrefetch()
+                end
+                local _,status=State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(request.url,request.fingerprint,onFinished)
+                if status~="started" and status~="pending" and not finished then onFinished(nil) end
+            end
+        end
+    end
+
+    State.AutoTrader.QueueUpcomingThumbnailPrefetch = function(servers,priority)
+        local state=State.AutoTrader.UpcomingThumbnailDisplay
+        state.prefetchQueue=type(state.prefetchQueue)=="table" and state.prefetchQueue or {}
+        state.prefetchQueued=type(state.prefetchQueued)=="table" and state.prefetchQueued or {}
+        local pending={}
+        for _,server in ipairs(type(servers)=="table" and servers or {}) do
+            local useDisplay=type(server)=="table" and type(server.previewDisplayThumbnailUrls)=="table" and #server.previewDisplayThumbnailUrls>0
+            local urls=type(server)=="table" and (useDisplay and server.previewDisplayThumbnailUrls or server.previewThumbnailUrls) or nil
+            local fingerprints=type(server)=="table" and (useDisplay and server.previewDisplayCanonicalFingerprints or (server.previewFingerprints or server.hashes)) or nil
+            for index,url in ipairs(type(urls)=="table" and urls or {}) do
+                local fingerprint=type(fingerprints)=="table" and fingerprints[index] or nil
+                local key=State.AutoTrader.GetUpcomingThumbnailDisplayKey(url,fingerprint)
+                if key and not state.prefetchQueued[key] then
+                    local cached=state.cache[key]
+                    if cached and (cached.state=="ready" or cached.state=="pending") then
+                        state.cacheHits=(tonumber(state.cacheHits) or 0)+1
+                    else
+                        state.prefetchQueued[key]=true
+                        table.insert(pending,{key=key,url=url,fingerprint=fingerprint})
+                    end
+                end
+            end
+        end
+        if priority==true and #pending>0 then
+            for index=#pending,1,-1 do table.insert(state.prefetchQueue,1,pending[index]) end
+        else
+            for _,request in ipairs(pending) do table.insert(state.prefetchQueue,request) end
+        end
+        State.AutoTrader.PumpUpcomingThumbnailPrefetch()
+        return #pending
+    end
+    State.AutoTrader.IsUpcomingThumbnailBindingCurrent = function(image,url,fingerprint,generation)
+        if typeof(image)~="Instance" or not image.Parent then return false end
+        if tonumber(State.AutoTrader.UpcomingThumbnailDisplay.generation)~=tonumber(generation) then return false end
+        local key=State.AutoTrader.GetUpcomingThumbnailDisplayKey(url,fingerprint)
+        local ok,bound=pcall(function() return image:GetAttribute("SVThumbnailDisplayKey") end)
+        return ok and bound==key
+    end
+    State.AutoTrader.ApplyUpcomingThumbnailDisplayResult = function(image,url,fingerprint,generation,asset,unavailableLabel)
+        if not State.AutoTrader.IsUpcomingThumbnailBindingCurrent(image,url,fingerprint,generation) then return false,"stale_binding" end
+        if type(asset)=="string" and asset~="" then
+            image.Image=asset
+            if typeof(unavailableLabel)=="Instance" and unavailableLabel.Parent then unavailableLabel.Visible=false end
+            return true
+        end
+        image.Image=""
+        if typeof(unavailableLabel)=="Instance" and unavailableLabel.Parent then unavailableLabel.Visible=true end
+        return false,"thumbnail_unavailable"
+    end
+    State.AutoTrader.BindUpcomingThumbnailImage = function(image,url,fingerprint,generation,unavailableLabel)
+        if typeof(image)~="Instance" or type(url)~="string" or url=="" then return false end
+        local key=State.AutoTrader.GetUpcomingThumbnailDisplayKey(url,fingerprint);if not key then return false end
+        image:SetAttribute("SVThumbnailDisplayKey",key);image.Image=url
+        local cached=State.AutoTrader.UpcomingThumbnailDisplay.cache[key]
+        if cached and cached.state=="ready" and type(cached.asset)=="string" and cached.asset~="" and cached.transport=="custom_asset_exact_bytes" then
+            State.AutoTrader.UpcomingThumbnailDisplay.cacheHits=(tonumber(State.AutoTrader.UpcomingThumbnailDisplay.cacheHits) or 0)+1
+            State.AutoTrader.ApplyUpcomingThumbnailDisplayResult(image,url,fingerprint,generation,cached.asset,unavailableLabel)
+            return true
+        end
+        if cached and cached.state=="pending" then
+            State.AutoTrader.UpcomingThumbnailDisplay.cacheHits=(tonumber(State.AutoTrader.UpcomingThumbnailDisplay.cacheHits) or 0)+1
+            State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(url,fingerprint,function(asset)
+                State.AutoTrader.ApplyUpcomingThumbnailDisplayResult(image,url,fingerprint,generation,asset,unavailableLabel)
+            end)
+            return true
+        end
+        task.delay(math.max(0.1,tonumber(CONFIG.AutoTraderUpcomingThumbnailRawWaitSeconds) or 1.25),function()
+            if not State.AutoTrader.IsUpcomingThumbnailBindingCurrent(image,url,fingerprint,generation) then return end
+            local loaded=false;pcall(function() loaded=image.IsLoaded==true end)
+            if loaded then
+                local state=State.AutoTrader.UpcomingThumbnailDisplay;local entry=state.cache[key] or {key=key,url=url,fingerprint=fingerprint}
+                entry.state="ready";entry.asset=url;entry.transport="raw_https";entry.lastUsedAt=os.clock();state.cache[key]=entry
+                if typeof(unavailableLabel)=="Instance" and unavailableLabel.Parent then unavailableLabel.Visible=false end
+                return
+            end
+            State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(url,fingerprint,function(asset)
+                State.AutoTrader.ApplyUpcomingThumbnailDisplayResult(image,url,fingerprint,generation,asset,unavailableLabel)
+            end)
+        end)
+        return true
+    end
+
+    -- Reuse the existing SERVERS tab, but keep one-time UI installation in its own
+    -- function scope so its locals/for-loop control variables do not consume chunk registers.
+    State.AutoTrader.InstallV37UpcomingServerBrowserUi = function()
+        if type(UI.AutoTraderV37UiHelpers) ~= "table"
+            or type(UI.AutoTraderV37UiHelpers.button) ~= "function"
+            or type(UI.AutoTraderV37UiHelpers.gradient) ~= "function"
+            or type(UI.AutoTraderV37UiHelpers.stroke) ~= "function"
+            or type(UI.AutoTraderV37UiHelpers.clearDynamic) ~= "function"
+            or type(UI.AutoTraderV37UiHelpers.pct01) ~= "function"
+            or type(UI.AutoTraderV37UiHelpers.palette) ~= "table"
+            or UI.AutoTraderV37UiHelpers.palette.cardAltTop == nil
+            or UI.AutoTraderV37UiHelpers.palette.cardAltBottom == nil then
+            error("v37 upcoming-server UI helper export is missing or incomplete")
+        end
+        if UI.AutoTraderServerCandidateScroll and UI.AutoTraderServerCandidateScroll.Parent then
+            local parent=UI.AutoTraderServerCandidateScroll.Parent
+            for _,child in ipairs(parent:GetChildren()) do
+                if child:IsA("TextLabel") and child.Text=="RECENT ELIGIBLE SERVERS" then child.Visible=false end
+            end
+            UI.AutoTraderUpcomingToggle=UI.AutoTraderV37UiHelpers.button(parent,"UPCOMING SERVERS ▼",UDim2.new(0.48,-4,0,20),false)
+            UI.AutoTraderUpcomingToggle.Position=UDim2.fromOffset(0,178);UI.AutoTraderUpcomingToggle.TextSize=10;UI.AutoTraderUpcomingToggle.ZIndex=1460
+            connect(UI.AutoTraderUpcomingToggle.MouseButton1Click,function()
+                State.AutoTrader.UpcomingServerBrowserOpen=not State.AutoTrader.UpcomingServerBrowserOpen
+                UI.AutoTraderServerCandidateScroll.Visible=State.AutoTrader.UpcomingServerBrowserOpen
+                UI.AutoTraderUpcomingToggle.Text=State.AutoTrader.UpcomingServerBrowserOpen and "UPCOMING SERVERS ▼" or "UPCOMING SERVERS ▶"
+                if State.AutoTrader.UpcomingServerBrowserOpen then State.AutoTrader.RebuildServerDashboard() end
+            end)
+        end
+    end
+    State.AutoTrader.InstallV37UpcomingServerBrowserUi()
+    State.AutoTrader.InstallV37UpcomingServerBrowserUi = nil
+
+    State.AutoTrader.RebuildServerDashboard = function()
+        if not UI.AutoTraderServerCandidateContent then return end
+        State.AutoTrader.UpcomingThumbnailDisplay.generation=(tonumber(State.AutoTrader.UpcomingThumbnailDisplay.generation) or 0)+1
+        local thumbnailGeneration=State.AutoTrader.UpcomingThumbnailDisplay.generation
+        UI.AutoTraderV37UiHelpers.clearDynamic(UI.AutoTraderServerCandidateContent)
+        if not State.AutoTrader.UpcomingServerBrowserOpen then return end
+        local queue=State.AutoTrader.GetUpcomingServerCandidates()
+        if #queue==0 then
+            local label=makeLabel(UI.AutoTraderServerCandidateContent,"No selector candidates are currently lined up. Refresh the server list or wait for a hop scan.",10,THEME.faint,Enum.Font.Arial)
+            label.Size=UDim2.new(1,0,0,44);label.TextWrapped=true;label.ZIndex=1454;return
+        end
+        local limit=math.max(1,tonumber(CONFIG.AutoTraderUpcomingServerUiLimit) or 12)
+        local iconLimit=math.max(1,tonumber(CONFIG.AutoTraderUpcomingServerPreviewIconLimit) or 4)
+        for index,server in ipairs(queue) do
+            if index>limit then break end
+            local preview=server.botPreview or State.AutoTrader.ClassifyServerPreview(server)
+            local trusted=preview and preview.previewTrusted==true
+            local previewUi=State.AutoTrader.GetUpcomingServerPreviewUiState(server)
+            local row=create("Frame",{Size=UDim2.new(1,0,0,110),BackgroundColor3=THEME.panel2,BorderSizePixel=0,ZIndex=1454},UI.AutoTraderServerCandidateContent)
+            addCorner(row,4);UI.AutoTraderV37UiHelpers.stroke(row,THEME.border,0.5);UI.AutoTraderV37UiHelpers.gradient(row,UI.AutoTraderV37UiHelpers.palette.cardAltTop,UI.AutoTraderV37UiHelpers.palette.cardAltBottom,90)
+            local id=tostring(server.id or "?");local short=#id>12 and (string.sub(id,1,8).."…") or id
+            local title=makeLabel(row,tostring(index)..". "..short.." · "..tostring(server.playing or "?").."/"..tostring(server.maxPlayers or "?"),10,THEME.text,Enum.Font.ArialBold)
+            title.Position=UDim2.fromOffset(8,4);title.Size=UDim2.new(1,-106,0,17);title.ZIndex=1455
+            local verdict
+            if type(previewUi.previewTokenSource)=="string" and string.sub(previewUi.previewTokenSource,1,17)=="browser_companion" then
+                verdict=tostring(previewUi.tokenCount).." avatar sample"..(previewUi.tokenCount==1 and "" or "s").." · "..tostring(server.playing or "?").." players"
+                if trusted then verdict=verdict.." · trusted bot matches "..UI.AutoTraderV37UiHelpers.pct01(preview.goldMatchRatio or 0).." (strict + manual DB)" end
+            else
+                verdict=trusted and ("trusted bot matches "..UI.AutoTraderV37UiHelpers.pct01(preview.goldMatchRatio or 0).." (strict + manual provenance)") or previewUi.title
+            end
+            local sub=makeLabel(row,verdict.." · actual selector order",9,trusted and THEME.muted or THEME.yellow,Enum.Font.Arial)
+            sub.Position=UDim2.fromOffset(8,21);sub.Size=UDim2.new(1,-106,0,15);sub.ZIndex=1455
+            local useDisplay=type(server.previewDisplayThumbnailUrls)=="table" and #server.previewDisplayThumbnailUrls>0
+            local urls=useDisplay and server.previewDisplayThumbnailUrls or (type(server.previewThumbnailUrls)=="table" and server.previewThumbnailUrls or {})
+            local hashes=useDisplay and (type(server.previewDisplayCanonicalFingerprints)=="table" and server.previewDisplayCanonicalFingerprints or {}) or (type(server.previewFingerprints)=="table" and server.previewFingerprints or {})
+            for imageIndex=1,math.min(#urls,iconLimit) do
+                local x=8+(imageIndex-1)*36
+                local unavailable=makeLabel(row,"N/A",7,THEME.faint,Enum.Font.ArialBold);unavailable.Position=UDim2.fromOffset(x,42);unavailable.Size=UDim2.fromOffset(32,32);unavailable.TextWrapped=true;unavailable.Visible=false;unavailable.ZIndex=1457
+                local image=create("ImageLabel",{Position=UDim2.fromOffset(x,42),Size=UDim2.fromOffset(32,32),BackgroundColor3=THEME.panel3,BorderSizePixel=0,Image="",ZIndex=1456},row);addCorner(image,4)
+                State.AutoTrader.BindUpcomingThumbnailImage(image,urls[imageIndex],hashes[imageIndex],thumbnailGeneration,unavailable)
+            end
+            if #urls==0 then
+                local evidence=makeLabel(row,previewUi.detail,9,previewUi.state=="NO_ROSTER_TOKENS" and THEME.yellow or THEME.faint,Enum.Font.ArialBold)
+                evidence.Position=UDim2.fromOffset(8,43);evidence.Size=UDim2.new(1,-110,0,31);evidence.TextWrapped=true;evidence.ZIndex=1455
+            end
+            local disclosure=previewUi.disclosure
+            if previewUi.canPromoteFingerprintEvidence and (#hashes>iconLimit or #urls>iconLimit) then
+                disclosure="Showing "..tostring(math.min(#urls,iconLimit)).."/"..tostring(#urls).." thumbnails · BOT SERVER promotes all "..tostring(#hashes).." captured fingerprint(s) as manual evidence."
+            end
+            local scope=makeLabel(row,disclosure,8,THEME.faint,Enum.Font.Arial);scope.Position=UDim2.fromOffset(8,80);scope.Size=UDim2.new(1,-8,0,24);scope.TextWrapped=true;scope.ZIndex=1455
+            local mark=UI.AutoTraderV37UiHelpers.button(row,previewUi.actionText,UDim2.fromOffset(88,28),false);mark.Position=UDim2.new(1,-96,0,48);mark.TextColor3=previewUi.canPromoteFingerprintEvidence and THEME.red or THEME.yellow;mark.TextSize=9;mark.ZIndex=1457
+            local clickConnection
+            clickConnection=mark.MouseButton1Click:Connect(function()
+                if clickConnection then clickConnection:Disconnect();clickConnection=nil end
+                task.spawn(function() State.AutoTrader.MarkUpcomingServerBot(id) end)
+            end)
+            row.Destroying:Connect(function() if clickConnection then clickConnection:Disconnect();clickConnection=nil end end)
+        end
+    end
+
+    State.AutoTrader.GetBotEvidenceProvenanceSummary = function()
+        local summary={strictIcons=0,manualIcons=0,strictJobs=0,manualJobs=0,strictSightings=0,manualSightings=0}
+        for _,record in pairs(State.AutoTrader.BotIconDb and State.AutoTrader.BotIconDb.icons or {}) do
+            local strict=State.AutoTrader.BotIconJobCount(record.strictGoldBotJobs);local manual=State.AutoTrader.BotIconJobCount(record.manualGoldBotJobs)
+            if strict>0 then summary.strictIcons+=1 end;if manual>0 then summary.manualIcons+=1 end
+            summary.strictJobs+=strict;summary.manualJobs+=manual
+            summary.strictSightings+=math.max(0,tonumber(record.strictGoldBotSightings) or 0);summary.manualSightings+=math.max(0,tonumber(record.manualGoldBotSightings) or 0)
+        end
+        return summary
+    end
+
+    State.AutoTrader.GetServerDiscoverySupportSummary = function()
+        local scan=type(State.AutoTrader.LastServerScan)=="table" and State.AutoTrader.LastServerScan or {}
+        local display=type(scan.displayThumbnail)=="table" and scan.displayThumbnail or {}
+        local thumbnail=type(scan.thumbnail)=="table" and scan.thumbnail or {}
+        return {
+            source=scan.discoverySource or scan.source or State.AutoTrader.LastServerDiscoverySource,
+            rawRows=tonumber(scan.rawRows) or 0,joinableRows=tonumber(scan.joinableRows) or 0,freshRows=tonumber(scan.freshRows) or 0,
+            preclassifyPool=tonumber(scan.preclassifyPool) or 0,preclassifyLimit=tonumber(scan.preclassifyLimit) or 0,queueCount=tonumber(scan.queueCount) or 0,
+            filteredCurrent=tonumber(scan.filteredCurrent) or 0,filteredFull=tonumber(scan.filteredFull) or 0,filteredManual=tonumber(scan.filteredManual) or 0,
+            filteredRecent=tonumber(scan.filteredRecent) or 0,filteredStale=tonumber(scan.filteredStale) or 0,filteredTokenless=tonumber(scan.filteredTokenless) or 0,
+            filteredInvalid=tonumber(scan.filteredInvalid) or 0,filteredBotPreview=tonumber(scan.filteredBotPreview) or 0,usedRecentFallback=scan.usedRecentFallback==true,
+            canonicalThumbnailTokens=tonumber(thumbnail.tokens) or 0,canonicalThumbnailCompleted=tonumber(thumbnail.completed) or 0,
+            displayThumbnailCompleted=tonumber(display.completed) or 0,sizeIdentityMismatch=tonumber(display.sizeIdentityMismatch) or 0,
+            unavailableReason=scan.unavailableReason,companionPrimaryUnavailableReason=scan.companionPrimaryUnavailableReason,
+        }
+    end
+
+    State.AutoTrader.V37BuildDebug = State.AutoTrader.BuildDebug
+    State.AutoTrader.BuildDebug = function()
+        local text,err=State.AutoTrader.V37BuildDebug();if not text then return nil,err end
+        local newline=string.find(text,"\n",1,true);if not newline then return text end
+        local body=string.sub(text,newline+1);local ok,payload=pcall(function() return HttpService:JSONDecode(body) end);if not ok or type(payload)~="table" then return text end
+        local playerDiagnostics={}
+        for _,player in ipairs(Players:GetPlayers()) do
+            if player~=LocalPlayer and player.Parent then
+                local info=State.Profile.totalsByName[player.Name]
+                local discovery=State.AutoTrader.GetInventoryDiscoveryDiagnostic(player)
+                table.insert(playerDiagnostics,{userId=player.UserId,name=player.Name,stage=discovery and discovery.stage,stageDetail=discovery and discovery.detail,stageHistory=discovery and discovery.history,
+                    valueState=info and info.valueState,valueReasonCode=info and info.valueReasonCode,total=info and info.total,partial=info and info.partial,
+                    unresolvedUnits=info and info.unresolvedUnits,nonNumericUnits=info and info.nonNumericUnits,nonNumericExamples=info and info.nonNumericExamples,unresolvedExamples=info and info.unresolvedExamples,
+                    ignoredMetadataLeaves=info and info.ignoredMetadataLeaves,ignoredMetadataExamples=info and info.ignoredMetadataExamples})
+            end
+        end
+        local upcoming={}
+        for index,server in ipairs(State.AutoTrader.GetUpcomingServerCandidates()) do
+            if index>20 then break end
+            local previewUi=State.AutoTrader.GetUpcomingServerPreviewUiState(server)
+            table.insert(upcoming,{id=server.id,playing=server.playing,maxPlayers=server.maxPlayers,discoverySource=server.discoverySource,previewTokenCount=previewUi.tokenCount,previewTokenSource=previewUi.previewTokenSource,previewCoverage=previewUi.previewCoverage,companionRowAgeSeconds=previewUi.companionRowAgeSeconds,previewAvailability=previewUi.state,actionMode=previewUi.actionMode,previewFingerprints=server.previewFingerprints,thumbnailCount=#(server.previewThumbnailUrls or {}),displayThumbnailCount=#(server.previewDisplayThumbnailUrls or {}),preview=server.botPreview})
+        end
+        payload.v37={
+            contract=State.AutoTrader.V37.contract,
+            supreme={status=DatabaseStatus,usable=SupremeDatabase~=nil,pipelineStage=HARDEN.supremePipelineStage,liveRefreshStage=HARDEN.supremeLiveRefreshStage,source=HARDEN.lastDatabaseSource,revision=HARDEN.supremeDataRevision,hash=HARDEN.supremeDataHash,hashPending=HARDEN.supremeHashPending,
+                decisionAuthority=HARDEN.supportJsonValue(State.AutoTrader.LastDecisionDataFreshness),backgroundHashRevision=HARDEN.supremeBackgroundHashRevision,backgroundHashStartedAt=HARDEN.supremeBackgroundHashStartedAt,backgroundHashFinishedAt=HARDEN.supremeBackgroundHashFinishedAt,backgroundHashError=HARDEN.supremeBackgroundHashError,
+                lkgPersistence={workerRunning=HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.workerRunning or false,desiredRevision=HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.desired and HARDEN.supremeLkgPersistenceState.desired.revision or nil,activeRevision=HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.active and HARDEN.supremeLkgPersistenceState.active.revision or nil,lastFinished=HARDEN.supportJsonValue(HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.lastFinished)}},
+            inventoryDiscovery=playerDiagnostics,
+            upcomingServerQueue={revision=State.AutoTrader.UpcomingServerQueueRevision,source=State.AutoTrader.UpcomingServerQueueSource,rows=upcoming},
+            serverPreviewAvailability=State.AutoTrader.GetServerPreviewAvailabilitySummary(),serverPreviewCompanion=State.AutoTrader.GetServerPreviewCompanionSupportSummary(),requestedServerPreviewHint=State.AutoTrader.GetRequestedServerPreviewHintSupportSummary(),serverRosterPolicy=State.AutoTrader.ServerRosterPolicy,
+            serverDiscoverySource=State.AutoTrader.LastServerDiscoverySource,serverDiscoveryDiagnostics=State.AutoTrader.GetServerDiscoverySupportSummary(),canonicalPreviewThumbnailSize=State.AutoTrader.CanonicalServerPreviewThumbnailSize or "150x150",displayPreviewThumbnailSize=CONFIG.AutoTraderUpcomingThumbnailDisplaySize,
+            manualBotServers=State.AutoTrader.PruneManualBotServerJobs(),lastManualClassification=State.AutoTrader.LastManualBotServerClassification,botEvidenceProvenance=State.AutoTrader.GetBotEvidenceProvenanceSummary(),
+            botTrustWriteArbiter=HARDEN.supportJsonValue(State.AutoTrader.BotTrustWriteArbiter),lastBotTrustWriteReject=HARDEN.supportJsonValue(State.AutoTrader.LastBotTrustWriteReject),
+            thumbnailDisplay=HARDEN.supportJsonValue(State.AutoTrader.GetUpcomingThumbnailDisplaySummary()),
+        }
+        local okEncode,encoded=pcall(function() return HttpService:JSONEncode(HARDEN.supportJsonValue(payload)) end);if not okEncode then return nil,tostring(encoded) end
+        return HARDEN.supportFormat.."\n"..encoded
+    end
+
+    State.AutoTrader.V37RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local priorDepth=tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0
+        State.AutoTrader.SelfTestExecutionDepth=priorDepth+1
+        local okBase,result=pcall(State.AutoTrader.V37RunSelfTests)
+        if not okBase then State.AutoTrader.SelfTestExecutionDepth=priorDepth;error(result) end
+        local tests=result.tests or {}
+        local function add(name,callback)
+            local ok,passed,detail=pcall(callback)
+            local row={name=name,ok=ok and passed==true,detail=nil}
+            if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
+        end
+        add("v37-ui-helper-export-contract",function()
+            local h=UI.AutoTraderV37UiHelpers
+            return type(h)=="table" and type(h.button)=="function" and type(h.gradient)=="function" and type(h.stroke)=="function" and type(h.clearDynamic)=="function" and type(h.pct01)=="function" and type(h.palette)=="table" and h.palette.cardAltTop~=nil and h.palette.cardAltBottom~=nil,
+                "v30 scoped UI helpers/palette were not exported for v37"
+        end)
+        add("v37-relative-supreme-value-is-nonnumeric",function()
+            local c=State.Profile.DescribeSupremeRecordValue({name="Relative",data={value="x4 T1 Rares",raw_value=nil}})
+            return c.status=="NON_NUMERIC_SUPREME_VALUE" and c.numeric==nil and numericValue({value="3x Tier 1 Legendaries"})==nil,"relative text became an absolute number"
+        end)
+        add("v37-genuine-numeric-supreme-value-still-resolves",function()
+            local a=State.Profile.DescribeSupremeRecordValue({data={value="17,750",raw_value=17750}});local b=numericValue({value="17,750"})
+            return a.status=="NUMERIC_ABSOLUTE_VALUE" and a.numeric==17750 and b==17750,"absolute numeric Supreme value stopped resolving"
+        end)
+        add("v37-superseded-background-hash-cancels",function()
+            local checks=0;local digest=sha256Hex(string.rep("a",64),true,function() checks+=1;return false end)
+            return digest==nil and checks>0,"superseded cooperative hash ignored its current-revision guard"
+        end)
+        add("v37-remote-resolver-rechecks-relative-value",function()
+            local oldUnderlying=State.Profile.V37ResolveRemoteInventoryItem
+            State.Profile.V37ResolveRemoteInventoryItem=function(itemId,itemType,quantity) return {resolved=true,itemId=itemId,itemType=itemType,quantity=quantity,record={name="Relative",category="Legendaries",key="rel",data={value="x4 T1 Rares",raw_value=nil}},unitValue=4} end
+            local ok,resolved=pcall(State.Profile.ResolveRemoteInventoryItem,"RelativeKnife","Weapons",1,nil)
+            State.Profile.V37ResolveRemoteInventoryItem=oldUnderlying
+            return ok and resolved and resolved.resolved==true and resolved.valueStatus=="NON_NUMERIC_SUPREME_VALUE" and resolved.unitValue==nil,"production remote resolver accepted a permissive numeric value for relative Supreme text"
+        end)
+        add("v37-remote-section-relative-value-makes-partial",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) return {resolved=true,itemId=itemId,itemType=itemType,quantity=quantity,record={name="Relative",category="Legendaries",key="rel",data={value="x4 T1 Rares",raw_value=nil}},unitValue=nil} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{RelativeKnife=1},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and section.partial==true and section.nonNumericUnits==1 and section.total==0,"production remote-section aggregation treated relative value as complete"
+        end)
+        add("v37-mixed-inventory-never-verifies",function()
+            local name="__v37_mixed__";local old=State.Profile.totalsByName[name]
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=10,unresolvedUnits=0,nonNumericUnits=1,nonNumericExamples={{name="Relative",valueExpression="x4 T1 Rares"}}}
+            local value,verified,reason=State.AutoTrader.GetVerifiedPlayerValue({Name=name})
+            State.Profile.totalsByName[name]=old
+            return value==nil and verified==false and tostring(reason):find("NON_NUMERIC_SUPREME_VALUE",1,true)~=nil,"mixed positive inventory was treated as fully valued"
+        end)
+        add("v37-unresolved-identity-never-verifies",function()
+            local name="__v37_unresolved__";local old=State.Profile.totalsByName[name]
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=10,unresolvedUnits=1,nonNumericUnits=0,unresolvedExamples={{itemId="Mystery",reason="NO_MATCH"}}}
+            local value,verified,reason=State.AutoTrader.GetVerifiedPlayerValue({Name=name})
+            State.Profile.totalsByName[name]=old
+            return value==nil and verified==false and tostring(reason):find("UNRESOLVED_ITEM_IDENTITY",1,true)~=nil,"unresolved identity was allowed into verified feasibility"
+        end)
+        add("v37-incomplete-nonnumeric-feasibility-is-inconclusive",function()
+            local uid=987650037;local fake={UserId=uid,Name="__v37_feasibility__",Parent=true}
+            local oldStamp=State.Profile.remoteTotals.lastSuccessByUserId[uid];local oldTradable=State.AutoTrader.GetTradableInventory;local oldResolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries;local oldEnsure=State.AutoTrader.EnsureServerPlayer
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=12345
+            State.AutoTrader.GetTradableInventory=function() return {{itemId="L",itemType="Weapons",name="L",unitValue=5,maxQuantity=1,quantity=1,record={name="L",key="L",category="godlies",data={value=5,demand=5}}}},nil,{partial=false,lastSuccess=456} end
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {},{partial=true,unresolvedUnits=0,nonNumericUnits=1,total=10} end
+            State.AutoTrader.EnsureServerPlayer=function() return {presenceGeneration=1} end
+            local ok,opportunity,reason,meta=pcall(State.AutoTrader.BuildPreTradeOpportunity,fake,nil,{noCache=true})
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=oldStamp;State.AutoTrader.GetTradableInventory=oldTradable;State.AutoTrader.GetResolvedRemoteOpportunityEntries=oldResolved;State.AutoTrader.EnsureServerPlayer=oldEnsure
+            return ok and opportunity==nil and meta and meta.feasibilityState=="SEARCH_INCONCLUSIVE" and meta.inventoryComplete==false,"nonnumeric incomplete inventory was allowed to become PROVEN_IMPOSSIBLE"
+        end)
+        add("v37-manual-server-evidence-preserves-strict-counters",function()
+            local fp="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";local db={version=5,icons={[fp]={strictGoldBotJobs={strictA=1},strictGoldBotSightings=7,manualGoldBotJobs={},manualGoldBotSightings=0}}}
+            local learned=State.AutoTrader.ApplyManualServerClassificationEvidence(db,{previewFingerprints={fp,fp}},"jobA");local r=db.icons[fp]
+            return learned==1 and r.strictGoldBotSightings==7 and r.strictGoldBotJobs.strictA==1 and r.manualGoldBotSightings==2 and r.manualGoldBotJobs.jobA~=nil,
+                "manual candidate classification contaminated strict automated counters"
+        end)
+        add("v37-mark-upcoming-bot-production-path",function()
+            local fp="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";local server={id="botjob",playing=6,maxPlayers=12,previewFingerprints={fp},previewThumbnailUrls={"https://t.example/b.png"}}
+            local saved={botDb=State.AutoTrader.BotIconDb,manual=State.AutoTrader.ManualBotServerJobs,hop=State.AutoTrader.ServerHopQueue,upcoming=State.AutoTrader.UpcomingServerQueue,cache=State.AutoTrader.ServerCandidateCache,scan=State.AutoTrader.LastServerScan,recent=State.AutoTrader.RecentJobs,index=State.AutoTrader.ServerHopQueueIndex,inProgress=State.AutoTrader.ServerHopInProgress,commit=State.AutoTrader.CommitTrustedBotDbCandidate,saveManual=State.AutoTrader.SaveManualBotServerJobs,saveRecent=State.AutoTrader.SaveRecentJobs,saveCache=State.AutoTrader.SaveServerCandidateCache,log=State.AutoTrader.Log,render=State.AutoTrader.Render,status=State.AutoTrader.Status,detail=State.AutoTrader.StatusDetail,last=State.AutoTrader.LastManualBotServerClassification,rev=State.AutoTrader.UpcomingServerQueueRevision}
+            State.AutoTrader.BotIconDb={version=5,trustedRevision=1,icons={[fp]={strictGoldBotJobs={strictJob=1},strictGoldBotSightings=4,manualGoldBotJobs={},manualGoldBotSightings=0}}};State.AutoTrader.ManualBotServerJobs={};State.AutoTrader.ServerHopInProgress=false;State.AutoTrader.ServerHopQueue={{id="keep"},server};State.AutoTrader.ServerHopQueueIndex=0;State.AutoTrader.UpcomingServerQueue={{id="keep"},server};State.AutoTrader.ServerCandidateCache={version=1,entries={server}};State.AutoTrader.LastServerScan={candidates={{id="keep"},{id="botjob"}}};State.AutoTrader.RecentJobs={}
+            local committedProvenance,committedDb
+            State.AutoTrader.CommitTrustedBotDbCandidate=function(candidate,provenance) committedDb=candidate;committedProvenance=provenance;State.AutoTrader.BotIconDb=candidate;return true end
+            State.AutoTrader.SaveManualBotServerJobs=function() return true end;State.AutoTrader.SaveRecentJobs=function() return true end;State.AutoTrader.SaveServerCandidateCache=function() return 0 end;State.AutoTrader.Log=function() end;State.AutoTrader.Render=function() end
+            local ok,class=State.AutoTrader.MarkUpcomingServerBot("botjob");local r=committedDb and committedDb.icons and committedDb.icons[fp]
+            local passed=ok==true and class and class.provenance=="manual_bot_server" and committedProvenance and committedProvenance.provenance=="manual_bot_server" and #State.AutoTrader.ServerHopQueue==1 and State.AutoTrader.ServerHopQueue[1].id=="keep" and State.AutoTrader.ManualBotServerJobs.botjob~=nil and r and r.strictGoldBotSightings==4 and r.manualGoldBotSightings==1 and r.manualGoldBotJobs.botjob~=nil
+            State.AutoTrader.BotIconDb=saved.botDb;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerHopQueue=saved.hop;State.AutoTrader.UpcomingServerQueue=saved.upcoming;State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.LastServerScan=saved.scan;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ServerHopQueueIndex=saved.index;State.AutoTrader.ServerHopInProgress=saved.inProgress;State.AutoTrader.CommitTrustedBotDbCandidate=saved.commit;State.AutoTrader.SaveManualBotServerJobs=saved.saveManual;State.AutoTrader.SaveRecentJobs=saved.saveRecent;State.AutoTrader.SaveServerCandidateCache=saved.saveCache;State.AutoTrader.Log=saved.log;State.AutoTrader.Render=saved.render;State.AutoTrader.Status=saved.status;State.AutoTrader.StatusDetail=saved.detail;State.AutoTrader.LastManualBotServerClassification=saved.last;State.AutoTrader.UpcomingServerQueueRevision=saved.rev
+            return passed,"MarkUpcomingServerBot did not preserve manual provenance/remove the real candidate/leave strict counters intact"
+        end)
+        add("v37-manual-server-removal-hits-real-selector-queue",function()
+            local oldHop,oldUpcoming,oldCache,oldIndex,oldScan,oldIn,oldRev=State.AutoTrader.ServerHopQueue,State.AutoTrader.UpcomingServerQueue,State.AutoTrader.ServerCandidateCache,State.AutoTrader.ServerHopQueueIndex,State.AutoTrader.LastServerScan,State.AutoTrader.ServerHopInProgress,State.AutoTrader.UpcomingServerQueueRevision
+            State.AutoTrader.ServerHopInProgress=false;State.AutoTrader.ServerHopQueue={{id="a"},{id="b"},{id="c"}};State.AutoTrader.ServerHopQueueIndex=0;State.AutoTrader.UpcomingServerQueue={{id="a"},{id="b"},{id="c"}};State.AutoTrader.ServerCandidateCache={version=1,entries={{id="b"}}};State.AutoTrader.LastServerScan={candidates={{id="a"},{id="b"},{id="c"}}}
+            local removed=State.AutoTrader.RemoveManualMarkedServerFromSelectorState("b",true)
+            local passed=removed>=3 and #State.AutoTrader.ServerHopQueue==2 and State.AutoTrader.ServerHopQueue[1].id=="a" and State.AutoTrader.ServerHopQueue[2].id=="c"
+            State.AutoTrader.ServerHopQueue,State.AutoTrader.UpcomingServerQueue,State.AutoTrader.ServerCandidateCache,State.AutoTrader.ServerHopQueueIndex,State.AutoTrader.LastServerScan,State.AutoTrader.ServerHopInProgress,State.AutoTrader.UpcomingServerQueueRevision=oldHop,oldUpcoming,oldCache,oldIndex,oldScan,oldIn,oldRev
+            return passed,"manual removal did not mutate the real selector queue"
+        end)
+        add("v37-manual-mark-filter-survives-candidate-refresh",function()
+            local old=State.AutoTrader.ManualBotServerJobs;State.AutoTrader.ManualBotServerJobs={blocked={atUnix=os.time(),provenance="manual_bot_server"}}
+            local filtered=State.AutoTrader.FilterManualBotServerQueue({{id="ok"},{id="blocked"},{id="later"}});State.AutoTrader.ManualBotServerJobs=old
+            return #filtered==2 and filtered[1].id=="ok" and filtered[2].id=="later","manually marked JobId re-entered a refreshed candidate queue"
+        end)
+        add("v37-upcoming-ui-source-prefers-live-selector-order",function()
+            local oldIn,oldQ,oldIndex,oldUpcoming=State.AutoTrader.ServerHopInProgress,State.AutoTrader.ServerHopQueue,State.AutoTrader.ServerHopQueueIndex,State.AutoTrader.UpcomingServerQueue
+            State.AutoTrader.ServerHopInProgress=true;State.AutoTrader.ServerHopQueue={{id="current"},{id="next"},{id="after"}};State.AutoTrader.ServerHopQueueIndex=1;State.AutoTrader.UpcomingServerQueue={{id="stale"}}
+            local q=State.AutoTrader.GetUpcomingServerCandidates();State.AutoTrader.ServerHopInProgress,State.AutoTrader.ServerHopQueue,State.AutoTrader.ServerHopQueueIndex,State.AutoTrader.UpcomingServerQueue=oldIn,oldQ,oldIndex,oldUpcoming
+            return #q==2 and q[1].id=="next" and q[2].id=="after","upcoming browser was not backed by live selector order"
+        end)
+        add("v37-candidate-cache-retains-avatar-image-evidence",function()
+            local row=State.AutoTrader.NormalizeServerCandidateCacheEntry({id="job",scannedAt=os.time(),playing=3,maxPlayers=12,previewFingerprints={"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},previewThumbnailUrls={"https://t.example/a.png"}})
+            return row and row.previewThumbnailUrls and row.previewThumbnailUrls[1]=="https://t.example/a.png","candidate cache stripped avatar image evidence needed by browser"
+        end)
+        add("v37-runtime-metadata-counter-does-not-poison-known-item",function()
+            local old=State.Profile.ResolveRemoteInventoryItem;local calls={}
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity)
+                table.insert(calls,itemId)
+                if itemId=="KnownKnife" then return {resolved=true,itemId=itemId,itemType=itemType,quantity=quantity,record={name="KnownKnife",category="godlies",key="KnownKnife",data={value=10,raw_value=10}},unitValue=10} end
+                return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"}
+            end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{KnownKnife=1,Survivals=3},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and section.partial==false and section.total==10 and section.unresolvedLeaves==0 and section.ignoredMetadataLeaves==1 and #section.cardHints==1 and calls[1]=="KnownKnife" and calls[2]==nil,
+                "runtime-proven Survivals metadata still poisoned a known numeric weapon section"
+        end)
+        add("v37-five-runtime-metadata-scalars-never-become-items",function()
+            local old=State.Profile.ResolveRemoteInventoryItem;local calls=0
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) calls+=1;return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{Survivals=3,Eliminations=4,Victories=5,CurrentTier=6,LeaderboardPoints=7},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and calls==0 and section.ignoredMetadataLeaves==5 and #section.cardHints==0 and #section.unresolvedAll==0 and section.unresolvedLeaves==0 and section.partial==false,
+                "one of the five runtime-verified scalar metadata counters entered item resolution"
+        end)
+        add("v37-unknown-scalar-key-still-fails-closed",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{FutureUnknownKnife=1},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and section.partial==true and section.unresolvedLeaves==1 and #section.unresolvedAll==1 and section.unresolvedAll[1].itemId=="FutureUnknownKnife" and section.ignoredMetadataLeaves==0,
+                "unknown genuine scalar identity was broadly suppressed instead of failing closed"
+        end)
+        add("v37-metadata-word-explicit-item-object-still-fails-closed",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{{ItemId="Survivals",Quantity=1}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and section.partial==true and section.unresolvedLeaves==1 and section.unresolvedAll[1].itemId=="Survivals" and section.ignoredMetadataLeaves==0,
+                "metadata denylist incorrectly suppressed an explicit object item identity"
+        end)
+        add("v37-relative-item-plus-metadata-remains-nonnumeric",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity)
+                if itemId=="RelativeKnife" then return {resolved=true,itemId=itemId,itemType=itemType,quantity=quantity,record={name="RelativeKnife",category="Legendaries",key="RelativeKnife",data={value="x3 T1 Uncommons",raw_value=nil}},unitValue=nil} end
+                return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"}
+            end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{RelativeKnife=1,Survivals=3,Victories=2},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            local diagnostics=ok and State.Profile.BuildV37InventoryDiagnostics({partial=section.partial,weapons=section,pets={}}) or nil
+            return ok and section.partial==true and section.nonNumericUnits==1 and section.ignoredMetadataLeaves==2 and diagnostics and diagnostics.reasonCode=="NON_NUMERIC_SUPREME_VALUE",
+                "metadata filtering caused a relative Supreme value to become complete/numeric"
+        end)
+        add("v37-mixed-numeric-and-unknown-scalar-remains-incomplete",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity)
+                if itemId=="KnownKnife" then return {resolved=true,itemId=itemId,itemType=itemType,quantity=quantity,record={name="KnownKnife",category="godlies",key="KnownKnife",data={value=10,raw_value=10}},unitValue=10} end
+                return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"}
+            end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{KnownKnife=1,FutureUnknownKnife=1,LeaderboardPoints=99},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and section.total==10 and section.partial==true and section.unresolvedLeaves==1 and section.unresolvedAll[1].itemId=="FutureUnknownKnife" and section.ignoredMetadataLeaves==1,
+                "mixed numeric + unknown genuine item was incorrectly treated as complete"
+        end)
+        add("v37-thumbnail-display-path-contract",function()
+            return State.AutoTrader.UpcomingThumbnailDisplayPathVersion=="raw_https_then_exact_bytes_custom_asset_v1"
+                and type(State.AutoTrader.BindUpcomingThumbnailImage)=="function"
+                and type(State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset)=="function"
+                and type(State.AutoTrader.ApplyUpcomingThumbnailDisplayResult)=="function",
+                "upcoming avatar UI lacks the bounded custom-asset fallback path"
+        end)
+        add("v37-thumbnail-display-dedupes-pending-and-ready",function()
+            local oldState,oldHooks=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            local pendingWorker=nil;local callbacks=0;local fp="cccccccccccccccccccccccccccccccc";local url="https://t.example/c.png"
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0}
+            State.AutoTrader.UpcomingThumbnailDisplayTestHooks={spawn=function(fn) pendingWorker=fn end,fetchBytes=function() return "PNG_BYTES","image/png" end,writefile=function() return true end,assetFunction=function() return "rbxasset://same-c" end}
+            local first,firstState=State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(url,fp,function(asset) if asset=="rbxasset://same-c" then callbacks+=1 end end)
+            local second,secondState=State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(url,fp,function(asset) if asset=="rbxasset://same-c" then callbacks+=1 end end)
+            local pendingOk=first==second and firstState=="started" and secondState=="pending" and State.AutoTrader.UpcomingThumbnailDisplay.downloadStarts==1 and type(pendingWorker)=="function"
+            if pendingWorker then pendingWorker() end
+            local before=State.AutoTrader.UpcomingThumbnailDisplay.downloadStarts
+            local third,thirdState=State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(url,fp,function(asset) if asset=="rbxasset://same-c" then callbacks+=1 end end)
+            local readyOk=third==first and thirdState=="ready" and State.AutoTrader.UpcomingThumbnailDisplay.downloadStarts==before and callbacks==3
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks=oldState,oldHooks
+            return pendingOk and readyOk,"same thumbnail evidence was redownloaded while pending/ready"
+        end)
+        add("v37-thumbnail-display-missing-apis-fails-closed",function()
+            local oldState,oldHooks=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            local fp="dddddddddddddddddddddddddddddddd";local url="https://t.example/d.png";local callbackAsset="sentinel"
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0}
+            State.AutoTrader.UpcomingThumbnailDisplayTestHooks={spawn=function(fn) fn() end,writefile=false,assetFunction=false,fetchBytes=function() return "PNG_BYTES","image/png" end}
+            local entry=State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(url,fp,function(asset) callbackAsset=asset end)
+            local key=State.AutoTrader.GetUpcomingThumbnailDisplayKey(url,fp);local cached=State.AutoTrader.UpcomingThumbnailDisplay.cache[key]
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks=oldState,oldHooks
+            return entry and cached and cached.state=="failed" and callbackAsset==nil and fp=="dddddddddddddddddddddddddddddddd" and url=="https://t.example/d.png",
+                "missing custom-asset APIs did not fail visual transport closed while retaining evidence identity"
+        end)
+        add("v37-thumbnail-stale-binding-cannot-paint-rebuilt-row",function()
+            local oldState=State.AutoTrader.UpcomingThumbnailDisplay;State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=20,downloadStarts=0}
+            local parent=Instance.new("Frame");local image=Instance.new("ImageLabel");image.Parent=parent;local fp="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";local url="https://t.example/e.png";image:SetAttribute("SVThumbnailDisplayKey",State.AutoTrader.GetUpcomingThumbnailDisplayKey(url,fp));image.Image=""
+            local stale=State.AutoTrader.ApplyUpcomingThumbnailDisplayResult(image,url,fp,19,"rbxasset://stale",nil)
+            local unchanged=image.Image=="";parent:Destroy()
+            local destroyed=State.AutoTrader.ApplyUpcomingThumbnailDisplayResult(image,url,fp,20,"rbxasset://late",nil)
+            State.AutoTrader.UpcomingThumbnailDisplay=oldState
+            return stale==false and unchanged and destroyed==false,"stale/destroyed thumbnail completion painted an invalid UI row"
+        end)
+        add("v37-thumbnail-display-does-not-mutate-candidate-evidence",function()
+            local server={previewThumbnailUrls={"https://t.example/f.png"},previewFingerprints={"ffffffffffffffffffffffffffffffff"}}
+            local beforeUrl=server.previewThumbnailUrls[1];local beforeFp=server.previewFingerprints[1]
+            local oldState,oldHooks=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0};State.AutoTrader.UpcomingThumbnailDisplayTestHooks={spawn=function(fn) fn() end,fetchBytes=function() return "PNG_BYTES","image/png" end,writefile=function() return true end,assetFunction=function() return "rbxasset://display-only" end}
+            State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(beforeUrl,beforeFp,function() end)
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks=oldState,oldHooks
+            return server.previewThumbnailUrls[1]==beforeUrl and server.previewFingerprints[1]==beforeFp and beforeFp~="rbxasset://display-only",
+                "display transport mutated canonical thumbnail/fingerprint evidence"
+        end)
+        add("v37-manual-classification-ignores-display-asset-identity",function()
+            local fp="12121212121212121212121212121212";local db={version=5,icons={}}
+            local learned=State.AutoTrader.ApplyManualServerClassificationEvidence(db,{previewFingerprints={fp},previewThumbnailUrls={"https://t.example/original.png"},displayAsset="rbxasset://not-evidence"},"job-display")
+            local record=db.icons[fp]
+            return learned==1 and record and record.manualGoldBotJobs and record.manualGoldBotJobs["job-display"]~=nil and db.icons["rbxasset://not-evidence"]==nil,
+                "manual BOT SERVER learning consumed display-path artifact instead of original captured fingerprint"
+        end)
+        add("v37-bot-trust-arbiter-blocks-unresolved-file-callback",function()
+            local arbiter=State.AutoTrader.BotTrustWriteArbiter;local oldBusy,oldSerial,oldActive,oldKind,oldHold,oldFile=arbiter.busy,arbiter.serial,arbiter.activeSerial,arbiter.kind,arbiter.unresolvedHold,arbiter.unresolvedFile
+            local fileName=State.AutoTrader.BotIconDbFile;local oldLock=HARDEN.fileWriteState.byFile[fileName];HARDEN.fileWriteState.byFile[fileName]={busy=true,uncertain=true,serial=999}
+            arbiter.busy=false;arbiter.activeSerial=nil;arbiter.kind=nil;local calls=0
+            local ok,reason=State.AutoTrader.WithBotTrustWriteArbiter("self_test_unresolved",function() calls+=1;return true end)
+            local held=ok==false and calls==0 and arbiter.busy==true and arbiter.unresolvedHold==true and tostring(reason):find("unresolved executor file callback",1,true)~=nil
+            HARDEN.fileWriteState.byFile[fileName]=nil;task.wait(0.25)
+            local released=arbiter.busy==false
+            HARDEN.fileWriteState.byFile[fileName]=oldLock;arbiter.busy,arbiter.serial,arbiter.activeSerial,arbiter.kind,arbiter.unresolvedHold,arbiter.unresolvedFile=oldBusy,oldSerial,oldActive,oldKind,oldHold,oldFile
+            return held and released,"trusted transaction arbiter released/entered while a trust-file executor callback was unresolved"
+        end)
+        add("v37-supreme-lkg-busy-errors-are-retryable-only",function()
+            return HARDEN.IsRetryableSupremeLkgPersistenceError("previous file write is still unresolved")
+                and HARDEN.IsRetryableSupremeLkgPersistenceError("Supreme LKG transaction already in progress")
+                and not HARDEN.IsRetryableSupremeLkgPersistenceError("candidate JSON encode failed"),
+                "Supreme LKG persistence did not distinguish retryable busy/unresolved failure from terminal failure"
+        end)
+        add("v37-stale-decision-data-blocks-eligibility-until-refresh",function()
+            local uid=987650137;local fake={UserId=uid,Name="__v37_stale_authority__",Parent=true};local entry={presenceGeneration=7,contactState="NOT_CONTACTED",outcome=nil}
+            local oldVerified,oldFriend,oldEnsure,oldFresh,oldCooldown,oldScore,oldBuild,oldAuthority=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.GetFriendStatus,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.CooldownRemaining,State.AutoTrader.GetTargetScore,State.AutoTrader.BuildPreTradeOpportunity,State.AutoTrader.LastDecisionDataFreshness
+            local plannerCalls=0;State.AutoTrader.GetVerifiedPlayerValue=function() return 10,true,"verified positive",{} end;State.AutoTrader.GetFriendStatus=function() return false end;State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.CooldownRemaining=function() return 0 end;State.AutoTrader.GetTargetScore=function() return 1 end
+            State.AutoTrader.DecisionDataFresh=function() State.AutoTrader.LastDecisionDataFreshness={fresh=false,reasonCode="VALUE_DB_STALE",ageSeconds=1900};return false,"stale test",1900 end
+            State.AutoTrader.BuildPreTradeOpportunity=function() plannerCalls+=1;return {kind="profit"},"witness",{feasibilityState="FEASIBLE",signature="fresh"} end
+            local stale=State.AutoTrader.EvaluatePlayerEligibility(fake,{now=os.clock()});State.AutoTrader.DecisionDataFresh=function() State.AutoTrader.LastDecisionDataFreshness={fresh=true,reasonCode="VALUE_DB_FRESH",ageSeconds=0};return true,nil,0 end;local fresh=State.AutoTrader.EvaluatePlayerEligibility(fake,{now=os.clock()})
+            State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.GetFriendStatus,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.CooldownRemaining,State.AutoTrader.GetTargetScore,State.AutoTrader.BuildPreTradeOpportunity,State.AutoTrader.LastDecisionDataFreshness=oldVerified,oldFriend,oldEnsure,oldFresh,oldCooldown,oldScore,oldBuild,oldAuthority
+            return stale.state=="decision_data_stale" and stale.feasibilityState=="SEARCH_INCONCLUSIVE" and stale.actionable==false and fresh.state=="actionable" and plannerCalls==1 and entry.contactState=="NOT_CONTACTED" and entry.presenceGeneration==7,"stale verified data either reached planning/contact or failed to become eligible after refresh"
+        end)
+        add("v37-stale-zero-never-proves-impossible",function()
+            local fake={UserId=987650138,Name="__v37_stale_zero__",Parent=true};local entry={presenceGeneration=1,contactState="NOT_CONTACTED"}
+            local oldVerified,oldFriend,oldEnsure,oldFresh,oldAuthority=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.GetFriendStatus,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.LastDecisionDataFreshness
+            State.AutoTrader.GetVerifiedPlayerValue=function() return 0,true,"verified zero",{} end;State.AutoTrader.GetFriendStatus=function() return false end;State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.DecisionDataFresh=function() State.AutoTrader.LastDecisionDataFreshness={fresh=false,reasonCode="VALUE_DB_STALE",ageSeconds=1900};return false,"stale test",1900 end
+            local row=State.AutoTrader.EvaluatePlayerEligibility(fake,{now=os.clock()});State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.GetFriendStatus,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.LastDecisionDataFreshness=oldVerified,oldFriend,oldEnsure,oldFresh,oldAuthority
+            return row.state=="decision_data_stale" and row.feasibilityState=="SEARCH_INCONCLUSIVE" and entry.feasibilityState=="SEARCH_INCONCLUSIVE","stale verified zero became PROVEN_IMPOSSIBLE"
+        end)
+        add("v37-try-send-request-stale-guard-precedes-target-contact",function()
+            local oldFresh,oldSelect,oldAutomation,oldFrozen,oldAuthority,oldGate=State.AutoTrader.DecisionDataFresh,State.AutoTrader.SelectTarget,State.AutoTrader.Preferences.automation,State.AutoTrader.SessionFrozen,State.AutoTrader.LastDecisionDataFreshness,State.AutoTrader.LastRequestGate;local selects=0
+            State.AutoTrader.Preferences.automation=true;State.AutoTrader.SessionFrozen=nil;State.AutoTrader.DecisionDataFresh=function() State.AutoTrader.LastDecisionDataFreshness={fresh=false,reasonCode="VALUE_DB_STALE",ageSeconds=1900};return false,"stale test",1900 end;State.AutoTrader.SelectTarget=function() selects+=1;return nil end
+            local ok,started,reason=pcall(State.AutoTrader.TrySendRequest);State.AutoTrader.DecisionDataFresh,State.AutoTrader.SelectTarget,State.AutoTrader.Preferences.automation,State.AutoTrader.SessionFrozen,State.AutoTrader.LastDecisionDataFreshness,State.AutoTrader.LastRequestGate=oldFresh,oldSelect,oldAutomation,oldFrozen,oldAuthority,oldGate
+            return ok and started==false and selects==0 and tostring(reason):find("VALUE_DB_STALE",1,true)~=nil,"stale decision data reached target selection/SendRequest path"
+        end)
+        add("v37-trusted-bot-stale-full-snapshot-rejected",function()
+            local oldDb,oldUnderlying,oldReject=State.AutoTrader.BotIconDb,State.AutoTrader.V37CommitTrustedBotDbCandidateUnserialized,State.AutoTrader.LastBotTrustWriteReject;local arbiter=State.AutoTrader.BotTrustWriteArbiter;local oldArbiterSerial=arbiter.serial;local fpA="11111111111111111111111111111111";local fpB="22222222222222222222222222222222"
+            State.AutoTrader.BotIconDb={version=5,trustedRevision=10,icons={[fpA]={strictGoldBotJobs={a=1},strictGoldBotSightings=1,manualGoldBotJobs={},manualGoldBotSightings=0}}}
+            local first=State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb);State.AutoTrader.ApplyBotEvidenceToDb(first,"strict",fpA,"b",1,nil,nil);local stale=State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb);State.AutoTrader.ApplyBotEvidenceToDb(stale,"manual",fpB,"manualJob",1,nil,nil)
+            State.AutoTrader.V37CommitTrustedBotDbCandidateUnserialized=function(candidate) candidate.trustedRevision=(tonumber(State.AutoTrader.BotIconDb.trustedRevision) or 0)+1;State.AutoTrader.BotIconDb=candidate;return true end
+            local ok1=State.AutoTrader.CommitTrustedBotDbCandidate(first,{source="strict_test"});local ok2,err2=State.AutoTrader.CommitTrustedBotDbCandidate(stale,{source="manual_bot_server_browser"});local live=State.AutoTrader.BotIconDb
+            local passed=ok1==true and ok2==false and tostring(err2):find("stale trusted bot DB candidate",1,true)~=nil and live.trustedRevision==11 and live.icons[fpA] and live.icons[fpA].strictGoldBotJobs.b~=nil and live.icons[fpB]==nil
+            State.AutoTrader.BotIconDb,State.AutoTrader.V37CommitTrustedBotDbCandidateUnserialized,State.AutoTrader.LastBotTrustWriteReject=oldDb,oldUnderlying,oldReject;arbiter.serial=oldArbiterSerial;return passed,"second full snapshot based on the same revision could overwrite the first trusted evidence commit"
+        end)
+        add("v37-trusted-bot-arbiter-blocks-overlap",function()
+            local arbiter=State.AutoTrader.BotTrustWriteArbiter;local oldBusy,oldKind,oldSerial,oldReject=arbiter.busy,arbiter.kind,arbiter.activeSerial,State.AutoTrader.LastBotTrustWriteReject;local oldDb=State.AutoTrader.BotIconDb
+            State.AutoTrader.BotIconDb={version=5,trustedRevision=3,icons={}};local candidate=State.AutoTrader.ClonePlainTable(State.AutoTrader.BotIconDb);arbiter.busy=true;arbiter.kind="strict_commit";arbiter.activeSerial=999
+            local ok,err=State.AutoTrader.CommitTrustedBotDbCandidate(candidate,{source="manual_bot_server_browser"});arbiter.busy,arbiter.kind,arbiter.activeSerial=oldBusy,oldKind,oldSerial;State.AutoTrader.BotIconDb=oldDb;State.AutoTrader.LastBotTrustWriteReject=oldReject
+            return ok==false and tostring(err):find("transaction busy",1,true)~=nil,"overlapping manual/strict trusted transaction was allowed to enter persistence"
+        end)
+        add("v37-save-bot-db-shares-trust-arbiter",function()
+            local arbiter=State.AutoTrader.BotTrustWriteArbiter;local oldBusy,oldKind,oldSerial,oldReject,oldGeneration=arbiter.busy,arbiter.kind,arbiter.activeSerial,State.AutoTrader.LastBotTrustWriteReject,State.AutoTrader.BotIconDbSaveGeneration;arbiter.busy=true;arbiter.kind="trusted_commit";arbiter.activeSerial=1000
+            local ok,err=State.AutoTrader.SaveBotIconDb(true);arbiter.busy,arbiter.kind,arbiter.activeSerial=oldBusy,oldKind,oldSerial;State.AutoTrader.LastBotTrustWriteReject=oldReject;State.AutoTrader.BotIconDbSaveGeneration=oldGeneration
+            return ok==false and tostring(err):find("transaction busy",1,true)~=nil,"SaveBotIconDb could enter persistence while a trusted commit was active"
+        end)
+        add("v37-inventory-diagnostic-live-state-beats-saved-queued",function()
+            local fake={UserId=987650139,Name="__v37_diag__"};local remote=State.Profile.remoteTotals;local oldSaved,oldHung,oldFlight,oldFresh=remote.discoveryByUserId[fake.UserId],remote.hungByUserId[fake.UserId],remote.inFlightByUserId[fake.UserId],State.AutoTrader.DecisionDataFresh
+            remote.discoveryByUserId[fake.UserId]={stage="INVENTORY_REMOTE_QUEUED",detail="old queued"};remote.hungByUserId[fake.UserId]=true;remote.inFlightByUserId[fake.UserId]=true;State.AutoTrader.DecisionDataFresh=function() return true,nil,0 end
+            local diag=State.AutoTrader.GetInventoryDiscoveryDiagnostic(fake);remote.discoveryByUserId[fake.UserId],remote.hungByUserId[fake.UserId],remote.inFlightByUserId[fake.UserId],State.AutoTrader.DecisionDataFresh=oldSaved,oldHung,oldFlight,oldFresh
+            return diag.stage=="INVENTORY_REMOTE_HUNG_IN_FLIGHT","saved QUEUED stage masked authoritative hung/in-flight state"
+        end)
+        add("v37-supreme-lkg-supersession-blocks-old-metadata-commit",function()
+            local oldAtomic=HARDEN.atomicWriteTextFileBestEffort;local state=HARDEN.supremeLkgWriteState;local oldBusy,oldSerial,oldStarted,oldFinished=state.busy,state.serial,state.startedAt,state.finishedAt;local writes={};local checks=0
+            state.busy=false;HARDEN.atomicWriteTextFileBestEffort=function(name) table.insert(writes,name);return true end
+            local ok,err=HARDEN.writeLkgEnvelope(HARDEN.supremeLkgFile,"test-body",string.rep("a",64),function() checks+=1;return checks==1 end)
+            HARDEN.atomicWriteTextFileBestEffort=oldAtomic;state.busy=oldBusy;state.serial=oldSerial;state.startedAt=oldStarted;state.finishedAt=oldFinished
+            return ok==false and #writes==1 and writes[1]==HARDEN.supremeLkgFile and tostring(err):find("superseded before metadata commit",1,true)~=nil,"superseded Supreme body reached the LKG metadata commit point"
+        end)
+        add("v37-live-defer-precedes-unverified-inventory",function()
+            local fake={UserId=987650143,Name="__v37_defer_unverified_inventory__",Parent=true};local now=os.clock();local entry={presenceGeneration=6,contactState="TRANSPORT_DEFERRED",transportDeferredUntil=now+1,contactReason="unacknowledged transport",feasibilityState="FEASIBLE"}
+            local oldVerified,oldEnsure=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer;local verifiedCalls=0
+            State.AutoTrader.GetVerifiedPlayerValue=function() verifiedCalls+=1;return nil,false,"inventory unresolved",{stale=true} end;State.AutoTrader.EnsureServerPlayer=function() return entry end
+            local ok,row=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now});State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer=oldVerified,oldEnsure
+            return ok and row.state=="transport_deferred" and row.contactState=="TRANSPORT_DEFERRED" and row.actionable==false and verifiedCalls==0,"live defer was hidden behind unresolved/stale inventory verification"
+        end)
+        add("v37-live-defer-survives-real-mark-remote-failure",function()
+            local fake={UserId=987650144,Name="__v37_defer_mark_remote_failure__",Parent=true};local now=os.clock();local entry={presenceGeneration=7,contactState="TRANSPORT_DEFERRED",transportDeferredUntil=now+1,contactReason="unacknowledged transport",feasibilityState="FEASIBLE"}
+            local remote=State.Profile.remoteTotals;local oldCached=State.Profile.totalsByName[fake.Name];local oldLast=remote.lastSuccessByUserId[fake.UserId];local oldFailures=remote.failureCountByUserId[fake.UserId];local oldDecorate,oldCurrent=State.Profile.DecorateLeaderboardFor,State.Profile.currentUsername
+            local oldEnsure=State.AutoTrader.EnsureServerPlayer;local oldSnapshot,oldQueue,oldSignature,oldProjection=State.AutoTrader.LastEligibilitySnapshot,State.AutoTrader.LastTradeQueue,State.AutoTrader.LastTradeQueueSignature,State.AutoTrader.QueueProjectionCache
+            local oldDb,oldSelect,oldDisposition,oldHop,oldJoined,oldProgress,oldFast,oldReason,oldRecoveries=SupremeDatabase,State.AutoTrader.SelectTarget,State.AutoTrader.GetServerDisposition,State.AutoTrader.TryServerHop,State.AutoTrader.ServerJoinedAt,State.AutoTrader.ServerMeaningfulProgressAt,State.AutoTrader.FastBotHopActive,State.AutoTrader.FastBotHopReason,State.AutoTrader.ServerNoProgressRecoveries;local hops=0
+            State.Profile.totalsByName[fake.Name]={source="GetFullInventoryVerified",stale=false,total=25,unresolvedUnits=0,nonNumericUnits=0};remote.lastSuccessByUserId[fake.UserId]=now-CONFIG.RemoteStaleSeconds-1;remote.failureCountByUserId[fake.UserId]=0;State.Profile.DecorateLeaderboardFor=function() end;State.Profile.currentUsername=nil;State.AutoTrader.EnsureServerPlayer=function() return entry end
+            State.Profile.MarkRemoteFailure(fake,"round3 regression transport timeout");local becameStale=State.Profile.totalsByName[fake.Name].stale==true
+            local okSnapshot,snapshot=pcall(State.AutoTrader.BuildEligibilitySnapshot,{fake},{now=now,canEconomicSkip=false,hopOpportunityRate=0,opportunityFloor=CONFIG.AutoTraderTargetOpportunityFloor});local row=okSnapshot and snapshot.rows and snapshot.rows[1];local counts=okSnapshot and snapshot.counts or {}
+            SupremeDatabase=SupremeDatabase or {};State.AutoTrader.SelectTarget=function() return nil end;State.AutoTrader.GetServerDisposition=function() return "WAITING_FOR_RETRY",counts end;State.AutoTrader.TryServerHop=function() hops+=1;return true end;State.AutoTrader.ServerJoinedAt=now-CONFIG.AutoTraderServerNoProgressTimeoutSeconds-20;State.AutoTrader.ServerMeaningfulProgressAt=State.AutoTrader.ServerJoinedAt;State.AutoTrader.FastBotHopActive=false;State.AutoTrader.FastBotHopReason=nil
+            local okNoProgress,triggered=pcall(State.AutoTrader.ProcessWholeServerNoProgress,now,true)
+            State.Profile.totalsByName[fake.Name]=oldCached;remote.lastSuccessByUserId[fake.UserId]=oldLast;remote.failureCountByUserId[fake.UserId]=oldFailures;State.Profile.DecorateLeaderboardFor,State.Profile.currentUsername=oldDecorate,oldCurrent;State.AutoTrader.EnsureServerPlayer=oldEnsure;State.AutoTrader.LastEligibilitySnapshot,State.AutoTrader.LastTradeQueue,State.AutoTrader.LastTradeQueueSignature,State.AutoTrader.QueueProjectionCache=oldSnapshot,oldQueue,oldSignature,oldProjection
+            SupremeDatabase,State.AutoTrader.SelectTarget,State.AutoTrader.GetServerDisposition,State.AutoTrader.TryServerHop,State.AutoTrader.ServerJoinedAt,State.AutoTrader.ServerMeaningfulProgressAt,State.AutoTrader.FastBotHopActive,State.AutoTrader.FastBotHopReason,State.AutoTrader.ServerNoProgressRecoveries=oldDb,oldSelect,oldDisposition,oldHop,oldJoined,oldProgress,oldFast,oldReason,oldRecoveries
+            return becameStale and okSnapshot and row and row.state=="transport_deferred" and counts.transportDeferred==1 and counts.retryLater==1 and okNoProgress and triggered==false and hops==0,"real MarkRemoteFailure staleness hid live defer or allowed aged no-progress hop"
+        end)
+        add("v37-live-defer-precedes-friend-lookup",function()
+            local fake={UserId=987650145,Name="__v37_defer_friend_unknown__",Parent=true};local now=os.clock();local entry={presenceGeneration=8,contactState="TRANSPORT_DEFERRED",transportDeferredUntil=now+1,contactReason="unacknowledged transport",feasibilityState="FEASIBLE"}
+            local oldVerified,oldEnsure,oldFriend,oldIgnore=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.GetFriendStatus,State.AutoTrader.Preferences.ignoreFriends;local verifiedCalls,friendCalls=0,0
+            State.AutoTrader.GetVerifiedPlayerValue=function() verifiedCalls+=1;return 25,true,"verified",{} end;State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.GetFriendStatus=function() friendCalls+=1;return nil end;State.AutoTrader.Preferences.ignoreFriends=true
+            local ok,row=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now});State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.GetFriendStatus,State.AutoTrader.Preferences.ignoreFriends=oldVerified,oldEnsure,oldFriend,oldIgnore
+            return ok and row.state=="transport_deferred" and row.actionable==false and verifiedCalls==0 and friendCalls==0,"live defer was hidden behind mutable friend/inventory prerequisites"
+        end)
+        add("v37-expired-defer-resumes-inventory-and-friend-gates",function()
+            local fake={UserId=987650146,Name="__v37_expired_defer_prereqs__",Parent=true};local now=os.clock();local entry={presenceGeneration=9,contactState="TRANSPORT_DEFERRED",transportDeferredUntil=now-0.1,contactReason="expired",feasibilityState="FEASIBLE",inventoryDiscoveryReadyAt=now}
+            local oldVerified,oldEnsure,oldFriend,oldIgnore=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.GetFriendStatus,State.AutoTrader.Preferences.ignoreFriends;local verifiedCalls,friendCalls=0,0
+            State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.GetVerifiedPlayerValue=function() verifiedCalls+=1;return nil,false,"inventory unresolved",{stale=true} end
+            local okInventory,rowInventory=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now});local contactAfterInventory=entry.contactState
+            entry.contactState="TRANSPORT_DEFERRED";entry.transportDeferredUntil=now-0.1;State.AutoTrader.Preferences.ignoreFriends=true;State.AutoTrader.GetVerifiedPlayerValue=function() verifiedCalls+=1;return 25,true,"verified",{} end;State.AutoTrader.GetFriendStatus=function() friendCalls+=1;return nil end
+            local okFriend,rowFriend=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now})
+            State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.GetFriendStatus,State.AutoTrader.Preferences.ignoreFriends=oldVerified,oldEnsure,oldFriend,oldIgnore
+            local inventoryGate=okInventory and contactAfterInventory=="NOT_CONTACTED" and (rowInventory.state=="discovery_pending" or rowInventory.state=="unresolvable")
+            return inventoryGate and okFriend and rowFriend.state=="friend_pending" and verifiedCalls>=2 and friendCalls==1,"expired defer did not resume normal inventory/friend eligibility gates"
+        end)
+        add("v37-stale-transport-deferred-precedes-decision-authority",function()
+            local fake={UserId=987650140,Name="__v37_stale_deferred__",Parent=true};local now=os.clock();local entry={presenceGeneration=3,contactState="TRANSPORT_DEFERRED",transportDeferredUntil=now+1,contactReason="unacknowledged transport",feasibilityState="FEASIBLE"}
+            local oldVerified,oldEnsure,oldFresh,oldIgnore=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.Preferences.ignoreFriends;local freshnessCalls=0
+            State.AutoTrader.GetVerifiedPlayerValue=function() return 25,true,"verified",{} end;State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.Preferences.ignoreFriends=false
+            State.AutoTrader.DecisionDataFresh=function() freshnessCalls+=1;State.AutoTrader.LastDecisionDataFreshness={fresh=false,reasonCode="VALUE_DB_STALE",ageSeconds=1900};return false,"stale test",1900 end
+            local ok,row=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now});State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.Preferences.ignoreFriends=oldVerified,oldEnsure,oldFresh,oldIgnore
+            return ok and row.state=="transport_deferred" and row.contactState=="TRANSPORT_DEFERRED" and row.actionable==false and (tonumber(row.retryIn) or 0)>0 and freshnessCalls==0,"stale Supreme authority masked a live TRANSPORT_DEFERRED promise"
+        end)
+        add("v37-stale-transport-deferred-counted-by-real-snapshot",function()
+            local fake={UserId=987650141,Name="__v37_stale_deferred_snapshot__",Parent=true};local now=os.clock();local entry={presenceGeneration=4,contactState="TRANSPORT_DEFERRED",transportDeferredUntil=now+1,contactReason="unacknowledged transport",feasibilityState="FEASIBLE"}
+            local oldVerified,oldEnsure,oldFresh,oldIgnore=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.Preferences.ignoreFriends;local oldSnapshot,oldQueue,oldSignature,oldProjection=State.AutoTrader.LastEligibilitySnapshot,State.AutoTrader.LastTradeQueue,State.AutoTrader.LastTradeQueueSignature,State.AutoTrader.QueueProjectionCache
+            State.AutoTrader.GetVerifiedPlayerValue=function() return 25,true,"verified",{} end;State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.DecisionDataFresh=function() State.AutoTrader.LastDecisionDataFreshness={fresh=false,reasonCode="VALUE_DB_STALE",ageSeconds=1900};return false,"stale test",1900 end
+            local ok,snapshot=pcall(State.AutoTrader.BuildEligibilitySnapshot,{fake},{now=now,canEconomicSkip=false,hopOpportunityRate=0,opportunityFloor=CONFIG.AutoTraderTargetOpportunityFloor})
+            State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.Preferences.ignoreFriends=oldVerified,oldEnsure,oldFresh,oldIgnore;State.AutoTrader.LastEligibilitySnapshot,State.AutoTrader.LastTradeQueue,State.AutoTrader.LastTradeQueueSignature,State.AutoTrader.QueueProjectionCache=oldSnapshot,oldQueue,oldSignature,oldProjection
+            local counts=ok and snapshot and snapshot.counts or {};return ok and counts.transportDeferred==1 and counts.retryLater==1 and counts.decisionDataStale==0 and (tonumber(snapshot.earliestRetry) or math.huge)<=1.1,"BuildEligibilitySnapshot lost the deferred transport promise while decision data was stale"
+        end)
+        add("v37-stale-transport-deferred-server-disposition-holds-retry",function()
+            local snapshot={counts={total=1,actionable=0,active=0,discoveryPending=0,friendPending=0,deepSearchPending=0,retryLater=1,transportDeferred=1,searchInconclusive=0,provenImpossible=0,friend=0,exhausted=0,unresolvable=0},earliestRetry=1}
+            local oldAutomation,oldFrozen,oldPost,oldPending,oldLifecycle,oldDecline,oldTrade,oldNative,oldBuild=State.AutoTrader.Preferences.automation,State.AutoTrader.SessionFrozen,State.AutoTrader.PostTradeAuditPending,State.AutoTrader.PendingRequest,State.AutoTrader.RequestLifecycle,State.AutoTrader.TradeDeclinePending,State.CurrentTrade,State.AutoTrader.IsAnyNativeOutgoingPending,State.AutoTrader.BuildEligibilitySnapshot
+            State.AutoTrader.Preferences.automation=true;State.AutoTrader.SessionFrozen=nil;State.AutoTrader.PostTradeAuditPending=false;State.AutoTrader.PendingRequest=nil;State.AutoTrader.RequestLifecycle="idle";State.AutoTrader.TradeDeclinePending=nil;State.CurrentTrade=nil;State.AutoTrader.IsAnyNativeOutgoingPending=function() return false end;State.AutoTrader.BuildEligibilitySnapshot=function() return snapshot end
+            local ok,disposition,counts=pcall(State.AutoTrader.GetServerDisposition);State.AutoTrader.Preferences.automation,State.AutoTrader.SessionFrozen,State.AutoTrader.PostTradeAuditPending,State.AutoTrader.PendingRequest,State.AutoTrader.RequestLifecycle,State.AutoTrader.TradeDeclinePending,State.CurrentTrade,State.AutoTrader.IsAnyNativeOutgoingPending,State.AutoTrader.BuildEligibilitySnapshot=oldAutomation,oldFrozen,oldPost,oldPending,oldLifecycle,oldDecline,oldTrade,oldNative,oldBuild
+            return ok and disposition=="WAITING_FOR_RETRY" and counts.transportDeferred==1,"live deferred transport was not represented as a server retry hold"
+        end)
+        add("v37-stale-transport-deferred-blocks-aged-no-progress-hop",function()
+            local now=os.clock();local oldDb,oldSelect,oldDisposition,oldHop,oldJoined,oldProgress,oldFast,oldReason,oldRecoveries=SupremeDatabase,State.AutoTrader.SelectTarget,State.AutoTrader.GetServerDisposition,State.AutoTrader.TryServerHop,State.AutoTrader.ServerJoinedAt,State.AutoTrader.ServerMeaningfulProgressAt,State.AutoTrader.FastBotHopActive,State.AutoTrader.FastBotHopReason,State.AutoTrader.ServerNoProgressRecoveries;local hops=0
+            SupremeDatabase=SupremeDatabase or {};State.AutoTrader.SelectTarget=function() return nil end;State.AutoTrader.GetServerDisposition=function() return "WAITING_FOR_RETRY",{transportDeferred=1,retryLater=1,earliestRetry=1} end;State.AutoTrader.TryServerHop=function() hops+=1;return true end;State.AutoTrader.ServerJoinedAt=now-CONFIG.AutoTraderServerNoProgressTimeoutSeconds-20;State.AutoTrader.ServerMeaningfulProgressAt=State.AutoTrader.ServerJoinedAt;State.AutoTrader.FastBotHopActive=false;State.AutoTrader.FastBotHopReason=nil
+            local ok,triggered=pcall(State.AutoTrader.ProcessWholeServerNoProgress,now,true);SupremeDatabase,State.AutoTrader.SelectTarget,State.AutoTrader.GetServerDisposition,State.AutoTrader.TryServerHop,State.AutoTrader.ServerJoinedAt,State.AutoTrader.ServerMeaningfulProgressAt,State.AutoTrader.FastBotHopActive,State.AutoTrader.FastBotHopReason,State.AutoTrader.ServerNoProgressRecoveries=oldDb,oldSelect,oldDisposition,oldHop,oldJoined,oldProgress,oldFast,oldReason,oldRecoveries
+            return ok and triggered==false and hops==0,"aged generic no-progress logic hopped while TRANSPORT_DEFERRED was still live"
+        end)
+        add("v37-stale-transport-deferred-revokes-armed-no-progress-hop",function()
+            local oldDisposition,oldFast,oldReason=State.AutoTrader.GetServerDisposition,State.AutoTrader.FastBotHopActive,State.AutoTrader.FastBotHopReason;State.AutoTrader.GetServerDisposition=function() return "WAITING_FOR_RETRY",{transportDeferred=1,retryLater=1,earliestRetry=1} end;State.AutoTrader.FastBotHopActive=true;State.AutoTrader.FastBotHopReason="EXHAUSTED_NO_PROGRESS"
+            local ok,allowed,why=pcall(State.AutoTrader.ServerHopStillAllowed);State.AutoTrader.GetServerDisposition,State.AutoTrader.FastBotHopActive,State.AutoTrader.FastBotHopReason=oldDisposition,oldFast,oldReason
+            return ok and allowed==false and tostring(why):find("transport-deferred retry",1,true)~=nil,"armed EXHAUSTED_NO_PROGRESS hop was not revoked by live deferred transport"
+        end)
+        add("v37-expired-defer-falls-back-to-stale-authority-and-send-block",function()
+            local fake={UserId=987650142,Name="__v37_expired_defer__",Parent=true};local now=os.clock();local entry={presenceGeneration=5,contactState="TRANSPORT_DEFERRED",transportDeferredUntil=now-0.1,contactReason="expired",feasibilityState="FEASIBLE"}
+            local oldVerified,oldEnsure,oldFresh,oldIgnore,oldAutomation,oldFrozen,oldSelect,oldAuthority=State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.Preferences.ignoreFriends,State.AutoTrader.Preferences.automation,State.AutoTrader.SessionFrozen,State.AutoTrader.SelectTarget,State.AutoTrader.LastDecisionDataFreshness;local selects=0
+            State.AutoTrader.GetVerifiedPlayerValue=function() return 25,true,"verified",{} end;State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.Preferences.automation=true;State.AutoTrader.SessionFrozen=nil;State.AutoTrader.DecisionDataFresh=function() State.AutoTrader.LastDecisionDataFreshness={fresh=false,reasonCode="VALUE_DB_STALE",ageSeconds=1900};return false,"stale test",1900 end;State.AutoTrader.SelectTarget=function() selects+=1;return fake end
+            local okRow,row=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now});local okSend,started,reason=pcall(State.AutoTrader.TrySendRequest)
+            State.AutoTrader.GetVerifiedPlayerValue,State.AutoTrader.EnsureServerPlayer,State.AutoTrader.DecisionDataFresh,State.AutoTrader.Preferences.ignoreFriends,State.AutoTrader.Preferences.automation,State.AutoTrader.SessionFrozen,State.AutoTrader.SelectTarget,State.AutoTrader.LastDecisionDataFreshness=oldVerified,oldEnsure,oldFresh,oldIgnore,oldAutomation,oldFrozen,oldSelect,oldAuthority
+            return okRow and row.state=="decision_data_stale" and entry.contactState=="NOT_CONTACTED" and okSend and started==false and selects==0 and tostring(reason):find("VALUE_DB_STALE",1,true)~=nil,"expired defer did not return to stale-authority blocking semantics"
+        end)
+        add("v37-tokenless-public-server-response-keeps-real-candidates",function()
+            local oldFetch,oldRecent=State.AutoTrader.FetchServerListPage,State.AutoTrader.RecentJobs
+            State.AutoTrader.RecentJobs={}
+            State.AutoTrader.FetchServerListPage=function()
+                local data={}
+                for i=1,100 do table.insert(data,{id="tokenless-job-"..tostring(i),playing=5,maxPlayers=12,playerTokens={}}) end
+                return {data=data,nextPageCursor=nil},{selectedTransport="degraded_unknown_fallback",gameHttpGet={ok=true,degraded=true},executor={ok=true,degraded=true}}
+            end
+            local ok,rows,diag=pcall(State.AutoTrader.FetchPublicServers,1)
+            State.AutoTrader.FetchServerListPage,State.AutoTrader.RecentJobs=oldFetch,oldRecent
+            return ok and #rows==100 and diag.usableRows==100 and diag.rowsWithPlayerTokens==0 and diag.totalPlayerTokens==0 and diag.tokenlessActivePages==1 and diag.selectedDegradedPages==1,
+                "tokenless public-server response did not remain a real UNKNOWN candidate set"
+        end)
+        add("v37-tokenless-upcoming-ui-is-explicit-and-job-only",function()
+            local state=State.AutoTrader.GetUpcomingServerPreviewUiState({id="tokenless",playing=5,maxPlayers=12,previewTokenCount=0,previewFingerprints={},previewThumbnailUrls={}})
+            return state.state=="NO_ROSTER_TOKENS" and state.title=="AVATAR PREVIEW UNAVAILABLE" and state.detail=="ROBLOX SERVER API PROVIDED NO ROSTER TOKENS" and state.actionText=="SKIP SERVER" and state.actionMode=="JOB_ID_ONLY_SKIP" and state.canPromoteFingerprintEvidence==false and state.fingerprintCount==0,
+                "tokenless upcoming row still looked like a renderer failure or bot-evidence action"
+        end)
+        add("v37-tokenless-skip-removes-job-with-zero-icon-learning",function()
+            local server={id="tokenless-skip-job",playing=5,maxPlayers=12,previewTokenCount=0,previewFingerprints={},previewThumbnailUrls={}}
+            local saved={botDb=State.AutoTrader.BotIconDb,manual=State.AutoTrader.ManualBotServerJobs,hop=State.AutoTrader.ServerHopQueue,upcoming=State.AutoTrader.UpcomingServerQueue,cache=State.AutoTrader.ServerCandidateCache,scan=State.AutoTrader.LastServerScan,recent=State.AutoTrader.RecentJobs,index=State.AutoTrader.ServerHopQueueIndex,inProgress=State.AutoTrader.ServerHopInProgress,commit=State.AutoTrader.CommitTrustedBotDbCandidate,saveManual=State.AutoTrader.SaveManualBotServerJobs,saveRecent=State.AutoTrader.SaveRecentJobs,saveCache=State.AutoTrader.SaveServerCandidateCache,log=State.AutoTrader.Log,render=State.AutoTrader.Render,status=State.AutoTrader.Status,detail=State.AutoTrader.StatusDetail,last=State.AutoTrader.LastManualBotServerClassification,rev=State.AutoTrader.UpcomingServerQueueRevision}
+            State.AutoTrader.BotIconDb={version=5,trustedRevision=4,icons={}};State.AutoTrader.ManualBotServerJobs={};State.AutoTrader.ServerHopInProgress=false;State.AutoTrader.ServerHopQueue={{id="keep"},server};State.AutoTrader.ServerHopQueueIndex=0;State.AutoTrader.UpcomingServerQueue={{id="keep"},server};State.AutoTrader.ServerCandidateCache={version=1,entries={server}};State.AutoTrader.LastServerScan={candidates={{id="keep"},{id=server.id}}};State.AutoTrader.RecentJobs={}
+            local commits=0
+            State.AutoTrader.CommitTrustedBotDbCandidate=function() commits+=1;return true end;State.AutoTrader.SaveManualBotServerJobs=function() return true end;State.AutoTrader.SaveRecentJobs=function() return true end;State.AutoTrader.SaveServerCandidateCache=function() return 0 end;State.AutoTrader.Log=function() end;State.AutoTrader.Render=function() end
+            local ok,class=State.AutoTrader.MarkUpcomingServerBot(server.id)
+            local passed=ok==true and class and class.action=="SKIP_SERVER" and class.provenance=="manual_server_skip_tokenless" and class.evidenceState=="JOB_ONLY_SUPPRESSION_NO_FINGERPRINT_EVIDENCE" and class.canonicalFingerprintCount==0 and commits==0 and next(State.AutoTrader.BotIconDb.icons)==nil and #State.AutoTrader.ServerHopQueue==1 and State.AutoTrader.ServerHopQueue[1].id=="keep" and State.AutoTrader.ManualBotServerJobs[server.id]~=nil
+            State.AutoTrader.BotIconDb=saved.botDb;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerHopQueue=saved.hop;State.AutoTrader.UpcomingServerQueue=saved.upcoming;State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.LastServerScan=saved.scan;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ServerHopQueueIndex=saved.index;State.AutoTrader.ServerHopInProgress=saved.inProgress;State.AutoTrader.CommitTrustedBotDbCandidate=saved.commit;State.AutoTrader.SaveManualBotServerJobs=saved.saveManual;State.AutoTrader.SaveRecentJobs=saved.saveRecent;State.AutoTrader.SaveServerCandidateCache=saved.saveCache;State.AutoTrader.Log=saved.log;State.AutoTrader.Render=saved.render;State.AutoTrader.Status=saved.status;State.AutoTrader.StatusDetail=saved.detail;State.AutoTrader.LastManualBotServerClassification=saved.last;State.AutoTrader.UpcomingServerQueueRevision=saved.rev
+            return passed,"tokenless manual skip promoted bot evidence or failed to suppress the real JobId"
+        end)
+        add("v37-token-bearing-preview-keeps-canonical-evidence-and-display-fallback",function()
+            local fp="34343434343434343434343434343434";local url="https://t.example/token-bearing.png";local server={previewTokenCount=2,previewFingerprints={fp},previewThumbnailUrls={url}}
+            local ui=State.AutoTrader.GetUpcomingServerPreviewUiState(server);local db={version=5,icons={}};local learned=State.AutoTrader.ApplyManualServerClassificationEvidence(db,server,"token-bearing-job")
+            local oldState,oldHooks=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            local asset=nil;State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0};State.AutoTrader.UpcomingThumbnailDisplayTestHooks={spawn=function(fn) fn() end,fetchBytes=function() return "PNG_BYTES","image/png" end,writefile=function() return true end,assetFunction=function() return "rbxasset://token-bearing-display" end}
+            State.AutoTrader.ResolveUpcomingThumbnailDisplayAsset(url,fp,function(value) asset=value end)
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks=oldState,oldHooks
+            return ui.state=="CANONICAL_AVATAR_EVIDENCE" and ui.actionText=="BOT SERVER" and ui.canPromoteFingerprintEvidence==true and learned==1 and db.icons[fp] and asset=="rbxasset://token-bearing-display" and server.previewFingerprints[1]==fp and server.previewThumbnailUrls[1]==url,
+                "token-bearing preview stopped using canonical fingerprint evidence plus display-only fallback"
+        end)
+        add("v37-public-roster-policy-forbids-authenticated-fallback",function()
+            return State.AutoTrader.ServerRosterPolicy=="AUTHENTICATED_COMPANION_DISCOVERY_LUA_POLICY_DIRECT_PUBLIC_FALLBACK",
+                "server preview policy no longer records the authorized companion-discovery/Lua-policy/direct-public-fallback architecture"
+        end)
+        add("v37-server-preview-support-surfaces-tokenless-degradation",function()
+            local oldUpcoming,oldHop,oldIn,oldScan=State.AutoTrader.UpcomingServerQueue,State.AutoTrader.ServerHopQueue,State.AutoTrader.ServerHopInProgress,State.AutoTrader.LastServerScan
+            State.AutoTrader.ServerHopInProgress=false;State.AutoTrader.UpcomingServerQueue={{id="no-token",previewTokenCount=0,previewFingerprints={},previewThumbnailUrls={}},{id="with-token",previewTokenCount=2,previewFingerprints={"56565656565656565656565656565656"},previewThumbnailUrls={"https://t.example/with.png"}}}
+            State.AutoTrader.LastServerScan={source="fresh_http_scan",fetch={usableRows=100,rowsWithPlayerTokens=0,totalPlayerTokens=0,tokenlessActivePages=1,selectedDegradedPages=1},thumbnail={tokens=0,batches=0,completed=0,lastError="candidate server rows contained no playerTokens"}}
+            local summary=State.AutoTrader.GetServerPreviewAvailabilitySummary()
+            State.AutoTrader.UpcomingServerQueue,State.AutoTrader.ServerHopQueue,State.AutoTrader.ServerHopInProgress,State.AutoTrader.LastServerScan=oldUpcoming,oldHop,oldIn,oldScan
+            return summary.upcomingRows==2 and summary.tokenlessUpcomingRows==1 and summary.tokenBearingUpcomingRows==1 and summary.fingerprintRows==1 and summary.fetch.usableRows==100 and summary.fetch.tokenlessActivePages==1 and summary.fetch.selectedDegradedPages==1 and summary.degraded==true,
+                "support telemetry did not expose tokenless/degraded server-preview state"
+        end)
+        add("v37-claimedrewards-subtree-is-verified-metadata",function()
+            local old=State.Profile.ResolveRemoteInventoryItem;local calls=0
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) calls+=1;return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{ClaimedRewards={[1]="One",[2]="Two",Claimed=3}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            local path=ok and section.ignoredMetadataExamples[1] and section.ignoredMetadataExamples[1].ancestryPath or ""
+            return ok and calls==0 and section.partial==false and section.unresolvedLeaves==0 and section.ignoredMetadataLeaves>=3 and tostring(path):find("ClaimedRewards",1,true)~=nil,
+                "ClaimedRewards descendants were still converted into item identities"
+        end)
+        add("v37-quests-and-santaslist-subtrees-are-verified-metadata",function()
+            local old=State.Profile.ResolveRemoteInventoryItem;local calls=0
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) calls+=1;return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{Quests={EventTotal={Progress=27},DailyCoins={Progress=450}},SantasList={List={[1]="2 Doves",[2]="North Pole"}}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            local paths={};for _,row in ipairs(ok and section.ignoredMetadataExamples or {}) do paths[row.ancestryPath]=true end
+            return ok and calls==0 and section.partial==false and section.unresolvedLeaves==0 and section.ignoredMetadataLeaves>=4 and paths["Quests>EventTotal>Progress"] and paths["Quests>DailyCoins>Progress"] and paths["SantasList>List>1"] and paths["SantasList>List>2"],
+                "Quests/SantasList verified metadata ancestry was not skipped or diagnosed"
+        end)
+        add("v37-known-item-plus-structured-metadata-remains-complete",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity)
+                if itemId=="KnownKnife" then return {resolved=true,itemId=itemId,itemType=itemType,quantity=quantity,record={name="KnownKnife",category="godlies",key="KnownKnife",data={value=10,raw_value=10}},unitValue=10} end
+                return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"}
+            end
+            local ok,calculated=pcall(State.Profile.CalculateRemoteInventory,{Weapons={KnownKnife=1,ClaimedRewards={[1]="One"},Quests={EventTotal={Progress=27}},SantasList={List={[1]="North Pole"}},CandiesFixed=3,PlantTime=9,TotalCandies=44},Pets={}})
+            State.Profile.ResolveRemoteInventoryItem=old
+            local diagnostics=ok and State.Profile.BuildV37InventoryDiagnostics(calculated) or nil
+            return ok and calculated.total==10 and calculated.partial==false and calculated.weapons.unresolvedLeaves==0 and calculated.weapons.ignoredMetadataLeaves>=6 and diagnostics and diagnostics.reasonCode=="COMPLETE" and diagnostics.ignoredMetadataLeaves>=6,
+                "verified non-item subtrees still poisoned an otherwise complete numeric inventory"
+        end)
+        add("v37-relative-item-plus-structured-metadata-stays-unknown",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity)
+                if itemId=="RelativeKnife" then return {resolved=true,itemId=itemId,itemType=itemType,quantity=quantity,record={name="RelativeKnife",category="Legendaries",key="RelativeKnife",data={value="x3 T1 Uncommons",raw_value=nil}},unitValue=nil} end
+                return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"}
+            end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{RelativeKnife=1,ClaimedRewards={[1]="One"},Quests={EventTotal={Progress=27}},SantasList={List={[1]="North Pole"}}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            local diagnostics=ok and State.Profile.BuildV37InventoryDiagnostics({partial=section.partial,weapons=section,pets={}}) or nil
+            return ok and section.nonNumericUnits==1 and section.unresolvedLeaves==0 and section.ignoredMetadataLeaves>=3 and diagnostics and diagnostics.reasonCode=="NON_NUMERIC_SUPREME_VALUE",
+                "structured metadata filtering masked a relative Supreme value"
+        end)
+        add("v37-owned-future-unknown-item-still-fails-closed",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{Owned={FutureUnknownKnife=1}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and section.partial==true and section.unresolvedLeaves==1 and section.unresolvedAll[1].itemId=="FutureUnknownKnife" and section.ignoredMetadataLeaves==0,
+                "unknown genuine identity under Owned was hidden by metadata ancestry filtering"
+        end)
+        add("v37-explicit-item-object-under-owned-is-never-hidden-by-metadata-word",function()
+            local old=State.Profile.ResolveRemoteInventoryItem;local seenId=nil
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) seenId=itemId;return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{Owned={ClaimedRewards={ItemId="FutureUnknownKnife",Quantity=1}}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and seenId=="FutureUnknownKnife" and section.partial==true and section.unresolvedLeaves==1 and section.unresolvedAll[1].itemId=="FutureUnknownKnife" and section.ignoredMetadataLeaves==0,
+                "explicit ItemId under genuine Owned ancestry was suppressed because its table key resembled metadata"
+        end)
+        add("v37-root-scalar-metadata-is-narrow-and-owned-same-word-is-not",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local okRoot,root=pcall(State.Profile.CalculateRemoteSection,{CandiesFixed=1,PlantTime=2,TotalCandies=3},"Weapons",{})
+            local okOwned,owned=pcall(State.Profile.CalculateRemoteSection,{Owned={CandiesFixed=1}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return okRoot and root.partial==false and root.ignoredMetadataLeaves==3 and root.unresolvedLeaves==0 and okOwned and owned.partial==true and owned.unresolvedLeaves==1 and owned.unresolvedAll[1].itemId=="CandiesFixed" and owned.ignoredMetadataLeaves==0,
+                "root scalar metadata rule broadened into genuine item-bearing ancestry"
+        end)
+        add("v37-crafted-common-effect-remains-fail-closed-pending-runtime-shape-proof",function()
+            local old=State.Profile.ResolveRemoteInventoryItem
+            State.Profile.ResolveRemoteInventoryItem=function(itemId,itemType,quantity) return {resolved=false,itemId=itemId,itemType=itemType,quantity=quantity,reason="NO_MATCH"} end
+            local ok,section=pcall(State.Profile.CalculateRemoteSection,{Crafted={CommonEffect=1}},"Weapons",{})
+            State.Profile.ResolveRemoteInventoryItem=old
+            return ok and section.partial==true and section.unresolvedLeaves==1 and section.unresolvedAll[1].itemId=="CommonEffect" and section.ignoredMetadataLeaves==0,
+                "ambiguous Crafted subtree was blindly suppressed without runtime shape proof"
+        end)
+
+        add("v37-companion-a-exact-jobid-enriches-real-candidate-only",function()
+            local now=2000000000;local token="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            local body=HttpService:JSONEncode({schemaVersion=1,collectorVersion="server-updater-v1-candidate",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="job-a",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}})
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(body,nil,now)
+            local oldBase,oldCache=State.AutoTrader.V37CompanionFetchPublicServers,State.AutoTrader.ServerPreviewCompanionCache
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            State.AutoTrader.V37CompanionFetchPublicServers=function() return {{id="job-a",playing=11,maxPlayers=12,occupancy=11/12,playerTokens={}}},{usableRows=1} end
+            local ok,rows,diag=pcall(State.AutoTrader.FetchPublicServers,1)
+            State.AutoTrader.V37CompanionFetchPublicServers,State.AutoTrader.ServerPreviewCompanionCache=oldBase,oldCache
+            return ok and #rows==1 and rows[1].id=="job-a" and #rows[1].playerTokens==1 and rows[1].playerTokens[1]==token and rows[1].previewTokenSource=="browser_companion_exact_jobid" and rows[1].previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and diag.companion and diag.companion.matchedSelectorRows==1,
+                "exact companion JobId did not enrich the existing selector row through the production fetch boundary"
+        end)
+        add("v37-companion-b-companion-only-jobid-cannot-enter-selector",function()
+            local now=2000000000;local token="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            local body=HttpService:JSONEncode({schemaVersion=1,collectorVersion="server-updater-v1-candidate",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="companion-only-b",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}})
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(body,nil,now)
+            local oldBase,oldCache=State.AutoTrader.V37CompanionFetchPublicServers,State.AutoTrader.ServerPreviewCompanionCache
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            State.AutoTrader.V37CompanionFetchPublicServers=function() return {{id="selector-b",playing=8,maxPlayers=12,occupancy=8/12,playerTokens={}}},{usableRows=1} end
+            local ok,rows=pcall(State.AutoTrader.FetchPublicServers,1)
+            State.AutoTrader.V37CompanionFetchPublicServers,State.AutoTrader.ServerPreviewCompanionCache=oldBase,oldCache
+            return ok and #rows==1 and rows[1].id=="selector-b" and #(rows[1].playerTokens or {})==0 and rows[1].previewTokenSource==nil,
+                "companion-only JobId entered or altered the real selector candidate set"
+        end)
+        add("v37-companion-c-missing-file-preserves-tokenless-fallback",function()
+            local oldHooks,oldCache,oldBase=State.AutoTrader.ServerPreviewCompanionTestHooks,State.AutoTrader.ServerPreviewCompanionCache,State.AutoTrader.V37CompanionFetchPublicServers
+            State.AutoTrader.ServerPreviewCompanionTestHooks={isfile=function() return false end,readfile=function() return "{}" end,nowUnix=function() return 2000000000 end}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=0,snapshot=nil,diagnostics=nil}
+            State.AutoTrader.V37CompanionFetchPublicServers=function() return {{id="missing-c",playing=5,maxPlayers=12,occupancy=5/12,playerTokens={}}},{usableRows=1} end
+            local ok,rows=pcall(State.AutoTrader.FetchPublicServers,1);local support=State.AutoTrader.GetServerPreviewCompanionSupportSummary()
+            State.AutoTrader.ServerPreviewCompanionTestHooks,State.AutoTrader.ServerPreviewCompanionCache,State.AutoTrader.V37CompanionFetchPublicServers=oldHooks,oldCache,oldBase
+            return ok and #rows==1 and rows[1].id=="missing-c" and #(rows[1].playerTokens or {})==0 and support.lastError=="FILE_MISSING",
+                "missing companion file disrupted Round-9 tokenless selector behavior"
+        end)
+        add("v37-companion-d-malformed-json-preserves-tokenless-fallback",function()
+            local oldHooks,oldCache,oldBase=State.AutoTrader.ServerPreviewCompanionTestHooks,State.AutoTrader.ServerPreviewCompanionCache,State.AutoTrader.V37CompanionFetchPublicServers
+            State.AutoTrader.ServerPreviewCompanionTestHooks={isfile=function() return true end,readfile=function() return "{" end,nowUnix=function() return 2000000000 end}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=0,snapshot=nil,diagnostics=nil}
+            State.AutoTrader.V37CompanionFetchPublicServers=function() return {{id="malformed-d",playing=5,maxPlayers=12,occupancy=5/12,playerTokens={}}},{usableRows=1} end
+            local ok,rows=pcall(State.AutoTrader.FetchPublicServers,1);local support=State.AutoTrader.GetServerPreviewCompanionSupportSummary()
+            State.AutoTrader.ServerPreviewCompanionTestHooks,State.AutoTrader.ServerPreviewCompanionCache,State.AutoTrader.V37CompanionFetchPublicServers=oldHooks,oldCache,oldBase
+            return ok and #rows==1 and #(rows[1].playerTokens or {})==0 and support.lastError=="MALFORMED_JSON",
+                "malformed companion JSON disrupted tokenless selector behavior"
+        end)
+        add("v37-companion-reader-uses-sv-workspace-path",function()
+            local oldHooks,oldCache=State.AutoTrader.ServerPreviewCompanionTestHooks,State.AutoTrader.ServerPreviewCompanionCache
+            local now=2000000000;local token="45454545454545454545454545454545";local seenIsfile=nil;local seenReadfile=nil
+            local body=HttpService:JSONEncode({schemaVersion=1,collectorVersion="path-test",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="path-job",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}})
+            State.AutoTrader.ServerPreviewCompanionTestHooks={isfile=function(path) seenIsfile=path;return path=="SV/ListOfServers.json" end,readfile=function(path) seenReadfile=path;if path~="SV/ListOfServers.json" then error("wrong companion path") end;return body end,nowUnix=function() return now end}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=0,snapshot=nil,diagnostics=nil}
+            local ok,snapshot=pcall(State.AutoTrader.RefreshServerPreviewCompanion,true);local support=State.AutoTrader.GetServerPreviewCompanionSupportSummary()
+            State.AutoTrader.ServerPreviewCompanionTestHooks,State.AutoTrader.ServerPreviewCompanionCache=oldHooks,oldCache
+            return ok and seenIsfile=="SV/ListOfServers.json" and seenReadfile=="SV/ListOfServers.json" and type(snapshot)=="table" and snapshot.usable==true and snapshot.diagnostics.filePresent==true and snapshot.diagnostics.parsed==true and support.filePath=="SV/ListOfServers.json" and support.filePresent==true and support.parsed==true,
+                "companion reader did not consume workspace/SV/ListOfServers.json through the production file/parser boundary"
+        end)
+        add("v37-companion-e-unhealthy-or-loggedout-file-is-ignored",function()
+            local now=2000000000
+            local unhealthy=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="BROWSER_ERROR",loggedIn=true,servers={}}),nil,now)
+            local loggedOut=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=false,servers={}}),nil,now)
+            return unhealthy.usable==false and unhealthy.diagnostics.lastError=="COLLECTOR_NOT_HEALTHY" and loggedOut.usable==false and loggedOut.diagnostics.lastError=="COLLECTOR_LOGGED_OUT",
+                "unhealthy/logged-out companion snapshot remained eligible for roster enrichment"
+        end)
+        add("v37-companion-f-stale-file-heartbeat-is-ignored",function()
+            local now=2000000000
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now-91,status="HEALTHY",loggedIn=true,servers={}}),nil,now)
+            return snapshot.usable==false and snapshot.diagnostics.lastError=="HEARTBEAT_STALE" and snapshot.diagnostics.heartbeatAgeSeconds==91,
+                "stale companion heartbeat remained eligible"
+        end)
+        add("v37-companion-g-fresh-file-stale-row-is-ignored",function()
+            local now=2000000000;local token="cccccccccccccccccccccccccccccccc"
+            local body=HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="stale-g",playing=11,maxPlayers=12,lastSeenUnix=now-181,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}})
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(body,nil,now);local oldCache=State.AutoTrader.ServerPreviewCompanionCache
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            local server={id="stale-g",playing=11,maxPlayers=12,playerTokens={}}
+            local enriched=State.AutoTrader.EnrichExistingServerCandidatesFromCompanion({server},"test")
+            State.AutoTrader.ServerPreviewCompanionCache=oldCache
+            return snapshot.usable==true and snapshot.diagnostics.staleRows==1 and #enriched==0 and #(server.playerTokens or {})==0 and server.companionPreviewState=="ROW_STALE" and server.companionRowAgeSeconds==181,
+                "fresh file heartbeat incorrectly made a stale individual server row usable"
+        end)
+        add("v37-companion-h-duplicate-jobid-fails-closed",function()
+            local now=2000000000;local a="dddddddddddddddddddddddddddddddd";local b="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            local rows={{jobId="dup-h",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={a},playerTokenCount=1,rosterEvidenceAvailable=true},{jobId="dup-h",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={b},playerTokenCount=1,rosterEvidenceAvailable=true}}
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers=rows}),nil,now)
+            return snapshot.usable==true and snapshot.index["dup-h"]==nil and snapshot.ambiguousJobIds["dup-h"]==true and snapshot.diagnostics.duplicateRows==1,
+                "duplicate companion JobId records were silently merged"
+        end)
+        add("v37-companion-h2-valid-then-malformed-duplicate-jobid-fails-closed",function()
+            local now=2000000000;local token="edededededededededededededededed";local jobId="dup-h2"
+            local rows={{jobId=jobId,playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true},{jobId=jobId,playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={"bad-token"},playerTokenCount=2,rosterEvidenceAvailable=true}}
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers=rows}),nil,now)
+            return snapshot.usable==true and snapshot.index[jobId]==nil and snapshot.ambiguousJobIds[jobId]==true and snapshot.diagnostics.duplicateRows==1 and snapshot.diagnostics.invalidRows==1,
+                "valid companion JobId survived a later malformed duplicate row"
+        end)
+        add("v37-companion-h3-malformed-then-valid-duplicate-jobid-fails-closed",function()
+            local now=2000000000;local token="fefefefefefefefefefefefefefefefe";local jobId="dup-h3"
+            local rows={{jobId=jobId,playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={"bad-token"},playerTokenCount=2,rosterEvidenceAvailable=true},{jobId=jobId,playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers=rows}),nil,now)
+            return snapshot.usable==true and snapshot.index[jobId]==nil and snapshot.ambiguousJobIds[jobId]==true and snapshot.diagnostics.duplicateRows==1 and snapshot.diagnostics.invalidRows==1,
+                "later valid companion JobId restored an identity already made ambiguous by a malformed duplicate"
+        end)
+        add("v37-companion-i-player-token-count-mismatch-fails-closed",function()
+            local now=2000000000;local token="ffffffffffffffffffffffffffffffff"
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="count-i",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=2,rosterEvidenceAvailable=true}}}),nil,now)
+            return snapshot.usable==true and snapshot.index["count-i"]==nil and snapshot.diagnostics.invalidRows==1,
+                "companion playerTokenCount mismatch was accepted"
+        end)
+        add("v37-companion-j-invalid-token-format-fails-closed",function()
+            local now=2000000000
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="format-j",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={"not-a-32hex-roblox-token"},playerTokenCount=1,rosterEvidenceAvailable=true}}}),nil,now)
+            return snapshot.usable==true and snapshot.index["format-j"]==nil and snapshot.diagnostics.invalidRows==1,
+                "non-32-hex companion token entered the canonical thumbnail path"
+        end)
+        add("v37-companion-zero-token-row-fails-closed",function()
+            local now=2000000000
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="zero-token-extra",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={},playerTokenCount=0,rosterEvidenceAvailable=false}}}),nil,now)
+            return snapshot.usable==true and snapshot.index["zero-token-extra"]==nil and snapshot.diagnostics.invalidRows==1,
+                "zero-token companion row was accepted despite the token-bearing evidence contract"
+        end)
+        add("v37-companion-k-direct-api-player-tokens-take-precedence",function()
+            local now=2000000000;local companion="11111111111111111111111111111111";local direct="22222222222222222222222222222222"
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="direct-k",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={companion},playerTokenCount=1,rosterEvidenceAvailable=true}}}),nil,now)
+            local oldCache=State.AutoTrader.ServerPreviewCompanionCache;State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            local server={id="direct-k",playing=11,maxPlayers=12,playerTokens={direct}};State.AutoTrader.EnrichExistingServerCandidatesFromCompanion({server},"test");local support=State.AutoTrader.GetServerPreviewCompanionSupportSummary()
+            State.AutoTrader.ServerPreviewCompanionCache=oldCache
+            return #server.playerTokens==1 and server.playerTokens[1]==direct and server.previewTokenSource=="direct_public_api" and support.directPrecedenceMatches==1,
+                "companion tokens overrode direct public-server tokens"
+        end)
+        add("v37-companion-l-direct-disagreement-is-never-unioned",function()
+            local now=2000000000;local c1="33333333333333333333333333333333";local c2="44444444444444444444444444444444";local d1="55555555555555555555555555555555";local d2="66666666666666666666666666666666"
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="mismatch-l",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={c1,c2},playerTokenCount=2,rosterEvidenceAvailable=true}}}),nil,now)
+            local oldCache=State.AutoTrader.ServerPreviewCompanionCache;State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            local server={id="mismatch-l",playing=11,maxPlayers=12,playerTokens={d1,d2}};State.AutoTrader.EnrichExistingServerCandidatesFromCompanion({server},"test");local support=State.AutoTrader.GetServerPreviewCompanionSupportSummary()
+            State.AutoTrader.ServerPreviewCompanionCache=oldCache
+            return #server.playerTokens==2 and server.playerTokens[1]==d1 and server.playerTokens[2]==d2 and support.directCompanionMismatches==1,
+                "direct and companion token sets were blended/unioned"
+        end)
+        add("v37-companion-m-valid-tokens-reach-existing-thumbnail-pipeline",function()
+            local now=2000000000;local token="77777777777777777777777777777777";local fp="88888888888888888888888888888888"
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="thumb-m",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}),nil,now)
+            local oldCache,oldBase=State.AutoTrader.ServerPreviewCompanionCache,State.AutoTrader.V37CompanionResolveServerPreviewFingerprints;State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            local server={id="thumb-m",playing=11,maxPlayers=12,playerTokens={}};local enriched=State.AutoTrader.EnrichExistingServerCandidatesFromCompanion({server},"test");local observed=nil
+            State.AutoTrader.V37CompanionResolveServerPreviewFingerprints=function(servers) observed=servers[1] and servers[1].playerTokens and servers[1].playerTokens[1];servers[1].previewFingerprints={fp};servers[1].previewThumbnailUrls={"https://t.example/m.png"};return true,nil,{completed=1} end
+            local ok=pcall(State.AutoTrader.ResolveServerPreviewFingerprints,enriched)
+            State.AutoTrader.ServerPreviewCompanionCache,State.AutoTrader.V37CompanionResolveServerPreviewFingerprints=oldCache,oldBase
+            return ok and #enriched==1 and observed==token and server.previewFingerprints[1]==fp and server.previewFingerprintSource=="browser_companion_exact_jobid",
+                "valid companion sample tokens did not reach the existing canonical thumbnail resolver boundary"
+        end)
+        add("v37-companion-n-five-of-eleven-is-explicitly-sampled",function()
+            local fps={"11111111111111111111111111111111","22222222222222222222222222222222","33333333333333333333333333333333","44444444444444444444444444444444","55555555555555555555555555555555"}
+            local state=State.AutoTrader.GetUpcomingServerPreviewUiState({id="sample-n",playing=11,maxPlayers=12,previewTokenCount=5,previewTokenSource="browser_companion_exact_jobid",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints=fps,previewThumbnailUrls={"a","b","c","d","e"}})
+            return state.previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and tostring(state.detail):find("5 avatar samples · 11 players",1,true)~=nil and tostring(state.disclosure):find("SAMPLES",1,true)~=nil,
+                "5 companion tokens for 11 players were presented as a complete roster"
+        end)
+        add("v37-companion-o-sample-enrichment-does-not-touch-strict-bot-counters",function()
+            local now=2000000000;local token="99999999999999999999999999999999"
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId="strict-o",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}),nil,now)
+            local oldCache=State.AutoTrader.ServerPreviewCompanionCache;local before=State.AutoTrader.GetBotEvidenceProvenanceSummary()
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics};State.AutoTrader.EnrichExistingServerCandidatesFromCompanion({{id="strict-o",playing=11,maxPlayers=12,playerTokens={}}},"test")
+            local after=State.AutoTrader.GetBotEvidenceProvenanceSummary();State.AutoTrader.ServerPreviewCompanionCache=oldCache
+            return before.strictJobs==after.strictJobs and before.strictSightings==after.strictSightings and before.strictIcons==after.strictIcons,
+                "pre-join companion sampling modified automated strict bot certification counters"
+        end)
+        add("v37-companion-p-manual-bot-server-keeps-manual-provenance",function()
+            local fp="abababababababababababababababab";local server={id="manual-p",playing=11,maxPlayers=12,previewTokenCount=5,previewTokenSource="browser_companion_exact_jobid",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints={fp},previewThumbnailUrls={"https://t.example/p.png"}}
+            local saved={botDb=State.AutoTrader.BotIconDb,manual=State.AutoTrader.ManualBotServerJobs,hop=State.AutoTrader.ServerHopQueue,upcoming=State.AutoTrader.UpcomingServerQueue,cache=State.AutoTrader.ServerCandidateCache,scan=State.AutoTrader.LastServerScan,recent=State.AutoTrader.RecentJobs,index=State.AutoTrader.ServerHopQueueIndex,inProgress=State.AutoTrader.ServerHopInProgress,commit=State.AutoTrader.CommitTrustedBotDbCandidate,saveManual=State.AutoTrader.SaveManualBotServerJobs,saveRecent=State.AutoTrader.SaveRecentJobs,saveCache=State.AutoTrader.SaveServerCandidateCache,log=State.AutoTrader.Log,render=State.AutoTrader.Render,last=State.AutoTrader.LastManualBotServerClassification,rev=State.AutoTrader.UpcomingServerQueueRevision,status=State.AutoTrader.Status,detail=State.AutoTrader.StatusDetail}
+            State.AutoTrader.BotIconDb={version=5,trustedRevision=1,icons={}};State.AutoTrader.ManualBotServerJobs={};State.AutoTrader.ServerHopInProgress=false;State.AutoTrader.ServerHopQueue={server};State.AutoTrader.ServerHopQueueIndex=0;State.AutoTrader.UpcomingServerQueue={server};State.AutoTrader.ServerCandidateCache={version=1,entries={server}};State.AutoTrader.LastServerScan={candidates={{id="manual-p"}}};State.AutoTrader.RecentJobs={}
+            local provenance=nil;State.AutoTrader.CommitTrustedBotDbCandidate=function(_,p) provenance=p;return true end;State.AutoTrader.SaveManualBotServerJobs=function() return true end;State.AutoTrader.SaveRecentJobs=function() return true end;State.AutoTrader.SaveServerCandidateCache=function() return 0 end;State.AutoTrader.Log=function() end;State.AutoTrader.Render=function() end
+            local ok,class=State.AutoTrader.MarkUpcomingServerBot("manual-p")
+            local passed=ok==true and class and class.provenance=="manual_bot_server" and class.previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and provenance and provenance.provenance=="manual_bot_server" and provenance.evidenceSource=="browser_companion_samples"
+            State.AutoTrader.BotIconDb=saved.botDb;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerHopQueue=saved.hop;State.AutoTrader.UpcomingServerQueue=saved.upcoming;State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.LastServerScan=saved.scan;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ServerHopQueueIndex=saved.index;State.AutoTrader.ServerHopInProgress=saved.inProgress;State.AutoTrader.CommitTrustedBotDbCandidate=saved.commit;State.AutoTrader.SaveManualBotServerJobs=saved.saveManual;State.AutoTrader.SaveRecentJobs=saved.saveRecent;State.AutoTrader.SaveServerCandidateCache=saved.saveCache;State.AutoTrader.Log=saved.log;State.AutoTrader.Render=saved.render;State.AutoTrader.LastManualBotServerClassification=saved.last;State.AutoTrader.UpcomingServerQueueRevision=saved.rev;State.AutoTrader.Status=saved.status;State.AutoTrader.StatusDetail=saved.detail
+            return passed,"manual BOT SERVER classification based on companion samples lost explicit manual provenance"
+        end)
+        add("v37-companion-q-refresh-cannot-resurrect-manual-suppressed-jobid",function()
+            local now=os.time();local policy=State.AutoTrader.ServerPreviewCompanionPolicy
+            local blockedToken=string.rep("a",32);local allowedToken=string.rep("b",32)
+            local payload={schemaVersion=1,collectorVersion=policy.expectedCollectorVersion,runtimeSourceSha256=policy.expectedRuntimeSourceSha256,placeId=policy.expectedPlaceId,pollIntervalSeconds=policy.requiredHealthyPollSeconds,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={
+                {jobId="blocked",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={blockedToken},playerTokenCount=1,rosterEvidenceAvailable=true},
+                {jobId="allowed",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={allowedToken},playerTokenCount=1,rosterEvidenceAvailable=true},
+            }}
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(payload),nil,now)
+            local saved={companion=State.AutoTrader.ServerPreviewCompanionCache,manual=State.AutoTrader.ManualBotServerJobs,recent=State.AutoTrader.RecentJobs,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,classify=State.AutoTrader.ClassifyServerPreview,merge=State.AutoTrader.MergeServerCandidateCache,setUpcoming=State.AutoTrader.SetUpcomingServerQueue,lastScan=State.AutoTrader.LastServerScan,lastSource=State.AutoTrader.LastServerDiscoverySource}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            State.AutoTrader.ManualBotServerJobs={blocked={atUnix=now,provenance="manual_bot_server"}}
+            State.AutoTrader.RecentJobs={}
+            State.AutoTrader.ResolveServerPreviewFingerprints=function(servers)
+                for _,server in ipairs(servers) do local fp=server.id=="blocked" and string.rep("c",32) or string.rep("d",32);server.previewFingerprints={fp};server.previewThumbnailUrls={"https://t.example/"..server.id.."-150.png"};server.previewFingerprintByTokenIndex={[1]=fp};server.previewThumbnailUrlByTokenIndex={[1]=server.previewThumbnailUrls[1]} end
+                return true,nil,{completed=#servers}
+            end
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=function(servers)
+                for _,server in ipairs(servers) do server.previewDisplayThumbnailUrls={"https://t.example/"..server.id.."-48.png"};server.previewDisplayCanonicalFingerprints={server.previewFingerprints[1]} end
+                return true,nil,{completed=#servers,sizeIdentityMismatch=0}
+            end
+            State.AutoTrader.ClassifyServerPreview=function(server) local p={safeEnough=true,previewTrusted=false,goldMatchRatio=0,score=1,sample=1,goldMatched=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,hardReject=false,suspicious=false};server.botPreview=p;return p end
+            State.AutoTrader.MergeServerCandidateCache=function() return 0 end
+            local capturedUpcoming=nil;State.AutoTrader.SetUpcomingServerQueue=function(queue) capturedUpcoming=table.clone(queue or {}) end
+            local ok,queue,scan=pcall(State.AutoTrader.BuildPublicServerQueue,true)
+            local scanBlocked=false
+            for _,row in ipairs(ok and type(scan)=="table" and type(scan.candidates)=="table" and scan.candidates or {}) do if row.id=="blocked" then scanBlocked=true end end
+            local passed=ok and snapshot.selectorUsable==true and #queue==1 and queue[1].id=="allowed" and type(scan)=="table" and scan.discoverySource=="browser_companion_authenticated" and scan.filteredManual>=1 and not scanBlocked and type(capturedUpcoming)=="table" and #capturedUpcoming==1 and capturedUpcoming[1].id=="allowed"
+            State.AutoTrader.ServerPreviewCompanionCache=saved.companion;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.SetUpcomingServerQueue=saved.setUpcoming;State.AutoTrader.LastServerScan=saved.lastScan;State.AutoTrader.LastServerDiscoverySource=saved.lastSource
+            return passed,"healthy companion-primary refresh resurrected a manually suppressed JobId into the real selector queue or scan projection"
+        end)
+        add("v37-companion-r-support-summary-never-contains-raw-tokens",function()
+            local secret="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";local oldCache=State.AutoTrader.ServerPreviewCompanionCache
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot={usable=true,index={x={jobId="x",playerTokens={secret}}}},diagnostics={filePath="SV/ListOfServers.json",readAvailable=true,filePresent=true,parsed=true,status="HEALTHY",loggedIn=true,acceptedRows=1,acceptedTokenCount=1}}
+            local support=State.AutoTrader.GetServerPreviewCompanionSupportSummary();local encoded=HttpService:JSONEncode(support);State.AutoTrader.ServerPreviewCompanionCache=oldCache
+            return encoded:find(secret,1,true)==nil and encoded:find("playerTokens",1,true)==nil and support.acceptedTokenCount==1,
+                "raw companion playerTokens leaked into support telemetry"
+        end)
+        add("v37-companion-s-parser-cache-helpers-are-table-scoped",function()
+            return type(State.AutoTrader.ParseServerPreviewCompanionBody)=="function" and type(State.AutoTrader.RefreshServerPreviewCompanion)=="function" and type(State.AutoTrader.EnrichExistingServerCandidatesFromCompanion)=="function" and type(State.AutoTrader.ServerPreviewCompanionCache)=="table",
+                "companion parser/cache helpers were not table-scoped; static artifact check must also confirm zero new chunk-frame locals"
+        end)
+        add("v37-companion-t-round9-tokenless-fallback-remains-job-only",function()
+            local state=State.AutoTrader.GetUpcomingServerPreviewUiState({id="tokenless-t",playing=5,maxPlayers=12,previewTokenCount=0,previewFingerprints={},previewThumbnailUrls={}})
+            return state.state=="NO_ROSTER_TOKENS" and state.detail=="ROBLOX SERVER API PROVIDED NO ROSTER TOKENS" and state.actionText=="SKIP SERVER" and state.actionMode=="JOB_ID_ONLY_SKIP" and state.canPromoteFingerprintEvidence==false,
+                "Round-9 tokenless fallback semantics changed after companion integration"
+        end)
+
+        add("v37-companion-cache-never-persists-companion-derived-roster-evidence",function()
+            local saved={cache=State.AutoTrader.ServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.ManualBotServerJobs,globalCache=rawget(_G,State.AutoTrader.ServerCandidateCacheKey),executorCache=rawget(ExecutorEnvironment,State.AutoTrader.ServerCandidateCacheKey),atomicWrite=HARDEN.atomicWriteTextFileBestEffort}
+            local fp="dededededededededededededededede";State.AutoTrader.ServerCandidateCache={version=1,entries={}};State.AutoTrader.RecentJobs={};State.AutoTrader.ManualBotServerJobs={}
+            HARDEN.atomicWriteTextFileBestEffort=function() return true end
+            local server={id="cache-companion",playing=11,maxPlayers=12,occupancy=11/12,playerTokens={"abababababababababababababababab"},previewTokenCount=5,previewTokenSource="browser_companion_exact_jobid",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprintSource="browser_companion_exact_jobid",previewFingerprints={fp},previewThumbnailUrls={"https://t.example/cache.png"},companionRowAgeSeconds=3,companionSamplePlaying=11,botPreview={safeEnough=true}}
+            local ok,mergeResult=pcall(State.AutoTrader.MergeServerCandidateCache,{server})
+            local entry=State.AutoTrader.ServerCandidateCache.entries and State.AutoTrader.ServerCandidateCache.entries[1]
+            local persisted=rawget(_G,State.AutoTrader.ServerCandidateCacheKey);local persistedEntry=type(persisted)=="table" and type(persisted.entries)=="table" and persisted.entries[1] or nil
+            local leaks={}
+            local function check(label,row)
+                if type(row)~="table" then table.insert(leaks,label..":missing");return end
+                if #(row.previewFingerprints or {})>0 then table.insert(leaks,label..":previewFingerprints") end
+                if #(row.previewThumbnailUrls or {})>0 then table.insert(leaks,label..":previewThumbnailUrls") end
+                if (tonumber(row.previewTokenCount) or 0)~=0 then table.insert(leaks,label..":previewTokenCount") end
+                if row.previewTokenSource~=nil then table.insert(leaks,label..":previewTokenSource") end
+                if row.previewCoverage~=nil then table.insert(leaks,label..":previewCoverage") end
+                if row.previewFingerprintSource~=nil then table.insert(leaks,label..":previewFingerprintSource") end
+                if row.companionRowAgeSeconds~=nil then table.insert(leaks,label..":companionRowAgeSeconds") end
+                if row.companionSamplePlaying~=nil then table.insert(leaks,label..":companionSamplePlaying") end
+                if row.playerTokens~=nil then table.insert(leaks,label..":playerTokens") end
+            end
+            check("cache",entry);check("persisted",persistedEntry)
+            State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ManualBotServerJobs=saved.manual;HARDEN.atomicWriteTextFileBestEffort=saved.atomicWrite
+            rawset(_G,State.AutoTrader.ServerCandidateCacheKey,saved.globalCache);rawset(ExecutorEnvironment,State.AutoTrader.ServerCandidateCacheKey,saved.executorCache)
+            if not ok then return false,"production cache merge/save boundary errored: "..tostring(mergeResult) end
+            return #leaks==0,"companion-derived sampled roster evidence persisted at production cache boundary: "..table.concat(leaks,",")
+        end)
+        add("v37-companion-cached-enrichment-does-not-renew-selector-authority",function()
+            local now=os.time();local ttl=math.max(1,tonumber(CONFIG.AutoTraderServerCandidateCacheTtlSeconds) or 180);local t0=now-math.min(30,math.max(1,ttl-1));local jobId="cache-authority-v37";local token="12121212121212121212121212121212"
+            local saved={cache=State.AutoTrader.ServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.ManualBotServerJobs,companion=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,merge=State.AutoTrader.MergeServerCandidateCache,classify=State.AutoTrader.ClassifyServerPreview,save=State.AutoTrader.SaveServerCandidateCache,lastCacheUse=State.AutoTrader.LastServerCandidateCacheUse}
+            State.AutoTrader.ServerCandidateCache={version=1,entries={{id=jobId,scannedAt=t0,playing=11,maxPlayers=12,occupancy=11/12,previewFingerprints={},previewThumbnailUrls={},previewTokenCount=0}}};State.AutoTrader.RecentJobs={};State.AutoTrader.ManualBotServerJobs={}
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId=jobId,playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}),nil,now)
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            State.AutoTrader.ResolveServerPreviewFingerprints=function() return true,nil,{completed=1} end;local mergeCalls=0;State.AutoTrader.MergeServerCandidateCache=function() mergeCalls+=1;return 0 end
+            State.AutoTrader.ClassifyServerPreview=function(server) server.botPreview={safeEnough=true,previewTrusted=false,goldMatchRatio=0,score=0,sample=0};return server.botPreview end;State.AutoTrader.SaveServerCandidateCache=function() return #(State.AutoTrader.ServerCandidateCache.entries or {}) end
+            local ok1,q1=pcall(State.AutoTrader.BuildCachedServerQueue);local persisted1=State.AutoTrader.ServerCandidateCache.entries and State.AutoTrader.ServerCandidateCache.entries[1];local stamp1=persisted1 and persisted1.scannedAt
+            local ok2,q2=pcall(State.AutoTrader.BuildCachedServerQueue);local persisted2=State.AutoTrader.ServerCandidateCache.entries and State.AutoTrader.ServerCandidateCache.entries[1];local stamp2=persisted2 and persisted2.scannedAt
+            local passed=ok1 and ok2 and q1 and q1[1] and q1[1].previewTokenSource=="browser_companion_exact_jobid" and q2 and q2[1] and q2[1].previewTokenSource=="browser_companion_exact_jobid" and stamp1==t0 and stamp2==t0 and mergeCalls==0
+            State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerPreviewCompanionCache=saved.companion;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.SaveServerCandidateCache=saved.save;State.AutoTrader.LastServerCandidateCacheUse=saved.lastCacheUse
+            return passed,"cached companion enrichment advanced selector scannedAt or re-merged ephemeral preview evidence"
+        end)
+        add("v37-companion-expired-selector-cache-cannot-be-kept-alive",function()
+            local now=os.time();local ttl=math.max(1,tonumber(CONFIG.AutoTraderServerCandidateCacheTtlSeconds) or 180);local jobId="expired-cache-v37";local token=string.rep("e",32);local t0=now-ttl-1
+            local policy=State.AutoTrader.ServerPreviewCompanionPolicy
+            local payload={schemaVersion=1,collectorVersion=policy.expectedCollectorVersion,runtimeSourceSha256=policy.expectedRuntimeSourceSha256,placeId=policy.expectedPlaceId,pollIntervalSeconds=policy.requiredHealthyPollSeconds,lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId=jobId,playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode(payload),nil,now)
+            local saved={cache=State.AutoTrader.ServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.ManualBotServerJobs,companion=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,save=State.AutoTrader.SaveServerCandidateCache,classify=State.AutoTrader.ClassifyServerPreview,setUpcoming=State.AutoTrader.SetUpcomingServerQueue,lastScan=State.AutoTrader.LastServerScan,lastCacheUse=State.AutoTrader.LastServerCandidateCacheUse,lastSource=State.AutoTrader.LastServerDiscoverySource}
+            State.AutoTrader.ServerCandidateCache={version=1,entries={{id=jobId,scannedAt=t0,playing=11,maxPlayers=12,occupancy=11/12,previewFingerprints={},previewThumbnailUrls={},previewTokenCount=0}}}
+            State.AutoTrader.RecentJobs={};State.AutoTrader.ManualBotServerJobs={}
+            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            State.AutoTrader.ResolveServerPreviewFingerprints=function(servers)
+                for _,server in ipairs(servers) do local fp=string.rep("f",32);server.previewFingerprints={fp};server.previewThumbnailUrls={"https://t.example/fresh-150.png"};server.previewFingerprintByTokenIndex={[1]=fp};server.previewThumbnailUrlByTokenIndex={[1]=server.previewThumbnailUrls[1]} end
+                return true,nil,{completed=#servers}
+            end
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=function(servers)
+                for _,server in ipairs(servers) do server.previewDisplayThumbnailUrls={"https://t.example/fresh-48.png"};server.previewDisplayCanonicalFingerprints={server.previewFingerprints[1]} end
+                return true,nil,{completed=#servers,sizeIdentityMismatch=0}
+            end
+            State.AutoTrader.ClassifyServerPreview=function(server) local p={safeEnough=true,previewTrusted=false,goldMatchRatio=0,score=1,sample=1,goldMatched=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,hardReject=false,suspicious=false};server.botPreview=p;return p end
+            State.AutoTrader.SaveServerCandidateCache=function() return #(State.AutoTrader.ServerCandidateCache.entries or {}) end
+            State.AutoTrader.SetUpcomingServerQueue=function() end
+            local ok,queue,scan=pcall(State.AutoTrader.BuildPublicServerQueue,false)
+            local persisted=nil
+            for _,entry in ipairs(State.AutoTrader.ServerCandidateCache.entries or {}) do if entry.id==jobId then persisted=entry end end
+            local passed=ok and snapshot.selectorUsable==true and type(queue)=="table" and #queue==1 and queue[1].id==jobId
+                and queue[1].discoverySource=="browser_companion_authenticated" and queue[1].cacheScannedAt==nil
+                and type(scan)=="table" and scan.discoverySource=="browser_companion_authenticated" and scan.cacheHit==false
+                and type(persisted)=="table" and tonumber(persisted.scannedAt)>t0 and tonumber(persisted.scannedAt)>=now-1
+                and persisted.previewTokenSource==nil and #(persisted.previewFingerprints or {})==0 and #(persisted.previewThumbnailUrls or {})==0
+            State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerPreviewCompanionCache=saved.companion;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display;State.AutoTrader.SaveServerCandidateCache=saved.save;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.SetUpcomingServerQueue=saved.setUpcoming;State.AutoTrader.LastServerScan=saved.lastScan;State.AutoTrader.LastServerCandidateCacheUse=saved.lastCacheUse;State.AutoTrader.LastServerDiscoverySource=saved.lastSource
+            return passed,"expired selector cache row was silently kept alive instead of being pruned and, if rediscovered, replaced by a fresh genuine companion-primary discovery row"
+        end)
+        add("v37-companion-explicit-nil-sanitization-cannot-retain-original",function()
+            local row=State.AutoTrader.NormalizeServerCandidateCacheEntry({
+                id="nil-sanitize",scannedAt=os.time(),playing=5,maxPlayers=12,
+                previewFingerprints={"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},previewThumbnailUrls={"https://t.example/nil.png"},previewTokenCount=1,
+                previewTokenSource="browser_companion_exact_jobid",previewCoverage="SAMPLED_NOT_FULL_ROSTER",
+                previewFingerprintSource="browser_companion_exact_jobid",companionRowAgeSeconds=4,companionSamplePlaying=11,
+            })
+            return row and row.previewTokenSource==nil and row.previewCoverage==nil and row.previewFingerprintSource==nil
+                and row.companionRowAgeSeconds==nil and row.companionSamplePlaying==nil
+                and #(row.previewFingerprints or {})==0 and #(row.previewThumbnailUrls or {})==0 and row.previewTokenCount==0,
+                "explicit nil sanitization retained old companion cache authority fields"
+        end)
+
+        add("v37-prefetch-starts-while-ui-closed-and-bounds-concurrency",function()
+            local oldState,oldHooks=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            local workers={}
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0,prefetchQueue={},prefetchQueued={},prefetchActive=0,prefetchStarts=0,prefetchedReady=0,cacheHits=0,maxObservedConcurrency=0}
+            State.AutoTrader.UpcomingThumbnailDisplayTestHooks={
+                spawn=function(fn) table.insert(workers,fn) end,
+                fetchBytes=function() return "PNG_BYTES","image/png" end,
+                writefile=function() return true end,
+                assetFunction=function(path) return "rbxasset://"..tostring(path) end,
+            }
+            local servers={}
+            for i=1,8 do
+                local fp=string.rep(string.format("%x",i),32)
+                table.insert(servers,{previewThumbnailUrls={"https://t.example/prefetch-"..tostring(i)..".png"},previewFingerprints={fp}})
+            end
+            local queued=State.AutoTrader.QueueUpcomingThumbnailPrefetch(servers,true)
+            local initialWorkers=#workers;local initialActive=State.AutoTrader.UpcomingThumbnailDisplay.prefetchActive;local cursor=1
+            while cursor<=#workers do local fn=workers[cursor];cursor+=1;fn() end
+            local summary=State.AutoTrader.GetUpcomingThumbnailDisplaySummary()
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks=oldState,oldHooks
+            return queued==8 and initialWorkers==5 and initialActive==5 and summary.queued==0 and summary.active==0
+                and summary.prefetchStarts==8 and summary.prefetchedReady==8 and summary.maxObservedConcurrency<=summary.concurrencyLimit and summary.maxObservedConcurrency==5,
+                "background prefetch failed to queue cooperatively or exceeded bounded concurrency"
+        end)
+
+        add("v37-prefetch-production-upcoming-path-starts-while-ui-closed",function()
+            local oldState,oldHooks,oldOpen=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks,State.AutoTrader.UpcomingServerBrowserOpen
+            local oldQueue,oldRev,oldSource,oldAt=State.AutoTrader.UpcomingServerQueue,State.AutoTrader.UpcomingServerQueueRevision,State.AutoTrader.UpcomingServerQueueSource,State.AutoTrader.UpcomingServerQueueAt
+            local workers={}
+            State.AutoTrader.UpcomingServerBrowserOpen=false
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0,prefetchQueue={},prefetchQueued={},prefetchActive=0,prefetchStarts=0,prefetchedReady=0,cacheHits=0,maxObservedConcurrency=0}
+            State.AutoTrader.UpcomingThumbnailDisplayTestHooks={
+                allowDuringSelfTest=true,
+                spawn=function(fn) table.insert(workers,fn) end,
+                fetchBytes=function() return "PNG_BYTES","image/png" end,
+                writefile=function() return true end,
+                assetFunction=function(path) return "rbxasset://"..tostring(path) end,
+            }
+            local fp="fefefefefefefefefefefefefefefefe";local url="https://t.example/production-prefetch.png"
+            local ok=pcall(State.AutoTrader.SetUpcomingServerQueue,{{id="production-prefetch",playing=8,maxPlayers=12,previewThumbnailUrls={url},previewFingerprints={fp}}},"self_test_selector")
+            local started=#workers==1 and State.AutoTrader.UpcomingThumbnailDisplay.prefetchActive==1 and State.AutoTrader.UpcomingThumbnailDisplay.prefetchStarts==1
+            if workers[1] then workers[1]() end
+            local ready=State.AutoTrader.UpcomingThumbnailDisplay.prefetchedReady==1 and State.AutoTrader.UpcomingThumbnailDisplay.prefetchActive==0
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks,State.AutoTrader.UpcomingServerBrowserOpen=oldState,oldHooks,oldOpen
+            State.AutoTrader.UpcomingServerQueue,State.AutoTrader.UpcomingServerQueueRevision,State.AutoTrader.UpcomingServerQueueSource,State.AutoTrader.UpcomingServerQueueAt=oldQueue,oldRev,oldSource,oldAt
+            return ok and started and ready,"real upcoming-selector setter did not start bounded thumbnail prefetch while the browser UI was closed"
+        end)
+
+        add("v37-prefetch-dedupes-canonical-display-key",function()
+            local oldState,oldHooks=State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks
+            local workers={}
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={},generation=1,downloadStarts=0,prefetchQueue={},prefetchQueued={},prefetchActive=0,prefetchStarts=0,prefetchedReady=0,cacheHits=0,maxObservedConcurrency=0}
+            State.AutoTrader.UpcomingThumbnailDisplayTestHooks={spawn=function(fn) table.insert(workers,fn) end,fetchBytes=function() return "PNG","image/png" end,writefile=function() return true end,assetFunction=function() return "rbxasset://dedupe" end}
+            local fp="abababababababababababababababab";local url="https://t.example/dedupe.png"
+            local first=State.AutoTrader.QueueUpcomingThumbnailPrefetch({{previewThumbnailUrls={url},previewFingerprints={fp}},{previewThumbnailUrls={url},previewFingerprints={fp}}},false)
+            local second=State.AutoTrader.QueueUpcomingThumbnailPrefetch({{previewThumbnailUrls={url},previewFingerprints={fp}}},false)
+            local starts=State.AutoTrader.UpcomingThumbnailDisplay.prefetchStarts
+            if workers[1] then workers[1]() end
+            State.AutoTrader.UpcomingThumbnailDisplay,State.AutoTrader.UpcomingThumbnailDisplayTestHooks=oldState,oldHooks
+            return first==1 and second==0 and starts==1 and #workers==1,"same canonical thumbnail key started more than one background download"
+        end)
+
+        add("v37-prefetched-ready-asset-binds-immediately",function()
+            local oldState=State.AutoTrader.UpcomingThumbnailDisplay
+            local fp="bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";local url="https://t.example/ready.png";local key=State.AutoTrader.GetUpcomingThumbnailDisplayKey(url,fp)
+            State.AutoTrader.UpcomingThumbnailDisplay={cache={[key]={key=key,url=url,fingerprint=fp,state="ready",asset="rbxasset://prefetched",transport="custom_asset_exact_bytes"}},generation=77,downloadStarts=0,prefetchQueue={},prefetchQueued={},prefetchActive=0,prefetchStarts=1,prefetchedReady=1,cacheHits=0,maxObservedConcurrency=1}
+            local parent=Instance.new("Frame");local image=Instance.new("ImageLabel");image.Parent=parent
+            local ok=State.AutoTrader.BindUpcomingThumbnailImage(image,url,fp,77,nil);local painted=image.Image=="rbxasset://prefetched";parent:Destroy()
+            State.AutoTrader.UpcomingThumbnailDisplay=oldState
+            return ok==true and painted,"prefetched ready custom asset did not bind immediately when UI row opened"
+        end)
+
+        add("v37-requested-jobid-hint-is-bounded-selector-only-and-token-free",function()
+            local oldManual=State.AutoTrader.ManualBotServerJobs;State.AutoTrader.ManualBotServerJobs={}
+            local servers={}
+            for i=1,35 do table.insert(servers,{id="hint-job-"..tostring(i),playerTokens={"secret-token-"..tostring(i)}}) end
+            table.insert(servers,{id="hint-job-1"})
+            local payload=State.AutoTrader.BuildRequestedServerPreviewHint(servers,2000000000);local encoded=HttpService:JSONEncode(payload)
+            State.AutoTrader.ManualBotServerJobs=oldManual
+            local unique={};for _,id in ipairs(payload.requestedJobIds or {}) do unique[id]=(unique[id] or 0)+1 end
+            local uniqueCount=0;for _ in pairs(unique) do uniqueCount+=1 end
+            return payload.schemaVersion==1 and payload.placeId==game.PlaceId and payload.generatedAtUnix==2000000000
+                and #payload.requestedJobIds==30 and uniqueCount==30 and encoded:find("playerTokens",1,true)==nil and encoded:find("secret-token",1,true)==nil,
+                "requested preview hint exceeded 30 unique selector JobIds or leaked roster evidence"
+        end)
+
+        add("v37-requested-jobid-hint-is-emitted-from-real-upcoming-selector-state",function()
+            local saved={queue=State.AutoTrader.UpcomingServerQueue,rev=State.AutoTrader.UpcomingServerQueueRevision,source=State.AutoTrader.UpcomingServerQueueSource,at=State.AutoTrader.UpcomingServerQueueAt,hooks=State.AutoTrader.RequestedServerPreviewHintTestHooks,hintState=State.AutoTrader.RequestedServerPreviewHintState,manual=State.AutoTrader.ManualBotServerJobs}
+            local captured=nil;local now=os.time()
+            State.AutoTrader.ManualBotServerJobs={["manual-blocked"]={atUnix=now,provenance="manual_bot_server"}}
+            State.AutoTrader.RequestedServerPreviewHintState={writes=0,failures=0,lastCount=0,lastWrittenAtUnix=0,lastError=nil}
+            State.AutoTrader.RequestedServerPreviewHintTestHooks={write=function(_,body) captured=body;return true end}
+            local ok=pcall(State.AutoTrader.SetUpcomingServerQueue,{{id="selector-a",playerTokens={"never-copy"}},{id="manual-blocked"},{id="selector-b"}},"test_selector")
+            local decoded=nil;if ok and type(captured)=="string" then pcall(function() decoded=HttpService:JSONDecode(captured) end) end
+            State.AutoTrader.UpcomingServerQueue,State.AutoTrader.UpcomingServerQueueRevision,State.AutoTrader.UpcomingServerQueueSource,State.AutoTrader.UpcomingServerQueueAt=saved.queue,saved.rev,saved.source,saved.at
+            State.AutoTrader.RequestedServerPreviewHintTestHooks,State.AutoTrader.RequestedServerPreviewHintState,State.AutoTrader.ManualBotServerJobs=saved.hooks,saved.hintState,saved.manual
+            return ok and type(decoded)=="table" and #decoded.requestedJobIds==2 and decoded.requestedJobIds[1]=="selector-a" and decoded.requestedJobIds[2]=="selector-b"
+                and captured:find("manual-blocked",1,true)==nil and captured:find("never-copy",1,true)==nil,
+                "production upcoming-selector setter emitted suppressed/non-selector data into requested preview hint"
+        end)
+
+        add("v37-requested-jobid-hint-write-is-nonfatal-and-support-is-count-only",function()
+            local oldHooks,oldState=State.AutoTrader.RequestedServerPreviewHintTestHooks,State.AutoTrader.RequestedServerPreviewHintState
+            local seenPath,seenBody=nil,nil
+            State.AutoTrader.RequestedServerPreviewHintState={writes=0,failures=0,lastCount=0,lastWrittenAtUnix=0,lastError=nil}
+            State.AutoTrader.RequestedServerPreviewHintTestHooks={write=function(path,body) seenPath=path;seenBody=body;return true end}
+            local ok,payload=State.AutoTrader.WriteRequestedServerPreviewHint({{id="hint-write-a"},{id="hint-write-b"}})
+            local support=State.AutoTrader.GetRequestedServerPreviewHintSupportSummary();local supportJson=HttpService:JSONEncode(support)
+            State.AutoTrader.RequestedServerPreviewHintTestHooks,State.AutoTrader.RequestedServerPreviewHintState=oldHooks,oldState
+            return ok==true and seenPath=="SV/RequestedServerPreviews.json" and type(seenBody)=="string" and #payload.requestedJobIds==2
+                and support.lastCount==2 and supportJson:find("hint-write-a",1,true)==nil and supportJson:find("requestedJobIds",1,true)==nil,
+                "requested preview hint write/support leaked target lists or failed the bounded hint path"
+        end)
+
+        add("v37-requested-jobid-hint-malformed-write-is-nonfatal",function()
+            local oldHooks,oldState=State.AutoTrader.RequestedServerPreviewHintTestHooks,State.AutoTrader.RequestedServerPreviewHintState
+            State.AutoTrader.RequestedServerPreviewHintState={writes=0,failures=0,lastCount=0,lastWrittenAtUnix=0,lastError=nil}
+            State.AutoTrader.RequestedServerPreviewHintTestHooks={write=function() return false end}
+            local ok,reason=State.AutoTrader.WriteRequestedServerPreviewHint({{id="hint-fail"}});local support=State.AutoTrader.GetRequestedServerPreviewHintSupportSummary()
+            State.AutoTrader.RequestedServerPreviewHintTestHooks,State.AutoTrader.RequestedServerPreviewHintState=oldHooks,oldState
+            return ok==false and tostring(reason)~="" and support.failures==1,"hint write failure became fatal or invisible instead of remaining optional"
+        end)
+
+        add("v37-companion-requested-sweep-support-is-scalar-only",function()
+            local now=2000000000;local token="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+            local body=HttpService:JSONEncode({schemaVersion=1,collectorVersion="server-updater-v2-round13-hint-candidate",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,
+                requestedCount=30,requestedFound=27,requestedMissing=3,requestedSweepPages=10,requestedLastUpdatedUnix=now-5,requestedSweepComplete=true,
+                servers={{jobId="scalar-only",playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}})
+            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(body,nil,now)
+            local oldCache=State.AutoTrader.ServerPreviewCompanionCache;State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
+            local support=State.AutoTrader.GetServerPreviewCompanionSupportSummary();local encoded=HttpService:JSONEncode(support);State.AutoTrader.ServerPreviewCompanionCache=oldCache
+            return support.requestedCount==30 and support.requestedFound==27 and support.requestedMissing==3 and support.requestedSweepPages==10
+                and support.requestedHintAgeSeconds==5 and support.requestedSweepComplete==true and encoded:find(token,1,true)==nil and encoded:find("requestedJobIds",1,true)==nil,
+                "requested sweep support omitted bounded scalar diagnostics or exposed roster/target payload"
+        end)
+
+        add("v37-upcoming-browser-displays-all-five-genuine-samples",function()
+            local urls,hashes={},{}
+            for i=1,5 do table.insert(urls,"https://t.example/five-"..tostring(i)..".png");table.insert(hashes,string.rep(string.format("%x",i),32)) end
+            local ui=State.AutoTrader.GetUpcomingServerPreviewUiState({id="five-samples",playing=11,maxPlayers=12,previewTokenCount=5,previewTokenSource="browser_companion_exact_jobid",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints=hashes,previewThumbnailUrls=urls})
+            return CONFIG.AutoTraderUpcomingServerPreviewIconLimit==5 and ui.tokenCount==5 and ui.detail:find("5 avatar samples · 11 players",1,true)==1 and ui.previewCoverage=="SAMPLED_NOT_FULL_ROSTER",
+                "five genuine samples were not exposed with explicit sampled-not-full-roster wording"
+        end)
+
+        add("v37-canonical-thumbnail-size-remains-150-until-runtime-identity-proof",function()
+            return State.AutoTrader.CanonicalServerPreviewThumbnailSize=="150x150",
+                "canonical bot/avatar fingerprint request size changed before 48x48 identity stability was runtime-proven"
+        end)
+
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v37",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        State.AutoTrader.SelfTestExecutionDepth=priorDepth
         return result
     end
 end

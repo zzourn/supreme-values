@@ -1,6 +1,6 @@
 {
     "_metadata": {
-        "scraped_at": "2026-08-15T13:03:17.130214+00:00",
+        "scraped_at": "2026-08-16T00:39:06.825314+00:00",
         "source": "https://supremevalues.com",
         "schema_version": 5,
         "item_indexing": "image_identity -> record",
@@ -73,17 +73,17 @@
         "identity_source": "normalized Supreme image URL/path",
         "image_key_format": "image::<filename-stem>::<sha256-prefix>",
         "matching_preview_source": "precomputed image pixels; display-only",
-        "Ancients_last_updated": "2026-08-13T13:58:04-04:00",
-        "Vintages_last_updated": "2026-08-13T13:58:04-04:00",
-        "Uniques_last_updated": "2026-08-13T13:58:04-04:00",
-        "Chromas_last_updated": "2026-08-13T13:58:04-04:00",
-        "Godlies_last_updated": "2026-08-13T13:58:04-04:00",
-        "Legendaries_last_updated": "2026-08-13T13:58:04-04:00",
-        "Rares_last_updated": "2026-08-13T13:58:04-04:00",
-        "Uncommons_last_updated": "2026-08-13T13:58:04-04:00",
-        "Commons_last_updated": "2026-08-13T13:58:04-04:00",
-        "Pets_last_updated": "2026-08-13T13:58:04-04:00",
-        "Misc_last_updated": "2026-08-13T13:58:04-04:00",
+        "Ancients_last_updated": "2026-08-15T14:00:08-04:00",
+        "Vintages_last_updated": "2026-08-15T14:00:08-04:00",
+        "Uniques_last_updated": "2026-08-15T14:00:08-04:00",
+        "Chromas_last_updated": "2026-08-15T14:00:08-04:00",
+        "Godlies_last_updated": "2026-08-15T14:00:08-04:00",
+        "Legendaries_last_updated": "2026-08-15T14:00:08-04:00",
+        "Rares_last_updated": "2026-08-15T14:00:08-04:00",
+        "Uncommons_last_updated": "2026-08-15T14:00:08-04:00",
+        "Commons_last_updated": "2026-08-15T14:00:08-04:00",
+        "Pets_last_updated": "2026-08-15T14:00:08-04:00",
+        "Misc_last_updated": "2026-08-15T14:00:08-04:00",
         "failed_categories": [],
         "complete": true,
         "drawing_previews": {
@@ -258,23 +258,23 @@
             "record_key": "ancients::image::vampires-axe::9e4f021e3584",
             "image_key": "image::vampires-axe::9e4f021e3584",
             "name": "Vampire's Axe",
-            "value": "1,300",
-            "raw_value": 1300,
-            "stability": "Stable",
+            "value": "1,325",
+            "raw_value": 1325,
+            "stability": "Doing Well",
             "demand": "6",
             "rarity": "4",
-            "change_in_value": "( +25 ) +2.0%",
+            "change_in_value": "( +25 ) +1.9%",
             "change_diff": null,
-            "change_pct": "+2.0%",
+            "change_pct": "+1.9%",
             "tier": "2",
             "origin": "Halloween 2024 (Tier 20)",
             "event": "Halloween",
             "year": "2024",
             "image_url": "https://supremevalues.com/media/mm2ancients/Vampires_Axe.webp",
             "aliases": "Vamp Axe, VA",
-            "flippability": "Rarely Flippable",
+            "flippability": "Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Vampire%27s_Axe",
-            "sort_value": 1300.0,
+            "sort_value": 1325.0,
             "source_key": "image::vampires-axe::9e4f021e3584",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -612,7 +612,7 @@
             "value": "13",
             "raw_value": 13,
             "stability": "Stable",
-            "demand": "2",
+            "demand": "1",
             "rarity": "2",
             "change_in_value": "( -2 ) -13.3%",
             "change_diff": null,
@@ -1042,14 +1042,14 @@
             "record_key": "uniques::image::corrupt::683b07820275",
             "image_key": "image::corrupt::683b07820275",
             "name": "Corrupt",
-            "value": "425",
-            "raw_value": 425,
+            "value": "410",
+            "raw_value": 410,
             "stability": "Stable",
             "demand": "4",
             "rarity": "3",
-            "change_in_value": "( -25 ) -5.6%",
+            "change_in_value": "( -15 ) -3.5%",
             "change_diff": null,
-            "change_pct": "-5.6%",
+            "change_pct": "-3.5%",
             "tier": null,
             "origin": "Data Loss from MM1 - MM2 Update",
             "event": null,
@@ -1058,7 +1058,7 @@
             "aliases": "N/A",
             "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Corrupt",
-            "sort_value": 425.0,
+            "sort_value": 410.0,
             "source_key": "image::corrupt::683b07820275",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -1356,8 +1356,8 @@
             "record_key": "chromas::image::crg::4eb033f2e164",
             "image_key": "image::crg::4eb033f2e164",
             "name": "Chroma Raygun",
-            "value": "13,500",
-            "raw_value": 13500,
+            "value": "13,750",
+            "raw_value": 13750,
             "stability": "Doing Well",
             "demand": "6",
             "rarity": "5",
@@ -1372,7 +1372,7 @@
             "aliases": "CRG, CRay",
             "flippability": "Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Chroma_Raygun",
-            "sort_value": 13500.0,
+            "sort_value": 13750.0,
             "source_key": "image::crg::4eb033f2e164",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -1512,14 +1512,14 @@
             "record_key": "chromas::image::cbz::98c8e978ef06",
             "image_key": "image::cbz::98c8e978ef06",
             "name": "Chroma Blizzard",
-            "value": "7,250",
-            "raw_value": 7250,
-            "stability": "Stable",
+            "value": "7,000",
+            "raw_value": 7000,
+            "stability": "Underpaid For",
             "demand": "5",
             "rarity": "5",
-            "change_in_value": "( -250 ) -3.3%",
+            "change_in_value": "( -250 ) -3.4%",
             "change_diff": null,
-            "change_pct": "-3.3%",
+            "change_pct": "-3.4%",
             "tier": "2w",
             "origin": "Christmas 2025 (Item Pack)",
             "event": "Christmas",
@@ -1528,7 +1528,7 @@
             "aliases": "CBlizz",
             "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Chroma_Blizzard",
-            "sort_value": 7250.0,
+            "sort_value": 7000.0,
             "source_key": "image::cbz::98c8e978ef06",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -1625,45 +1625,6 @@
                 ]
             }
         },
-        "image::cdagger::cff022d86563": {
-            "record_key": "chromas::image::cdagger::cff022d86563",
-            "image_key": "image::cdagger::cff022d86563",
-            "name": "Chroma Snow Dagger",
-            "value": "3,500",
-            "raw_value": 3500,
-            "stability": "Stable",
-            "demand": "5",
-            "rarity": "5",
-            "change_in_value": "( -250 ) -6.7%",
-            "change_diff": null,
-            "change_pct": "-6.7%",
-            "tier": "2w",
-            "origin": "Christmas 2025 (Unboxed)",
-            "event": "Christmas",
-            "year": "2025",
-            "image_url": "https://supremevalues.com/media/mm2chromas/CDagger.webp",
-            "aliases": "CDagger, CDag",
-            "flippability": "Rarely Flippable",
-            "wiki_link": "https://mm2.fandom.com/wiki/Chroma_Snow_Dagger",
-            "sort_value": 3500.0,
-            "source_key": "image::cdagger::cff022d86563",
-            "drawing_preview": {
-                "format": "palette-rle-v2",
-                "w": 1,
-                "h": 1,
-                "palette": [
-                    [
-                        164,
-                        167,
-                        172
-                    ]
-                ],
-                "rle": [
-                    1,
-                    1
-                ]
-            }
-        },
         "image::cwg::a71c4ff0f401": {
             "record_key": "chromas::image::cwg::a71c4ff0f401",
             "image_key": "image::cwg::a71c4ff0f401",
@@ -1703,18 +1664,57 @@
                 ]
             }
         },
+        "image::cdagger::cff022d86563": {
+            "record_key": "chromas::image::cdagger::cff022d86563",
+            "image_key": "image::cdagger::cff022d86563",
+            "name": "Chroma Snow Dagger",
+            "value": "3,250",
+            "raw_value": 3250,
+            "stability": "Stable",
+            "demand": "5",
+            "rarity": "4",
+            "change_in_value": "( -250 ) -7.1%",
+            "change_diff": null,
+            "change_pct": "-7.1%",
+            "tier": "2w",
+            "origin": "Christmas 2025 (Unboxed)",
+            "event": "Christmas",
+            "year": "2025",
+            "image_url": "https://supremevalues.com/media/mm2chromas/CDagger.webp",
+            "aliases": "CDagger, CDag",
+            "flippability": "Rarely Flippable",
+            "wiki_link": "https://mm2.fandom.com/wiki/Chroma_Snow_Dagger",
+            "sort_value": 3250.0,
+            "source_key": "image::cdagger::cff022d86563",
+            "drawing_preview": {
+                "format": "palette-rle-v2",
+                "w": 1,
+                "h": 1,
+                "palette": [
+                    [
+                        164,
+                        167,
+                        172
+                    ]
+                ],
+                "rle": [
+                    1,
+                    1
+                ]
+            }
+        },
         "image::ctreat::bda2506fed18": {
             "record_key": "chromas::image::ctreat::bda2506fed18",
             "image_key": "image::ctreat::bda2506fed18",
             "name": "Chroma Treat",
-            "value": "2,400",
-            "raw_value": 2400,
+            "value": "2,300",
+            "raw_value": 2300,
             "stability": "Receding",
             "demand": "5",
             "rarity": "4",
-            "change_in_value": "( -100 ) -4.0%",
+            "change_in_value": "( -100 ) -4.2%",
             "change_diff": null,
-            "change_pct": "-4.0%",
+            "change_pct": "-4.2%",
             "tier": "2w",
             "origin": "Valentine's 2026 (Item Pack)",
             "event": "Valentine's",
@@ -1723,7 +1723,7 @@
             "aliases": "CTreat",
             "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Chroma_Treat",
-            "sort_value": 2400.0,
+            "sort_value": 2300.0,
             "source_key": "image::ctreat::bda2506fed18",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -1746,14 +1746,14 @@
             "record_key": "chromas::image::csweet::9810cf0e481f",
             "image_key": "image::csweet::9810cf0e481f",
             "name": "Chroma Sweet",
-            "value": "2,200",
-            "raw_value": 2200,
+            "value": "2,150",
+            "raw_value": 2150,
             "stability": "Stable",
             "demand": "5",
             "rarity": "4",
-            "change_in_value": "( -50 ) -2.2%",
+            "change_in_value": "( -50 ) -2.3%",
             "change_diff": null,
-            "change_pct": "-2.2%",
+            "change_pct": "-2.3%",
             "tier": "2w",
             "origin": "Valentine's 2026 (Item Pack)",
             "event": "Valentine's",
@@ -1762,7 +1762,7 @@
             "aliases": "CSweet",
             "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Chroma_Sweet",
-            "sort_value": 2200.0,
+            "sort_value": 2150.0,
             "source_key": "image::csweet::9810cf0e481f",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -3113,14 +3113,14 @@
             "record_key": "godlies::image::alienbeam::e486164a283e",
             "image_key": "image::alienbeam::e486164a283e",
             "name": "Alienbeam",
-            "value": "1,975",
-            "raw_value": 1975,
+            "value": "2,100",
+            "raw_value": 2100,
             "stability": "Overpaid For",
             "demand": "6",
             "rarity": "4",
-            "change_in_value": "( +50 ) +2.6%",
+            "change_in_value": "( +125 ) +6.3%",
             "change_diff": null,
-            "change_pct": "+2.6%",
+            "change_pct": "+6.3%",
             "tier": "4",
             "origin": "Halloween 2025 (Unboxed)",
             "event": "Halloween",
@@ -3129,7 +3129,7 @@
             "aliases": "AB, ALB",
             "flippability": "Highly Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Alienbeam",
-            "sort_value": 1975.0,
+            "sort_value": 2100.0,
             "source_key": "image::alienbeam::e486164a283e",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -3187,51 +3187,12 @@
                 ]
             }
         },
-        "image::darkshot::dc7d8c4dd172": {
-            "record_key": "godlies::image::darkshot::dc7d8c4dd172",
-            "image_key": "image::darkshot::dc7d8c4dd172",
-            "name": "Darkshot",
-            "value": "1,775",
-            "raw_value": 1775,
-            "stability": "Doing Well",
-            "demand": "6",
-            "rarity": "4",
-            "change_in_value": "( +25 ) +1.4%",
-            "change_diff": null,
-            "change_pct": "+1.4%",
-            "tier": "4",
-            "origin": "Halloween 2023 (Item Pack)",
-            "event": "Halloween",
-            "year": "2023",
-            "image_url": "https://supremevalues.com/media/mm2godlies/Darkshot.webp",
-            "aliases": "DShot",
-            "flippability": "Flippable",
-            "wiki_link": "https://mm2.fandom.com/wiki/Darkshot",
-            "sort_value": 1775.0,
-            "source_key": "image::darkshot::dc7d8c4dd172",
-            "drawing_preview": {
-                "format": "palette-rle-v2",
-                "w": 1,
-                "h": 1,
-                "palette": [
-                    [
-                        26,
-                        30,
-                        35
-                    ]
-                ],
-                "rle": [
-                    1,
-                    1
-                ]
-            }
-        },
         "image::raygun::a8d751f98d8f": {
             "record_key": "godlies::image::raygun::a8d751f98d8f",
             "image_key": "image::raygun::a8d751f98d8f",
             "name": "Raygun",
-            "value": "1,750",
-            "raw_value": 1750,
+            "value": "1,800",
+            "raw_value": 1800,
             "stability": "Overpaid For",
             "demand": "6",
             "rarity": "3",
@@ -3246,7 +3207,7 @@
             "aliases": "RG, Ray",
             "flippability": "Highly Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Raygun",
-            "sort_value": 1750.0,
+            "sort_value": 1800.0,
             "source_key": "image::raygun::a8d751f98d8f",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -3265,13 +3226,52 @@
                 ]
             }
         },
+        "image::darkshot::dc7d8c4dd172": {
+            "record_key": "godlies::image::darkshot::dc7d8c4dd172",
+            "image_key": "image::darkshot::dc7d8c4dd172",
+            "name": "Darkshot",
+            "value": "1,800",
+            "raw_value": 1800,
+            "stability": "Stable",
+            "demand": "6",
+            "rarity": "4",
+            "change_in_value": "( +25 ) +1.4%",
+            "change_diff": null,
+            "change_pct": "+1.4%",
+            "tier": "4",
+            "origin": "Halloween 2023 (Item Pack)",
+            "event": "Halloween",
+            "year": "2023",
+            "image_url": "https://supremevalues.com/media/mm2godlies/Darkshot.webp",
+            "aliases": "DShot",
+            "flippability": "Rarely Flippable",
+            "wiki_link": "https://mm2.fandom.com/wiki/Darkshot",
+            "sort_value": 1800.0,
+            "source_key": "image::darkshot::dc7d8c4dd172",
+            "drawing_preview": {
+                "format": "palette-rle-v2",
+                "w": 1,
+                "h": 1,
+                "palette": [
+                    [
+                        26,
+                        30,
+                        35
+                    ]
+                ],
+                "rle": [
+                    1,
+                    1
+                ]
+            }
+        },
         "image::darksword::5426a769bc1b": {
             "record_key": "godlies::image::darksword::5426a769bc1b",
             "image_key": "image::darksword::5426a769bc1b",
             "name": "Darksword",
-            "value": "1,750",
-            "raw_value": 1750,
-            "stability": "Doing Well",
+            "value": "1,775",
+            "raw_value": 1775,
+            "stability": "Stable",
             "demand": "6",
             "rarity": "4",
             "change_in_value": "( +25 ) +1.4%",
@@ -3283,9 +3283,9 @@
             "year": "2023",
             "image_url": "https://supremevalues.com/media/mm2godlies/Darksword.webp",
             "aliases": "DSword",
-            "flippability": "Flippable",
+            "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Darksword",
-            "sort_value": 1750.0,
+            "sort_value": 1775.0,
             "source_key": "image::darksword::5426a769bc1b",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -3308,9 +3308,9 @@
             "record_key": "godlies::image::blossom::88e1d5c2f996",
             "image_key": "image::blossom::88e1d5c2f996",
             "name": "Blossom",
-            "value": "1,360",
-            "raw_value": 1360,
-            "stability": "Doing Well",
+            "value": "1,370",
+            "raw_value": 1370,
+            "stability": "Stable",
             "demand": "6",
             "rarity": "4",
             "change_in_value": "( +10 ) +0.7%",
@@ -3322,9 +3322,9 @@
             "year": "2023",
             "image_url": "https://supremevalues.com/media/mm2godlies/Blossom.webp",
             "aliases": "N/A",
-            "flippability": "Flippable",
+            "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Blossom",
-            "sort_value": 1360.0,
+            "sort_value": 1370.0,
             "source_key": "image::blossom::88e1d5c2f996",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -3347,9 +3347,9 @@
             "record_key": "godlies::image::sakura::e9ce988c4230",
             "image_key": "image::sakura::e9ce988c4230",
             "name": "Sakura",
-            "value": "1,350",
-            "raw_value": 1350,
-            "stability": "Doing Well",
+            "value": "1,360",
+            "raw_value": 1360,
+            "stability": "Stable",
             "demand": "6",
             "rarity": "4",
             "change_in_value": "( +10 ) +0.7%",
@@ -3361,9 +3361,9 @@
             "year": "2023",
             "image_url": "https://supremevalues.com/media/mm2godlies/Sakura.webp",
             "aliases": "Sak",
-            "flippability": "Flippable",
+            "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Sakura",
-            "sort_value": 1350.0,
+            "sort_value": 1360.0,
             "source_key": "image::sakura::e9ce988c4230",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -3850,6 +3850,84 @@
                 ]
             }
         },
+        "image::xenoknife::976050f7132b": {
+            "record_key": "godlies::image::xenoknife::976050f7132b",
+            "image_key": "image::xenoknife::976050f7132b",
+            "name": "Xenoknife",
+            "value": "285",
+            "raw_value": 285,
+            "stability": "Stable",
+            "demand": "4",
+            "rarity": "3",
+            "change_in_value": "( +5 ) +1.8%",
+            "change_diff": null,
+            "change_pct": "+1.8%",
+            "tier": "3",
+            "origin": "Halloween 2025 (Item Pack)",
+            "event": "Halloween",
+            "year": "2025",
+            "image_url": "https://supremevalues.com/media/mm2godlies/Xenoknife.webp",
+            "aliases": "N/A",
+            "flippability": "Rarely Flippable",
+            "wiki_link": "https://mm2.fandom.com/wiki/Xenoknife",
+            "sort_value": 285.0,
+            "source_key": "image::xenoknife::976050f7132b",
+            "drawing_preview": {
+                "format": "palette-rle-v2",
+                "w": 1,
+                "h": 1,
+                "palette": [
+                    [
+                        56,
+                        37,
+                        79
+                    ]
+                ],
+                "rle": [
+                    1,
+                    1
+                ]
+            }
+        },
+        "image::xenoshot::4681ddcab6cd": {
+            "record_key": "godlies::image::xenoshot::4681ddcab6cd",
+            "image_key": "image::xenoshot::4681ddcab6cd",
+            "name": "Xenoshot",
+            "value": "285",
+            "raw_value": 285,
+            "stability": "Stable",
+            "demand": "4",
+            "rarity": "3",
+            "change_in_value": "( +5 ) +1.8%",
+            "change_diff": null,
+            "change_pct": "+1.8%",
+            "tier": "3",
+            "origin": "Halloween 2025 (Item Pack)",
+            "event": "Halloween",
+            "year": "2025",
+            "image_url": "https://supremevalues.com/media/mm2godlies/Xenoshot.webp",
+            "aliases": "N/A",
+            "flippability": "Rarely Flippable",
+            "wiki_link": "https://mm2.fandom.com/wiki/Xenoshot",
+            "sort_value": 285.0,
+            "source_key": "image::xenoshot::4681ddcab6cd",
+            "drawing_preview": {
+                "format": "palette-rle-v2",
+                "w": 1,
+                "h": 1,
+                "palette": [
+                    [
+                        52,
+                        37,
+                        74
+                    ]
+                ],
+                "rle": [
+                    1,
+                    1
+                ]
+            }
+        },
         "image::waves::b91196c09e54": {
             "record_key": "godlies::image::waves::b91196c09e54",
             "image_key": "image::waves::b91196c09e54",
@@ -3881,84 +3959,6 @@
                         86,
                         140,
                         182
-                    ]
-                ],
-                "rle": [
-                    1,
-                    1
-                ]
-            }
-        },
-        "image::xenoknife::976050f7132b": {
-            "record_key": "godlies::image::xenoknife::976050f7132b",
-            "image_key": "image::xenoknife::976050f7132b",
-            "name": "Xenoknife",
-            "value": "280",
-            "raw_value": 280,
-            "stability": "Stable",
-            "demand": "4",
-            "rarity": "3",
-            "change_in_value": "( +5 ) +1.8%",
-            "change_diff": null,
-            "change_pct": "+1.8%",
-            "tier": "3",
-            "origin": "Halloween 2025 (Item Pack)",
-            "event": "Halloween",
-            "year": "2025",
-            "image_url": "https://supremevalues.com/media/mm2godlies/Xenoknife.webp",
-            "aliases": "N/A",
-            "flippability": "Rarely Flippable",
-            "wiki_link": "https://mm2.fandom.com/wiki/Xenoknife",
-            "sort_value": 280.0,
-            "source_key": "image::xenoknife::976050f7132b",
-            "drawing_preview": {
-                "format": "palette-rle-v2",
-                "w": 1,
-                "h": 1,
-                "palette": [
-                    [
-                        56,
-                        37,
-                        79
-                    ]
-                ],
-                "rle": [
-                    1,
-                    1
-                ]
-            }
-        },
-        "image::xenoshot::4681ddcab6cd": {
-            "record_key": "godlies::image::xenoshot::4681ddcab6cd",
-            "image_key": "image::xenoshot::4681ddcab6cd",
-            "name": "Xenoshot",
-            "value": "280",
-            "raw_value": 280,
-            "stability": "Stable",
-            "demand": "4",
-            "rarity": "3",
-            "change_in_value": "( +5 ) +1.8%",
-            "change_diff": null,
-            "change_pct": "+1.8%",
-            "tier": "3",
-            "origin": "Halloween 2025 (Item Pack)",
-            "event": "Halloween",
-            "year": "2025",
-            "image_url": "https://supremevalues.com/media/mm2godlies/Xenoshot.webp",
-            "aliases": "N/A",
-            "flippability": "Rarely Flippable",
-            "wiki_link": "https://mm2.fandom.com/wiki/Xenoshot",
-            "sort_value": 280.0,
-            "source_key": "image::xenoshot::4681ddcab6cd",
-            "drawing_preview": {
-                "format": "palette-rle-v2",
-                "w": 1,
-                "h": 1,
-                "palette": [
-                    [
-                        52,
-                        37,
-                        74
                     ]
                 ],
                 "rle": [
@@ -4279,84 +4279,6 @@
                 ]
             }
         },
-        "image::beachy::d30c043ff9ff": {
-            "record_key": "godlies::image::beachy::d30c043ff9ff",
-            "image_key": "image::beachy::d30c043ff9ff",
-            "name": "Beachy",
-            "value": "145",
-            "raw_value": 145,
-            "stability": "Fluctuating",
-            "demand": "2",
-            "rarity": "3",
-            "change_in_value": "( -5 ) -3.3%",
-            "change_diff": null,
-            "change_pct": "-3.3%",
-            "tier": "3",
-            "origin": "Summer 2026 (Item Pack)",
-            "event": "Summer",
-            "year": "2026",
-            "image_url": "https://supremevalues.com/media/mm2godlies/Beachy.webp",
-            "aliases": "N/A",
-            "flippability": "Flippable",
-            "wiki_link": "https://mm2.fandom.com/wiki/Beachy",
-            "sort_value": 145.0,
-            "source_key": "image::beachy::d30c043ff9ff",
-            "drawing_preview": {
-                "format": "palette-rle-v2",
-                "w": 1,
-                "h": 1,
-                "palette": [
-                    [
-                        161,
-                        150,
-                        163
-                    ]
-                ],
-                "rle": [
-                    1,
-                    1
-                ]
-            }
-        },
-        "image::sands::219d78bd8dee": {
-            "record_key": "godlies::image::sands::219d78bd8dee",
-            "image_key": "image::sands::219d78bd8dee",
-            "name": "Sands",
-            "value": "145",
-            "raw_value": 145,
-            "stability": "Fluctuating",
-            "demand": "2",
-            "rarity": "3",
-            "change_in_value": "( -5 ) -3.3%",
-            "change_diff": null,
-            "change_pct": "-3.3%",
-            "tier": "3",
-            "origin": "Summer 2026 (Item Pack)",
-            "event": "Summer",
-            "year": "2026",
-            "image_url": "https://supremevalues.com/media/mm2godlies/Sands.webp",
-            "aliases": "N/A",
-            "flippability": "Flippable",
-            "wiki_link": "https://mm2.fandom.com/wiki/Sands",
-            "sort_value": 145.0,
-            "source_key": "image::sands::219d78bd8dee",
-            "drawing_preview": {
-                "format": "palette-rle-v2",
-                "w": 1,
-                "h": 1,
-                "palette": [
-                    [
-                        123,
-                        115,
-                        137
-                    ]
-                ],
-                "rle": [
-                    1,
-                    1
-                ]
-            }
-        },
         "image::borealis::05b24a4ea8ae": {
             "record_key": "godlies::image::borealis::05b24a4ea8ae",
             "image_key": "image::borealis::05b24a4ea8ae",
@@ -4435,27 +4357,105 @@
                 ]
             }
         },
-        "image::icecream::58512277cd41": {
-            "record_key": "godlies::image::icecream::58512277cd41",
-            "image_key": "image::icecream::58512277cd41",
-            "name": "Icecream",
+        "image::beachy::d30c043ff9ff": {
+            "record_key": "godlies::image::beachy::d30c043ff9ff",
+            "image_key": "image::beachy::d30c043ff9ff",
+            "name": "Beachy",
             "value": "135",
             "raw_value": 135,
             "stability": "Fluctuating",
             "demand": "2",
             "rarity": "3",
-            "change_in_value": "( -15 ) -10.0%",
+            "change_in_value": "( -10 ) -6.9%",
             "change_diff": null,
-            "change_pct": "-10.0%",
+            "change_pct": "-6.9%",
+            "tier": "3",
+            "origin": "Summer 2026 (Item Pack)",
+            "event": "Summer",
+            "year": "2026",
+            "image_url": "https://supremevalues.com/media/mm2godlies/Beachy.webp",
+            "aliases": "N/A",
+            "flippability": "Flippable",
+            "wiki_link": "https://mm2.fandom.com/wiki/Beachy",
+            "sort_value": 135.0,
+            "source_key": "image::beachy::d30c043ff9ff",
+            "drawing_preview": {
+                "format": "palette-rle-v2",
+                "w": 1,
+                "h": 1,
+                "palette": [
+                    [
+                        161,
+                        150,
+                        163
+                    ]
+                ],
+                "rle": [
+                    1,
+                    1
+                ]
+            }
+        },
+        "image::sands::219d78bd8dee": {
+            "record_key": "godlies::image::sands::219d78bd8dee",
+            "image_key": "image::sands::219d78bd8dee",
+            "name": "Sands",
+            "value": "135",
+            "raw_value": 135,
+            "stability": "Fluctuating",
+            "demand": "2",
+            "rarity": "3",
+            "change_in_value": "( -10 ) -6.9%",
+            "change_diff": null,
+            "change_pct": "-6.9%",
+            "tier": "3",
+            "origin": "Summer 2026 (Item Pack)",
+            "event": "Summer",
+            "year": "2026",
+            "image_url": "https://supremevalues.com/media/mm2godlies/Sands.webp",
+            "aliases": "N/A",
+            "flippability": "Flippable",
+            "wiki_link": "https://mm2.fandom.com/wiki/Sands",
+            "sort_value": 135.0,
+            "source_key": "image::sands::219d78bd8dee",
+            "drawing_preview": {
+                "format": "palette-rle-v2",
+                "w": 1,
+                "h": 1,
+                "palette": [
+                    [
+                        123,
+                        115,
+                        137
+                    ]
+                ],
+                "rle": [
+                    1,
+                    1
+                ]
+            }
+        },
+        "image::icecream::58512277cd41": {
+            "record_key": "godlies::image::icecream::58512277cd41",
+            "image_key": "image::icecream::58512277cd41",
+            "name": "Icecream",
+            "value": "130",
+            "raw_value": 130,
+            "stability": "Underpaid For",
+            "demand": "2",
+            "rarity": "3",
+            "change_in_value": "( -5 ) -3.7%",
+            "change_diff": null,
+            "change_pct": "-3.7%",
             "tier": "3",
             "origin": "Summer 2026 (Unboxed)",
             "event": "Summer",
             "year": "2026",
             "image_url": "https://supremevalues.com/media/mm2godlies/Icecream.webp",
             "aliases": "IC",
-            "flippability": "Flippable",
+            "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Icecream",
-            "sort_value": 135.0,
+            "sort_value": 130.0,
             "source_key": "image::icecream::58512277cd41",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -4673,14 +4673,14 @@
             "record_key": "godlies::image::luger::0f7ee1468c10",
             "image_key": "image::luger::0f7ee1468c10",
             "name": "Luger",
-            "value": "40",
-            "raw_value": 40,
+            "value": "37",
+            "raw_value": 37,
             "stability": "Stable",
             "demand": "1",
             "rarity": "2",
-            "change_in_value": "( -2 ) -4.8%",
+            "change_in_value": "( -3 ) -7.5%",
             "change_diff": null,
-            "change_pct": "-4.8%",
+            "change_pct": "-7.5%",
             "tier": "2",
             "origin": "Gun Box #1",
             "event": null,
@@ -4689,7 +4689,7 @@
             "aliases": "Lug",
             "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Luger",
-            "sort_value": 40.0,
+            "sort_value": 37.0,
             "source_key": "image::luger::0f7ee1468c10",
             "drawing_preview": {
                 "format": "palette-rle-v2",
@@ -4739,6 +4739,45 @@
                         157,
                         37,
                         33
+                    ]
+                ],
+                "rle": [
+                    1,
+                    1
+                ]
+            }
+        },
+        "image::ornament::fe925bc3dd0b": {
+            "record_key": "godlies::image::ornament::fe925bc3dd0b",
+            "image_key": "image::ornament::fe925bc3dd0b",
+            "name": "Ornament",
+            "value": "35",
+            "raw_value": 35,
+            "stability": "Doing Well",
+            "demand": "2",
+            "rarity": "2",
+            "change_in_value": "( +3 ) +9.4%",
+            "change_diff": null,
+            "change_pct": "+9.4%",
+            "tier": "2",
+            "origin": "Christmas 2025 (Gifting 100 Gifts)",
+            "event": "Christmas",
+            "year": "2025",
+            "image_url": "https://supremevalues.com/media/mm2godlies/Ornament.webp",
+            "aliases": "Orn",
+            "flippability": "Flippable",
+            "wiki_link": "https://mm2.fandom.com/wiki/Ornament_Godly",
+            "sort_value": 35.0,
+            "source_key": "image::ornament::fe925bc3dd0b",
+            "drawing_preview": {
+                "format": "palette-rle-v2",
+                "w": 1,
+                "h": 1,
+                "palette": [
+                    [
+                        182,
+                        132,
+                        126
                     ]
                 ],
                 "rle": [
@@ -5090,45 +5129,6 @@
                         72,
                         66,
                         74
-                    ]
-                ],
-                "rle": [
-                    1,
-                    1
-                ]
-            }
-        },
-        "image::ornament::fe925bc3dd0b": {
-            "record_key": "godlies::image::ornament::fe925bc3dd0b",
-            "image_key": "image::ornament::fe925bc3dd0b",
-            "name": "Ornament",
-            "value": "32",
-            "raw_value": 32,
-            "stability": "Doing Well",
-            "demand": "1",
-            "rarity": "2",
-            "change_in_value": "( +2 ) +6.7%",
-            "change_diff": null,
-            "change_pct": "+6.7%",
-            "tier": "2",
-            "origin": "Christmas 2025 (Gifting 100 Gifts)",
-            "event": "Christmas",
-            "year": "2025",
-            "image_url": "https://supremevalues.com/media/mm2godlies/Ornament.webp",
-            "aliases": "Orn",
-            "flippability": "Flippable",
-            "wiki_link": "https://mm2.fandom.com/wiki/Ornament_Godly",
-            "sort_value": 32.0,
-            "source_key": "image::ornament::fe925bc3dd0b",
-            "drawing_preview": {
-                "format": "palette-rle-v2",
-                "w": 1,
-                "h": 1,
-                "palette": [
-                    [
-                        182,
-                        132,
-                        126
                     ]
                 ],
                 "rle": [
@@ -10800,14 +10800,14 @@
             "record_key": "rares::image::dungeon::e28db0ed0f82",
             "image_key": "image::dungeon::e28db0ed0f82",
             "name": "Dungeon",
-            "value": "200",
-            "raw_value": 200,
+            "value": "190",
+            "raw_value": 190,
             "stability": "Receding",
             "demand": "3",
             "rarity": "5",
-            "change_in_value": "( -10 ) -4.8%",
+            "change_in_value": "( -10 ) -5.0%",
             "change_diff": null,
-            "change_pct": "-4.8%",
+            "change_pct": "-5.0%",
             "tier": "3",
             "origin": "Halloween 2019 (Unboxed)",
             "event": "Halloween",
@@ -10816,7 +10816,7 @@
             "aliases": "N/A",
             "flippability": "Rarely Flippable",
             "wiki_link": "https://mm2.fandom.com/wiki/Dungeon",
-            "sort_value": 200.0,
+            "sort_value": 190.0,
             "source_key": "image::dungeon::e28db0ed0f82",
             "drawing_preview": {
                 "format": "palette-rle-v2",

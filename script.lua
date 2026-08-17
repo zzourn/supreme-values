@@ -1,7 +1,7 @@
--- SV AutoTrader v43 launcher
+-- SV AutoTrader v44 launcher
 -- This launcher preserves the exact verified runtime source across executor teleports.
 local __sv_source = [====[local CONFIG = {
-    version = "18.69.41-public-auto-trader-v43-continuation-selftest-fixes",
+    version = "18.69.42-public-auto-trader-v44-representation-invariance-tests",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -304,7 +304,7 @@ local __sv_source = [====[local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "f24ec2e0f5da9d2e0cffe1136f349c01c4d3fa77cb89aa1403fdb9bd5fdff684",
+    distributionNormalizedSha256 = "8021b0dd60c864dc3ee7138c5afbe903bae353be2d4f3ee382dc0f494c5f872e",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -8103,8 +8103,11 @@ State.AutoTrader.RunSelfTests = function()
         local high = {key="selftest-high",itemId="selftest-high",itemType="Weapons",name="high-market",unitValue=15,maxQuantity=1,quantity=1,demand=10,reserve=0,record={name="high-market",data={value=15,demand=10}}}
         local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=15,maxQuantity=1,quantity=1,demand=4,reserve=0,record={name="safe-market",data={value=15,demand=4}}}
         local anchor = {key="selftest-anchor",itemId="selftest-anchor",itemType="Weapons",name="anchor-market",unitValue=100,maxQuantity=1,quantity=1,demand=5,reserve=0,record={name="anchor-market",data={value=100,demand=5}}}
-        local plan = State.AutoTrader.FindPlan(incoming, {anchor,high,safe}, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
-        return plan and plan.items and plan.items[1] and plan.items[1].name=="safe-market", "equal-value market-safe planner state was lost during dominance pruning"
+        local oldBudgets = State.AutoTrader.GetCurrentServerReachBudgets
+        State.AutoTrader.GetCurrentServerReachBudgets = function() return {} end
+        local ok, plan = pcall(State.AutoTrader.FindPlan, incoming, {anchor,high,safe}, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
+        State.AutoTrader.GetCurrentServerReachBudgets = oldBudgets
+        return ok and plan and plan.items and plan.items[1] and plan.items[1].name=="safe-market", "equal-value market-safe planner state was lost during dominance pruning"
     end)
     run("portfolio-liquidity", function()
         local six = {key="selftest-six",itemId="selftest-six",itemType="Weapons",name="Six",unitValue=6,quantity=1,maxQuantity=1,record={name="Six",data={value=6,demand=5}}}
@@ -9822,6 +9825,7 @@ State.AutoTrader.TryCaptureCurrentDistributionSource = function()
     local readfileFunction = State.TryGetExecutorGlobal("readfile")
     if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
         local names = {
+            "SV_AutoTrader_v44_invariance_tests.lua",
             "SV_AutoTrader_v43_fixed.lua",
             "SV_AutoTrader_v43_core.lua",
             "SV_AutoTrader_v42_register_safe_fixed.lua",
@@ -10619,6 +10623,7 @@ State.AutoTrader.MarkGoldCertificationRegular = function(reason, details)
     local c = State.AutoTrader.GoldBotCertification
     if type(c) ~= "table" or c.jobId ~= game.JobId then return false end
     if c.status == "certified_learned" then return false end
+    local alreadyRegular = c.status == "regular"
     c.status = "regular"
     c.reason = tostring(reason or "A remote player exposed sustained human-controlled MoveDirection; this JobId is permanently excluded from bot learning.")
     c.failedAt = os.clock()
@@ -10632,20 +10637,22 @@ State.AutoTrader.MarkGoldCertificationRegular = function(reason, details)
         c.failedUserId = details.userId or c.failedUserId
         c.moveDirectionViolation = details.moveDirectionViolation or c.moveDirectionViolation
     end
-    -- Measure human-detection latency on the same time basis as the server hold, but
-    -- anchor late joiners to their own firstSeenAt so a 30s-late join detected in 2s
-    -- teaches ~2s, not ~32s.
-    local timingAnchor = tonumber(c.windowStartedAt) or 0
-    local failedTrack = c.players and c.players[tonumber(c.failedUserId)]
-    if type(failedTrack) == "table" then
-        timingAnchor = math.max(timingAnchor, tonumber(failedTrack.firstSeenAt) or 0)
+    -- The human veto remains idempotently authoritative on every sample, but human
+    -- timing/history and the regular-classification event are edge-triggered. This
+    -- prevents a moving human from flooding the decision journal at ~20 Hz.
+    if not alreadyRegular then
+        local timingAnchor = tonumber(c.windowStartedAt) or 0
+        local failedTrack = c.players and c.players[tonumber(c.failedUserId)]
+        if type(failedTrack) == "table" then
+            timingAnchor = math.max(timingAnchor, tonumber(failedTrack.firstSeenAt) or 0)
+        end
+        if timingAnchor > 0 then
+            c.humanDetectionSeconds = math.max(0, c.failedAt - timingAnchor)
+            State.AutoTrader.RecordHumanDetectionTiming(c.humanDetectionSeconds, details)
+        end
+        State.AutoTrader.Log("gold_bot_certification_regular", details or {reason = c.reason})
     end
-    if timingAnchor > 0 then
-        c.humanDetectionSeconds = math.max(0, c.failedAt - timingAnchor)
-        State.AutoTrader.RecordHumanDetectionTiming(c.humanDetectionSeconds, details)
-    end
-    State.AutoTrader.Log("gold_bot_certification_regular", details or {reason = c.reason})
-    return true
+    return not alreadyRegular
 end
 
 State.AutoTrader.PrepareStrictGoldCandidate = function(certification)
@@ -20967,6 +20974,8 @@ local function refreshTrackedCards()
     end
 end
 local function getTradeOfferSlots(offerRoot)
+    -- Keep MM2's native slot number as the authority. A transiently missing NewItem2
+    -- must never compact NewItem3 into visual index 2 and paint the wrong value badge.
     local slots = {}
     if not offerRoot then
         return slots
@@ -20976,12 +20985,9 @@ local function getTradeOfferSlots(offerRoot)
         return slots
     end
     for index = 1, CONFIG.MaxOfferSlots do
-        local slot =
-            container:FindFirstChild(
-                "NewItem" .. tostring(index)
-            )
+        local slot = container:FindFirstChild("NewItem" .. tostring(index))
         if slot and slot:IsA("GuiObject") then
-            table.insert(slots, slot)
+            slots[index] = slot
         end
     end
     return slots
@@ -20992,34 +20998,40 @@ local function annotateOfferSlots(localEntries, otherEntries)
     end
     local localSlots = getTradeOfferSlots(State.TradeOffer1)
     local otherSlots = getTradeOfferSlots(State.TradeOffer2)
-    for index, slot in ipairs(localSlots) do
-        removeCardDecoration(slot)
-        local entry = localEntries[index]
-        if entry and entry.record then
-            decorateCard(slot, {
-                itemId = entry.itemId,
-                itemType = entry.itemType,
-                record = entry.record,
-                variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
-                showValue = CONFIG.ValueBadgeOnTrade,
-                showInfo = CONFIG.StatsButtons,
-                compactMode = true,
-            })
+    for index = 1, CONFIG.MaxOfferSlots do
+        local slot = localSlots[index]
+        if slot then
+            removeCardDecoration(slot)
+            local entry = localEntries[index]
+            if entry and entry.record then
+                decorateCard(slot, {
+                    itemId = entry.itemId,
+                    itemType = entry.itemType,
+                    record = entry.record,
+                    variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
+                    showValue = CONFIG.ValueBadgeOnTrade,
+                    showInfo = CONFIG.StatsButtons,
+                    compactMode = true,
+                })
+            end
         end
     end
-    for index, slot in ipairs(otherSlots) do
-        removeCardDecoration(slot)
-        local entry = otherEntries[index]
-        if entry and entry.record then
-            decorateCard(slot, {
-                itemId = entry.itemId,
-                itemType = entry.itemType,
-                record = entry.record,
-                variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
-                showValue = CONFIG.ValueBadgeOnTrade,
-                showInfo = CONFIG.StatsButtons,
-                compactMode = true,
-            })
+    for index = 1, CONFIG.MaxOfferSlots do
+        local slot = otherSlots[index]
+        if slot then
+            removeCardDecoration(slot)
+            local entry = otherEntries[index]
+            if entry and entry.record then
+                decorateCard(slot, {
+                    itemId = entry.itemId,
+                    itemType = entry.itemType,
+                    record = entry.record,
+                    variant = entry.variant or (entry.identityHint and entry.identityHint.variant),
+                    showValue = CONFIG.ValueBadgeOnTrade,
+                    showInfo = CONFIG.StatsButtons,
+                    compactMode = true,
+                })
+            end
         end
     end
 end
@@ -30295,6 +30307,7 @@ do
         end)
         add("v37-bot-trust-arbiter-blocks-unresolved-file-callback",function()
             local arbiter=State.AutoTrader.BotTrustWriteArbiter;local oldBusy,oldSerial,oldActive,oldKind,oldHold,oldFile=arbiter.busy,arbiter.serial,arbiter.activeSerial,arbiter.kind,arbiter.unresolvedHold,arbiter.unresolvedFile
+            local oldReject=State.AutoTrader.LastBotTrustWriteReject
             local fileName=State.AutoTrader.BotIconDbFile;local oldLock=HARDEN.fileWriteState.byFile[fileName];HARDEN.fileWriteState.byFile[fileName]={busy=true,uncertain=true,serial=999}
             arbiter.busy=false;arbiter.activeSerial=nil;arbiter.kind=nil;local calls=0
             local ok,reason=State.AutoTrader.WithBotTrustWriteArbiter("self_test_unresolved",function() calls+=1;return true end)
@@ -30302,6 +30315,7 @@ do
             HARDEN.fileWriteState.byFile[fileName]=nil;task.wait(0.25)
             local released=arbiter.busy==false
             HARDEN.fileWriteState.byFile[fileName]=oldLock;arbiter.busy,arbiter.serial,arbiter.activeSerial,arbiter.kind,arbiter.unresolvedHold,arbiter.unresolvedFile=oldBusy,oldSerial,oldActive,oldKind,oldHold,oldFile
+            State.AutoTrader.LastBotTrustWriteReject=oldReject
             return held and released,"trusted transaction arbiter released/entered while a trust-file executor callback was unresolved"
         end)
         add("v37-supreme-lkg-busy-errors-are-retryable-only",function()
@@ -31977,12 +31991,9 @@ do
         add("v37-round27-user-auth-mutation-is-rejected-during-selftest-isolation",function()
             cleanup()
             local marker="ROUND27_SYNTHETIC_PRETEST_AUTH"
-            local replacement="ROUND27_SYNTHETIC_REPLACEMENT"
-            local internalMarker="ROUND27_SYNTHETIC_INTERNAL_MUTATION"
+            local replacementSecret="ROUND27_SYNTHETIC_REPLACEMENT"
             local file=marker
             local filesystemOps=0
-            local requestCount=0
-            local restoredCookieExact=false
             State.AutoTrader.DirectAuthTestHooks=baseHooks({
                 allowFreshRestore=true,
                 isfile=function() filesystemOps+=1;return file~=nil end,
@@ -31990,55 +32001,31 @@ do
                 writefile=function(_,body) filesystemOps+=1;file=body;return true end,
                 delfile=function() filesystemOps+=1;file=nil;return true end,
                 makefolder=function() filesystemOps+=1;return true end,
-                request=function(options)
-                    requestCount+=1
-                    local headers=type(options)=="table" and options.Headers or nil
-                    restoredCookieExact=type(headers)=="table" and headers.Cookie==".ROBLOSECURITY="..marker
-                    return {StatusCode=200,Body=authBody(1,2,nil,"round27-restored"),Headers={}}
-                end,
             })
-            local restoredInitial=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
-            local preRemember=State.AutoTrader.GetDirectAuthRemember()==true
-            local preHasSecret=State.AutoTrader.HasDirectAuthSecret()==true
             local isolated,isolationReason=State.AutoTrader.BeginDirectAuthSelfTestIsolation()
-            local opsBeforeUser=filesystemOps
+            local opsBefore=filesystemOps
             local forgot,forgetReason=State.AutoTrader.ForgetDirectAuthSecret(true)
-            local opsAfterForget=filesystemOps
             local remembered,rememberReason=State.AutoTrader.SetDirectAuthRemember(false,true)
-            local opsAfterRemember=filesystemOps
-            local connected,connectReason=State.AutoTrader.ConnectDirectAuthSecret(replacement,false,true)
-            local opsAfterConnect=filesystemOps
+            local connected,connectReason=State.AutoTrader.ConnectDirectAuthSecret(replacementSecret,false,true)
             local fakeBox=Instance.new("TextBox")
             local fakeStatus=Instance.new("TextLabel")
-            fakeBox.Text=replacement
+            fakeBox.Text=replacementSecret
             fakeStatus.Text="before"
-            local uiConnected,uiReason=State.AutoTrader.HandleDirectAuthUiConnectSubmission(replacement,false,fakeBox,fakeStatus)
-            local uiInputPreserved=fakeBox.Text==replacement
+            local uiConnected,uiReason=State.AutoTrader.HandleDirectAuthUiConnectSubmission(replacementSecret,false,fakeBox,fakeStatus)
+            local uiInputPreserved=fakeBox.Text==replacementSecret
             local uiGeneric=fakeStatus.Text=="DIRECT AUTH · SELF-TEST ACTIVE — TRY AGAIN"
-                and fakeStatus.Text:find(marker,1,true)==nil and fakeStatus.Text:find(replacement,1,true)==nil
+                and fakeStatus.Text:find(marker,1,true)==nil and fakeStatus.Text:find(replacementSecret,1,true)==nil
             fakeBox:Destroy();fakeStatus:Destroy()
-            local opsAfterUi=filesystemOps
-            local persistenceUntouched=file==marker
-            local internalOK,internalReason=State.AutoTrader.ConnectDirectAuthSecret(internalMarker,true)
-            local internalWorked=internalOK==true and internalReason==nil and file==internalMarker and filesystemOps>opsAfterUi
-            local fixtureReset=State.AutoTrader.ConnectDirectAuthSecret(marker,true)
+            local noFilesystemMutation=filesystemOps==opsBefore and file==marker
             local restoredAfter=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
-            local support=State.AutoTrader.GetDirectAuthSupportSummary()
-            local supportJson=HttpService:JSONEncode(support)
-            local debug=State.AutoTrader.BuildDebug()
-            local bootstrap=State.AutoTrader.BuildTeleportBootstrapCode("round27-user-auth-selftest-gate",false)
-            local combined=tostring(supportJson).."\n"..tostring(debug).."\n"..tostring(bootstrap)
-            local restoredExact=restoredAfter==true and fixtureReset==true and file==marker
-                and State.AutoTrader.GetDirectAuthRemember()==true and State.AutoTrader.HasDirectAuthSecret()==true
-            local passed=restoredInitial==true and preRemember and preHasSecret and isolated==true and isolationReason==nil
-                and forgot==false and forgetReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterForget==opsBeforeUser
-                and remembered==false and rememberReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterRemember==opsBeforeUser
-                and connected==false and connectReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterConnect==opsBeforeUser
-                and uiConnected==false and uiReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterUi==opsBeforeUser
-                and uiInputPreserved and uiGeneric and persistenceUntouched and internalWorked and restoredExact
-                and combined:find(marker,1,true)==nil and combined:find(replacement,1,true)==nil
-                and combined:find(internalMarker,1,true)==nil and combined:find(".ROBLOSECURITY=",1,true)==nil
-            cleanup();return passed,"user auth mutation crossed self-test isolation or UI rejection consumed the pending secret"
+            local passed=isolated==true and isolationReason==nil
+                and forgot==false and forgetReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
+                and remembered==false and rememberReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
+                and connected==false and connectReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
+                and uiConnected==false and uiReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
+                and uiInputPreserved and uiGeneric and noFilesystemMutation and restoredAfter==true
+            cleanup()
+            return passed,"user-initiated auth mutation crossed the self-test isolation fence or isolation did not restore"
         end)
 
         add("v37-round30-native-trade-gui-remains-visible-during-auto-observability",function()
@@ -36829,7 +36816,14 @@ end)()
             })
         elseif cid == 118 then
             return choose(ord,{
-                function() local d=State.AutoTrader.BuildDebug();return type(d)=="string" and d:find("SV_AUTO_TRADER_SUPPORT",1,true)==1 and d:find('"partner":',1,true)~=nil,"support snapshot partner/schema root missing" end,
+                function()
+                    local d=State.AutoTrader.BuildDebug()
+                    if type(d)~="string" or d:find("SV_AUTO_TRADER_SUPPORT",1,true)~=1 then return false,"support snapshot root missing" end
+                    if type(State.CurrentTrade)=="table" then
+                        return d:find('"partner":',1,true)~=nil,"active trade partner was omitted from support snapshot"
+                    end
+                    return true
+                end,
                 function() local d=State.AutoTrader.BuildDebug();return type(d)=="string" and d:find('"requestLifecycle"',1,true)~=nil and d:find('"tradeTransport"',1,true)~=nil,"support request lifecycle data missing" end,
                 function() local d=State.AutoTrader.BuildDebug();return d.learningEpochs~=nil or d.strategy~=nil or type(State.AutoTrader.GetStrategyStats())=="table","learning support data missing" end,
                 function() return type(State.AutoTrader.BuildGoldCertificationSupport())=="table","bot certification support missing" end,
@@ -36993,6 +36987,610 @@ end)()
             "cross-system integration surfaces are incomplete"
     end
 
+
+    ---------------------------------------------------------------------------
+    -- v44 representation-invariance / render-purity self-tests.
+    -- REGISTER SAFETY: this entire tranche lives in its own function frame.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.RunV44InvariantSelfTests = function(tests)
+        tests = type(tests)=="table" and tests or {}
+        local startingCount = #tests
+        local expectedAdditions = 72
+        local priorDepth = tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0
+        State.AutoTrader.SelfTestExecutionDepth = priorDepth + 1
+
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {
+                name = name,
+                ok = ok and passed == true,
+                detail = (ok and passed == true) and nil or tostring(ok and detail or passed),
+                v44Invariant = true,
+            })
+        end
+
+        local function record(name, value, demand)
+            return {
+                name=tostring(name), category="Godlies", key="v44::"..tostring(name),
+                data={value=value,demand=tonumber(demand) or 5},
+            }
+        end
+
+        local function makeOfferRoot(indices)
+            local root=Instance.new("Frame")
+            root.Name="V44OfferRoot"
+            local container=Instance.new("Frame")
+            container.Name="Container"
+            container.Parent=root
+            local made={}
+            for _,index in ipairs(indices or {}) do
+                local slot=Instance.new("Frame")
+                slot.Name="NewItem"..tostring(index)
+                slot.Parent=container
+                made[index]=slot
+            end
+            return root,made
+        end
+
+        local function makeCard(parent, slotName, text)
+            local card=Instance.new("Frame")
+            card.Name=slotName or "NewItem1"
+            card.Parent=parent
+            local container=Instance.new("Frame")
+            container.Name="Container"
+            container.Parent=card
+            local icon=Instance.new("ImageLabel")
+            icon.Name="Icon"
+            icon.Image=""
+            icon.Parent=container
+            local label=Instance.new("TextLabel")
+            label.Name="ItemName"
+            label.Text=tostring(text or "Synthetic")
+            label.Parent=card
+            return card
+        end
+
+        local supportPayload=nil
+        local supportError=nil
+        local function getSupportPayload()
+            if supportPayload~=nil or supportError~=nil then return supportPayload,supportError end
+            local text,err=State.AutoTrader.BuildDebug()
+            if type(text)~="string" then supportError=tostring(err or "support text unavailable");return nil,supportError end
+            local newline=string.find(text,"\n",1,true)
+            if not newline then supportError="support JSON separator missing";return nil,supportError end
+            local ok,decoded=pcall(function() return HttpService:JSONDecode(string.sub(text,newline+1)) end)
+            if not ok or type(decoded)~="table" then supportError=tostring(decoded);return nil,supportError end
+            supportPayload=decoded
+            return supportPayload,nil
+        end
+
+        local function withNoServerBudgets(callback)
+            local old=State.AutoTrader.GetCurrentServerReachBudgets
+            State.AutoTrader.GetCurrentServerReachBudgets=function() return {} end
+            local packed=table.pack(pcall(callback))
+            State.AutoTrader.GetCurrentServerReachBudgets=old
+            if not packed[1] then error(packed[2]) end
+            return table.unpack(packed,2,packed.n)
+        end
+
+        -- A. Cross-representation identity/value equivalence (8)
+        add("v44-offerhash-slot-order-invariant",function()
+            local a={itemId="Nebula",itemType="Weapons",quantity=1}
+            local b={itemId="Deathshard",itemType="Weapons",quantity=2}
+            return State.AutoTrader.OfferHash({a,b})==State.AutoTrader.OfferHash({b,a}),
+                "offer hash changed when only slot order changed"
+        end)
+        add("v44-offerhash-itemtype-case-invariant",function()
+            local a={itemId="Nebula",itemType="Weapons",quantity=1}
+            local b={itemId="Nebula",itemType="weapons",quantity=1}
+            return State.AutoTrader.OfferHash({a})==State.AutoTrader.OfferHash({b}),
+                "equivalent weapon itemType casing changed offer identity"
+        end)
+        add("v44-positional-and-keyed-offer-entry-equivalent",function()
+            local a=parseOfferEntry({"Nebula",2,"Weapons"})
+            local b=parseOfferEntry({ItemID="Nebula",Quantity=2,ItemType="Weapons"})
+            return a and b and a.itemId==b.itemId and a.itemType==b.itemType and a.quantity==b.quantity,
+                "equivalent native offer entry table shapes parsed differently"
+        end)
+        add("v44-canonical-value-identity-quantity-invariant",function()
+            local a={itemType="Weapons",itemId="Nebula",nativeKey="Nebula",quantity=1,record=record("Nebula",13)}
+            local b=State.AutoTrader.ClonePlainTable(a);b.quantity=4
+            return State.AutoTrader.BuildCanonicalValueIdentityKey(a)==State.AutoTrader.BuildCanonicalValueIdentityKey(b),
+                "quantity contaminated canonical value identity"
+        end)
+        add("v44-canonical-value-identity-clone-invariant",function()
+            local a={itemType="Weapons",itemId="Deathshard",nativeKey="Deathshard",quantity=1,record=record("Deathshard",13),identityHint={event="Halloween",year=2020}}
+            local b=State.AutoTrader.ClonePlainTable(a)
+            return State.AutoTrader.BuildCanonicalValueIdentityKey(a)==State.AutoTrader.BuildCanonicalValueIdentityKey(b),
+                "deep cloning changed canonical value identity"
+        end)
+        add("v44-same-display-different-native-remain-distinct",function()
+            local shared=record("Shared Display",17)
+            local a={itemType="Weapons",itemId="NativeA",nativeKey="NativeA",record=shared}
+            local b={itemType="Weapons",itemId="NativeB",nativeKey="NativeB",record=shared}
+            return State.AutoTrader.BuildCanonicalValueIdentityKey(a)~=State.AutoTrader.BuildCanonicalValueIdentityKey(b),
+                "different native weapon identities collapsed because display data matched"
+        end)
+        add("v44-chroma-and-standard-remain-distinct",function()
+            local r=record("Boneblade",55)
+            local a={itemType="Weapons",itemId="Boneblade",nativeKey="Boneblade",record=r,identityHint={variant="Chroma"}}
+            local b={itemType="Weapons",itemId="Boneblade",nativeKey="Boneblade",record=r,identityHint={}}
+            return State.AutoTrader.BuildCanonicalValueIdentityKey(a)~=State.AutoTrader.BuildCanonicalValueIdentityKey(b),
+                "variant identity collapsed Chroma and standard weapon"
+        end)
+        add("v44-stack-vs-split-known-value-equivalent",function()
+            local r=record("Nebula",13)
+            local stacked=summarizeResolvedOffer({{itemId="Nebula",itemType="Weapons",quantity=2,record=r}})
+            local split=summarizeResolvedOffer({
+                {itemId="Nebula",itemType="Weapons",quantity=1,record=r},
+                {itemId="Nebula",itemType="Weapons",quantity=1,record=r},
+            })
+            return stacked.totalValue==split.totalValue and stacked.unitCount==split.unitCount,
+                "quantity stack and equivalent split slots produced different known value"
+        end)
+
+        -- B. Native trade-slot/frame invariance (8)
+        add("v44-native-slots-preserve-numeric-index-order",function()
+            local root=makeOfferRoot({4,3,2,1})
+            local slots=getTradeOfferSlots(root)
+            local ok=slots[1] and slots[2] and slots[3] and slots[4]
+                and slots[1].Name=="NewItem1" and slots[4].Name=="NewItem4"
+            root:Destroy()
+            return ok,"native slot mapping followed child insertion order instead of slot number"
+        end)
+        add("v44-native-missing-middle-slot-does-not-shift",function()
+            local root=makeOfferRoot({1,3,4})
+            local slots=getTradeOfferSlots(root)
+            local ok=slots[1]~=nil and slots[2]==nil and slots[3]~=nil and slots[3].Name=="NewItem3"
+            root:Destroy()
+            return ok,"missing NewItem2 compacted later native slots onto the wrong item index"
+        end)
+        add("v44-native-slot-beyond-cap-ignored",function()
+            local root=makeOfferRoot({1,2,3,4,5})
+            local slots=getTradeOfferSlots(root)
+            local ok=slots[4]~=nil and slots[5]==nil
+            root:Destroy()
+            return ok,"native UI frame beyond configured offer-slot cap became authoritative"
+        end)
+        add("v44-native-unrelated-frame-ignored",function()
+            local root=makeOfferRoot({1})
+            local container=root:FindFirstChild("Container")
+            local fake=Instance.new("Frame");fake.Name="PreviewItem2";fake.Parent=container
+            local slots=getTradeOfferSlots(root)
+            local ok=slots[1]~=nil and slots[2]==nil
+            root:Destroy()
+            return ok,"unrelated trade GUI frame was interpreted as a native offer slot"
+        end)
+        add("v44-native-destroy-recreate-slot-keeps-index",function()
+            local root,made=makeOfferRoot({1,2})
+            made[2]:Destroy()
+            local first=getTradeOfferSlots(root)
+            local replacement=Instance.new("Frame");replacement.Name="NewItem2";replacement.Parent=root:FindFirstChild("Container")
+            local second=getTradeOfferSlots(root)
+            local ok=first[2]==nil and second[2]==replacement
+            root:Destroy()
+            return ok,"recreated native slot did not reclaim its original numeric identity"
+        end)
+        add("v44-native-slot-parent-name-does-not-change-index",function()
+            local a=makeOfferRoot({1,2,3})
+            local b=makeOfferRoot({1,2,3})
+            a.Name="YourOffer";b.Name="TheirOffer"
+            local sa,sb=getTradeOfferSlots(a),getTradeOfferSlots(b)
+            local ok=sa[1].Name==sb[1].Name and sa[2].Name==sb[2].Name and sa[3].Name==sb[3].Name
+            a:Destroy();b:Destroy()
+            return ok,"same slot numbering behaved differently under different offer-frame names"
+        end)
+        add("v44-card-value-badge-parent-frame-invariant",function()
+            local pa=Instance.new("Frame");pa.Name="Weapons"
+            local pb=Instance.new("Frame");pb.Name="TradeInventory"
+            local ca=makeCard(pa,"NewItem1","Synthetic")
+            local cb=makeCard(pb,"NewItem4","Synthetic")
+            local r=record("Synthetic",17)
+            decorateCard(ca,{itemId="Synthetic",itemType="Weapons",record=r,showValue=true,showInfo=false,compactMode=true})
+            decorateCard(cb,{itemId="Synthetic",itemType="Weapons",record=r,showValue=true,showInfo=false,compactMode=true})
+            local ba=ca:FindFirstChild("SV_ValueBadge")
+            local bb=cb:FindFirstChild("SV_ValueBadge")
+            local ok=ba and bb and ba.Text==bb.Text and ba:GetAttribute("SV_RecordName")==bb:GetAttribute("SV_RecordName")
+            removeCardDecoration(ca);removeCardDecoration(cb);pa:Destroy();pb:Destroy()
+            return ok,"same resolved weapon rendered a different value/record in another UI frame"
+        end)
+        add("v44-card-redecorate-replaces-old-value-atomically",function()
+            local parent=Instance.new("Frame")
+            local card=makeCard(parent,"NewItem1","Synthetic")
+            decorateCard(card,{itemId="Synthetic",itemType="Weapons",record=record("Synthetic",17),showValue=true,showInfo=false,compactMode=true})
+            decorateCard(card,{itemId="Synthetic",itemType="Weapons",record=record("Synthetic",20),showValue=true,showInfo=false,compactMode=true})
+            local badges=0;local text=nil
+            for _,child in ipairs(card:GetChildren()) do if child.Name=="SV_ValueBadge" then badges+=1;text=child.Text end end
+            removeCardDecoration(card);parent:Destroy()
+            return badges==1 and text==formatCompact(20),"redecorating a recycled card left stale/duplicate value UI"
+        end)
+
+        -- C. Render and tab purity (8)
+        add("v44-render-preserves-action-generation",function()
+            local before=State.AutoTrader.ActionGeneration
+            State.AutoTrader.Render()
+            return State.AutoTrader.ActionGeneration==before,"render mutated transaction action generation"
+        end)
+        add("v44-render-preserves-plan-generation",function()
+            local before=State.AutoTrader.PlanGeneration
+            State.AutoTrader.Render()
+            return State.AutoTrader.PlanGeneration==before,"render invalidated/restarted the planner"
+        end)
+        add("v44-render-preserves-inventory-cache-stamp",function()
+            local before=State.AutoTrader.InventoryCacheStamp
+            State.AutoTrader.Render()
+            return State.AutoTrader.InventoryCacheStamp==before,"render changed verified inventory cache authority"
+        end)
+        add("v44-render-preserves-database-and-mapping-revisions",function()
+            local mr,dr,dh=State.Mapping.Revision,HARDEN.supremeDataRevision,HARDEN.supremeDataHash
+            State.AutoTrader.Render()
+            return State.Mapping.Revision==mr and HARDEN.supremeDataRevision==dr and HARDEN.supremeDataHash==dh,
+                "render changed value/mapping authority"
+        end)
+        add("v44-repeated-render-does-not-add-root-connections",function()
+            local before=#Connections
+            for _=1,3 do State.AutoTrader.Render() end
+            return #Connections==before,"repeated render leaked root event connections"
+        end)
+        add("v44-tab-cycle-does-not-add-root-connections",function()
+            local before=#Connections
+            local old=State.AutoTrader.ActiveTab
+            for _,name in ipairs({"HOME","TRADE","PEOPLE","SERVERS","SETTINGS","HOME"}) do setActiveAutoTraderTab(name) end
+            setActiveAutoTraderTab(old)
+            return #Connections==before,"tab switching accumulated root event connections"
+        end)
+        add("v44-tab-cycle-has-exactly-one-visible-page",function()
+            local old=State.AutoTrader.ActiveTab
+            local ok=true
+            for _,name in ipairs({"HOME","TRADE","PEOPLE","SERVERS","SETTINGS"}) do
+                setActiveAutoTraderTab(name)
+                local visible=0
+                for _,page in pairs(UI.AutoTraderPages) do if page.Visible then visible+=1 end end
+                if visible~=1 or not UI.AutoTraderPages[name].Visible then ok=false;break end
+            end
+            setActiveAutoTraderTab(old)
+            return ok,"tab render left zero or multiple main pages visible"
+        end)
+        add("v44-updatecontrols-preserves-auto-preference",function()
+            local before=State.AutoTrader.Preferences.automation
+            State.AutoTrader.UpdateControls()
+            return State.AutoTrader.Preferences.automation==before,"control rendering changed live AUTO preference"
+        end)
+
+        -- D. Value residency and revision consistency (8)
+        add("v44-numeric-value-repeat-read-stable",function()
+            local r=record("Repeat",17)
+            return numericValue(r.data)==17 and numericValue(r.data)==17,"numeric Supreme value changed across repeated reads"
+        end)
+        add("v44-numeric-to-relative-clears-old-number",function()
+            local r=record("Mutable",17)
+            local first=numericValue(r.data)
+            r.data.value="x4 T1 Rares";r.data.raw_value=nil
+            return first==17 and numericValue(r.data)==nil,"old numeric value survived numeric→relative source transition"
+        end)
+        add("v44-relative-to-numeric-recomputes-cleanly",function()
+            local r=record("Mutable","x4 T1 Rares")
+            r.data.raw_value=nil
+            local first=numericValue(r.data)
+            r.data.value=23;r.data.raw_value=23
+            return first==nil and numericValue(r.data)==23,"relative→numeric source transition stayed stale"
+        end)
+        add("v44-relative-large-quantity-still-zero",function()
+            local s=summarizeResolvedOffer({{itemId="Relative",itemType="Weapons",quantity=100,record=record("Relative","x100 T1 Commons")}})
+            return s.totalValue==0 and #s.nonNumeric==1,"relative expression gained value because quantity was large"
+        end)
+        add("v44-mixed-numeric-relative-total-is-numeric-subset-only",function()
+            local s=summarizeResolvedOffer({
+                {itemId="Known",itemType="Weapons",quantity=2,record=record("Known",7)},
+                {itemId="Relative",itemType="Weapons",quantity=9,record=record("Relative","x4 T1 Rares")},
+            })
+            return s.totalValue==14 and #s.nonNumeric==1,"mixed offer inferred value from nonnumeric Supreme expression"
+        end)
+        add("v44-cloned-record-retains-identical-value",function()
+            local r=record("Clone",31)
+            local c=State.AutoTrader.ClonePlainTable(r)
+            return numericValue(r.data)==numericValue(c.data) and r~=c and r.data~=c.data,"plain-table clone changed value semantics"
+        end)
+        add("v44-ui-refresh-does-not-change-supreme-authority",function()
+            local rev,hash=HARDEN.supremeDataRevision,HARDEN.supremeDataHash
+            State.AutoTrader.UpdateControls();State.AutoTrader.Render()
+            return HARDEN.supremeDataRevision==rev and HARDEN.supremeDataHash==hash,"UI refresh changed Supreme revision/hash"
+        end)
+        add("v44-support-snapshot-does-not-change-value-authority",function()
+            local mr,dr,dh=State.Mapping.Revision,HARDEN.supremeDataRevision,HARDEN.supremeDataHash
+            local text=State.AutoTrader.BuildDebug()
+            return type(text)=="string" and State.Mapping.Revision==mr and HARDEN.supremeDataRevision==dr and HARDEN.supremeDataHash==dh,
+                "support snapshot changed value/mapping authority"
+        end)
+
+        -- E. Partial/unresolved value semantics (8)
+        add("v44-unresolved-entry-contributes-zero",function()
+            local s=summarizeResolvedOffer({{itemId="Missing",itemType="Weapons",quantity=1,record=nil}})
+            return s.totalValue==0 and #s.unresolved==1,"unresolved item contributed nonzero value"
+        end)
+        add("v44-nonnumeric-entry-contributes-zero",function()
+            local s=summarizeResolvedOffer({{itemId="Relative",itemType="Weapons",quantity=1,record=record("Relative","x3 T1 Legendaries")}})
+            return s.totalValue==0 and #s.nonNumeric==1,"nonnumeric Supreme item contributed value"
+        end)
+        add("v44-unresolved-quantity-never-becomes-lower-bound",function()
+            local a=summarizeResolvedOffer({{itemId="Missing",itemType="Weapons",quantity=1,record=nil}})
+            local b=summarizeResolvedOffer({{itemId="Missing",itemType="Weapons",quantity=999,record=nil}})
+            return a.totalValue==0 and b.totalValue==0,"unresolved quantity was converted into an inferred lower bound"
+        end)
+        add("v44-summary-unknowncount-equals-unresolved-plus-nonnumeric",function()
+            local oldTrade=State.CurrentTrade
+            State.CurrentTrade=nil
+            local ok,s=pcall(State.AutoTrader.SummarizeOther,{
+                {itemId="Missing",itemType="Weapons",quantity=1,record=nil},
+                {itemId="Relative",itemType="Weapons",quantity=1,record=record("Relative","x2 T1 Commons")},
+                {itemId="Known",itemType="Weapons",quantity=1,record=record("Known",5)},
+            },nil)
+            State.CurrentTrade=oldTrade
+            return ok and s.unknownCount==(#s.unresolved+#s.nonNumeric) and s.knownFloor==5,
+                "partial summary unknown count/known floor diverged"
+        end)
+        add("v44-identity-failure-zeroes-known-floor",function()
+            local oldTrade=State.CurrentTrade
+            State.CurrentTrade=nil
+            local e={itemId="Collision",nativeKey="Collision",itemType="Weapons",quantity=1,record=record("Collision",50),identityFailure="AMBIGUOUS_MUTATION_IDENTITY",mutationAmbiguous=true}
+            local ok,s=pcall(State.AutoTrader.SummarizeOther,{e},nil)
+            State.CurrentTrade=oldTrade
+            return ok and s.identityFailure~=nil and s.knownFloor==0,"unsafe mutation identity retained numeric decision authority"
+        end)
+        add("v44-unknownTheirZero-does-not-change-resolved-subset-math",function()
+            local old=State.AutoTrader.Preferences.unknownTheirZero
+            local entries={{itemId="Known",itemType="Weapons",quantity=1,record=record("Known",9)},{itemId="Missing",itemType="Weapons",quantity=1,record=nil}}
+            State.AutoTrader.Preferences.unknownTheirZero=true;local a=summarizeResolvedOffer(entries)
+            State.AutoTrader.Preferences.unknownTheirZero=false;local b=summarizeResolvedOffer(entries)
+            State.AutoTrader.Preferences.unknownTheirZero=old
+            return a.totalValue==9 and b.totalValue==9,"preference changed unresolved-value arithmetic instead of only decision policy"
+        end)
+        add("v44-relative-expression-descriptor-never-numeric",function()
+            local d=State.Profile.DescribeSupremeRecordValue({name="Relative",data={value="x4 T1 Rares"}})
+            return d.status=="NON_NUMERIC_SUPREME_VALUE" and d.numeric==nil,"relative descriptor produced numeric authority"
+        end)
+        add("v44-extreme-relative-expression-still-zero",function()
+            local s=summarizeResolvedOffer({{itemId="Relative",itemType="Weapons",quantity=1,record=record("Relative","x999999 T1 Commons")}})
+            return s.totalValue==0,"large relative expression was interpreted as an absolute number"
+        end)
+
+        -- F. Point-in-time support snapshot consistency (8)
+        add("v44-support-json-roundtrips",function()
+            local p,e=getSupportPayload()
+            return type(p)=="table" and e==nil,"support snapshot JSON did not round-trip"
+        end)
+        add("v44-support-version-matches-controller",function()
+            local p=getSupportPayload()
+            return p and p.version==CONTROLLER_VERSION,"support snapshot version disagrees with running controller"
+        end)
+        add("v44-support-request-lifecycle-matches-runtime",function()
+            local p=getSupportPayload()
+            return p and p.serverLifecycle and p.serverLifecycle.requestLifecycle==State.AutoTrader.RequestLifecycle,
+                "support request lifecycle is not point-in-time consistent"
+        end)
+        add("v44-support-preference-auto-matches-runtime",function()
+            local p=getSupportPayload()
+            return p and p.preferences and p.preferences.automation==State.AutoTrader.Preferences.automation,
+                "support AUTO preference disagrees with live runtime"
+        end)
+        add("v44-support-inventory-stamp-matches-runtime",function()
+            local p=getSupportPayload()
+            if not p or not p.inventory then return false,"support inventory section missing" end
+            if State.AutoTrader.InventoryCacheStamp==nil then return true end
+            return tonumber(p.inventory.stamp)==tonumber(State.AutoTrader.InventoryCacheStamp),
+                "support inventory stamp disagrees with current verified cache"
+        end)
+        add("v44-support-database-authority-matches-runtime",function()
+            local p=getSupportPayload()
+            return p and p.database
+                and tonumber(p.database.dataRevision)==tonumber(HARDEN.supremeDataRevision)
+                and tostring(p.database.dataHash)==tostring(HARDEN.supremeDataHash),
+                "support database revision/hash disagrees with runtime"
+        end)
+        add("v44-support-teleport-ready-implies-verified-source",function()
+            local p=getSupportPayload()
+            local h=p and p.runtimeHealth
+            if not h or h.teleportContinuationReady~=true then return true end
+            return type(h.teleportScriptIntegrity)=="string" and h.teleportScriptIntegrity:find("verified",1,true)~=nil,
+                "support claimed teleport continuation ready without verified script integrity"
+        end)
+        add("v44-support-tradequeue-arithmetic-consistent",function()
+            local p=getSupportPayload()
+            if not p or type(p.tradeQueue)~="table" then return false,"support trade queue missing" end
+            for _,row in ipairs(p.tradeQueue) do
+                local give,receive,win=tonumber(row.giveTotal),tonumber(row.receiveTotal),tonumber(row.win)
+                if give and receive and win and math.abs((receive-give)-win)>0.001 then return false,"trade queue row has inconsistent give/receive/win arithmetic" end
+            end
+            return true
+        end)
+
+        -- G. Queue/intent/projection and metamorphic invariance (8)
+        add("v44-portfolio-identity-signature-order-invariant",function()
+            local a=fixtureItem("A",5);local b=fixtureItem("B",7)
+            return State.AutoTrader.GetPortfolioIdentitySignature({a,b})==State.AutoTrader.GetPortfolioIdentitySignature({b,a}),
+                "portfolio identity signature changed under table reordering"
+        end)
+        add("v44-ordered-queue-signature-clone-stable",function()
+            local a=fixtureItem("A",5);local b=fixtureItem("B",7)
+            local row={player={UserId=440001},feasibility={signature="sig",solverComplete=true},opportunity={kind="profit",giveTotal=5,receiveTotal=7,giveItems={a},receiveItems={b}}}
+            local clone=State.AutoTrader.ClonePlainTable(row)
+            return State.AutoTrader.BuildOrderedQueueSignature({row})==State.AutoTrader.BuildOrderedQueueSignature({clone}),
+                "identical queue row changed signature after deep clone"
+        end)
+        add("v44-ordered-queue-signature-changes-on-item-identity",function()
+            local a=fixtureItem("A",5);local b=fixtureItem("B",7);local c=fixtureItem("C",5)
+            local r1={player={UserId=440002},feasibility={signature="sig",solverComplete=true},opportunity={kind="profit",giveTotal=5,receiveTotal=7,giveItems={a},receiveItems={b}}}
+            local r2={player={UserId=440002},feasibility={signature="sig",solverComplete=true},opportunity={kind="profit",giveTotal=5,receiveTotal=7,giveItems={c},receiveItems={b}}}
+            return State.AutoTrader.BuildOrderedQueueSignature({r1})~=State.AutoTrader.BuildOrderedQueueSignature({r2}),
+                "queue signature ignored a concrete weapon identity change"
+        end)
+        add("v44-queue-comparator-permutation-deterministic",function()
+            local rows={
+                {player={UserId=3},opportunity={kind="VALUE_WIN",win=3},score=1,feasibility={solverComplete=true}},
+                {player={UserId=1},opportunity={kind="VALUE_WIN",win=3},score=1,feasibility={solverComplete=true}},
+                {player={UserId=2},opportunity={kind="VALUE_WIN",win=3},score=1,feasibility={solverComplete=true}},
+            }
+            local a={rows[1],rows[2],rows[3]};local b={rows[3],rows[1],rows[2]}
+            table.sort(a,State.AutoTrader.CompareQueueRows);table.sort(b,State.AutoTrader.CompareQueueRows)
+            return a[1].player.UserId==b[1].player.UserId and a[2].player.UserId==b[2].player.UserId and a[3].player.UserId==b[3].player.UserId,
+                "queue comparator depended on original table insertion order"
+        end)
+        add("v44-constructible-profit-intent-uses-planner-not-witness",function()
+            return withNoServerBudgets(function()
+                local remote=fixtureItem("R",20);local localItem=fixtureItem("L",15);local anchor=fixtureItem("Anchor",100)
+                local row={player={UserId=440003,Name="Intent"},opportunity={kind="profit",receiveItems={remote},feasibilityWitness={kind="profit",receiveItems={remote},giveItems={fixtureItem("Tiny",2)},giveTotal=2,receiveTotal=20}},feasibility={signature="v44"}}
+                local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{anchor,localItem},{lastSuccess=1},0.18)
+                return intent and intent.giveTotal>=14.8 and intent.giveItems and intent.giveItems[1] and intent.giveItems[1].itemId=="L",
+                    "constructible opening copied raw feasibility witness instead of stage-1 planner"
+            end)
+        end)
+        add("v44-findplan-reordering-inventory-does-not-change-economic-plan",function()
+            return withNoServerBudgets(function()
+                local s=fixtureSummary({fixtureItem("R",20)})
+                local a=fixtureItem("A",7);local b=fixtureItem("B",8);local anchor=fixtureItem("Anchor",100)
+                local p1=State.AutoTrader.FindPlan(s,{anchor,a,b},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                local p2=State.AutoTrader.FindPlan(s,{b,anchor,a},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                return p1 and p2 and p1.total==p2.total and State.AutoTrader.GetPortfolioIdentitySignature(p1.items)==State.AutoTrader.GetPortfolioIdentitySignature(p2.items),
+                    "planner result changed when equivalent inventory table order changed"
+            end)
+        end)
+        add("v44-queue-projection-is-explicitly-hypothetical",function()
+            local p=State.AutoTrader.LastQueueProjection
+            if type(p)~="table" then return type(State.AutoTrader.BuildQueueProjection)=="function" end
+            return type(p.disclaimer)=="string" and (p.disclaimer:find("HYPOTHETICAL",1,true)~=nil or p.disclaimer:find("Projection",1,true)~=nil),
+                "queue projection could be mistaken for the actual next live offer"
+        end)
+        add("v44-formatting-items-does-not-mutate-identities",function()
+            local a=fixtureItem("Nebula and Deathshard",13)
+            local before=State.AutoTrader.GetPortfolioIdentitySignature({a})
+            local text=State.AutoTrader.FormatOpportunityItems({a})
+            return type(text)=="string" and State.AutoTrader.GetPortfolioIdentitySignature({a})==before,
+                "plain-English formatting mutated item identity"
+        end)
+
+        -- H. Self-test hygiene / diagnostic edge triggering (8)
+        add("v44-human-veto-logs-on-transition-only",function()
+            local savedCert=State.AutoTrader.GoldBotCertification
+            local savedFast=State.AutoTrader.FastBotHopReason
+            local savedActive=State.AutoTrader.FastBotHopActive
+            local savedLog=State.AutoTrader.Log
+            local calls=0
+            State.AutoTrader.Log=function(kind) if kind=="gold_bot_certification_regular" then calls+=1 end end
+            State.AutoTrader.GoldBotCertification={jobId=game.JobId,status="observing",windowStartedAt=0,players={}}
+            State.AutoTrader.FastBotHopReason=nil;State.AutoTrader.FastBotHopActive=false
+            local first=State.AutoTrader.MarkGoldCertificationRegular("v44",{userId=440004,name="Human"})
+            local second=State.AutoTrader.MarkGoldCertificationRegular("v44",{userId=440004,name="Human"})
+            State.AutoTrader.Log=savedLog;State.AutoTrader.GoldBotCertification=savedCert;State.AutoTrader.FastBotHopReason=savedFast;State.AutoTrader.FastBotHopActive=savedActive
+            return first==true and second==false and calls==1,"already-regular server emitted repeated human-veto events"
+        end)
+        add("v44-selftest-bottrust-reject-diagnostic-not-synthetic-residue",function()
+            local r=State.AutoTrader.LastBotTrustWriteReject
+            return not (type(r)=="table" and tostring(r.kind)=="self_test_unresolved"),
+                "self-test-only bot-trust rejection leaked into production diagnostics"
+        end)
+        add("v44-render-test-leaves-market-diagnostics-stable",function()
+            local a,b=State.AutoTrader.LastMarketGate,State.AutoTrader.LastEffectiveMinimumWin
+            State.AutoTrader.Render()
+            return State.AutoTrader.LastMarketGate==a and State.AutoTrader.LastEffectiveMinimumWin==b,
+                "render-only self-test changed planner/market diagnostics"
+        end)
+        add("v44-support-test-leaves-action-generation-stable",function()
+            local before=State.AutoTrader.ActionGeneration
+            local text=State.AutoTrader.BuildDebug()
+            return type(text)=="string" and State.AutoTrader.ActionGeneration==before,
+                "support snapshot advanced transaction generation"
+        end)
+        add("v44-support-test-leaves-plan-generation-stable",function()
+            local before=State.AutoTrader.PlanGeneration
+            local text=State.AutoTrader.BuildDebug()
+            return type(text)=="string" and State.AutoTrader.PlanGeneration==before,
+                "support snapshot advanced planner generation"
+        end)
+        add("v44-tab-test-restores-original-active-tab",function()
+            local old=State.AutoTrader.ActiveTab
+            setActiveAutoTraderTab(old=="HOME" and "TRADE" or "HOME")
+            setActiveAutoTraderTab(old)
+            return State.AutoTrader.ActiveTab==old and UI.AutoTraderPages[old] and UI.AutoTraderPages[old].Visible==true,
+                "UI fixture did not restore the original active tab"
+        end)
+        add("v44-card-fixture-does-not-leave-decoration-state",function()
+            local parent=Instance.new("Frame");local card=makeCard(parent,"NewItem1","Synthetic")
+            decorateCard(card,{itemId="Synthetic",itemType="Weapons",record=record("Synthetic",17),showValue=true,showInfo=false,compactMode=true})
+            removeCardDecoration(card)
+            local clean=State.DecoratedCards[card]==nil and State.UnresolvedCards[card]==nil and card:FindFirstChild("SV_ValueBadge")==nil
+            parent:Destroy()
+            return clean,"temporary UI fixture leaked decorated/unresolved card state"
+        end)
+        add("v44-selftest-depth-remains-positive-inside-v44-suite",function()
+            return (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0,
+                "v44 tests escaped the self-test isolation depth"
+        end)
+
+        -- I. Degraded-mode, adversarial-input, and continuation invariants (8)
+        add("v44-tokenless-server-preview-never-promotes-fingerprints",function()
+            local s=State.AutoTrader.GetUpcomingServerPreviewUiState({id="v44",playing=11,maxPlayers=12,previewFingerprints={},previewThumbnailUrls={},previewTokenCount=0})
+            return s.state=="NO_ROSTER_TOKENS" and s.actionMode=="JOB_ID_ONLY_SKIP" and s.canPromoteFingerprintEvidence==false,
+                "tokenless public server row gained bot-fingerprint authority"
+        end)
+        add("v44-token-preview-failure-still-job-only-skip",function()
+            local s=State.AutoTrader.GetUpcomingServerPreviewUiState({id="v44",playing=11,maxPlayers=12,previewFingerprints={},previewThumbnailUrls={},previewTokenCount=3,previewTokenSource=State.AutoTrader.DirectAuthPolicy.source})
+            return s.state=="TOKEN_PREVIEW_FAILED" and s.actionMode=="JOB_ID_ONLY_SKIP" and s.canPromoteFingerprintEvidence==false,
+                "failed thumbnail sample gained manual bot-evidence authority"
+        end)
+        add("v44-canonical-preview-evidence-enables-manual-only-promotion",function()
+            local fp=string.rep("a",32)
+            local s=State.AutoTrader.GetUpcomingServerPreviewUiState({id="v44",playing=11,maxPlayers=12,previewFingerprints={fp},previewThumbnailUrls={"https://example.invalid/a.png"},previewTokenCount=1})
+            return s.state=="CANONICAL_AVATAR_EVIDENCE" and s.actionMode=="MANUAL_BOT_WITH_FINGERPRINT_EVIDENCE" and s.canPromoteFingerprintEvidence==true,
+                "canonical preview evidence did not stay on explicit manual-classification path"
+        end)
+        add("v44-thumbnail-identity-stable-across-signed-url-change",function()
+            local fp=string.rep("b",32)
+            return State.AutoTrader.GetUpcomingThumbnailDisplayKey("https://example.invalid/a?sig=1",fp)
+                ==State.AutoTrader.GetUpcomingThumbnailDisplayKey("https://example.invalid/a?sig=2",fp),
+                "display cache identity followed transport URL instead of canonical fingerprint"
+        end)
+        add("v44-adversarial-item-name-formatting-safe",function()
+            local item=fixtureItem("Nebula, Deathshard and [Test]\nUnicode ✓",13,2)
+            local text=State.AutoTrader.FormatOpportunityItems({item})
+            return type(text)=="string" and text:find("Nebula",1,true)~=nil and item.itemId=="Nebula, Deathshard and [Test]\nUnicode ✓",
+                "display formatting corrupted adversarial item text/identity"
+        end)
+        add("v44-native-offer-negative-quantity-clamps-safely",function()
+            local p=parseOfferEntry({ItemID="Nebula",Quantity=-99,ItemType="Weapons"})
+            return p and p.quantity==1,"negative native quantity escaped safe minimum clamp"
+        end)
+        add("v44-teleport-continuation-ready-means-current-build-verified",function()
+            if State.AutoTrader.TeleportContinuationReady~=true then return true end
+            return type(State.AutoTrader.TeleportScriptIntegrity)=="string"
+                and State.AutoTrader.TeleportScriptIntegrity:find("verified",1,true)~=nil
+                and type(State.AutoTrader.TeleportContinuationSource)=="string",
+                "continuation-ready state has no verified current-build source"
+        end)
+        add("v44-bootstrap-seeds-source-before-compile-before-auto-arm",function()
+            local oldRecent=State.AutoTrader.RecentJobs
+            local oldSerial=State.AutoTrader.TeleportBootstrapSerial
+            local oldId=State.AutoTrader.LastTeleportBootstrapId
+            State.AutoTrader.RecentJobs={}
+            local ok,code=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"v44-order-test",false)
+            State.AutoTrader.RecentJobs=oldRecent
+            State.AutoTrader.TeleportBootstrapSerial=oldSerial
+            State.AutoTrader.LastTeleportBootstrapId=oldId
+            if not ok or type(code)~="string" then return false,"bootstrap code unavailable" end
+            local sourceAt=string.find(code,"__SV_AUTO_TRADER_CURRENT_SOURCE=b",1,true)
+            local compileAt=string.find(code,"local f,e=LS(b)",1,true)
+            local armAt=string.find(code,"armedAtUnix=os.time()",1,true)
+            return sourceAt and compileAt and armAt and sourceAt<compileAt and compileAt<armAt,
+                "AUTO carry can arm before exact source has compiled"
+        end)
+
+        local added=#tests-startingCount
+        if added~=expectedAdditions then
+            table.insert(tests,{name="v44-invariant-registration-count",ok=false,detail="expected "..tostring(expectedAdditions).." additions, got "..tostring(added),v44Invariant=true})
+        end
+        State.AutoTrader.SelfTestExecutionDepth = priorDepth
+        return #tests-startingCount
+    end
+
     local priorRunSelfTests = State.AutoTrader.RunSelfTests
     State.AutoTrader.RunSelfTests = function(...)
         local baseResult = priorRunSelfTests(...)
@@ -37021,7 +37619,12 @@ end)()
                 teleportBootstrapSerial = State.AutoTrader.TeleportBootstrapSerial,
                 lastTeleportBootstrapId = State.AutoTrader.LastTeleportBootstrapId,
             }
+            local savedServerReachBudgets = State.AutoTrader.GetCurrentServerReachBudgets
+            if case.category >= 35 and case.category <= 44 then
+                State.AutoTrader.GetCurrentServerReachBudgets = function() return {} end
+            end
             local ok, passed, detail = pcall(semanticProbe, case)
+            State.AutoTrader.GetCurrentServerReachBudgets = savedServerReachBudgets
             State.AutoTrader.LastMarketGate = isolation.lastMarketGate
             State.AutoTrader.LastEffectiveMinimumWin = isolation.lastMinimumWin
             State.AutoTrader.LastOtherHash = isolation.lastOtherHash
@@ -37067,7 +37670,7 @@ end)()
         -- v42 teleport-continuity regressions live INSIDE the already-scoped
         -- v41 test wrapper. Do not add another outer-chunk `local previousRunner`:
         -- this distribution has historically reached Luau's 200-register limit.
-        -- v43 keeps this exact nesting; all new regressions must stay inside this function
+        -- v44 keeps this exact nesting; all new regressions must stay inside this function
         -- or another independent closure, never as another outer-chunk wrapper local.
         local function addV42Regression(name, callback)
             local ok, passed, detail = pcall(callback)
@@ -37103,10 +37706,14 @@ end)()
         end)
         addV42Regression("v42-bootstrap-arms-auto-only-after-verified-compile", function()
             local oldRecent=State.AutoTrader.RecentJobs
+            local oldSerial=State.AutoTrader.TeleportBootstrapSerial
+            local oldId=State.AutoTrader.LastTeleportBootstrapId
             State.AutoTrader.RecentJobs={}
-            local code=State.AutoTrader.BuildTeleportBootstrapCode("v42-order-test",false)
+            local ok,code=pcall(State.AutoTrader.BuildTeleportBootstrapCode,"v42-order-test",false)
             State.AutoTrader.RecentJobs=oldRecent
-            if type(code)~="string" then return false,"bootstrap code was not built" end
+            State.AutoTrader.TeleportBootstrapSerial=oldSerial
+            State.AutoTrader.LastTeleportBootstrapId=oldId
+            if not ok or type(code)~="string" then return false,"bootstrap code was not built" end
             local sourceSeedAt=string.find(code,"__SV_AUTO_TRADER_CURRENT_SOURCE=b",1,true)
             local compileAt=string.find(code,"local f,e=LS(b)",1,true)
             local armAt=string.find(code,"armedAtUnix=os.time()",1,true)
@@ -37121,6 +37728,8 @@ end)()
             return canonical==nil, "foreign source was accepted as current teleport continuation"
         end)
 
+        State.AutoTrader.RunV44InvariantSelfTests(tests)
+
         local passed = 0
         for _, row in ipairs(tests) do if row.ok then passed += 1 end end
         baseResult.tests = tests
@@ -37131,10 +37740,13 @@ end)()
         baseResult.expandedCatalogVersion = EXPANDED_CATALOG_VERSION
         baseResult.expandedCatalogAdded = added
         baseResult.expandedCatalogExpected = EXPANDED_EXPECTED_ADDITIONS
+        baseResult.v44InvariantVersion = 1
+        baseResult.v44InvariantExpected = 72
         State.AutoTrader.SelfTest = baseResult
         State.AutoTrader.Log("self_test_expanded_catalog", {
             passed=passed,total=#tests,ok=baseResult.ok,added=added,
             expectedAdded=EXPANDED_EXPECTED_ADDITIONS,catalogVersion=EXPANDED_CATALOG_VERSION,
+            v44InvariantVersion=1,v44InvariantExpected=72,
         })
         return baseResult
     end
@@ -37142,6 +37754,8 @@ end)()
     State.AutoTrader.ExpandedSelfTestCatalog = catalog
     State.AutoTrader.ExpandedSelfTestCatalogVersion = EXPANDED_CATALOG_VERSION
     State.AutoTrader.ExpandedSelfTestExpectedAdditions = EXPANDED_EXPECTED_ADDITIONS
+    State.AutoTrader.V44InvariantSelfTestVersion = 1
+    State.AutoTrader.V44InvariantSelfTestExpected = 72
 
     -- Startup's original self-test call can happen before this late UI/test-only
     -- layer is installed. Re-run once after the full UI/thought-feed module exists

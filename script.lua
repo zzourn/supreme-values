@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.34-public-auto-trader-v37-round37-transport-self-heal",
+    version = "18.69.35-public-auto-trader-v37-round38-transport-self-heal-syntax-fix",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -286,8 +286,8 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "9447110c604b1541c68448363c9b2236204a72ad5f864c5f713d2582fa31c5fc",
-    readyGlobalCurrent = "__SV_AUTO_TRADER_V37_READY",
+    distributionNormalizedSha256 = "2208330fd01b445ded86cb3598a9c0cc7e242b5f387195065d3e3498dd7c189d",
+    readyGlobalCurrent = "__SV_AUTO_TRADER_V38_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
     guiDiscovery = {mainCalls=0,tradeCalls=0,tradeCacheHits=0,tradeSuccess=0,inventoryScans=0,totalTradeSeconds=0,maxTradeSeconds=0,totalInventorySeconds=0,maxInventorySeconds=0},
@@ -32323,7 +32323,7 @@ end)()
 -- per-player no-ack behavior, and genuine cross-target transport health so a
 -- valuable server is not abandoned just because one or two players fail to
 -- produce MM2's authoritative SendingRequest/StartTrade state.
-(function()
+;(function()
     CONFIG.AutoTraderRequestUiStableSeconds = 0.35
     CONFIG.AutoTraderRequestUiRecoverySeconds = 8.0
     CONFIG.AutoTraderTransportPerTargetFailureLimit = 2

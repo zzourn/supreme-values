@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.32-public-auto-trader-v37-round35-decision-journal-register-scope-fix",
+    version = "18.69.33-public-auto-trader-v37-round36-auto-off-request-fence",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -286,8 +286,8 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "96263c1b597e19ae187a7801d003221542cf6cb4c2168d3afae2e02374dc178b",
-    readyGlobalCurrent = "__SV_AUTO_TRADER_V34_READY",
+    distributionNormalizedSha256 = "931fc41a2d2667ce1c4a27f8cd829f11fe067f484c71c901970ef42a862b6cc3",
+    readyGlobalCurrent = "__SV_AUTO_TRADER_V36_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
     guiDiscovery = {mainCalls=0,tradeCalls=0,tradeCacheHits=0,tradeSuccess=0,inventoryScans=0,totalTradeSeconds=0,maxTradeSeconds=0,totalInventorySeconds=0,maxInventorySeconds=0},
@@ -16466,6 +16466,13 @@ State.AutoTrader.OnNoTrade = function()
                 if os.clock() - State.AutoTrader.ServerExhaustedSince >= CONFIG.AutoTraderServerHopGraceSeconds then
                     State.AutoTrader.TryServerHop(disposition, counts)
                 end
+            elseif disposition == "ACTIVE" then
+                -- SelectTarget() and GetServerDisposition() are separate snapshots.
+                -- A request/native trade can become active between them. That is a
+                -- normal race to hold/reconcile, not controller corruption.
+                State.AutoTrader.ServerExhaustedSince = 0
+                State.AutoTrader.Status = "WAIT · ACTIVE STATE"
+                State.AutoTrader.StatusDetail = "A request or native MM2 trade state became active while the target snapshot refreshed; holding and reconciling instead of rejoining."
             else
                 State.AutoTrader.ServerExhaustedSince = 0
                 local reason = "shared eligibility invariant produced no target with unexpected disposition " .. tostring(disposition)
@@ -19564,6 +19571,26 @@ connect(UI.AutoTraderCanary.MouseButton1Click, function()
         State.AutoTrader.Render()
     end
 end)
+-- Round 36: AUTO OFF is an operator kill fence for any outbound request that
+-- has already been invoked but has not reached a terminal MM2 state yet.
+State.AutoTrader.FenceOutstandingRequestForAutomationOff = function()
+    local pending = State.AutoTrader.PendingRequest
+    if not pending then return true, "no pending request" end
+    if pending.phase == "canceling" then return true, "already canceling" end
+    local started, reason = State.AutoTrader.BeginPendingRequestCancellation(
+        "operator disabled AUTO",
+        "local_cancel",
+        false
+    )
+    State.AutoTrader.Log(started and "automation_off_request_cancel_started" or "automation_off_request_cancel_failed", {
+        userId = pending.userId,
+        name = pending.name,
+        phase = pending.phase,
+        reason = reason,
+    })
+    return started, reason
+end
+
 connect(UI.AutoTraderEnabled.MouseButton1Click, function()
     if not State.AutoTrader.Preferences.automation
         and State.AutoTrader.SupervisedCanaryArmed
@@ -19602,6 +19629,7 @@ connect(UI.AutoTraderEnabled.MouseButton1Click, function()
         State.AutoTrader.ActionGeneration += 1
         State.AutoTrader.AutoAcceptGeneration += 1
         State.AutoTrader.ActionInFlight = nil
+        State.AutoTrader.FenceOutstandingRequestForAutomationOff()
         State.AutoTrader.AutoAcceptScheduledKey = nil
         State.AutoTrader.AutoAcceptSentKey = nil
         State.AutoTrader.ManagedPartnerUserId = nil
@@ -31949,8 +31977,8 @@ do
 end
 
 
--- Round 34/35: bounded decision-journal observability.
--- Round 35 installs this telemetry inside a nested function scope so the already-large
+-- Round 34/35/36: bounded decision-journal observability.
+-- Round 35+ installs this telemetry inside a nested function scope so the already-large
 -- controller chunk does not consume Luau's 200-local-register ceiling. This is a
 -- compiler-scope fix only; planner, transport, trade, audit, hop, and teleport authority
 -- are unchanged.
@@ -32240,6 +32268,44 @@ end
                 and history.decisionJournal.entries[1].data.reason=="fixture reason retained"
             State.AutoTrader.DecisionJournal=savedJournal;State.AutoTrader.DecisionJournalLastSignature=savedLast;State.AutoTrader.DecisionJournalSequence=savedSeq;State.AutoTrader.DecisionJournalDropped=savedDropped
             return passed,"decision reason did not survive support/cross-session serialization"
+        end)
+
+        add("v37-round36-auto-off-fences-outstanding-request", function()
+            local savedPending=State.AutoTrader.PendingRequest
+            local savedBegin=State.AutoTrader.BeginPendingRequestCancellation
+            local savedLog=State.AutoTrader.Log
+            local captured=nil
+            State.AutoTrader.PendingRequest={userId=360001,name="Round36Pending",phase="awaiting_native"}
+            State.AutoTrader.BeginPendingRequestCancellation=function(reason,outcome,alreadySent)
+                captured={reason=reason,outcome=outcome,alreadySent=alreadySent}
+                return true,nil
+            end
+            State.AutoTrader.Log=function() end
+            local ok=State.AutoTrader.FenceOutstandingRequestForAutomationOff()
+            local passed=ok==true and type(captured)=="table"
+                and captured.reason=="operator disabled AUTO"
+                and captured.outcome=="local_cancel"
+                and captured.alreadySent==false
+            State.AutoTrader.PendingRequest=savedPending
+            State.AutoTrader.BeginPendingRequestCancellation=savedBegin
+            State.AutoTrader.Log=savedLog
+            return passed,"AUTO OFF did not immediately begin authoritative cancellation of an outstanding outbound request"
+        end)
+
+        add("v37-round36-auto-off-fence-is-idempotent-while-canceling", function()
+            local savedPending=State.AutoTrader.PendingRequest
+            local savedBegin=State.AutoTrader.BeginPendingRequestCancellation
+            local calls=0
+            State.AutoTrader.PendingRequest={userId=360002,name="Round36Canceling",phase="canceling"}
+            State.AutoTrader.BeginPendingRequestCancellation=function()
+                calls+=1
+                return false,"should not be called"
+            end
+            local ok,reason=State.AutoTrader.FenceOutstandingRequestForAutomationOff()
+            local passed=ok==true and reason=="already canceling" and calls==0
+            State.AutoTrader.PendingRequest=savedPending
+            State.AutoTrader.BeginPendingRequestCancellation=savedBegin
+            return passed,"AUTO OFF tried to restart an already-running outgoing cancellation"
         end)
 
         local passed=0

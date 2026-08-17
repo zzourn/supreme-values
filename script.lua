@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.39-public-auto-trader-v41-expanded-selftests",
+    version = "18.69.40-public-auto-trader-v42-teleport-continuity",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -302,7 +302,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "2452bc2f6316bfd1702b1041128426a26af4107d4e163a114f9e35f32c0c1bfd",
+    distributionNormalizedSha256 = "b3c2dff8f9bc984466f5ada0abeb064499f7a39f50c56d3da0955de76bc54b02",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -6864,6 +6864,7 @@ State.AutoTrader = {
     HumanTimingKey = "__SV_AUTO_TRADER_HUMAN_TIMING_V1",
     HumanTimingFile = "SV_AutoTrader_HumanDetectionTiming_v1.json",
     TeleportBootstrapKey = "__SV_AUTO_TRADER_TELEPORT_BOOTSTRAP_V1",
+    TeleportBootstrapAuthKey = "__SV_AUTO_TRADER_TELEPORT_AUTH_V2",
     FriendCache = {},
     FriendCacheMeta = {},
     FriendPending = {},
@@ -7428,6 +7429,35 @@ HARDEN.queueSupremeLkgPersistence = function(body,digest,revision,source)
 end
 State.AutoTrader.TeleportBootstrap = rawget(ExecutorEnvironment, State.AutoTrader.TeleportBootstrapKey)
     or rawget(_G, State.AutoTrader.TeleportBootstrapKey)
+State.AutoTrader.TeleportBootstrapAuthorization = rawget(ExecutorEnvironment, State.AutoTrader.TeleportBootstrapAuthKey)
+    or rawget(_G, State.AutoTrader.TeleportBootstrapAuthKey)
+State.AutoTrader.IsAuthorizedTeleportBootstrap = function(bootstrap, authorization, nowUnix, destinationJobId)
+    if type(bootstrap) ~= "table" or type(authorization) ~= "table" then
+        return false, "missing bootstrap authorization"
+    end
+    if authorization.armed ~= true then return false, "bootstrap authorization is not armed" end
+    local bootstrapId = tostring(bootstrap.bootstrapId or "")
+    if bootstrapId == "" or tostring(authorization.bootstrapId or "") ~= bootstrapId then
+        return false, "bootstrap authorization id mismatch"
+    end
+    if tostring(authorization.controllerVersion or "") ~= tostring(bootstrap.controllerVersion or "") then
+        return false, "bootstrap authorization version mismatch"
+    end
+    local expectedJobId = tostring(destinationJobId or game.JobId or "")
+    if expectedJobId == "" or tostring(authorization.destinationJobId or "") ~= expectedJobId then
+        return false, "bootstrap authorization destination mismatch"
+    end
+    local armedAtUnix = tonumber(authorization.armedAtUnix) or 0
+    local now = tonumber(nowUnix) or os.time()
+    local age = now - armedAtUnix
+    if armedAtUnix <= 0 or age < -5 or age > 120 then
+        return false, "bootstrap authorization expired"
+    end
+    if type(bootstrap.preferences) ~= "table" then
+        return false, "bootstrap preferences missing"
+    end
+    return true
+end
 local function defaultPreferences()
     return {
         automation = CONFIG.AutoTraderActiveDefault,
@@ -7484,10 +7514,16 @@ State.AutoTrader.Preferences = normalizePreferences(loadedPreferences)
 local AutoPrefs = State.AutoTrader.Preferences
 do
     local bootstrap = State.AutoTrader.TeleportBootstrap
-    local teleportAutomationCarry = type(bootstrap) == "table"
+    local authorization = State.AutoTrader.TeleportBootstrapAuthorization
+    local authorized, authorizationReason = State.AutoTrader.IsAuthorizedTeleportBootstrap(
+        bootstrap, authorization, os.time(), game.JobId
+    )
+    State.AutoTrader.TeleportBootstrapAuthorized = authorized == true
+    State.AutoTrader.TeleportBootstrapRejectReason = authorized and nil or tostring(authorizationReason or "unauthorized bootstrap")
+    local teleportAutomationCarry = authorized
         and type(bootstrap.preferences) == "table"
         and bootstrap.preferences.automation == true
-    if type(bootstrap) == "table" and type(bootstrap.preferences) == "table" then
+    if authorized and type(bootstrap.preferences) == "table" then
         local merged = {}
         for k,v in pairs(AutoPrefs) do merged[k] = v end
         for _, key in ipairs({"automation", "ignoreFriends", "openingAnchor", "preferDuplicates", "unknownTheirZero", "winPreset", "reserves", "panelPosition"}) do
@@ -7495,14 +7531,22 @@ do
         end
         State.AutoTrader.Preferences = normalizePreferences(merged)
         AutoPrefs = State.AutoTrader.Preferences
+        State.AutoTrader.TeleportBootstrap = bootstrap
+    else
+        -- A stale/failed queued bootstrap is not teleport authority. Ignore the
+        -- entire payload, not only its AUTO bit, so a later manual execution is clean.
+        State.AutoTrader.TeleportBootstrap = nil
     end
     -- AUTO is session/teleport state, never a manual-launch preference. A normal
-    -- user execution always starts OFF; only the explicit queue_on_teleport bootstrap
-    -- may carry AUTO=true into the destination server.
-    State.AutoTrader.Preferences.automation = teleportAutomationCarry
+    -- user execution always starts OFF; only a fresh one-shot authorization armed
+    -- immediately before executing a verified queued source may carry AUTO=true.
+    State.AutoTrader.Preferences.automation = teleportAutomationCarry == true
     AutoPrefs = State.AutoTrader.Preferences
     rawset(ExecutorEnvironment, State.AutoTrader.TeleportBootstrapKey, nil)
     rawset(_G, State.AutoTrader.TeleportBootstrapKey, nil)
+    rawset(ExecutorEnvironment, State.AutoTrader.TeleportBootstrapAuthKey, nil)
+    rawset(_G, State.AutoTrader.TeleportBootstrapAuthKey, nil)
+    State.AutoTrader.TeleportBootstrapAuthorization = nil
 end
 rawset(_G, State.AutoTrader.PreferencesKey, State.AutoTrader.Preferences)
 local STRATEGY_SCHEMA_VERSION = 2
@@ -9707,6 +9751,157 @@ State.AutoTrader.RefreshTeleportScriptLkg = function()
     end
     return true, writeErr
 end
+
+State.AutoTrader.GetVerifiedTeleportContinuationSource = function()
+    local body, readErr, source = HARDEN.readTextFileBestEffort(State.AutoTrader.TeleportScriptLkgFile)
+    if type(body) ~= "string" then return nil, tostring(readErr or "continuation LKG unavailable") end
+    local valid, detail = verifyDistributionSource(body)
+    if not valid then return nil, tostring(detail or "continuation LKG failed verification") end
+    State.AutoTrader.TeleportContinuationReady = true
+    State.AutoTrader.TeleportContinuationSource = "verified_lkg_" .. tostring(source or "unknown")
+    State.AutoTrader.TeleportContinuationError = nil
+    return body
+end
+
+State.AutoTrader.CanonicalizeCapturedDistributionSource = function(candidate)
+    if type(candidate) ~= "string" or #candidate < 1000 then return nil, "candidate source missing/too small" end
+    local variants, seen = {}, {}
+    local function add(value)
+        if type(value) ~= "string" or seen[value] then return end
+        seen[value] = true
+        table.insert(variants, value)
+    end
+    add(candidate)
+    local withoutBom = candidate
+    if string.sub(withoutBom, 1, 3) == string.char(239,187,191) then
+        withoutBom = string.sub(withoutBom, 4)
+        add(withoutBom)
+    end
+    local lf = string.gsub(withoutBom, "\r\n", "\n")
+    add(lf)
+    if string.sub(lf, -1) ~= "\n" then add(lf .. "\n") end
+    if string.sub(lf, -1) == "\n" then add(string.sub(lf, 1, -2)) end
+    local lastDetail = "source did not match this build"
+    for _, body in ipairs(variants) do
+        local valid, detail = verifyDistributionSource(body)
+        if valid then return body end
+        lastDetail = tostring(detail or lastDetail)
+    end
+    return nil, lastDetail
+end
+
+State.AutoTrader.TryCaptureCurrentDistributionSource = function()
+    local existing = State.AutoTrader.GetVerifiedTeleportContinuationSource()
+    if existing then return true, State.AutoTrader.TeleportContinuationSource end
+
+    local candidates = {}
+    local function addCandidate(label, body)
+        if type(body) == "string" and #body >= 1000 then
+            table.insert(candidates, {label=label, body=body})
+        end
+    end
+
+    for _, key in ipairs({"__SV_AUTO_TRADER_CURRENT_SOURCE", "__SV_AUTO_TRADER_SOURCE"}) do
+        addCandidate("executor_global:" .. key, rawget(ExecutorEnvironment, key))
+        addCandidate("global:" .. key, rawget(_G, key))
+    end
+
+    local getclipboardFunction = State.TryGetExecutorGlobal("getclipboard")
+    if type(getclipboardFunction) == "function" then
+        local okClip, clipboard = waitForExternalWithDeadline("getclipboard", 1.0, function()
+            return getclipboardFunction()
+        end)
+        if okClip then addCandidate("clipboard", clipboard) end
+    end
+
+    local isfileFunction = State.TryGetExecutorGlobal("isfile")
+    local readfileFunction = State.TryGetExecutorGlobal("readfile")
+    if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
+        local names = {
+            "SV_AutoTrader_v42_teleport_continuity.lua",
+            "SV_AutoTrader_v41_expanded_selftests.lua",
+            "script.lua",
+            "autoexec/script.lua",
+        }
+        local debugSource = nil
+        pcall(function()
+            if type(debug) == "table" and type(debug.info) == "function" then
+                debugSource = debug.info(1, "s")
+            elseif type(debug) == "table" and type(debug.getinfo) == "function" then
+                local info = debug.getinfo(1, "S")
+                debugSource = type(info)=="table" and info.source or nil
+            end
+        end)
+        if type(debugSource) == "string" and string.sub(debugSource,1,1) == "@" and #debugSource > 1 then
+            table.insert(names, 1, string.sub(debugSource,2))
+        end
+        for _, fileName in ipairs(names) do
+            local okExists, exists = waitForExternalWithDeadline("isfile continuation candidate", 0.75, function()
+                return isfileFunction(fileName)
+            end)
+            if okExists and exists then
+                local okRead, body = waitForExternalWithDeadline("readfile continuation candidate", 1.5, function()
+                    return readfileFunction(fileName)
+                end)
+                if okRead then addCandidate("file:" .. fileName, body) end
+            end
+        end
+    end
+
+    local lastError = "current distribution source was not available from globals, clipboard, or known files"
+    for _, row in ipairs(candidates) do
+        local canonical, detail = State.AutoTrader.CanonicalizeCapturedDistributionSource(row.body)
+        if canonical then
+            local wrote, writeErr = HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.TeleportScriptLkgFile, canonical)
+            if wrote then
+                local readback = State.AutoTrader.GetVerifiedTeleportContinuationSource()
+                if readback then
+                    State.AutoTrader.TeleportContinuationReady = true
+                    State.AutoTrader.TeleportContinuationSource = row.label
+                    State.AutoTrader.TeleportContinuationError = nil
+                    State.AutoTrader.TeleportScriptIntegrity = "verified_current_source_lkg"
+                    State.AutoTrader.Log("teleport_current_source_captured", {
+                        source=row.label, bytes=#canonical, normalizedSha256=HARDEN.distributionNormalizedSha256,
+                    })
+                    return true, row.label
+                end
+                lastError = "captured source write did not verify on read-back"
+            else
+                lastError = tostring(writeErr or "captured source LKG write failed")
+            end
+        elseif detail then
+            lastError = tostring(detail)
+        end
+    end
+    State.AutoTrader.TeleportContinuationReady = false
+    State.AutoTrader.TeleportContinuationError = lastError
+    return false, lastError
+end
+
+State.AutoTrader.EnsureTeleportContinuationSource = function()
+    local body = State.AutoTrader.GetVerifiedTeleportContinuationSource()
+    if body then return true, State.AutoTrader.TeleportContinuationSource end
+
+    local captured, captureDetail = State.AutoTrader.TryCaptureCurrentDistributionSource()
+    if captured then return true, captureDetail end
+
+    -- A remote source is acceptable only if it is this exact build. This deliberately
+    -- refuses the older GitHub copy rather than hopping into a server without the
+    -- current controller or silently downgrading production behavior.
+    local refreshed, refreshDetail = State.AutoTrader.RefreshTeleportScriptLkg()
+    if refreshed then
+        State.AutoTrader.TeleportContinuationReady = true
+        State.AutoTrader.TeleportContinuationSource = "verified_remote_current_build"
+        State.AutoTrader.TeleportContinuationError = nil
+        return true, State.AutoTrader.TeleportContinuationSource
+    end
+
+    local detail = tostring(refreshDetail or captureDetail or "no verified continuation source")
+    State.AutoTrader.TeleportContinuationReady = false
+    State.AutoTrader.TeleportContinuationError = detail
+    return false, detail
+end
+
 HARDEN.bootstrapShaCode = [[
 local K={0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2}
 local function S(m)
@@ -9734,7 +9929,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
     local bootstrapId = State.AutoTrader.ControllerEpoch .. "-" .. tostring(State.AutoTrader.TeleportBootstrapSerial) .. "-" .. tostring(os.time())
     State.AutoTrader.LastTeleportBootstrapId = bootstrapId
     local payload = {
-        version = 2,
+        version = 3,
         bootstrapId = bootstrapId,
         issuedAtUnix = os.time(),
         issuedOrder = os.time() * 100000 + State.AutoTrader.TeleportBootstrapSerial,
@@ -9762,6 +9957,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
     local quotedJson = string.format("%q", encoded)
     local quotedUrl = string.format("%q", CONFIG.AutoTraderTeleportScriptUrl)
     local quotedKey = string.format("%q", State.AutoTrader.TeleportBootstrapKey)
+    local quotedAuthKey = string.format("%q", State.AutoTrader.TeleportBootstrapAuthKey)
     local quotedLkg = string.format("%q", State.AutoTrader.TeleportScriptLkgFile)
     local quotedVersion = string.format("%q", CONTROLLER_VERSION)
     local quotedHash = string.format("%q", HARDEN.distributionNormalizedSha256)
@@ -9777,8 +9973,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
         "local E=(getgenv and getgenv()) or _G",
         "local PLS=game:GetService('Players'); local D=os.clock()+60; while (not game:IsLoaded() or not PLS.LocalPlayer) and os.clock()<D do task.wait(.1) end; if not game:IsLoaded() or not PLS.LocalPlayer then warn('[SV bootstrap] destination did not finish loading inside startup window'); return end; local PG=PLS.LocalPlayer:FindFirstChildOfClass('PlayerGui') or PLS.LocalPlayer:WaitForChild('PlayerGui',20); if not PG then warn('[SV bootstrap] destination PlayerGui unavailable after load'); return end; task.wait(1.5)",
         "local B=H:JSONDecode(" .. quotedJson .. ")",
-        "local T=E.__SV_AUTO_TRADER_BOOTSTRAP_IDS or {}; local A=T.latest; if type(A)=='table' and tonumber(A.order or 0)>tonumber(B.issuedOrder or 0) then return end; if type(A)=='table' and A.id==B.bootstrapId and A.started then return end; T.latest={id=B.bootstrapId,order=B.issuedOrder,issuedAt=B.issuedAtUnix,started=true}; E.__SV_AUTO_TRADER_BOOTSTRAP_IDS=T; _G.__SV_AUTO_TRADER_BOOTSTRAP_IDS=T",
-        "E[" .. quotedKey .. "]=B; _G[" .. quotedKey .. "]=B",
+        "local T=E.__SV_AUTO_TRADER_BOOTSTRAP_IDS or {}; local A=T.latest; if type(A)=='table' and tonumber(A.order or 0)>tonumber(B.issuedOrder or 0) then return end; if type(A)=='table' and A.id==B.bootstrapId and A.claimed then return end; T.latest={id=B.bootstrapId,order=B.issuedOrder,issuedAt=B.issuedAtUnix,claimed=true}; E.__SV_AUTO_TRADER_BOOTSTRAP_IDS=T; _G.__SV_AUTO_TRADER_BOOTSTRAP_IDS=T",
         HARDEN.bootstrapShaCode,
         "local V=" .. quotedVersion .. "; local X=" .. quotedHash .. "; local P=" .. quotedSentinel,
         "local function C(b) if type(b)~='string' or #b<1000 or not string.find(b,V,1,true) then return false end; local n,c=string.gsub(b,'distributionNormalizedSha256 = \\\"[^\\\"]+\\\"','distributionNormalizedSha256 = \\\"'..P..'\\\"',1); return c==1 and S(n)==X end",
@@ -9787,9 +9982,10 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
         "local function R() local function q(n) local z={d=false,b=nil}; task.spawn(function() local ok,e=pcall(function() return IF and IF(n) and RF and RF(n) end); if ok then z.b=e end; z.d=true end); local x=os.clock()+" .. fileTimeout .. "; while not z.d and os.clock()<x do task.wait(.05) end; if z.d and C(z.b) then return z.b end end; return q(L) or q(L..'.bak') end",
         "local U=" .. quotedUrl,
         "local function F() local q={d=false,o=false,b=nil}; task.spawn(function() local o,b=pcall(function() return game:HttpGet(U) end); q.o=o;q.b=b;q.d=true end); local x=os.clock()+" .. httpAttemptTimeout .. "; while not q.d and os.clock()<x do task.wait(.1) end; if q.d and q.o and C(q.b) then if WF then task.spawn(function() pcall(WF,L,q.b) end) end; return q.b end end",
-        "local b=R(); local d=" .. initialRetry .. "; local i=0; while not b and i<" .. maxAttempts .. " do i=i+1; b=F(); if not b and i<" .. maxAttempts .. " then task.wait(d); d=math.min(" .. maxRetry .. ",d*2) end end; if not b then warn('[SV bootstrap] no verified script available for '..tostring(B.bootstrapId)); return end",
+        "local b=R(); local d=" .. initialRetry .. "; local i=0; while not b and i<" .. maxAttempts .. " do i=i+1; b=F(); if not b and i<" .. maxAttempts .. " then task.wait(d); d=math.min(" .. maxRetry .. ",d*2) end end; if not b then warn('[SV bootstrap] no verified current-build script available for '..tostring(B.bootstrapId)); return end",
         "local LS=nil; if type(loadstring)=='function' then LS=loadstring elseif type(E.loadstring)=='function' then LS=E.loadstring elseif type(load)=='function' then LS=load elseif type(E.load)=='function' then LS=E.load end; if type(LS)~='function' then warn('[SV bootstrap] no compatible loadstring/load compiler is exposed after teleport; verified source was not executed'); return end; local f,e=LS(b); if not f then warn('[SV bootstrap] verified script failed to compile:',e); return end",
-        "local q={d=false,o=false,e=nil}; task.spawn(function() local o,e=pcall(f); q.o=o;q.e=e;q.d=true end); local x=os.clock()+" .. executionTimeout .. "; while not q.d and os.clock()<x do task.wait(.2) end; if not q.d then warn('[SV bootstrap] verified controller execution exceeded startup deadline; not launching a duplicate'); return end; if not q.o then warn('[SV bootstrap] verified controller execution failed:',q.e) end",
+        "local BK=" .. quotedKey .. "; local AK=" .. quotedAuthKey .. "; local function Z() E[BK]=nil; _G[BK]=nil; E[AK]=nil; _G[AK]=nil end; local Q={armed=true,bootstrapId=B.bootstrapId,controllerVersion=B.controllerVersion,destinationJobId=game.JobId,armedAtUnix=os.time()}; E[BK]=B; _G[BK]=B; E[AK]=Q; _G[AK]=Q",
+        "local q={d=false,o=false,e=nil}; task.spawn(function() local o,e=pcall(f); q.o=o;q.e=e;q.d=true end); local x=os.clock()+" .. executionTimeout .. "; while not q.d and os.clock()<x do task.wait(.2) end; if not q.d then Z(); warn('[SV bootstrap] verified controller execution exceeded startup deadline; AUTO carry authorization was revoked'); return end; if not q.o then Z(); warn('[SV bootstrap] verified controller execution failed:',q.e); return end; if E[BK]==B or _G[BK]==B then Z() end",
     }, ";\n")
 end
 State.AutoTrader.QueueTeleportScript = function(reason)
@@ -9801,6 +9997,18 @@ State.AutoTrader.QueueTeleportScript = function(reason)
     if type(queueFunction) ~= "function" then
         State.AutoTrader.Log("queue_on_teleport_unavailable", {reason = reason})
         return false, "queue_on_teleport unavailable"
+    end
+    local continuationReady, continuationDetail = true, "self_test_isolation"
+    if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) <= 0 then
+        continuationReady, continuationDetail = State.AutoTrader.EnsureTeleportContinuationSource()
+    end
+    if not continuationReady then
+        State.AutoTrader.Log("teleport_continuation_unavailable", {
+            reason=reason, detail=tostring(continuationDetail or "no verified current-build source"),
+            expectedVersion=CONTROLLER_VERSION, expectedNormalizedSha256=HARDEN.distributionNormalizedSha256,
+        })
+        State.AutoTrader.TeleportQueueOutcome = "blocked_no_verified_current_source"
+        return false, "cannot preserve current script across teleport: " .. tostring(continuationDetail or "verified source unavailable")
     end
     -- File persistence is idempotent/best-effort. The queue call itself is not:
     -- if our wait times out we intentionally do NOT issue a second queue call.
@@ -17005,6 +17213,11 @@ State.AutoTrader.BuildDebug = function()
             decision = State.AutoTrader.LastDecisionEvent,
             render = {count=State.AutoTrader.RenderCount, lastAt=State.AutoTrader.LastRenderedAt},
             teleportScriptIntegrity = State.AutoTrader.TeleportScriptIntegrity,
+            teleportContinuationReady = State.AutoTrader.TeleportContinuationReady == true,
+            teleportContinuationSource = State.AutoTrader.TeleportContinuationSource,
+            teleportContinuationError = State.AutoTrader.TeleportContinuationError,
+            teleportBootstrapAuthorized = State.AutoTrader.TeleportBootstrapAuthorized == true,
+            teleportBootstrapRejectReason = State.AutoTrader.TeleportBootstrapRejectReason,
             teleportQueueOutcome = State.AutoTrader.TeleportQueueOutcome,
             bootstrapId = State.AutoTrader.LastTeleportBootstrapId,
             degradedReason = State.AutoTrader.DataDegradedReason,
@@ -33999,8 +34212,8 @@ task.spawn(function()
                 State.Profile.QueueRemoteLeaderboardSweep(true)
             end
             State.AutoTrader.RunSelfTests()
-            task.spawn(function()
-                if not Destroyed then State.AutoTrader.RefreshTeleportScriptLkg() end
+            task.delay(4.0, function()
+                if not Destroyed then pcall(State.AutoTrader.EnsureTeleportContinuationSource) end
             end)
 
             -- These are cosmetic/binding concerns and are intentionally
@@ -36867,6 +37080,76 @@ end)()
     end)
 end)()
 
+---------------------------------------------------------------------------
+-- v42 teleport-continuity regressions.
+---------------------------------------------------------------------------
+do
+    local v41RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function(...)
+        local result = v41RunSelfTests(...)
+        result = type(result)=="table" and result or {tests={},passed=0,total=0,ok=false}
+        local tests = type(result.tests)=="table" and result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {
+                name=name,
+                ok=ok and passed==true,
+                detail=(ok and passed==true) and nil or tostring(ok and detail or passed),
+            })
+        end
+        add("v42-stale-bootstrap-without-auth-cannot-carry-auto", function()
+            local bootstrap={bootstrapId="stale",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
+            local allowed=State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,nil,os.time(),game.JobId)
+            return allowed==false, "bootstrap without one-shot authorization was accepted"
+        end)
+        add("v42-bootstrap-auth-is-job-and-id-bound", function()
+            local now=os.time()
+            local bootstrap={bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
+            local auth={armed=true,bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,destinationJobId=game.JobId,armedAtUnix=now}
+            local good=State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,auth,now,game.JobId)
+            local wrongId=table.clone(auth);wrongId.bootstrapId="other"
+            local wrongJob=table.clone(auth);wrongJob.destinationJobId=tostring(game.JobId).."-other"
+            return good==true
+                and State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,wrongId,now,game.JobId)==false
+                and State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,wrongJob,now,game.JobId)==false,
+                "bootstrap authorization was not one-shot identity/destination bound"
+        end)
+        add("v42-bootstrap-auth-expires", function()
+            local now=os.time()
+            local bootstrap={bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
+            local auth={armed=true,bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,destinationJobId=game.JobId,armedAtUnix=now-121}
+            return State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,auth,now,game.JobId)==false,
+                "expired teleport AUTO authorization was accepted"
+        end)
+        add("v42-bootstrap-arms-auto-only-after-verified-compile", function()
+            local oldRecent=State.AutoTrader.RecentJobs
+            State.AutoTrader.RecentJobs={}
+            local code=State.AutoTrader.BuildTeleportBootstrapCode("v42-order-test",false)
+            State.AutoTrader.RecentJobs=oldRecent
+            if type(code)~="string" then return false,"bootstrap code was not built" end
+            local compileAt=string.find(code,"local f,e=LS(b)",1,true)
+            local armAt=string.find(code,"armedAtUnix=os.time()",1,true)
+            local sourceFailAt=string.find(code,"no verified current-build script available",1,true)
+            return compileAt and armAt and sourceFailAt and sourceFailAt<compileAt and compileAt<armAt,
+                "AUTO carry was armed before source verification/compilation"
+        end)
+        add("v42-current-source-canonicalizer-rejects-wrong-version", function()
+            local fake='local CONFIG={version="not-this-build"}\\nlocal HARDEN={distributionNormalizedSha256="'..string.rep("0",64)..'"}\\n'..string.rep("--x\\n",300)
+            local canonical=State.AutoTrader.CanonicalizeCapturedDistributionSource(fake)
+            return canonical==nil, "foreign source was accepted as current teleport continuation"
+        end)
+        local passed=0
+        for _, row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.tests=tests
+        result.passed=passed
+        result.total=#tests
+        result.ok=passed==#tests
+        result.controllerVersion=CONTROLLER_VERSION
+        State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v42",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end
 
 rawset(_G, HARDEN.readyGlobalCurrent, true)
 rawset(ExecutorEnvironment, HARDEN.readyGlobalCurrent, true)

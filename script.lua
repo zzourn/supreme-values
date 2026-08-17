@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.18-public-auto-trader-v37-round19-preflight-fixture-deploy-candidate",
+    version = "18.69.25-public-auto-trader-v37-round29-release-readiness-candidate",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -237,8 +237,16 @@ local CONFIG = {
     AutoTraderUpcomingThumbnailPrefetchConcurrency = 5,
     AutoTraderRequestedServerPreviewMaxJobIds = 30,
     AutoTraderRequestedServerPreviewHintFreshSeconds = 120,
+    -- Legacy companion knobs remain only so the preserved Round-22 regression surface
+    -- can execute; production Round-23 discovery no longer reads companion files/pins.
     AutoTraderCompanionSelectorRowFreshSeconds = 90,
     AutoTraderCompanionPrimaryPreclassifyLimit = 80,
+    AutoTraderDirectAuthRefreshSeconds = 5,
+    AutoTraderDirectAuthRowFreshSeconds = 30,
+    AutoTraderDirectAuthMaxPages = 3,
+    AutoTraderDirectAuthMaxRows = 300,
+    AutoTraderDirectAuthPreclassifyLimit = 80,
+    AutoTraderDirectAuthMaxBackoffSeconds = 60,
     AutoTraderUpcomingThumbnailDisplaySize = "48x48",
     AutoTraderMovementWatchdogEnabled = true,
     AutoTraderMovementTimeoutSeconds = 20,
@@ -273,7 +281,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "f5bc1e66834f83409f203c3c9cf2f7aebfe464d8a13919ebf31b1e5e91ebb043",
+    distributionNormalizedSha256 = "7e957ca5cb6d1030f506effce03ba96ace7470c5734e548dea366f2b8fafb4fe",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -300,7 +308,13 @@ local function validateConfigRelationships()
     need(CONFIG.AutoTraderUpcomingThumbnailPrefetchConcurrency >= 1 and CONFIG.AutoTraderUpcomingThumbnailPrefetchConcurrency <= 6, "thumbnail prefetch concurrency must be between 1 and 6")
     need(CONFIG.AutoTraderRequestedServerPreviewMaxJobIds >= 1 and CONFIG.AutoTraderRequestedServerPreviewMaxJobIds <= 30, "requested server preview hint limit must be between 1 and 30")
     need(CONFIG.AutoTraderCompanionSelectorRowFreshSeconds >= 15 and CONFIG.AutoTraderCompanionSelectorRowFreshSeconds <= CONFIG.AutoTraderServerCandidateCacheTtlSeconds, "companion selector row freshness must be bounded by selector cache TTL")
-    need(CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit >= CONFIG.AutoTraderServerQueueLimit and CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit <= 100, "companion preclassification pool must cover the queue and remain bounded")
+    need(CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit >= CONFIG.AutoTraderServerQueueLimit and CONFIG.AutoTraderCompanionPrimaryPreclassifyLimit <= 100, "legacy companion preclassification pool must remain bounded for preserved regressions")
+    need(CONFIG.AutoTraderDirectAuthRefreshSeconds >= 3 and CONFIG.AutoTraderDirectAuthRefreshSeconds <= 15, "direct-auth healthy refresh must remain bounded near the requested 5-second cadence")
+    need(CONFIG.AutoTraderDirectAuthRowFreshSeconds >= CONFIG.AutoTraderDirectAuthRefreshSeconds and CONFIG.AutoTraderDirectAuthRowFreshSeconds <= 30, "direct-auth row freshness must remain <= 30 seconds")
+    need(CONFIG.AutoTraderDirectAuthMaxPages >= 1 and CONFIG.AutoTraderDirectAuthMaxPages <= 5, "direct-auth page walk must remain bounded")
+    need(CONFIG.AutoTraderDirectAuthMaxRows >= CONFIG.AutoTraderServerQueueLimit and CONFIG.AutoTraderDirectAuthMaxRows <= 500, "direct-auth row collection must remain bounded")
+    need(CONFIG.AutoTraderDirectAuthPreclassifyLimit >= CONFIG.AutoTraderServerQueueLimit and CONFIG.AutoTraderDirectAuthPreclassifyLimit <= 100, "direct-auth preclassification pool must cover the final queue and remain bounded")
+    need(CONFIG.AutoTraderDirectAuthMaxBackoffSeconds >= 20 and CONFIG.AutoTraderDirectAuthMaxBackoffSeconds <= 60, "direct-auth backoff cap must remain <= 60 seconds")
     need(CONFIG.AutoTraderUpcomingThumbnailDisplaySize == "48x48", "Round-14 display thumbnail size must remain 48x48")
     need(CONFIG.AutoTraderTradeTransportRecoveryFailures >= 1, "trade transport recovery threshold is invalid")
     need(CONFIG.AutoTraderManualBotServerJobTtlSeconds > 0, "manual bot-server JobId TTL must be positive")
@@ -693,6 +707,7 @@ local State = {
         currentUsername = nil,
         totalsByName = {},
         remoteCardHintsByUserId = {},
+        remoteMutationSafetyByUserId = {},
         leaderboardBadges = setmetatable({}, {__mode = "k"}),
         visibleRemoteGeneration = 0,
         summaryDisplay = {
@@ -8152,7 +8167,7 @@ State.AutoTrader.RecordStrategyEvent = function(player, kind, data)
     end
     local total = tonumber(data.verifiedTotal)
     if total == nil and player then
-        local value, verified = State.AutoTrader.GetVerifiedPlayerValue(player)
+        local value, verified = State.AutoTrader.GetPlayerKnownValueFloor(player)
         if verified then total = tonumber(value) end
     end
     total = math.max(0, total or 0)
@@ -8713,7 +8728,7 @@ State.AutoTrader.GetServerPlayerClassification = function(player)
             return "friend", nil, state
         end
     end
-    local total, verified = State.AutoTrader.GetVerifiedPlayerValue(player)
+    local total, verified = State.AutoTrader.GetPlayerKnownValueFloor(player)
     if verified and total ~= nil then
         state.lastVerifiedTotal = total
         state.lastVerifiedAt = os.clock()
@@ -12044,6 +12059,71 @@ State.AutoTrader.BuildCanonicalValueIdentityKey = function(entry)
         .. "|year=" .. tostring(year or "") .. "|ancestry=" .. ancestry .. "|supreme=" .. supreme
 end
 
+-- Round 22: complete mutation-family classifier. It consumes all current resolved
+-- card hints (including nonnumeric/zero values) plus every unresolved leaf BEFORE
+-- positive-value planner filtering.
+State.Profile.BuildMutationFamilySafetyFromCalculated = function(calculated)
+    local families, blocked = {}, {}
+    local function familyRow(mutation)
+        if not mutation then return nil end
+        local row=families[mutation]
+        if not row then row={values={},resolvedCount=0,unresolvedCount=0,identityFailure=false};families[mutation]=row end
+        return row
+    end
+    local function mutationKey(itemType,itemId)
+        if itemId==nil or tostring(itemId)=="" then return nil end
+        return normalizeTradeItemType(itemType or "Weapons").."|"..tostring(itemId)
+    end
+    local function ingestResolved(section,fallbackType)
+        for _,hint in ipairs(type(section)=="table" and type(section.cardHints)=="table" and section.cardHints or {}) do
+            local row=familyRow(mutationKey(hint.itemType or fallbackType,hint.itemId))
+            if row then
+                row.resolvedCount+=1
+                local probe={itemType=hint.itemType or fallbackType,itemId=hint.itemId,nativeKey=hint.itemId,record=hint.record,
+                    variant=hint.variant or (hint.identityHint and hint.identityHint.variant),identityHint=hint.identityHint,numericItemId=hint.numericItemId}
+                local valueIdentity=State.AutoTrader.BuildCanonicalValueIdentityKey(probe)
+                if valueIdentity then row.values[valueIdentity]=true else row.identityFailure=true end
+                if hint.identityFailure or (type(hint.resolutionMeta)=="table" and hint.resolutionMeta.identityFailure) then row.identityFailure=true end
+            end
+        end
+    end
+    local function ingestUnresolved(section,fallbackType)
+        for _,miss in ipairs(type(section)=="table" and type(section.unresolvedAll)=="table" and section.unresolvedAll or {}) do
+            local row=familyRow(mutationKey(miss.itemType or fallbackType,miss.itemId))
+            if row then row.unresolvedCount+=math.max(1,math.floor(tonumber(miss.quantity) or 1)) end
+        end
+    end
+    local weapons=type(calculated)=="table" and calculated.weapons or nil
+    local pets=type(calculated)=="table" and calculated.pets or nil
+    ingestResolved(weapons,"Weapons");ingestResolved(pets,"Pets");ingestUnresolved(weapons,"Weapons");ingestUnresolved(pets,"Pets")
+    local familyCount,blockedCount=0,0
+    for mutation,row in pairs(families) do
+        familyCount+=1
+        local valueIdentityCount=0;for _ in pairs(row.values) do valueIdentityCount+=1 end
+        if valueIdentityCount>1 or row.unresolvedCount>0 or row.identityFailure then
+            blockedCount+=1
+            local reason=valueIdentityCount>1 and "AMBIGUOUS_MUTATION_IDENTITY" or (row.unresolvedCount>0 and "UNRESOLVED_MUTATION_FAMILY" or "MUTATION_IDENTITY_FAILURE")
+            blocked[mutation]={mutationIdentity=mutation,valueIdentityCount=valueIdentityCount,unresolvedCount=row.unresolvedCount,resolvedCount=row.resolvedCount,identityFailure=row.identityFailure==true,failure=reason}
+        end
+    end
+    return {blocked=blocked,familyCount=familyCount,blockedCount=blockedCount}
+end
+State.Profile.ApplyMutationFamilySafety = function(entries,safety)
+    entries=type(entries)=="table" and entries or {}
+    local blocked=type(safety)=="table" and type(safety.blocked)=="table" and safety.blocked or {}
+    for _,entry in ipairs(entries) do
+        local nativeKey=entry.nativeKey or entry.itemId
+        local mutation=nativeKey~=nil and normalizeTradeItemType(entry.itemType or "Weapons").."|"..tostring(nativeKey) or nil
+        local failure=mutation and blocked[mutation] or nil
+        if mutation then entry.mutationIdentity=entry.mutationIdentity or mutation end
+        if failure then entry.mutationAmbiguous=true;entry.identityFailure=tostring(failure.failure or "UNSAFE_MUTATION_FAMILY") end
+    end
+    return entries
+end
+State.Profile.MutationSafetyHasBlocked = function(safety)
+    return type(safety)=="table" and type(safety.blocked)=="table" and next(safety.blocked)~=nil
+end
+
 State.AutoTrader.SimulatePortfolioExchange = function(baseEntries, giveItems, receiveItems)
     local byKey = {}
     local function keyFor(entry)
@@ -12782,6 +12862,7 @@ State.AutoTrader.BuildLocalResolvedEntriesFromCalculated = function(calculated)
         if tostring(a.key) ~= tostring(b.key) then return tostring(a.key) < tostring(b.key) end
         return tostring(a.valueIdentity or "") < tostring(b.valueIdentity or "")
     end)
+    State.Profile.ApplyMutationFamilySafety(entries,State.Profile.BuildMutationFamilySafetyFromCalculated(calculated))
     return entries
 end
 State.AutoTrader.GetLocalInventory = function(force)
@@ -12810,7 +12891,9 @@ State.AutoTrader.GetLocalInventory = function(force)
     if not calculated then
         return nil, tostring(reason or "inventory calculation failed")
     end
+    local mutationSafety = State.Profile.BuildMutationFamilySafetyFromCalculated(calculated)
     local entries = State.AutoTrader.BuildLocalResolvedEntriesFromCalculated(calculated)
+    State.Profile.ApplyMutationFamilySafety(entries,mutationSafety)
     local unresolvedLocal = {}
     local nonNumericLocal = {}
     local function collectLocalDiagnostics(section)
@@ -12832,15 +12915,17 @@ State.AutoTrader.GetLocalInventory = function(force)
     collectLocalDiagnostics(calculated.weapons)
     collectLocalDiagnostics(calculated.pets)
     State.AutoTrader.LastLocalInventoryDiagnostics = {
-        at=os.clock(), stamp=lastSuccess, resolvedTypes=#entries, partial=calculated.partial==true,
+        at=os.clock(), stamp=lastSuccess, resolvedTypes=#entries, partial=calculated.partial==true or (State.Profile.MutationSafetyHasBlocked(mutationSafety)),
         unresolved=unresolvedLocal, nonNumeric=nonNumericLocal,
+        blockedMutationFamilies=mutationSafety and tonumber(mutationSafety.blockedCount) or 0,
     }
     State.AutoTrader.InventoryCache = {
         entries = entries,
         raw = raw,
         lastSuccess = lastSuccess,
         age = age,
-        partial = calculated.partial == true,
+        partial = calculated.partial == true or (State.Profile.MutationSafetyHasBlocked(mutationSafety)),
+        mutationSafety = mutationSafety,
     }
     State.AutoTrader.InventoryCacheAt = os.clock()
     State.AutoTrader.InventoryCacheStamp = lastSuccess
@@ -13007,13 +13092,13 @@ State.AutoTrader.SummarizeOther = function(entries, player)
     end
     local summary = summarizeResolvedOffer(entries)
     for _, entry in ipairs(summary.entries or {}) do
-        if entry.mutationAmbiguous == true or entry.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
-            summary.identityFailure = "AMBIGUOUS_MUTATION_IDENTITY"
+        if entry.mutationAmbiguous == true or entry.identityFailure then
+            summary.identityFailure = tostring(entry.identityFailure or "AMBIGUOUS_MUTATION_IDENTITY")
             break
         end
     end
     summary.unknownCount = #summary.unresolved + #summary.nonNumeric
-    summary.knownFloor = summary.totalValue
+    summary.knownFloor = summary.identityFailure and 0 or summary.totalValue
     return summary
 end
 State.AutoTrader.GetEffectiveMinimumWin = function(otherSummary)
@@ -13466,8 +13551,8 @@ State.AutoTrader.ValidatePlan = function(plan, context)
     if State.AutoTrader.LastOtherHash ~= expectedOtherHash or os.clock() - State.AutoTrader.OtherStableSince < CONFIG.AutoTraderStableSeconds then return fail("their offer is not stable") end
     local otherSummary = State.AutoTrader.SummarizeOther(currentOtherEntries, currentPartner)
     if otherSummary.slotCount == 0 then return fail("their offer disappeared") end
-    if otherSummary.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
-        return fail("their live offer has AMBIGUOUS_MUTATION_IDENTITY")
+    if otherSummary.identityFailure then
+        return fail("their live offer contains an unsafe mutation identity family: "..tostring(otherSummary.identityFailure))
     end
     if not State.AutoTrader.Preferences.unknownTheirZero and otherSummary.unknownCount > 0 then return fail("their offer contains unknown value data") end
     local tradable, inventoryReason = State.AutoTrader.GetTradableInventory()
@@ -14232,8 +14317,8 @@ State.AutoTrader.CaptureAcceptAudit = function(info)
         auditOtherEntries = State.AutoTrader.EnrichTradeEntriesWithProfileIdentity(auditOtherEntries, info.partner)
     end
     for _, item in ipairs(auditOtherEntries) do
-        if item.mutationAmbiguous == true or item.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
-            State.AutoTrader.Log("accept_audit_ambiguous_incoming_identity", {itemId=item.itemId,itemType=item.itemType})
+        if item.mutationAmbiguous == true or item.identityFailure then
+            State.AutoTrader.Log("accept_audit_ambiguous_incoming_identity", {itemId=item.itemId,itemType=item.itemType,reason=item.identityFailure})
             return nil
         end
     end
@@ -15760,11 +15845,11 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     end
     local otherSummary = State.AutoTrader.SummarizeOther(otherEntries, partner)
     State.AutoTrader.OtherSummary = otherSummary
-    if otherSummary.identityFailure == "AMBIGUOUS_MUTATION_IDENTITY" then
+    if otherSummary.identityFailure then
         State.AutoTrader.Plan = nil
         State.AutoTrader.Desired = nil
-        State.AutoTrader.Status = "WAIT · AMBIGUOUS IDENTITY"
-        State.AutoTrader.StatusDetail = "Their live offer maps to multiple canonical value identities sharing one MM2 mutation identity. Automation will not mutate or accept until the offer becomes unambiguous."
+        State.AutoTrader.Status = "WAIT · UNSAFE IDENTITY"
+        State.AutoTrader.StatusDetail = "Their live offer contains a mutation family that is ambiguous or unresolved in the current inventory snapshot. Automation will not value, mutate, or accept that family."
         State.AutoTrader.Render()
         return
     end
@@ -16297,7 +16382,7 @@ State.AutoTrader.BuildDebug = function()
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
             local eligibility = State.AutoTrader.EvaluatePlayerEligibility(player, eligibilityContext)
-            local total, verified, valueReason, info = State.AutoTrader.GetVerifiedPlayerValue(player)
+            local total, verified, valueReason, info, valueComplete = State.AutoTrader.GetPlayerKnownValueFloor(player)
             local rawStats = State.AutoTrader.TargetStats.players[tostring(player.UserId)]
             local profile = total and State.AutoTrader.GetTargetProfile(player) or nil
             local score = total and State.AutoTrader.GetTargetScore(player, total) or nil
@@ -16305,6 +16390,8 @@ State.AutoTrader.BuildDebug = function()
                 name = player.Name,
                 userId = player.UserId,
                 verifiedTotal = verified and total or nil,
+                knownValueFloor = verified and total or nil,
+                valueComplete = valueComplete == true,
                 valueState = valueReason,
                 rawVerifiedInfo = info and {
                     total = info.total,
@@ -16512,7 +16599,7 @@ State.AutoTrader.BuildDebug = function()
             maxStabilityDrop = CONFIG.AutoTraderMaxStabilityDrop,
         },
         solverConfig = {
-            objective = "planner-first: try every human once when resolved inventory proves a safe value win or anchor-preserving non-loss liquidity improvement; EV only orders; aggressively escape bot-heavy servers",
+            objective = "planner-first: try every human once when resolved numeric items prove a safe value win or anchor-preserving non-loss liquidity improvement; unresolved remainder contributes zero; EV only orders; aggressively escape bot-heavy servers",
             maxOfferSlots = CONFIG.MaxOfferSlots,
             exactStateLimit = CONFIG.AutoTraderExactStateLimit,
             beamWidth = CONFIG.AutoTraderBeamWidth,
@@ -16598,7 +16685,7 @@ State.AutoTrader.BuildDebug = function()
             bestEconomicName = State.AutoTrader.LastEligibilitySnapshot.bestEconomic and State.AutoTrader.LastEligibilitySnapshot.bestEconomic.Name or nil,
             bestEconomicScore = State.AutoTrader.LastEligibilitySnapshot.bestEconomicScore,
             queueLength = #(State.AutoTrader.LastEligibilitySnapshot.queue or {}),
-            philosophy = "resolved inventory must prove a safe value win or anchor-preserving non-loss liquidity improvement; unknown inventory alone never triggers a request; EV only orders feasible humans",
+            philosophy = "resolved numeric items may prove a safe value win or anchor-preserving non-loss liquidity improvement even when the rest of inventory is unknown; unknown items contribute zero; no-witness partial inventories keep their bounded discovery window; EV only orders feasible humans",
         } or nil,
         tradeQueue = tradeQueueSupport,
         queueProjection = queueProjection,
@@ -17733,7 +17820,7 @@ State.AutoTrader.RebuildPlayerDashboard = function()
         if player and player.Parent then
             local total = eligibility.verifiedTotal
             if total == nil then
-                local verifiedTotal, verified = State.AutoTrader.GetVerifiedPlayerValue(player)
+                local verifiedTotal, verified = State.AutoTrader.GetPlayerKnownValueFloor(player)
                 if verified then total = verifiedTotal end
             end
             local score = eligibility.score
@@ -22043,6 +22130,9 @@ State.Profile.RemovePlayerCache = function(player)
     State.Profile.remoteCardHintsByUserId[
         player.UserId
     ] = nil
+    State.Profile.remoteMutationSafetyByUserId[
+        player.UserId
+    ] = nil
     local remoteState =
         State.Profile.remoteTotals
     remoteState.rawByUserId[
@@ -23294,6 +23384,8 @@ State.Profile.ApplyRemoteInventoryData = function(player, data, freshRemote)
     }
     State.Profile.remoteCardHintsByUserId[player.UserId] =
         remoteCardHints
+    State.Profile.remoteMutationSafetyByUserId[player.UserId] =
+        State.Profile.BuildMutationFamilySafetyFromCalculated(calculated)
     local unresolvedUnits = 0
     local unresolvedLeaves = 0
     local nonNumericUnits = 0
@@ -23867,6 +23959,21 @@ do
         return collisions
     end
 
+    -- Table-scoped shared entry point used by remote and local planners.
+    State.AutoTrader.BuildMutationFamilySafetyFromCalculated = function(calculated)
+        return State.Profile.BuildMutationFamilySafetyFromCalculated(calculated)
+    end
+
+    State.AutoTrader.ApplyMutationFamilySafety = function(entries, safety)
+        State.Profile.ApplyMutationFamilySafety(entries,safety)
+        for _,entry in ipairs(type(entries)=="table" and entries or {}) do State.AutoTrader.AnnotateIdentity(entry) end
+        return entries
+    end
+
+    State.AutoTrader.MutationSafetyHasBlocked = function(safety)
+        return State.Profile.MutationSafetyHasBlocked(safety)
+    end
+
     State.AutoTrader.EnrichTradeEntriesWithProfileIdentity = function(entries, player)
         entries = type(entries) == "table" and entries or {}
         if not player and type(State.CurrentTrade) == "table" then
@@ -23940,6 +24047,9 @@ do
                 end
             end
         end
+        if player and State.AutoTrader.ApplyMutationFamilySafety then
+            State.AutoTrader.ApplyMutationFamilySafety(entries,State.Profile.remoteMutationSafetyByUserId[player.UserId])
+        end
         return entries
     end
 
@@ -23947,13 +24057,14 @@ do
     State.AutoTrader.GetTradableInventory = function()
         local entries, reason, inventory = State.AutoTrader.V35GetTradableInventory()
         if type(entries) ~= "table" then return entries, reason, inventory end
+        if type(inventory)=="table" and inventory.mutationSafety and State.AutoTrader.ApplyMutationFamilySafety then State.AutoTrader.ApplyMutationFamilySafety(entries,inventory.mutationSafety) end
         local collisions = State.AutoTrader.FindMutationIdentityCollisions(entries)
-        if next(collisions) == nil then return entries, reason, inventory end
-        local safe = {}
-        for _, entry in ipairs(entries) do if not entry.mutationAmbiguous then table.insert(safe, entry) end end
+        local safe,blocked = {},false
+        for _, entry in ipairs(entries) do if entry.mutationAmbiguous or entry.identityFailure then blocked=true else table.insert(safe, entry) end end
+        if not blocked and next(collisions) == nil then return entries, reason, inventory end
         State.AutoTrader.LastMutationIdentityCollisions = collisions
-        State.AutoTrader.Log("mutation_identity_ambiguity", {scope="local_tradable", collisions=collisions})
-        if #safe == 0 then return nil, "all otherwise-tradable entries are blocked by ambiguous mutation identity", inventory end
+        State.AutoTrader.Log("mutation_identity_ambiguity", {scope="local_tradable", collisions=collisions,blockedFamily=blocked})
+        if #safe == 0 then return nil, "all otherwise-tradable entries are blocked by unsafe mutation identity", inventory end
         return safe, nil, inventory
     end
 
@@ -24405,8 +24516,11 @@ do
         if not localEntries or #localEntries==0 then return nil,tostring(inventoryReason or "no tradable numeric local inventory"),{feasibilityState="SEARCH_INCONCLUSIVE",solverComplete=false} end
         local remoteEntries,profile=State.AutoTrader.GetResolvedRemoteOpportunityEntries(player)
         State.AutoTrader.FindMutationIdentityCollisions(remoteEntries)
-        local safeRemote={}; local remoteCollision=false
-        for _,entry in ipairs(remoteEntries) do if entry.mutationAmbiguous then remoteCollision=true else table.insert(safeRemote,entry) end end
+        local remoteFamilySafety=State.Profile.remoteMutationSafetyByUserId[player.UserId]
+        local safeRemote={}; local remoteCollision=State.AutoTrader.MutationSafetyHasBlocked and State.AutoTrader.MutationSafetyHasBlocked(remoteFamilySafety) or false
+        for _,entry in ipairs(remoteEntries) do
+            if entry.mutationAmbiguous or entry.identityFailure then remoteCollision=true else table.insert(safeRemote,entry) end
+        end
         remoteEntries=safeRemote
         local signature=State.AutoTrader.BuildFeasibilitySignature(player,localEntries,localInventory,profile)
         if not options.noCache then
@@ -24529,7 +24643,7 @@ do
             meta.portfolioCandidatesEvaluated+=1
             if not delta.anchorOK then return end
             local candidate={kind="profit",giveItems=pair.give.items,receiveItems=pair.receive.items,giveTotal=pair.give.total,receiveTotal=pair.receive.total,win=pair.win,minWin=pair.minWin,marketGate=pair.market,portfolioDelta=delta,
-                reason="resolved inventory proves a safe value-winning exchange ("..formatCompact(pair.give.total).." → "..formatCompact(pair.receive.total)..", +"..formatCompact(pair.win)..")"}
+                reason=(inventoryComplete and "resolved inventory proves a safe value-winning exchange (" or "resolved numeric subset proves a safe value-winning exchange (")..formatCompact(pair.give.total).." → "..formatCompact(pair.receive.total)..", +"..formatCompact(pair.win)..")"}
             if not feasibilityWitness or (feasibilityWitness.kind=="profit" and pair.win<feasibilityWitness.win) or feasibilityWitness.kind~="profit" then feasibilityWitness=candidate end
             if not bestFoundValueWitness or pair.win>bestFoundValueWitness.win+0.000001 or (math.abs(pair.win-bestFoundValueWitness.win)<=0.000001 and pair.receive.total>bestFoundValueWitness.receiveTotal) then bestFoundValueWitness=candidate end
         end
@@ -24539,7 +24653,7 @@ do
             meta.portfolioCandidatesEvaluated+=1
             if not delta.ok then return end
             local candidate={kind="liquidity",strategicKind="liquidity",strategicSubkind=delta.strategicSubkind,giveItems=pair.give.items,receiveItems=pair.receive.items,giveTotal=pair.give.total,receiveTotal=pair.receive.total,
-                win=pair.win,minWin=0,marketGate=pair.market,portfolioDelta=delta,reason="resolved inventory proves a non-loss "..string.lower(delta.strategicSubkind or "rebalance").." that improves ≤4-slot portfolio reach"}
+                win=pair.win,minWin=0,marketGate=pair.market,portfolioDelta=delta,reason=(inventoryComplete and "resolved inventory proves a non-loss " or "resolved numeric subset proves a non-loss ")..string.lower(delta.strategicSubkind or "rebalance").." that improves ≤4-slot portfolio reach"}
             if not strategicWitness or (delta.score or 0)>(strategicWitness.portfolioDelta and strategicWitness.portfolioDelta.score or 0)+0.000001 then strategicWitness=candidate end
             if not feasibilityWitness then feasibilityWitness=candidate end
         end
@@ -24664,7 +24778,7 @@ do
             return {state="transport_deferred",feasibilityState=entry.feasibilityState or "SEARCH_INCONCLUSIVE",contactState=contactState,player=player,entry=entry,actionable=false,
                 retryIn=math.max(0,(entry.transportDeferredUntil or now)-now),reason=entry.contactReason or "client transport deferred"}
         end
-        local total,verified,valueReason=State.AutoTrader.GetVerifiedPlayerValue(player)
+        local total,verified,valueReason,valueInfo,valueComplete=State.AutoTrader.GetPlayerKnownValueFloor(player)
         if State.AutoTrader.Preferences.ignoreFriends then
             local friend=State.AutoTrader.GetFriendStatus(player)
             if friend==nil then
@@ -24693,31 +24807,45 @@ do
         if total<=0 then entry.feasibilityState="PROVEN_IMPOSSIBLE";return {state="zero",feasibilityState="PROVEN_IMPOSSIBLE",contactState=contactState,player=player,entry=entry,actionable=false,verifiedTotal=total,reason="verified zero"} end
         local cooldown=State.AutoTrader.CooldownRemaining(player)
         if cooldown>0 then return {state="retry_later",feasibilityState=entry.feasibilityState,contactState=contactState,player=player,entry=entry,actionable=false,retryIn=cooldown,verifiedTotal=total,reason=State.AutoTrader.Cooldowns[player.UserId] and State.AutoTrader.Cooldowns[player.UserId].reason or "cooldown"} end
-        local lastRequest=State.AutoTrader.RequestHistory[player.UserId] or 0
-        local repeatRemaining=math.max(0,CONFIG.AutoTraderRepeatRequestSeconds-(now-lastRequest))
+        local lastRequest=tonumber(State.AutoTrader.RequestHistory[player.UserId]) or 0
+        local repeatRemaining=lastRequest>0 and math.max(0,CONFIG.AutoTraderRepeatRequestSeconds-(now-lastRequest)) or 0
         if repeatRemaining>0 then return {state="retry_later",feasibilityState=entry.feasibilityState,contactState=contactState,player=player,entry=entry,actionable=false,retryIn=repeatRemaining,verifiedTotal=total,reason="repeat-request spacing"} end
         local score=State.AutoTrader.GetTargetScore(player,total)
         local opportunity,reason,meta=State.AutoTrader.BuildPreTradeOpportunity(player)
         local feasibilityState=meta and meta.feasibilityState or (opportunity and "FEASIBLE" or "SEARCH_INCONCLUSIVE")
         entry.feasibilityState=feasibilityState;entry.feasibilitySignature=meta and meta.signature or entry.feasibilitySignature
         if opportunity then
-            return {state="actionable",feasibilityState="FEASIBLE",contactState=contactState,player=player,entry=entry,actionable=true,verifiedTotal=total,score=score,opportunity=opportunity,reason=reason,feasibility=meta}
+            return {state="actionable",feasibilityState="FEASIBLE",contactState=contactState,player=player,entry=entry,actionable=true,verifiedTotal=total,knownValueFloor=total,valueComplete=valueComplete==true,score=score,opportunity=opportunity,reason=reason,feasibility=meta}
         end
         if feasibilityState=="SEARCH_INCONCLUSIVE" and meta and meta.signature then State.AutoTrader.QueueDeepFeasibilitySearch(player,meta.signature) end
+        if feasibilityState=="SEARCH_INCONCLUSIVE" and valueComplete~=true then
+            local discoveryAge,discoveryReady=State.AutoTrader.GetInventoryDiscoveryAge(entry,now)
+            if not discoveryReady or discoveryAge<CONFIG.AutoTraderUnresolvedMaxWaitSeconds then
+                return {state="discovery_pending",feasibilityState="SEARCH_INCONCLUSIVE",contactState=contactState,player=player,entry=entry,actionable=false,
+                    verifiedTotal=total,knownValueFloor=total,valueComplete=false,score=score,reason=(reason or "resolved subset has no proven exchange yet").." · continuing bounded partial-inventory discovery",feasibility=meta}
+            end
+        end
         return {state=feasibilityState=="PROVEN_IMPOSSIBLE" and "proven_impossible" or "search_inconclusive",feasibilityState=feasibilityState,contactState=contactState,
-            player=player,entry=entry,actionable=false,verifiedTotal=total,score=score,reason=reason,feasibility=meta}
+            player=player,entry=entry,actionable=false,verifiedTotal=total,knownValueFloor=total,valueComplete=valueComplete==true,score=score,reason=reason,feasibility=meta}
     end
 
     State.AutoTrader.BuildEligibilitySnapshot = function(playersOverride, contextOverride)
         local context=contextOverride or State.AutoTrader.BuildEligibilityContext()
         local snapshotPlayers=type(playersOverride)=="table" and playersOverride or Players:GetPlayers()
         local counts={total=0,valued=0,zero=0,unknown=0,unresolvable=0,friend=0,exhausted=0,active=0,verifiedPositive=0,verifiedZero=0,verifiedCount=0,
-            actionable=0,retryLater=0,friendPending=0,discoveryPending=0,decisionDataStale=0,provenImpossible=0,searchInconclusive=0,deepSearchPending=0,transportDeferred=0}
+            knownFloorCount=0,knownFloorPositive=0,actionable=0,retryLater=0,friendPending=0,discoveryPending=0,decisionDataStale=0,provenImpossible=0,searchInconclusive=0,deepSearchPending=0,transportDeferred=0}
         local rows={}; local earliestRetry=math.huge
         for _,player in ipairs(snapshotPlayers) do
             if player~=LocalPlayer and player.Parent then
                 counts.total+=1; local row=State.AutoTrader.EvaluatePlayerEligibility(player,context);table.insert(rows,row)
-                if row.verifiedTotal~=nil then counts.verifiedCount+=1;if row.verifiedTotal>0 then counts.verifiedPositive+=1;counts.valued+=1 else counts.verifiedZero+=1 end end
+                if row.verifiedTotal~=nil then
+                    if row.valueComplete==true then
+                        counts.verifiedCount+=1;if row.verifiedTotal>0 then counts.verifiedPositive+=1 else counts.verifiedZero+=1 end
+                    else
+                        counts.knownFloorCount+=1;if row.verifiedTotal>0 then counts.knownFloorPositive+=1 end
+                    end
+                    if row.verifiedTotal>0 then counts.valued+=1 end
+                end
                 if row.state=="actionable" then counts.actionable+=1
                 elseif row.state=="retry_later" then counts.retryLater+=1;earliestRetry=math.min(earliestRetry,tonumber(row.retryIn) or math.huge)
                 elseif row.state=="transport_deferred" then counts.transportDeferred+=1;counts.retryLater+=1;earliestRetry=math.min(earliestRetry,tonumber(row.retryIn) or math.huge)
@@ -24912,7 +25040,7 @@ do
         if State.AutoTrader.Preferences.ignoreFriends then local friend=State.AutoTrader.GetFriendStatus(player);if friend==true then return "decline","Ignore Friends is ON" elseif friend==nil then return "wait","friend status pending" end end
         local contactState=State.AutoTrader.GetContactState(player)
         if contactState=="TERMINAL_THIS_PRESENCE" then return "decline","this player already reached a terminal contact outcome for this presence" end
-        local total,verified,valueReason=State.AutoTrader.GetVerifiedPlayerValue(player);if not verified or total==nil then return "wait",valueReason or "inventory unresolved" end
+        local total,verified,valueReason=State.AutoTrader.GetPlayerKnownValueFloor(player);if not verified or total==nil then return "wait",valueReason or "inventory unresolved" end
         if total<=0 then return "decline","verified inventory value is 0" end
         local eligibility=State.AutoTrader.EvaluatePlayerEligibility(player,State.AutoTrader.BuildEligibilityContext())
         if eligibility.feasibilityState=="PROVEN_IMPOSSIBLE" then return "decline","complete feasibility search proves no safe useful exchange" end
@@ -25877,6 +26005,7 @@ do
     State.AutoTrader.GetResolvedRemoteOpportunityEntries=function(player)
         if not player then return {},nil end
         local entries=State.AutoTrader.BuildRemoteOpportunityEntriesFromHints(State.Profile.remoteCardHintsByUserId[player.UserId])
+        if State.AutoTrader.ApplyMutationFamilySafety then State.AutoTrader.ApplyMutationFamilySafety(entries,State.Profile.remoteMutationSafetyByUserId[player.UserId]) end
         return entries,State.AutoTrader.GetTargetProfile(player)
     end
 
@@ -26312,7 +26441,7 @@ end
 -- v37: conservative relative-value handling, upcoming-server browser, and manual candidate bot provenance.
 do
     State.AutoTrader.V37 = State.AutoTrader.V37 or {}
-    State.AutoTrader.V37.contract = "relative Supreme values remain UNKNOWN; upcoming UI mirrors selector candidates; exact-JobId browser samples enrich only; manual bot evidence stays manual"
+    State.AutoTrader.V37.contract = "relative Supreme values remain UNKNOWN; authenticated direct server samples are preview-only; upcoming UI mirrors selector candidates; manual bot evidence stays manual"
 
     State.Profile.remoteTotals.discoveryByUserId = State.Profile.remoteTotals.discoveryByUserId or {}
     State.Profile.V37InventoryDiagnosticsByUserId = State.Profile.V37InventoryDiagnosticsByUserId or {}
@@ -26519,7 +26648,29 @@ do
         return ok, reason
     end
 
+    -- Round 21: derive every planning lower bound from the same collision-safe resolved
+    -- numeric identity set used by the trade planner. Ambiguous mutation identities and any
+    -- entry carrying identityFailure contribute ZERO authority.
+    State.AutoTrader.GetCollisionSafeResolvedRemoteValue = function(player)
+        if not player or player.UserId==nil then return 0,false,{},nil,{} end
+        local entries,profile=State.AutoTrader.GetResolvedRemoteOpportunityEntries(player)
+        entries=type(entries)=="table" and entries or {}
+        local familySafety=State.Profile.remoteMutationSafetyByUserId[player.UserId]
+        if State.AutoTrader.ApplyMutationFamilySafety then State.AutoTrader.ApplyMutationFamilySafety(entries,familySafety) end
+        local collisions=State.AutoTrader.FindMutationIdentityCollisions(entries)
+        local combined={};for mutation,row in pairs(collisions) do combined[mutation]=row end
+        if type(familySafety)=="table" and type(familySafety.blocked)=="table" then for mutation,row in pairs(familySafety.blocked) do if combined[mutation]==nil then combined[mutation]=row end end end
+        local safe,total={},0
+        for _,entry in ipairs(entries) do
+            local unitValue=tonumber(entry.unitValue)
+            local quantity=math.max(0,math.floor(tonumber(entry.maxQuantity or entry.quantity) or 0))
+            if unitValue and unitValue>0 and quantity>0 and entry.mutationAmbiguous~=true and not entry.identityFailure then total+=unitValue*quantity;table.insert(safe,entry) end
+        end
+        return total,next(combined)~=nil,safe,profile,combined
+    end
+
     -- v37 completeness gate: mixed positive numeric value + any trade-relevant unknown value is still UNKNOWN.
+    -- Round 21 additionally treats an explicitly partial snapshot or any mutation-identity collision as incomplete.
     State.AutoTrader.GetVerifiedPlayerValue = function(player)
         if not player then return nil, false, "player unavailable", nil end
         local info = State.Profile.totalsByName[player.Name]
@@ -26546,8 +26697,36 @@ do
             local suffix = example and (" · "..tostring(example.itemId or "item").." ("..tostring(example.reason or "unresolved")..")") or ""
             return nil, false, "UNRESOLVED_ITEM_IDENTITY" .. suffix, info
         end
+        if info.partial==true then
+            return nil,false,"INVENTORY_PARTIAL",info
+        end
+        local _,hasCollision=State.AutoTrader.GetCollisionSafeResolvedRemoteValue(player)
+        if hasCollision then
+            return nil,false,"AMBIGUOUS_MUTATION_IDENTITY",info
+        end
         if total > 0 then return total, true, "verified positive", info end
         return 0, true, "verified zero", info
+    end
+
+    -- Trading may use a lower bound made only from independently resolved, collision-safe
+    -- numeric items. Unknown/relative/unresolved/ambiguous items contribute ZERO to this floor
+    -- and can never enter an automated offer. A zero floor with incomplete data remains UNKNOWN.
+    State.AutoTrader.GetPlayerKnownValueFloor = function(player)
+        local strictValue, strictVerified, strictReason, info = State.AutoTrader.GetVerifiedPlayerValue(player)
+        if strictVerified and strictValue ~= nil then
+            return strictValue,true,strictReason,info,true
+        end
+        if type(info)~="table" or info.source~="GetFullInventoryVerified" or info.stale then
+            return strictValue,strictVerified,strictReason,info,false
+        end
+        local knownTotal,hasCollision=State.AutoTrader.GetCollisionSafeResolvedRemoteValue(player)
+        if not knownTotal or knownTotal<=0 then
+            return nil,false,strictReason or (hasCollision and "AMBIGUOUS_MUTATION_IDENTITY" or "inventory unresolved"),info,false
+        end
+        local unresolved=math.max(0,tonumber(info.unresolvedUnits) or 0)
+        local nonNumeric=math.max(0,tonumber(info.nonNumericUnits) or 0)
+        local suffix=(unresolved>0 or nonNumeric>0 or info.partial==true or hasCollision) and " · unresolved/ambiguous remainder excluded" or ""
+        return knownTotal,true,"PARTIAL_KNOWN_VALUE_FLOOR · "..formatCompact(knownTotal).."+ collision-safe resolved numeric"..suffix,info,false
     end
 
     -- Upcoming-server/manual classification state. Job marks are deliberately separate from fingerprint evidence.
@@ -26558,13 +26737,13 @@ do
     State.AutoTrader.UpcomingServerQueueRevision = tonumber(State.AutoTrader.UpcomingServerQueueRevision) or 0
     State.AutoTrader.UpcomingServerBrowserOpen = State.AutoTrader.UpcomingServerBrowserOpen ~= false
 
-    -- Optional authenticated browser-companion discovery. The companion may supply genuine
-    -- candidate JobIds/roster samples when its snapshot passes the strict source gate, but Lua
-    -- remains authoritative for eligibility, suppression, bot preview classification, ranking,
-    -- and final queue order. Sampled tokens never constitute full-roster certification.
-    State.AutoTrader.ServerRosterPolicy = "AUTHENTICATED_COMPANION_DISCOVERY_LUA_POLICY_DIRECT_PUBLIC_FALLBACK"
+    -- Legacy companion parser/test surface is retained only to preserve the reviewed 207-test
+    -- inventory while Round 23 replaces production discovery with executor-local direct auth.
+    -- No production selector path below depends on these files, collector pins, or hint writes.
+    State.AutoTrader.ServerRosterPolicy = "AUTHENTICATED_DIRECT_EXECUTOR_REQUEST_LUA_POLICY_DIRECT_PUBLIC_FALLBACK"
     State.AutoTrader.CanonicalServerPreviewThumbnailSize = "150x150"
     State.AutoTrader.ServerPreviewCompanionPolicy = {
+        legacyDisabled = true,
         filePath = "SV/ListOfServers.json",
         maxBytes = 2 * 1024 * 1024,
         maxRows = 1000,
@@ -26576,7 +26755,7 @@ do
         expectedPlaceId = 142823291,
         requiredHealthyPollSeconds = 20,
         expectedCollectorVersion = "server-updater-v3-round14-companion-primary-candidate",
-        expectedRuntimeSourceSha256 = "c40dda8b3cb3b730e400c5bf6b55d8c2f5a9a05abd44c1290f4bc371e7f01ecb",
+        expectedRuntimeSourceSha256 = string.rep("b",64), -- legacy self-test sentinel; not a production source pin
         futureToleranceSeconds = 15,
     }
     State.AutoTrader.ServerPreviewCompanionCache = State.AutoTrader.ServerPreviewCompanionCache or {
@@ -26612,6 +26791,9 @@ do
     end
 
     State.AutoTrader.WriteRequestedServerPreviewHintPayload = function(payload)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return false,"ROUND23_DIRECT_AUTH_HINT_DISABLED"
+        end
         local policy=State.AutoTrader.RequestedServerPreviewHintPolicy
         local state=State.AutoTrader.RequestedServerPreviewHintState
         local hooks=State.AutoTrader.RequestedServerPreviewHintTestHooks
@@ -26635,6 +26817,9 @@ do
     end
 
     State.AutoTrader.WriteRequestedServerPreviewHint = function(servers)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return false,"ROUND23_DIRECT_AUTH_HINT_DISABLED"
+        end
         local hooks=State.AutoTrader.RequestedServerPreviewHintTestHooks
         if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 and not (type(hooks)=="table" and type(hooks.write)=="function") then
             return false,"SELF_TEST_HINT_WRITE_SUPPRESSED"
@@ -26643,6 +26828,9 @@ do
     end
 
     State.AutoTrader.QueueRequestedServerPreviewHintWrite = function(servers)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return false,"ROUND23_DIRECT_AUTH_HINT_DISABLED"
+        end
         local state=State.AutoTrader.RequestedServerPreviewHintState
         local hooks=State.AutoTrader.RequestedServerPreviewHintTestHooks
         if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 then
@@ -26665,6 +26853,9 @@ do
     end
 
     State.AutoTrader.GetRequestedServerPreviewHintSupportSummary = function()
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return {disabled=true,reason="ROUND23_DIRECT_AUTH_HINT_DISABLED"}
+        end
         local state=State.AutoTrader.RequestedServerPreviewHintState
         local policy=State.AutoTrader.RequestedServerPreviewHintPolicy
         return {
@@ -26703,6 +26894,9 @@ do
     end
 
     State.AutoTrader.ReadServerPreviewCompanionFile = function()
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return nil,{filePresent=false,readAvailable=false,disabled=true,lastError="ROUND23_LEGACY_COMPANION_DISABLED"}
+        end
         local policy = State.AutoTrader.ServerPreviewCompanionPolicy
         local path = tostring(policy.filePath)
         local hooks = State.AutoTrader.ServerPreviewCompanionTestHooks
@@ -26885,6 +27079,9 @@ do
     end
 
     State.AutoTrader.RefreshServerPreviewCompanion = function(force)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return nil
+        end
         local cache = State.AutoTrader.ServerPreviewCompanionCache
         local policy = State.AutoTrader.ServerPreviewCompanionPolicy
         local nowClock = os.clock()
@@ -26906,6 +27103,9 @@ do
     end
 
     State.AutoTrader.GetServerPreviewCompanionSupportSummary = function()
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return {disabled=true,reason="ROUND23_LEGACY_COMPANION_DISABLED"}
+        end
         local cache = State.AutoTrader.ServerPreviewCompanionCache
         local source = type(cache)=="table" and cache.diagnostics or nil
         local policy = State.AutoTrader.ServerPreviewCompanionPolicy
@@ -26933,6 +27133,9 @@ do
     end
 
     State.AutoTrader.EnrichExistingServerCandidatesFromCompanion = function(servers, sourceLabel)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return {},0,{disabled=true,lastError="ROUND23_LEGACY_COMPANION_DISABLED"}
+        end
         local snapshot = State.AutoTrader.RefreshServerPreviewCompanion(false)
         local diagnostics = type(snapshot)=="table" and snapshot.diagnostics or nil
         if type(diagnostics)=="table" then
@@ -27003,12 +27206,972 @@ do
         return enriched, changed, diagnostics
     end
 
+
+    -- Round 23: the external browser companion is no longer a production dependency.
+    -- Authenticated server discovery happens directly inside the executor. The session
+    -- secret is held only in this closure (or the dedicated auth-only executor file
+    -- when the user explicitly opts into cross-teleport persistence).
+    State.AutoTrader.ServerRosterPolicy = "AUTHENTICATED_DIRECT_EXECUTOR_REQUEST_LUA_POLICY_DIRECT_PUBLIC_FALLBACK"
+    State.AutoTrader.DirectAuthPolicy = {
+        schemaVersion = 1,
+        source = "authenticated_direct_executor_request",
+        expectedPlaceId = 142823291,
+        endpointHost = "games.roblox.com",
+        endpointPathPrefix = "/v1/games/142823291/servers/Public",
+        refreshSeconds = math.max(3, math.min(10, tonumber(CONFIG.AutoTraderDirectAuthRefreshSeconds) or 5)),
+        rowFreshSeconds = math.max(5, math.min(30, tonumber(CONFIG.AutoTraderDirectAuthRowFreshSeconds) or 30)),
+        maxPages = math.max(1, math.min(5, tonumber(CONFIG.AutoTraderDirectAuthMaxPages) or 3)),
+        maxRows = math.max(30, math.min(500, tonumber(CONFIG.AutoTraderDirectAuthMaxRows) or 300)),
+        preclassifyLimit = math.max(CONFIG.AutoTraderServerQueueLimit, math.min(100, tonumber(CONFIG.AutoTraderDirectAuthPreclassifyLimit) or 80)),
+        maxBackoffSeconds = math.max(20, math.min(60, tonumber(CONFIG.AutoTraderDirectAuthMaxBackoffSeconds) or 60)),
+        maxTokensPerRow = 100,
+        authFile = "SV/AuthSession.dat",
+    }
+    State.AutoTrader.LegacyCompanionStatus = {disabled=true,reason="ROUND23_REPLACED_BY_AUTHENTICATED_DIRECT_EXECUTOR_REQUEST"}
+    State.AutoTrader.LegacyRequestedServerPreviewHintStatus = {disabled=true,reason="ROUND23_DIRECT_AUTH_DOES_NOT_REQUIRE_REQUEST_HINT_FILES"}
+
+    State.AutoTrader.InstallV37DirectAuthRuntime = function()
+        local memorySecret = nil
+        local authGeneration = 0
+        local rememberAcrossTeleports = false
+        local persistedLoadAttempted = false
+        local snapshot = nil
+        local refreshInFlight = false
+        local pendingAuthCall = nil
+        local refreshWorkerRunning = false
+        local productionRefreshPaused = true
+        local selfTestIsolationActive = false
+        local resumeMemorySecret = nil
+        local nextAttemptClock = 0
+        local backoffSeconds = 0
+        local lastSuccessUnix = 0
+        local diagnostics = {
+            source="authenticated_direct_executor_request",
+            status="AUTH_DIRECT_MISSING_SECRET",
+            schemaVersion=1,
+            requestPrimitiveName=nil,
+            lastHttpStatus=nil,
+            lastSuccessAgeSeconds=nil,
+            refreshIntervalSeconds=math.max(3,tonumber(CONFIG.AutoTraderDirectAuthRefreshSeconds) or 5),
+            backoffSeconds=0,
+            pagesFetched=0,
+            acceptedRows=0,
+            tokenBearingRows=0,
+            totalPlayerTokenCount=0,
+            duplicateRows=0,
+            invalidRows=0,
+            selectorEligible=false,
+            workerRunning=false,
+            rememberAcrossTeleports=false,
+            persistenceAvailable=false,
+            lastFailureCode=nil,
+        }
+
+        local function getHooks()
+            if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then return nil end
+            return type(State.AutoTrader.DirectAuthTestHooks)=="table" and State.AutoTrader.DirectAuthTestHooks or nil
+        end
+
+        local function nowClock()
+            local hooks=getHooks()
+            if hooks and type(hooks.nowClock)=="function" then
+                local ok,value=pcall(hooks.nowClock)
+                if ok and tonumber(value) then return tonumber(value) end
+            end
+            return os.clock()
+        end
+
+        local function nowUnix()
+            local hooks=getHooks()
+            if hooks and type(hooks.nowUnix)=="function" then
+                local ok,value=pcall(hooks.nowUnix)
+                if ok and tonumber(value) then return tonumber(value) end
+            end
+            return os.time()
+        end
+
+        local function normalizeSecret(value)
+            if type(value)~="string" then return nil end
+            value=value:gsub("^%s+",""):gsub("%s+$","")
+            if value=="" or #value>16384 or value:find("[\r\n%z]") then return nil end
+            local eq=value:find("=",1,true)
+            if eq then
+                local key=string.lower((string.sub(value,1,eq-1):gsub("%s+","")))
+                if key==".roblosecurity" or key=="roblosecurity" then
+                    value=string.sub(value,eq+1):gsub("^%s+",""):gsub("%s+$","")
+                end
+            end
+            if value=="" or #value>16384 or value:find("[\r\n%z]") then return nil end
+            return value
+        end
+
+        local function requestPrimitiveName()
+            local hooks=getHooks()
+            if hooks and type(hooks.request)=="function" then return "test_request" end
+            if type(httpRequest)~="function" then return "unavailable" end
+            if rawget(EarlyExecutorEnvironment,"request")==httpRequest then return "request" end
+            if rawget(EarlyExecutorEnvironment,"http_request")==httpRequest then return "http_request" end
+            if rawget(EarlyExecutorEnvironment,"httprequest")==httpRequest then return "httprequest" end
+            for _,tableName in ipairs({"syn","http","fluxus","krnl"}) do
+                local container=rawget(EarlyExecutorEnvironment,tableName)
+                if type(container)=="table" and container.request==httpRequest then return tableName..".request" end
+            end
+            return "request(options)"
+        end
+
+        local function performAuthenticatedServerGet(requestFn,url)
+            local policy=State.AutoTrader.DirectAuthPolicy
+            if type(requestFn)~="function" then return false,nil,nil,"REQUEST_PRIMITIVE_UNAVAILABLE" end
+            local exactBase="https://"..policy.endpointHost..policy.endpointPathPrefix.."?sortOrder=Desc&limit=100&excludeFullGames=true"
+            if type(url)~="string" or (url~=exactBase and string.sub(url,1,#exactBase+8)~=exactBase.."&cursor=") then
+                return false,nil,nil,"AUTH_DIRECT_ENDPOINT_REJECTED"
+            end
+            if pendingAuthCall then
+                if pendingAuthCall.done~=true then
+                    return false,nil,nil,"AUTH_DIRECT_REQUEST_STILL_RUNNING"
+                end
+                pendingAuthCall.body=nil
+                pendingAuthCall=nil
+            end
+            local requestSecret=memorySecret
+            if type(requestSecret)~="string" or requestSecret=="" then return false,nil,nil,"AUTH_DIRECT_MISSING_SECRET" end
+            local call={done=false,ok=false,status=nil,body=nil,timedOut=false,generation=authGeneration}
+            pendingAuthCall=call
+            local options={
+                Url=url,URL=url,Method="GET",
+                Headers={["Accept"]="application/json",["Cache-Control"]="no-cache",["Cookie"]=".ROBLOSECURITY="..requestSecret},
+                Redirect=false,FollowRedirects=false,
+            }
+            requestSecret=nil
+            task.spawn(function()
+                local okRequest,rawResponse=pcall(requestFn,options)
+                if options.Headers then options.Headers.Cookie=nil end
+                options.Headers=nil
+                options=nil
+                if call.timedOut~=true and call.generation==authGeneration then
+                    if okRequest then
+                        local okNormalize,response=pcall(normalizeHttpResponse,rawResponse)
+                        if okNormalize and type(response)=="table" then
+                            call.ok=true
+                            call.status=tonumber(response.StatusCode)
+                            call.body=type(response.Body)=="string" and response.Body or nil
+                            response.Headers=nil
+                            response.Body=nil
+                        else
+                            call.ok=false
+                        end
+                        response=nil
+                    else
+                        call.ok=false
+                    end
+                end
+                rawResponse=nil
+                call.done=true
+            end)
+            local deadline=os.clock()+math.max(0.25,tonumber(CONFIG.AutoTraderHttpTimeoutSeconds) or 7.5)
+            while not call.done and os.clock()<deadline do
+                if call.timedOut==true or call.generation~=authGeneration then
+                    call.timedOut=true
+                    call.body=nil
+                    if pendingAuthCall==call then pendingAuthCall=nil end
+                    return false,nil,nil,"AUTH_DIRECT_SUPERSEDED"
+                end
+                task.wait(0.03)
+            end
+            if not call.done then
+                call.timedOut=true
+                call.body=nil
+                return false,nil,nil,"REQUEST_TIMEOUT"
+            end
+            if call.generation~=authGeneration then
+                call.body=nil
+                if pendingAuthCall==call then pendingAuthCall=nil end
+                return false,nil,nil,"AUTH_DIRECT_SUPERSEDED"
+            end
+            local okRequest,status,body=call.ok==true,call.status,call.body
+            call.body=nil
+            if pendingAuthCall==call then pendingAuthCall=nil end
+            local failure=nil
+            if not okRequest then failure="REQUEST_EXCEPTION_OR_UNSUPPORTED_RESPONSE" end
+            return okRequest,status,body,failure
+        end
+
+        local function fileFunctions()
+            local hooks=getHooks()
+            if hooks then
+                return hooks.isfile,hooks.readfile,hooks.writefile,hooks.delfile,hooks.makefolder
+            end
+            if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 then
+                return nil,nil,nil,nil,nil
+            end
+            return State.TryGetExecutorGlobal("isfile"),State.TryGetExecutorGlobal("readfile"),State.TryGetExecutorGlobal("writefile"),State.TryGetExecutorGlobal("delfile"),State.TryGetExecutorGlobal("makefolder")
+        end
+
+        local function persistenceAvailable()
+            local _,readFn,writeFn=fileFunctions()
+            return type(readFn)=="function" and type(writeFn)=="function"
+        end
+
+        local function verifyPersistedSecretCleared()
+            local policy=State.AutoTrader.DirectAuthPolicy
+            local isfileFn,readFn=fileFunctions()
+            if type(isfileFn)=="function" then
+                local okExists,exists=pcall(isfileFn,policy.authFile)
+                if okExists and exists~=true then return true end
+            end
+            if type(readFn)=="function" then
+                local okRead,body=pcall(readFn,policy.authFile)
+                local cleared=okRead and type(body)=="string" and body==""
+                body=nil
+                if cleared then return true end
+            end
+            return false
+        end
+
+        local function clearPersistedSecret()
+            local policy=State.AutoTrader.DirectAuthPolicy
+            local _,_,writeFn,deleteFn=fileFunctions()
+            if verifyPersistedSecretCleared() then return true end
+            if type(deleteFn)=="function" then
+                pcall(deleteFn,policy.authFile)
+                if verifyPersistedSecretCleared() then return true end
+            end
+            if type(writeFn)=="function" then
+                pcall(writeFn,policy.authFile,"")
+                if verifyPersistedSecretCleared() then return true end
+            end
+            return false
+        end
+
+        local function persistSecret(secret)
+            if type(secret)~="string" or secret=="" then return false end
+            local policy=State.AutoTrader.DirectAuthPolicy
+            local _,readFn,writeFn,_,makefolderFn=fileFunctions()
+            if type(writeFn)~="function" then return false end
+            if type(makefolderFn)=="function" then pcall(makefolderFn,"SV") end
+            local ok=pcall(writeFn,policy.authFile,secret)
+            if not ok then return false end
+            if type(readFn)=="function" then
+                local okRead,verify=pcall(readFn,policy.authFile)
+                if not okRead or verify~=secret then return false end
+            end
+            return true
+        end
+
+        local function updateSupportAges()
+            diagnostics.requestPrimitiveName=requestPrimitiveName()
+            diagnostics.refreshIntervalSeconds=State.AutoTrader.DirectAuthPolicy.refreshSeconds
+            diagnostics.backoffSeconds=math.max(0,tonumber(backoffSeconds) or 0)
+            diagnostics.workerRunning=refreshWorkerRunning==true or refreshInFlight==true
+            diagnostics.rememberAcrossTeleports=rememberAcrossTeleports==true
+            diagnostics.persistenceAvailable=persistenceAvailable()
+            diagnostics.lastSuccessAgeSeconds=lastSuccessUnix>0 and math.max(0,nowUnix()-lastSuccessUnix) or nil
+        end
+
+        local function refreshUi()
+            if type(State.AutoTrader.UpdateDirectAuthUi)=="function" then
+                pcall(State.AutoTrader.UpdateDirectAuthUi)
+            end
+        end
+
+        local function setFailure(status,httpStatus,code,backoffable)
+            snapshot=nil
+            diagnostics.status=status
+            diagnostics.lastHttpStatus=tonumber(httpStatus)
+            diagnostics.lastFailureCode=tostring(code or status)
+            diagnostics.selectorEligible=false
+            diagnostics.pagesFetched=0
+            diagnostics.acceptedRows=0
+            diagnostics.tokenBearingRows=0
+            diagnostics.totalPlayerTokenCount=0
+            diagnostics.duplicateRows=0
+            diagnostics.invalidRows=0
+            if backoffable then
+                backoffSeconds=backoffSeconds>0 and math.min(State.AutoTrader.DirectAuthPolicy.maxBackoffSeconds,backoffSeconds*2) or State.AutoTrader.DirectAuthPolicy.refreshSeconds
+                nextAttemptClock=nowClock()+backoffSeconds
+            elseif status=="AUTH_DIRECT_REJECTED" then
+                backoffSeconds=State.AutoTrader.DirectAuthPolicy.maxBackoffSeconds
+                nextAttemptClock=nowClock()+backoffSeconds
+            else
+                backoffSeconds=0
+                nextAttemptClock=nowClock()+State.AutoTrader.DirectAuthPolicy.refreshSeconds
+            end
+            updateSupportAges()
+            refreshUi()
+            return nil,diagnostics
+        end
+
+        local function loadPersistedSecret()
+            if persistedLoadAttempted then return memorySecret~=nil end
+            persistedLoadAttempted=true
+            local policy=State.AutoTrader.DirectAuthPolicy
+            local isfileFn,readFn=fileFunctions()
+            if type(readFn)~="function" then
+                diagnostics.status="AUTH_DIRECT_MISSING_SECRET"
+                updateSupportAges()
+                return false
+            end
+            local exists=true
+            if type(isfileFn)=="function" then
+                local ok,value=pcall(isfileFn,policy.authFile)
+                exists=ok and value==true
+            end
+            if not exists then
+                diagnostics.status="AUTH_DIRECT_MISSING_SECRET"
+                updateSupportAges()
+                return false
+            end
+            local okRead,body=pcall(readFn,policy.authFile)
+            local loaded=okRead and normalizeSecret(body) or nil
+            body=nil
+            if loaded then
+                memorySecret=loaded
+                rememberAcrossTeleports=true
+                diagnostics.status="AUTH_DIRECT_PENDING"
+                diagnostics.lastFailureCode=nil
+                nextAttemptClock=0
+                updateSupportAges()
+                return true
+            end
+            local cleared=clearPersistedSecret()
+            rememberAcrossTeleports=cleared~=true
+            diagnostics.status=cleared and "AUTH_DIRECT_MISSING_SECRET" or "AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+            diagnostics.lastFailureCode=cleared and "AUTH_FILE_MALFORMED" or "AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+            updateSupportAges()
+            return false
+        end
+
+        State.AutoTrader.IsValidDirectAuthPlayerToken = function(value)
+            return type(value)=="string" and value~="" and #value<=512 and value:find("[\r\n%z]")==nil
+        end
+
+        State.AutoTrader.ParseDirectAuthServerListBody = function(body,discoveredAtUnix)
+            local policy=State.AutoTrader.DirectAuthPolicy
+            local out={rows={},nextPageCursor=nil,acceptedRows=0,tokenBearingRows=0,totalPlayerTokenCount=0,invalidRows=0}
+            if type(body)~="string" or body=="" or #body>CONFIG.ServerListJsonMaxBytes then return nil,"AUTH_DIRECT_SCHEMA_INVALID",out end
+            local okDecode,decoded=pcall(function() return HttpService:JSONDecode(body) end)
+            body=nil
+            if not okDecode or type(decoded)~="table" or type(decoded.data)~="table" then return nil,"AUTH_DIRECT_SCHEMA_INVALID",out end
+            local dense,count=State.AutoTrader.IsDenseBoundedArray(decoded.data,1000)
+            if not dense then return nil,"AUTH_DIRECT_SCHEMA_INVALID",out end
+            local cursor=decoded.nextPageCursor
+            if cursor~=nil and (type(cursor)~="string" or #cursor>4096 or cursor:find("[\r\n%z]")) then return nil,"AUTH_DIRECT_SCHEMA_INVALID",out end
+            out.nextPageCursor=cursor
+            for _,raw in ipairs(decoded.data) do
+                local valid=type(raw)=="table"
+                local jobId=valid and raw.id or nil
+                local playing=valid and raw.playing or nil
+                local maxPlayers=valid and raw.maxPlayers or nil
+                local tokens=valid and raw.playerTokens or nil
+                if type(jobId)~="string" or jobId=="" or #jobId>128 or jobId:find("[\r\n%z]")
+                    or type(playing)~="number" or playing~=playing or playing%1~=0
+                    or type(maxPlayers)~="number" or maxPlayers~=maxPlayers or maxPlayers%1~=0
+                    or playing<0 or maxPlayers<=0 or playing>maxPlayers or type(tokens)~="table" then
+                    valid=false
+                end
+                local tokenCount=0
+                if valid then
+                    local tokenDense,rawTokenCount=State.AutoTrader.IsDenseBoundedArray(tokens,policy.maxTokensPerRow)
+                    if not tokenDense then
+                        valid=false
+                    else
+                        for _,token in ipairs(tokens) do
+                            if not State.AutoTrader.IsValidDirectAuthPlayerToken(token) then valid=false break end
+                            tokenCount+=1
+                        end
+                        if rawTokenCount~=tokenCount then valid=false end
+                    end
+                end
+                if valid then
+                    local row={
+                        id=jobId,jobId=jobId,playing=playing,maxPlayers=maxPlayers,
+                        occupancy=playing/math.max(1,maxPlayers),ping=tonumber(raw.ping),fps=tonumber(raw.fps),
+                        playerTokens=table.clone(tokens),playerTokenCount=tokenCount,
+                        rosterEvidenceAvailable=tokenCount>0,discoveredAtUnix=tonumber(discoveredAtUnix) or os.time(),
+                        source=policy.source,
+                    }
+                    table.insert(out.rows,row)
+                    out.acceptedRows+=1
+                    if tokenCount>0 then out.tokenBearingRows+=1;out.totalPlayerTokenCount+=tokenCount end
+                else
+                    out.invalidRows+=1
+                end
+            end
+            return out,nil,out
+        end
+
+        local function userAuthMutationBlocked(userInitiated)
+            return userInitiated==true and (selfTestIsolationActive==true or (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0)
+        end
+
+        State.AutoTrader.SetDirectAuthRemember = function(enabled,userInitiated)
+            if userAuthMutationBlocked(userInitiated) then return false,"AUTH_DIRECT_SELF_TEST_ACTIVE" end
+            local requested=enabled==true
+            if requested then
+                rememberAcrossTeleports=true
+                if memorySecret and not persistSecret(memorySecret) then
+                    local cleared=clearPersistedSecret()
+                    rememberAcrossTeleports=cleared~=true
+                    diagnostics.status=cleared and diagnostics.status or "AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                    diagnostics.lastFailureCode=cleared and "AUTH_DIRECT_PERSIST_FAILED" or "AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                    updateSupportAges()
+                    refreshUi()
+                    return false,diagnostics.lastFailureCode
+                end
+            else
+                if not clearPersistedSecret() then
+                    rememberAcrossTeleports=true
+                    diagnostics.status="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                    diagnostics.lastFailureCode="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                    updateSupportAges()
+                    refreshUi()
+                    return false,"AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                end
+                rememberAcrossTeleports=false
+                if diagnostics.lastFailureCode=="AUTH_DIRECT_PERSIST_CLEAR_FAILED" then diagnostics.lastFailureCode=nil end
+                if diagnostics.status=="AUTH_DIRECT_PERSIST_CLEAR_FAILED" then
+                    diagnostics.status=memorySecret and "AUTH_DIRECT_PENDING" or "AUTH_DIRECT_MISSING_SECRET"
+                end
+            end
+            updateSupportAges()
+            refreshUi()
+            return true
+        end
+
+        State.AutoTrader.GetDirectAuthRemember = function()
+            return rememberAcrossTeleports==true
+        end
+
+        State.AutoTrader.HasDirectAuthSecret = function()
+            loadPersistedSecret()
+            return type(memorySecret)=="string" and memorySecret~=""
+        end
+
+        State.AutoTrader.ConnectDirectAuthSecret = function(input,remember,userInitiated)
+            if userAuthMutationBlocked(userInitiated) then return false,"AUTH_DIRECT_SELF_TEST_ACTIVE" end
+            local normalized=normalizeSecret(input)
+            input=nil
+            if not normalized then
+                diagnostics.lastFailureCode="AUTH_DIRECT_INVALID_SECRET_INPUT"
+                if not memorySecret then diagnostics.status="AUTH_DIRECT_MISSING_SECRET" end
+                updateSupportAges()
+                refreshUi()
+                return false,"AUTH_DIRECT_INVALID_SECRET_INPUT"
+            end
+            local requestedRemember=remember==true
+            if not requestedRemember and not clearPersistedSecret() then
+                normalized=nil
+                diagnostics.status="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                diagnostics.lastFailureCode="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                rememberAcrossTeleports=true
+                updateSupportAges()
+                refreshUi()
+                return false,"AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+            end
+            authGeneration+=1
+            if pendingAuthCall then pendingAuthCall.timedOut=true;pendingAuthCall.body=nil end
+            memorySecret=normalized
+            normalized=nil
+            snapshot=nil
+            persistedLoadAttempted=true
+            backoffSeconds=0
+            nextAttemptClock=0
+            diagnostics.status="AUTH_DIRECT_PENDING"
+            diagnostics.lastHttpStatus=nil
+            diagnostics.lastFailureCode=nil
+            rememberAcrossTeleports=requestedRemember
+            if rememberAcrossTeleports then
+                if not persistSecret(memorySecret) then
+                    local cleared=clearPersistedSecret()
+                    rememberAcrossTeleports=cleared~=true
+                    diagnostics.lastFailureCode=cleared and "AUTH_DIRECT_PERSIST_FAILED" or "AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                    if not cleared then diagnostics.status="AUTH_DIRECT_PERSIST_CLEAR_FAILED" end
+                    updateSupportAges()
+                    refreshUi()
+                    return cleared==true,diagnostics.lastFailureCode
+                end
+            end
+            updateSupportAges()
+            refreshUi()
+            return true,diagnostics.lastFailureCode
+        end
+
+        State.AutoTrader.ForgetDirectAuthSecret = function(userInitiated)
+            if userAuthMutationBlocked(userInitiated) then return false,"AUTH_DIRECT_SELF_TEST_ACTIVE" end
+            authGeneration+=1
+            if pendingAuthCall then pendingAuthCall.timedOut=true;pendingAuthCall.body=nil end
+            memorySecret=nil
+            snapshot=nil
+            persistedLoadAttempted=true
+            backoffSeconds=0
+            nextAttemptClock=0
+            local cleared=clearPersistedSecret()
+            rememberAcrossTeleports=cleared~=true
+            diagnostics.status=cleared and "AUTH_DIRECT_MISSING_SECRET" or "AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+            diagnostics.lastHttpStatus=nil
+            if cleared then
+                diagnostics.lastFailureCode=nil
+            else
+                diagnostics.lastFailureCode="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+            end
+            diagnostics.selectorEligible=false
+            diagnostics.pagesFetched=0
+            diagnostics.acceptedRows=0
+            diagnostics.tokenBearingRows=0
+            diagnostics.totalPlayerTokenCount=0
+            diagnostics.duplicateRows=0
+            diagnostics.invalidRows=0
+            updateSupportAges()
+            refreshUi()
+            if type(State.AutoTrader.SetUpcomingServerQueue)=="function" then
+                State.AutoTrader.SetUpcomingServerQueue({},"direct_public_api")
+            end
+            if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+                task.spawn(function()
+                    if not Destroyed and type(State.AutoTrader.BuildPublicServerQueue)=="function" then
+                        pcall(State.AutoTrader.BuildPublicServerQueue,true)
+                    end
+                end)
+            end
+            if not cleared then return false,"AUTH_DIRECT_PERSIST_CLEAR_FAILED" end
+            return true
+        end
+
+        State.AutoTrader.RefreshDirectAuthServerSnapshot = function()
+            loadPersistedSecret()
+            if productionRefreshPaused and (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+                diagnostics.status=type(memorySecret)=="string" and memorySecret~="" and "AUTH_DIRECT_PENDING" or "AUTH_DIRECT_MISSING_SECRET"
+                diagnostics.selectorEligible=false
+                updateSupportAges()
+                refreshUi()
+                return nil,diagnostics
+            end
+            if type(memorySecret)~="string" or memorySecret=="" then
+                return setFailure("AUTH_DIRECT_MISSING_SECRET",nil,"AUTH_DIRECT_MISSING_SECRET",false)
+            end
+            if refreshInFlight then
+                updateSupportAges()
+                return snapshot,diagnostics
+            end
+            if pendingAuthCall then
+                if pendingAuthCall.done~=true then
+                    diagnostics.status="AUTH_DIRECT_BACKOFF"
+                    diagnostics.selectorEligible=false
+                    diagnostics.lastFailureCode="AUTH_DIRECT_REQUEST_STILL_RUNNING"
+                    updateSupportAges()
+                    return nil,diagnostics
+                end
+                pendingAuthCall.body=nil
+                pendingAuthCall=nil
+            end
+            local policy=State.AutoTrader.DirectAuthPolicy
+            if game.PlaceId~=policy.expectedPlaceId then
+                return setFailure("AUTH_DIRECT_REQUEST_FAILED",nil,"AUTH_DIRECT_PLACE_MISMATCH",false)
+            end
+            local clock=nowClock()
+            if clock<nextAttemptClock then
+                updateSupportAges()
+                return snapshot,diagnostics
+            end
+            local requestFn=(getHooks() and getHooks().request) or httpRequest
+            if type(requestFn)~="function" then
+                return setFailure("AUTH_DIRECT_REQUEST_FAILED",nil,"REQUEST_PRIMITIVE_UNAVAILABLE",true)
+            end
+            refreshInFlight=true
+            updateSupportAges()
+            local collected,index={},{}
+            local duplicateRows,invalidRows,tokenBearingRows,totalTokens,pagesFetched=0,0,0,0,0
+            local selectorPotentialRows=0
+            local cursor=nil
+            local httpStatus=nil
+            local failureStatus=nil
+            local failureCode=nil
+            local backoffable=false
+            local discoveredAt=nowUnix()
+            for pageIndex=1,policy.maxPages do
+                local url="https://games.roblox.com/v1/games/142823291/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
+                if cursor and cursor~="" then url=url.."&cursor="..HttpService:UrlEncode(cursor) end
+                local okRequest,statusCode,responseBody,requestFailure=performAuthenticatedServerGet(requestFn,url)
+                httpStatus=tonumber(statusCode)
+                if requestFailure=="AUTH_DIRECT_SUPERSEDED" then
+                    responseBody=nil
+                    refreshInFlight=false
+                    updateSupportAges()
+                    return nil,diagnostics
+                end
+                if not okRequest then
+                    failureStatus="AUTH_DIRECT_REQUEST_FAILED"
+                    failureCode=requestFailure=="AUTH_DIRECT_ENDPOINT_REJECTED" and "AUTH_DIRECT_ENDPOINT_REJECTED"
+                        or (requestFailure=="AUTH_DIRECT_REQUEST_STILL_RUNNING" and "AUTH_DIRECT_REQUEST_STILL_RUNNING"
+                        or (requestFailure=="AUTH_DIRECT_MISSING_SECRET" and "AUTH_DIRECT_MISSING_SECRET"
+                        or "REQUEST_EXCEPTION_OR_TIMEOUT"))
+                    backoffable=failureCode=="REQUEST_EXCEPTION_OR_TIMEOUT"
+                    responseBody=nil
+                    break
+                elseif httpStatus==401 or httpStatus==403 then
+                    responseBody=nil;failureStatus="AUTH_DIRECT_REJECTED";failureCode="AUTH_REJECTED";break
+                elseif httpStatus==429 then
+                    responseBody=nil;failureStatus="AUTH_DIRECT_RATE_LIMITED";failureCode="HTTP_429";backoffable=true;break
+                elseif not httpStatus or httpStatus>=500 then
+                    responseBody=nil;failureStatus="AUTH_DIRECT_REQUEST_FAILED";failureCode=httpStatus and "HTTP_5XX" or "UNSUPPORTED_RESPONSE";backoffable=true;break
+                elseif httpStatus>=300 and httpStatus<400 then
+                    responseBody=nil;failureStatus="AUTH_DIRECT_REQUEST_FAILED";failureCode="REDIRECT_REJECTED";break
+                elseif httpStatus~=200 or type(responseBody)~="string" then
+                    responseBody=nil;failureStatus="AUTH_DIRECT_REQUEST_FAILED";failureCode="HTTP_NON_200";break
+                end
+                local page,parseError=State.AutoTrader.ParseDirectAuthServerListBody(responseBody,discoveredAt)
+                responseBody=nil
+                if not page then
+                    failureStatus="AUTH_DIRECT_SCHEMA_INVALID";failureCode=parseError or "AUTH_DIRECT_SCHEMA_INVALID";break
+                end
+                pagesFetched+=1
+                invalidRows+=page.invalidRows
+                for _,row in ipairs(page.rows) do
+                    if not index[row.id] then
+                        index[row.id]=row
+                        table.insert(collected,row)
+                        if row.playerTokenCount>0 then
+                            tokenBearingRows+=1
+                            totalTokens+=row.playerTokenCount
+                            local manuallyBlocked=type(State.AutoTrader.ManualBotServerJobs)=="table" and State.AutoTrader.ManualBotServerJobs[row.id]~=nil
+                            local recentlyVisited=type(State.AutoTrader.RecentJobs)=="table" and State.AutoTrader.RecentJobs[row.id]~=nil
+                            if row.id~=game.JobId and row.playing<row.maxPlayers and not manuallyBlocked and not recentlyVisited then
+                                selectorPotentialRows+=1
+                            end
+                        end
+                        if #collected>=policy.maxRows then break end
+                    else
+                        duplicateRows+=1
+                    end
+                end
+                if #collected>=policy.maxRows then break end
+                cursor=page.nextPageCursor
+                if not cursor or cursor=="" then break end
+                if selectorPotentialRows>=policy.preclassifyLimit then break end
+            end
+            refreshInFlight=false
+            if failureStatus then
+                return setFailure(failureStatus,httpStatus,failureCode,backoffable)
+            end
+            if pagesFetched<=0 then
+                return setFailure("AUTH_DIRECT_REQUEST_FAILED",httpStatus,"NO_PAGE_COMPLETED",true)
+            end
+            if tokenBearingRows<=0 then
+                return setFailure("AUTH_DIRECT_TOKENLESS",httpStatus,"AUTH_DIRECT_TOKENLESS",false)
+            end
+            snapshot={
+                usable=true,selectorUsable=true,index=index,rows=collected,loadedAtUnix=discoveredAt,
+                source=policy.source,schemaVersion=policy.schemaVersion,
+            }
+            lastSuccessUnix=discoveredAt
+            backoffSeconds=0
+            nextAttemptClock=nowClock()+policy.refreshSeconds
+            diagnostics.status="AUTH_DIRECT_READY"
+            diagnostics.lastHttpStatus=httpStatus or 200
+            diagnostics.lastFailureCode=nil
+            diagnostics.selectorEligible=true
+            diagnostics.pagesFetched=pagesFetched
+            diagnostics.acceptedRows=#collected
+            diagnostics.tokenBearingRows=tokenBearingRows
+            diagnostics.totalPlayerTokenCount=totalTokens
+            diagnostics.duplicateRows=duplicateRows
+            diagnostics.invalidRows=invalidRows
+            updateSupportAges()
+            refreshUi()
+            return snapshot,diagnostics
+        end
+
+        State.AutoTrader.GetDirectAuthSnapshot = function()
+            local current=State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            if type(current)~="table" or current.usable~=true then return nil end
+            local age=math.max(0,nowUnix()-(tonumber(current.loadedAtUnix) or 0))
+            if age>State.AutoTrader.DirectAuthPolicy.rowFreshSeconds then
+                snapshot=nil
+                diagnostics.status="AUTH_DIRECT_BACKOFF"
+                diagnostics.selectorEligible=false
+                diagnostics.lastFailureCode="AUTH_DIRECT_STALE"
+                updateSupportAges()
+                refreshUi()
+                return nil
+            end
+            return current
+        end
+
+        State.AutoTrader.BeginDirectAuthSelfTestIsolation = function()
+            productionRefreshPaused=true
+            local depth=tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0
+            if depth<=0 and not selfTestIsolationActive then
+                resumeMemorySecret=memorySecret
+                selfTestIsolationActive=true
+            end
+            authGeneration+=1
+            local supersededCall=pendingAuthCall
+            if supersededCall then
+                supersededCall.timedOut=true
+                supersededCall.body=nil
+            end
+            local deadline=os.clock()+1.0
+            while refreshInFlight and os.clock()<deadline do task.wait(0.01) end
+            if refreshInFlight then
+                return false,"AUTH_DIRECT_SELF_TEST_QUIESCE_TIMEOUT"
+            end
+            if pendingAuthCall==supersededCall then
+                if supersededCall then supersededCall.body=nil end
+                pendingAuthCall=nil
+            end
+            memorySecret=nil
+            snapshot=nil
+            rememberAcrossTeleports=false
+            persistedLoadAttempted=true
+            backoffSeconds=0
+            nextAttemptClock=0
+            lastSuccessUnix=0
+            diagnostics.status="AUTH_DIRECT_MISSING_SECRET"
+            diagnostics.lastHttpStatus=nil
+            diagnostics.lastSuccessAgeSeconds=nil
+            diagnostics.lastFailureCode=nil
+            diagnostics.selectorEligible=false
+            diagnostics.pagesFetched=0
+            diagnostics.acceptedRows=0
+            diagnostics.tokenBearingRows=0
+            diagnostics.totalPlayerTokenCount=0
+            diagnostics.duplicateRows=0
+            diagnostics.invalidRows=0
+            updateSupportAges()
+            refreshUi()
+            return true
+        end
+
+        State.AutoTrader.RestoreDirectAuthAfterSelfTests = function()
+            local depth=tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0
+            if depth>0 then
+                local hooks=getHooks()
+                if not (hooks and hooks.allowFreshRestore==true) then return false,"SELF_TEST_ACTIVE" end
+            end
+            productionRefreshPaused=true
+            local okRestore,loaded=pcall(function()
+                authGeneration+=1
+                if pendingAuthCall then pendingAuthCall.timedOut=true;pendingAuthCall.body=nil end
+                memorySecret=nil
+                snapshot=nil
+                rememberAcrossTeleports=false
+                persistedLoadAttempted=false
+                backoffSeconds=0
+                nextAttemptClock=0
+                diagnostics.status="AUTH_DIRECT_MISSING_SECRET"
+                diagnostics.lastHttpStatus=nil
+                diagnostics.lastFailureCode=nil
+                diagnostics.selectorEligible=false
+                diagnostics.pagesFetched=0
+                diagnostics.acceptedRows=0
+                diagnostics.tokenBearingRows=0
+                diagnostics.totalPlayerTokenCount=0
+                diagnostics.duplicateRows=0
+                diagnostics.invalidRows=0
+                local restored=loadPersistedSecret()
+                if depth<=0 and not restored and selfTestIsolationActive and type(resumeMemorySecret)=="string" and resumeMemorySecret~="" then
+                    memorySecret=resumeMemorySecret
+                    persistedLoadAttempted=true
+                    rememberAcrossTeleports=false
+                    diagnostics.status="AUTH_DIRECT_PENDING"
+                    diagnostics.lastFailureCode=nil
+                    nextAttemptClock=0
+                    restored=true
+                end
+                return restored==true
+            end)
+            if depth<=0 then
+                resumeMemorySecret=nil
+                selfTestIsolationActive=false
+                productionRefreshPaused=false
+                if not refreshWorkerRunning and type(State.AutoTrader.StartDirectAuthRefreshWorker)=="function" then
+                    pcall(State.AutoTrader.StartDirectAuthRefreshWorker)
+                end
+            end
+            if not okRestore then
+                pcall(updateSupportAges)
+                pcall(refreshUi)
+                return false,"AUTH_DIRECT_SELF_TEST_RESTORE_FAILED"
+            end
+            updateSupportAges()
+            refreshUi()
+            return loaded==true
+        end
+
+        State.AutoTrader.GetDirectAuthSupportSummary = function()
+            updateSupportAges()
+            return {
+                source=diagnostics.source,status=diagnostics.status,schemaVersion=diagnostics.schemaVersion,
+                requestPrimitiveName=diagnostics.requestPrimitiveName,lastHttpStatus=diagnostics.lastHttpStatus,
+                lastSuccessAgeSeconds=diagnostics.lastSuccessAgeSeconds,refreshIntervalSeconds=diagnostics.refreshIntervalSeconds,
+                backoffSeconds=diagnostics.backoffSeconds,pagesFetched=diagnostics.pagesFetched,
+                acceptedRows=diagnostics.acceptedRows,tokenBearingRows=diagnostics.tokenBearingRows,
+                totalPlayerTokenCount=diagnostics.totalPlayerTokenCount,duplicateRows=diagnostics.duplicateRows,
+                invalidRows=diagnostics.invalidRows,selectorEligible=diagnostics.selectorEligible==true,
+                workerRunning=diagnostics.workerRunning==true,rememberAcrossTeleports=diagnostics.rememberAcrossTeleports==true,
+                persistenceAvailable=diagnostics.persistenceAvailable==true,lastFailureCode=diagnostics.lastFailureCode,
+            }
+        end
+
+        State.AutoTrader.StartDirectAuthRefreshWorker = function()
+            if refreshWorkerRunning then return false,"ALREADY_RUNNING" end
+            refreshWorkerRunning=true
+            updateSupportAges()
+            task.spawn(function()
+                while not Destroyed do
+                    task.wait(1)
+                    if not Destroyed and not productionRefreshPaused
+                        and (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0
+                        and type(memorySecret)=="string" and memorySecret~="" then
+                        pcall(State.AutoTrader.RefreshDirectAuthServerSnapshot)
+                    end
+                end
+                refreshWorkerRunning=false
+                updateSupportAges()
+            end)
+            return true
+        end
+
+        loadPersistedSecret()
+        State.AutoTrader.StartDirectAuthRefreshWorker()
+    end
+    State.AutoTrader.InstallV37DirectAuthRuntime()
+    State.AutoTrader.InstallV37DirectAuthRuntime=nil
+
+    State.AutoTrader.BuildAuthenticatedDirectServerQueue = function()
+        local snapshot=State.AutoTrader.GetDirectAuthSnapshot()
+        local support=State.AutoTrader.GetDirectAuthSupportSummary()
+        local policy=State.AutoTrader.DirectAuthPolicy
+        local scan={
+            at=os.clock(),source=policy.source,discoverySource=policy.source,cacheHit=false,
+            directAuth=support,candidates={},queueCount=0,
+            rawRows=0,joinableRows=0,freshRows=0,recentFallbackRows=0,usedRecentFallback=false,
+            filteredCurrent=0,filteredFull=0,filteredManual=0,filteredRecent=0,filteredStale=0,filteredTokenless=0,
+            filteredInvalid=0,filteredBotPreview=0,preclassifyPool=0,preclassifyLimit=policy.preclassifyLimit,
+            selectorRowFreshSeconds=policy.rowFreshSeconds,
+            filterSource="authenticated_direct_executor_request_then_existing_lua_suppression_and_bot_preview",
+        }
+        if type(snapshot)~="table" or snapshot.usable~=true or snapshot.selectorUsable~=true or type(snapshot.index)~="table" then
+            scan.unavailableReason=support.lastFailureCode or support.status or "AUTH_DIRECT_UNAVAILABLE"
+            return {},scan,false
+        end
+        local currentUnix=os.time()
+        State.AutoTrader.PruneRecentJobs()
+        local candidates={}
+        for jobId,row in pairs(snapshot.index) do
+            scan.rawRows+=1
+            local valid=type(jobId)=="string" and jobId~="" and type(row)=="table"
+            if not valid then
+                scan.filteredInvalid+=1
+            elseif jobId==game.JobId then
+                scan.filteredCurrent+=1
+            elseif State.AutoTrader.IsManualBotServerJob and State.AutoTrader.IsManualBotServerJob(jobId) then
+                scan.filteredManual+=1
+            elseif not tonumber(row.playing) or not tonumber(row.maxPlayers) or row.playing<0 or row.maxPlayers<=0 or row.playing>row.maxPlayers then
+                scan.filteredInvalid+=1
+            elseif row.playing>=row.maxPlayers then
+                scan.filteredFull+=1
+            else
+                local rowAge=currentUnix-(tonumber(row.discoveredAtUnix) or currentUnix)
+                if rowAge<0 or rowAge>policy.rowFreshSeconds then
+                    scan.filteredStale+=1
+                elseif row.rosterEvidenceAvailable~=true or math.max(0,tonumber(row.playerTokenCount) or 0)<=0 or type(row.playerTokens)~="table" or #row.playerTokens<=0 then
+                    scan.filteredTokenless+=1
+                elseif State.AutoTrader.RecentJobs[jobId]~=nil then
+                    scan.filteredRecent+=1
+                else
+                    scan.joinableRows+=1
+                    table.insert(candidates,{
+                        id=jobId,playing=row.playing,maxPlayers=row.maxPlayers,occupancy=row.playing/math.max(1,row.maxPlayers),
+                        ping=row.ping,fps=row.fps,playerTokens=table.clone(row.playerTokens),previewTokenCount=#row.playerTokens,
+                        previewTokenSource=policy.source,previewCoverage="SAMPLED_NOT_FULL_ROSTER",
+                        previewFingerprintSource=nil,directAuthRowAgeSeconds=rowAge,directAuthSamplePlaying=row.playing,
+                        directAuthPreviewState="PRIMARY_DISCOVERY",discoverySource=policy.source,
+                    })
+                    scan.freshRows+=1
+                end
+            end
+        end
+        table.sort(candidates,function(a,b)
+            local ap=a.occupancy>=CONFIG.AutoTraderServerPreferredMinOccupancy and a.occupancy<=CONFIG.AutoTraderServerPreferredMaxOccupancy
+            local bp=b.occupancy>=CONFIG.AutoTraderServerPreferredMinOccupancy and b.occupancy<=CONFIG.AutoTraderServerPreferredMaxOccupancy
+            if ap~=bp then return ap end
+            if (a.directAuthRowAgeSeconds or math.huge)~=(b.directAuthRowAgeSeconds or math.huge) then return (a.directAuthRowAgeSeconds or math.huge)<(b.directAuthRowAgeSeconds or math.huge) end
+            if a.playing~=b.playing then return a.playing>b.playing end
+            return tostring(a.id)<tostring(b.id)
+        end)
+        while #candidates>policy.preclassifyLimit do table.remove(candidates) end
+        scan.preclassifyPool=#candidates
+        local thumbOK,thumbReason,thumbDiagnostics=State.AutoTrader.ResolveServerPreviewFingerprints(candidates)
+        scan.thumbnailAvailable=thumbOK;scan.thumbnailReason=thumbReason;scan.thumbnail=thumbDiagnostics
+        local queue={}
+        for _,server in ipairs(candidates) do
+            local preview=State.AutoTrader.ClassifyServerPreview(server)
+            table.insert(scan.candidates,{
+                id=server.id,playing=server.playing,maxPlayers=server.maxPlayers,occupancy=server.occupancy,
+                previewSample=preview.sample,previewTokenCount=server.previewTokenCount,goldBotMatches=preview.goldMatched,goldBotMatchRatio=preview.goldMatchRatio,
+                confirmedBotRatio=preview.confirmedRatio,suspectBotRatio=preview.suspectRatio,botLikelihood=preview.goldMatchRatio,safeConfidence=preview.safeConfidence,
+                previewTrusted=preview.previewTrusted,safeEnough=preview.safeEnough,hardReject=preview.hardReject,suspicious=preview.suspicious,score=preview.score,
+                hashes=server.previewFingerprints,previewThumbnailUrls=table.clone(server.previewThumbnailUrls or {}),recent=State.AutoTrader.RecentJobs[server.id]~=nil,
+                previewTokenSource=server.previewTokenSource,previewCoverage=server.previewCoverage,previewFingerprintSource=server.previewFingerprintSource,
+                directAuthRowAgeSeconds=server.directAuthRowAgeSeconds,directAuthSamplePlaying=server.directAuthSamplePlaying,discoverySource=server.discoverySource,
+            })
+            if preview.safeEnough then table.insert(queue,server) else scan.filteredBotPreview+=1 end
+        end
+        table.sort(queue,State.AutoTrader.CompareFreshServerCandidates)
+        while #queue>CONFIG.AutoTraderServerQueueLimit do table.remove(queue) end
+        local displayOK,displayReason,displayDiagnostics=State.AutoTrader.ResolveServerDisplayThumbnailUrls(queue)
+        scan.displayThumbnailAvailable=displayOK;scan.displayThumbnailReason=displayReason;scan.displayThumbnail=displayDiagnostics
+        scan.queueCount=#queue;scan.safeCandidateCount=#queue;scan.trustedCandidateCount=0;scan.unknownCandidateCount=0
+        for _,server in ipairs(queue) do
+            if server.botPreview and server.botPreview.previewTrusted then scan.trustedCandidateCount+=1 else scan.unknownCandidateCount+=1 end
+        end
+        scan.selected=queue[1] and queue[1].id or nil
+        local bestServer=queue[1]
+        local bestPreview=bestServer and bestServer.botPreview or nil
+        scan.bestScanned=bestServer and {
+            id=bestServer.id,goldBotMatchRatio=bestPreview and bestPreview.goldMatchRatio or 0,
+            safeConfidence=bestPreview and bestPreview.safeConfidence or 0,previewTrusted=bestPreview and bestPreview.previewTrusted==true,
+            safeEnough=bestPreview and bestPreview.safeEnough==true,playing=bestServer.playing,maxPlayers=bestServer.maxPlayers,
+        } or nil
+        scan.cachedCandidateCount=State.AutoTrader.MergeServerCandidateCache(queue)
+        State.AutoTrader.LastServerDiscoverySource=policy.source
+        State.AutoTrader.LastServerScan=scan
+        return queue,scan,true
+    end
+
+    State.AutoTrader.EnrichExistingServerCandidatesFromDirectAuth = function(servers)
+        local snapshot=State.AutoTrader.GetDirectAuthSnapshot()
+        if type(snapshot)~="table" or type(snapshot.index)~="table" then return {},0 end
+        local changed,rows=0,{}
+        for _,server in ipairs(type(servers)=="table" and servers or {}) do
+            if type(server)=="table" and type(server.id)=="string" then
+                local row=snapshot.index[server.id]
+                if row and row.rosterEvidenceAvailable==true and type(row.playerTokens)=="table" and #row.playerTokens>0 then
+                    server.playerTokens=table.clone(row.playerTokens)
+                    server.previewTokenCount=#row.playerTokens
+                    server.previewTokenSource=State.AutoTrader.DirectAuthPolicy.source
+                    server.previewCoverage="SAMPLED_NOT_FULL_ROSTER"
+                    server.discoverySource=server.discoverySource or "direct_public_api"
+                    table.insert(rows,server)
+                    changed+=1
+                end
+            end
+        end
+        return rows,changed
+    end
+
     State.AutoTrader.V37CompanionFetchPublicServers = State.AutoTrader.FetchPublicServers
     State.AutoTrader.FetchPublicServers = function(maxPages)
-        local rows, diagnostics = State.AutoTrader.V37CompanionFetchPublicServers(maxPages)
-        State.AutoTrader.EnrichExistingServerCandidatesFromCompanion(rows, "fresh_public_server_rows")
-        if type(diagnostics)=="table" then diagnostics.companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary() end
-        return rows, diagnostics
+        -- Round 23 production public fallback is deliberately unauthenticated and independent
+        -- of legacy companion files. The old enrichment path is reachable only while the
+        -- preserved legacy self-tests are executing.
+        local rows,diagnostics=State.AutoTrader.V37CompanionFetchPublicServers(maxPages)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 then
+            State.AutoTrader.EnrichExistingServerCandidatesFromCompanion(rows,"legacy_self_test_only")
+            if type(diagnostics)=="table" then diagnostics.companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary() end
+        end
+        return rows,diagnostics
     end
 
     State.AutoTrader.V37CompanionResolveServerPreviewFingerprints = State.AutoTrader.ResolveServerPreviewFingerprints
@@ -27110,6 +28273,9 @@ do
     end
 
     State.AutoTrader.BuildCompanionPrimaryServerQueue = function()
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+            return {},{source="legacy_companion_disabled",discoverySource="legacy_companion_disabled",disabled=true,unavailableReason="ROUND23_LEGACY_COMPANION_DISABLED"},false
+        end
         local snapshot=State.AutoTrader.RefreshServerPreviewCompanion(false)
         local diagnostics=type(snapshot)=="table" and snapshot.diagnostics or nil
         local scan={
@@ -27260,25 +28426,20 @@ do
     State.AutoTrader.V37BuildCachedServerQueue = State.AutoTrader.BuildCachedServerQueue
     State.AutoTrader.BuildCachedServerQueue = function()
         local queue, scan = State.AutoTrader.V37BuildCachedServerQueue()
-        local enriched = State.AutoTrader.EnrichExistingServerCandidatesFromCompanion(queue, "candidate_cache")
-        if #enriched > 0 then
-            local _, _, companionThumb = State.AutoTrader.ResolveServerPreviewFingerprints(enriched)
-            if type(scan)=="table" then scan.companionThumbnail=companionThumb end
-        end
         local safeQueue={}
         for _,server in ipairs(queue) do
             local preview=State.AutoTrader.ClassifyServerPreview(server)
             if preview and preview.safeEnough then table.insert(safeQueue,server) end
         end
         queue = State.AutoTrader.FilterManualBotServerQueue(safeQueue)
-        -- Companion evidence on a cached selector row is intentionally ephemeral.
-        -- Never merge it back here: MergeServerCandidateCache stamps os.time() and would
-        -- incorrectly renew genuine Roblox selector authority without a fresh server scan.
+        -- Authenticated roster samples are intentionally stripped by the selector-cache
+        -- serializer (SAMPLED_NOT_FULL_ROSTER). Cached rows therefore carry only genuine
+        -- selector authority and can never extend authenticated avatar freshness.
         if type(scan)=="table" then
             local manual=State.AutoTrader.PruneManualBotServerJobs();local rows={}
             for _,row in ipairs(type(scan.candidates)=="table" and scan.candidates or {}) do if not manual[row.id] then table.insert(rows,row) end end
             scan.candidates=rows;scan.queueCount=#queue;scan.safeCandidateCount=#queue;scan.selected=queue[1] and queue[1].id or nil
-            scan.companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary()
+            scan.directAuth=State.AutoTrader.GetDirectAuthSupportSummary()
         end
         return queue, scan
     end
@@ -27288,7 +28449,13 @@ do
         State.AutoTrader.UpcomingServerQueueRevision += 1
         State.AutoTrader.UpcomingServerQueueSource = tostring(source or "selector")
         State.AutoTrader.UpcomingServerQueueAt = os.clock()
-        State.AutoTrader.QueueRequestedServerPreviewHintWrite(State.AutoTrader.UpcomingServerQueue)
+        -- Round 23 production direct auth does not require any requested-JobId sidecar file.
+        -- Preserve the old write hook only inside its historical self-tests.
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0
+            and type(State.AutoTrader.RequestedServerPreviewHintTestHooks)=="table"
+            and type(State.AutoTrader.RequestedServerPreviewHintTestHooks.write)=="function" then
+            State.AutoTrader.QueueRequestedServerPreviewHintWrite(State.AutoTrader.UpcomingServerQueue)
+        end
         if type(State.AutoTrader.QueueUpcomingThumbnailPrefetch)=="function" then
             local prefetchHooks=State.AutoTrader.UpcomingThumbnailDisplayTestHooks
             if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0
@@ -27300,21 +28467,52 @@ do
 
     State.AutoTrader.V37BuildPublicServerQueue = State.AutoTrader.BuildPublicServerQueue
     State.AutoTrader.BuildPublicServerQueue = function(forceFresh)
-        local queue,scan,companionEligible=State.AutoTrader.BuildCompanionPrimaryServerQueue()
-        if not companionEligible or #queue==0 then
+        -- Keep the exact Round-22 selector composition reachable only to the preserved
+        -- pre-Round-23 self-tests. Production (depth 0) and Round-23 tests use direct auth.
+        local directHooks=type(State.AutoTrader.DirectAuthTestHooks)=="table" and State.AutoTrader.DirectAuthTestHooks or nil
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 and not (directHooks and directHooks.round23==true) then
+            local legacyQueue,legacyScan,companionEligible=State.AutoTrader.BuildCompanionPrimaryServerQueue()
+            if not companionEligible or #legacyQueue==0 then
+                local directQueue,directScan=State.AutoTrader.V37BuildPublicServerQueue(true)
+                if #directQueue>0 then
+                    legacyQueue,legacyScan=directQueue,directScan
+                    if type(legacyScan)=="table" then legacyScan.source="direct_public_api";legacyScan.discoverySource="direct_public_api" end
+                elseif forceFresh~=true then
+                    legacyQueue,legacyScan=State.AutoTrader.BuildCachedServerQueue()
+                end
+            end
+            legacyQueue=State.AutoTrader.FilterManualBotServerQueue(legacyQueue)
+            State.AutoTrader.SetUpcomingServerQueue(legacyQueue,legacyScan and (legacyScan.discoverySource or legacyScan.source) or "selector")
+            return legacyQueue,legacyScan
+        end
+
+        local queue,scan,authEligible=State.AutoTrader.BuildAuthenticatedDirectServerQueue()
+        if not authEligible then
             local directQueue,directScan=State.AutoTrader.V37BuildPublicServerQueue(true)
             if #directQueue>0 then
                 queue,scan=directQueue,directScan
-                if type(scan)=="table" then scan.source="direct_public_api";scan.discoverySource="direct_public_api";scan.companionPrimaryUnavailableReason=companionEligible and "NO_SAFE_COMPANION_CANDIDATES" or (scan.companion and (scan.companion.selectorLastError or scan.companion.lastError) or "COMPANION_UNAVAILABLE") end
+                if type(scan)=="table" then
+                    scan.source="direct_public_api"
+                    scan.discoverySource="direct_public_api"
+                    scan.directAuthPrimaryUnavailableReason=State.AutoTrader.GetDirectAuthSupportSummary().lastFailureCode
+                        or State.AutoTrader.GetDirectAuthSupportSummary().status or "AUTH_DIRECT_UNAVAILABLE"
+                    scan.directAuth=State.AutoTrader.GetDirectAuthSupportSummary()
+                end
                 State.AutoTrader.LastServerDiscoverySource="direct_public_api"
             elseif forceFresh~=true then
                 local cachedQueue,cachedScan=State.AutoTrader.BuildCachedServerQueue()
                 queue,scan=cachedQueue,cachedScan
-                if type(scan)=="table" then scan.source="cached_selector";scan.discoverySource="cached_selector" end
+                if type(scan)=="table" then
+                    scan.source="cached_selector";scan.discoverySource="cached_selector"
+                    scan.directAuth=State.AutoTrader.GetDirectAuthSupportSummary()
+                end
                 State.AutoTrader.LastServerDiscoverySource="cached_selector"
             else
                 queue,scan=directQueue,directScan
-                if type(scan)=="table" then scan.source="direct_public_api";scan.discoverySource="direct_public_api" end
+                if type(scan)=="table" then
+                    scan.source="direct_public_api";scan.discoverySource="direct_public_api"
+                    scan.directAuth=State.AutoTrader.GetDirectAuthSupportSummary()
+                end
                 State.AutoTrader.LastServerDiscoverySource="direct_public_api"
             end
         end
@@ -27328,7 +28526,7 @@ do
         end
         State.AutoTrader.SetUpcomingServerQueue(queue,scan and (scan.discoverySource or scan.source) or "selector")
         if type(State.AutoTrader.QueueUpcomingThumbnailPrefetch)=="function" and type(scan)=="table" and type(scan.candidates)=="table"
-            and scan.discoverySource~="browser_companion_authenticated" then
+            and scan.discoverySource~=State.AutoTrader.DirectAuthPolicy.source then
             local prefetchHooks=State.AutoTrader.UpcomingThumbnailDisplayTestHooks
             if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0
                 or (type(prefetchHooks)=="table" and prefetchHooks.allowDuringSelfTest==true) then
@@ -27360,7 +28558,7 @@ do
         local scan=State.AutoTrader.LastServerScan
         for _, row in ipairs(scan and type(scan.candidates)=="table" and scan.candidates or {}) do
             if row.id==jobId then
-                return {id=row.id,playing=row.playing,maxPlayers=row.maxPlayers,occupancy=row.occupancy,previewFingerprints=table.clone(row.hashes or {}),previewThumbnailUrls=table.clone(row.previewThumbnailUrls or {}),previewTokenCount=math.max(0,tonumber(row.previewTokenCount) or 0),previewTokenSource=row.previewTokenSource,previewCoverage=row.previewCoverage,previewFingerprintSource=row.previewFingerprintSource,companionRowAgeSeconds=tonumber(row.companionRowAgeSeconds),companionSamplePlaying=tonumber(row.companionSamplePlaying)}
+                return {id=row.id,playing=row.playing,maxPlayers=row.maxPlayers,occupancy=row.occupancy,previewFingerprints=table.clone(row.hashes or {}),previewThumbnailUrls=table.clone(row.previewThumbnailUrls or {}),previewTokenCount=math.max(0,tonumber(row.previewTokenCount) or 0),previewTokenSource=row.previewTokenSource,previewCoverage=row.previewCoverage,previewFingerprintSource=row.previewFingerprintSource,directAuthRowAgeSeconds=tonumber(row.directAuthRowAgeSeconds),directAuthSamplePlaying=tonumber(row.directAuthSamplePlaying),companionRowAgeSeconds=tonumber(row.companionRowAgeSeconds),companionSamplePlaying=tonumber(row.companionSamplePlaying)}
             end
         end
         return nil
@@ -27418,8 +28616,10 @@ do
         local source = type(server)=="table" and server.previewTokenSource or nil
         local coverage = type(server)=="table" and server.previewCoverage or nil
         local players = type(server)=="table" and tonumber(server.playing) or nil
-        local companionSample = type(source)=="string" and string.sub(source,1,17)=="browser_companion"
-        local samplePrefix = companionSample and (tostring(tokenCount).." avatar sample"..(tokenCount==1 and "" or "s").." · "..tostring(players or "?").." players · ") or ""
+        local directAuthSample = source==State.AutoTrader.DirectAuthPolicy.source
+        local legacyCompanionSample = type(source)=="string" and string.sub(source,1,17)=="browser_companion"
+        local sampledPreview = directAuthSample or legacyCompanionSample
+        local samplePrefix = sampledPreview and (tostring(tokenCount).." avatar sample"..(tokenCount==1 and "" or "s").." · "..tostring(players or "?").." players · ") or ""
         if #fingerprints <= 0 then
             if tokenCount <= 0 then
                 local detail="ROBLOX SERVER API PROVIDED NO ROSTER TOKENS"
@@ -27433,34 +28633,42 @@ do
                     actionMode="JOB_ID_ONLY_SKIP",
                     canPromoteFingerprintEvidence=false,
                     tokenCount=0, fingerprintCount=0, thumbnailCount=#urls,
-                    previewTokenSource=source, previewCoverage=coverage, companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
+                    previewTokenSource=source, previewCoverage=coverage,
+                    directAuthRowAgeSeconds=type(server)=="table" and tonumber(server.directAuthRowAgeSeconds) or nil,
+                    companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
                     disclosure="SKIP SERVER suppresses only this JobId; zero avatar fingerprints or bot-icon counters will be learned.",
                 }
             end
             return {
                 state="TOKEN_PREVIEW_FAILED",
-                title=companionSample and "AVATAR SAMPLE PREVIEW UNAVAILABLE" or "AVATAR PREVIEW UNAVAILABLE",
+                title=sampledPreview and "AVATAR SAMPLE PREVIEW UNAVAILABLE" or "AVATAR PREVIEW UNAVAILABLE",
                 detail=samplePrefix.."ROSTER TOKENS WERE PRESENT, BUT NO CANONICAL THUMBNAIL FINGERPRINT COMPLETED",
                 actionText="SKIP SERVER",
                 actionMode="JOB_ID_ONLY_SKIP",
                 canPromoteFingerprintEvidence=false,
                 tokenCount=tokenCount, fingerprintCount=0, thumbnailCount=#urls,
-                previewTokenSource=source, previewCoverage=coverage, companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
-                disclosure=companionSample
-                    and "These are browser-companion samples, not a complete roster. SKIP SERVER suppresses only this JobId; no fingerprint evidence exists to promote."
-                    or "SKIP SERVER suppresses only this JobId; no fingerprint evidence exists to promote.",
+                previewTokenSource=source, previewCoverage=coverage,
+                    directAuthRowAgeSeconds=type(server)=="table" and tonumber(server.directAuthRowAgeSeconds) or nil,
+                    companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
+                disclosure=directAuthSample
+                    and "These are authenticated direct server-list SAMPLES, not a complete roster. SKIP SERVER suppresses only this JobId; no fingerprint evidence exists to promote."
+                    or (legacyCompanionSample
+                        and "These are legacy browser-companion samples, not a complete roster. SKIP SERVER suppresses only this JobId; no fingerprint evidence exists to promote."
+                        or "SKIP SERVER suppresses only this JobId; no fingerprint evidence exists to promote."),
             }
         end
         return {
             state="CANONICAL_AVATAR_EVIDENCE",
-            title=companionSample and "AVATAR SAMPLES AVAILABLE" or "AVATAR PREVIEW AVAILABLE",
+            title=sampledPreview and "AVATAR SAMPLES AVAILABLE" or "AVATAR PREVIEW AVAILABLE",
             detail=samplePrefix..tostring(#fingerprints).." canonical avatar fingerprint(s) captured from "..tostring(tokenCount).." roster token(s)",
             actionText="BOT SERVER",
             actionMode="MANUAL_BOT_WITH_FINGERPRINT_EVIDENCE",
             canPromoteFingerprintEvidence=true,
             tokenCount=tokenCount, fingerprintCount=#fingerprints, thumbnailCount=#urls,
-            previewTokenSource=source, previewCoverage=coverage, companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
-            disclosure=companionSample
+            previewTokenSource=source, previewCoverage=coverage,
+                    directAuthRowAgeSeconds=type(server)=="table" and tonumber(server.directAuthRowAgeSeconds) or nil,
+                    companionRowAgeSeconds=type(server)=="table" and tonumber(server.companionRowAgeSeconds) or nil,
+            disclosure=sampledPreview
                 and "These avatars are SAMPLES; unseen players remain unknown. BOT SERVER is an explicit manual whole-server label, and all captured fingerprint(s) become manual evidence only."
                 or "BOT SERVER labels the whole candidate; all "..tostring(#fingerprints).." captured fingerprint(s) become explicit manual evidence.",
         }
@@ -27472,17 +28680,19 @@ do
         local summary = {
             source=scan and scan.source or State.AutoTrader.UpcomingServerQueueSource,
             upcomingRows=#queue, tokenlessUpcomingRows=0, tokenBearingUpcomingRows=0,
-            fingerprintRows=0, thumbnailRows=0, companionSampleRows=0,
+            fingerprintRows=0, thumbnailRows=0, directAuthSampleRows=0, companionSampleRows=0,
             fetch={usableRows=0,rowsWithPlayerTokens=0,totalPlayerTokens=0,tokenlessActivePages=0,selectedDegradedPages=0},
             thumbnail={tokens=0,batches=0,completed=0,lastError=nil},
-            companion=State.AutoTrader.GetServerPreviewCompanionSupportSummary(),
+            directAuth=State.AutoTrader.GetDirectAuthSupportSummary(),
+            companion={disabled=true,reason="ROUND23_REPLACED_BY_AUTHENTICATED_DIRECT_EXECUTOR_REQUEST"},
         }
         for _, server in ipairs(queue) do
             local state = State.AutoTrader.GetUpcomingServerPreviewUiState(server)
             if state.tokenCount > 0 then summary.tokenBearingUpcomingRows += 1 else summary.tokenlessUpcomingRows += 1 end
             if state.fingerprintCount > 0 then summary.fingerprintRows += 1 end
             if state.thumbnailCount > 0 then summary.thumbnailRows += 1 end
-            if type(state.previewTokenSource)=="string" and string.sub(state.previewTokenSource,1,17)=="browser_companion" then summary.companionSampleRows += 1 end
+            if state.previewTokenSource==State.AutoTrader.DirectAuthPolicy.source then summary.directAuthSampleRows += 1
+            elseif type(state.previewTokenSource)=="string" and string.sub(state.previewTokenSource,1,17)=="browser_companion" then summary.companionSampleRows += 1 end
         end
         local fetch = scan and scan.fetch
         if type(fetch)=="table" then
@@ -27516,7 +28726,9 @@ do
             previewTokenSource=previewState.previewTokenSource,previewCoverage=previewState.previewCoverage,
             companionRowAgeSeconds=previewState.companionRowAgeSeconds,
             browserVisibleThumbnailLimit=math.max(1,tonumber(CONFIG.AutoTraderUpcomingServerPreviewIconLimit) or 4),
-            evidenceScope=hasCanonicalEvidence and ((type(previewState.previewTokenSource)=="string" and string.sub(previewState.previewTokenSource,1,17)=="browser_companion") and "manual_whole_server_label_based_on_sampled_avatar_evidence" or "whole_server_all_captured_fingerprints") or "job_id_only_no_fingerprint_learning",
+            evidenceScope=hasCanonicalEvidence and ((previewState.previewTokenSource==State.AutoTrader.DirectAuthPolicy.source
+                or (type(previewState.previewTokenSource)=="string" and string.sub(previewState.previewTokenSource,1,17)=="browser_companion"))
+                and "manual_whole_server_label_based_on_sampled_avatar_evidence" or "whole_server_all_captured_fingerprints") or "job_id_only_no_fingerprint_learning",
             previewAvailability=previewState.state,
             evidenceState=hasCanonicalEvidence and "pending" or "JOB_ONLY_SUPPRESSION_NO_FINGERPRINT_EVIDENCE",
         }
@@ -27534,7 +28746,10 @@ do
             classification.fingerprints=canonical
             if learned>0 then
                 candidate=State.AutoTrader.PruneBotDbCandidate(candidate)
-                local saved,err=State.AutoTrader.CommitTrustedBotDbCandidate(candidate,{source="manual_bot_server_browser",provenance="manual_bot_server",evidenceSource=(type(classification.previewTokenSource)=="string" and string.sub(classification.previewTokenSource,1,17)=="browser_companion") and "browser_companion_samples" or "selector_preview",previewCoverage=classification.previewCoverage,jobId=jobId,classifiedAtUnix=now,fingerprintCount=canonicalCount,thumbnailCount=classification.thumbnailCount,rosterTokenCount=classification.rosterTokenCount})
+                local saved,err=State.AutoTrader.CommitTrustedBotDbCandidate(candidate,{source="manual_bot_server_browser",provenance="manual_bot_server",
+                    evidenceSource=classification.previewTokenSource==State.AutoTrader.DirectAuthPolicy.source and "authenticated_direct_samples"
+                        or ((type(classification.previewTokenSource)=="string" and string.sub(classification.previewTokenSource,1,17)=="browser_companion") and "legacy_browser_companion_samples" or "selector_preview"),
+                    previewCoverage=classification.previewCoverage,jobId=jobId,classifiedAtUnix=now,fingerprintCount=canonicalCount,thumbnailCount=classification.thumbnailCount,rosterTokenCount=classification.rosterTokenCount})
                 classification.evidenceState=saved and "TRUSTED_MANUAL_EVIDENCE" or "MANUAL_EVIDENCE_PERSISTENCE_FAILED"
                 classification.evidenceError=nil
                 if not saved then classification.evidenceError=tostring(err) end
@@ -27802,6 +29017,133 @@ do
         return true
     end
 
+
+    State.AutoTrader.UpdateDirectAuthUi = function()
+        local support=type(State.AutoTrader.GetDirectAuthSupportSummary)=="function" and State.AutoTrader.GetDirectAuthSupportSummary() or {}
+        if UI.AutoTraderDirectAuthStatus and UI.AutoTraderDirectAuthStatus.Parent then
+            local status=tostring(support.status or "AUTH_DIRECT_MISSING_SECRET")
+            if status=="AUTH_DIRECT_READY" then
+                UI.AutoTraderDirectAuthStatus.Text="DIRECT AUTH · READY · "..tostring(support.tokenBearingRows or 0).." token rows · "..tostring(support.refreshIntervalSeconds or 5).."s refresh"
+                UI.AutoTraderDirectAuthStatus.TextColor3=THEME.green
+            elseif status=="AUTH_DIRECT_MISSING_SECRET" then
+                UI.AutoTraderDirectAuthStatus.Text="DIRECT AUTH · DISCONNECTED · enter the cookie locally below"
+                UI.AutoTraderDirectAuthStatus.TextColor3=THEME.yellow
+            elseif status=="AUTH_DIRECT_REJECTED" then
+                UI.AutoTraderDirectAuthStatus.Text="DIRECT AUTH · REJECTED · check the local session cookie"
+                UI.AutoTraderDirectAuthStatus.TextColor3=THEME.red
+            else
+                UI.AutoTraderDirectAuthStatus.Text="DIRECT AUTH · "..status.." · backoff "..tostring(support.backoffSeconds or 0).."s"
+                UI.AutoTraderDirectAuthStatus.TextColor3=THEME.yellow
+            end
+        end
+        if UI.AutoTraderDirectAuthRemember and UI.AutoTraderDirectAuthRemember.Parent then
+            local enabled=State.AutoTrader.GetDirectAuthRemember and State.AutoTrader.GetDirectAuthRemember() or false
+            UI.AutoTraderDirectAuthRemember.Text=enabled and "REMEMBER: ON" or "REMEMBER: OFF"
+            UI.AutoTraderDirectAuthRemember.TextColor3=enabled and THEME.green or THEME.muted
+        end
+    end
+
+    State.AutoTrader.ShowDirectAuthSelfTestActiveUi = function(statusLabel)
+        local label=statusLabel or UI.AutoTraderDirectAuthStatus
+        if typeof(label)=="Instance" then
+            label.Text="DIRECT AUTH · SELF-TEST ACTIVE — TRY AGAIN"
+            label.TextColor3=THEME.yellow
+        end
+        return true
+    end
+
+    State.AutoTrader.HandleDirectAuthUiConnectSubmission = function(input,remember,secretBox,statusLabel)
+        local accepted,reason=State.AutoTrader.ConnectDirectAuthSecret(input,remember,true)
+        if accepted==true then
+            if typeof(secretBox)=="Instance" and secretBox.Text==input then secretBox.Text="" end
+            State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            if not Destroyed then
+                State.AutoTrader.BuildPublicServerQueue(true)
+                State.AutoTrader.UpdateDirectAuthUi()
+            end
+        elseif reason=="AUTH_DIRECT_SELF_TEST_ACTIVE" then
+            State.AutoTrader.ShowDirectAuthSelfTestActiveUi(statusLabel)
+        elseif not Destroyed then
+            State.AutoTrader.UpdateDirectAuthUi()
+        end
+        return accepted,reason
+    end
+
+    State.AutoTrader.InstallV37DirectAuthUi = function()
+        local settings=UI.AutoTraderPages and UI.AutoTraderPages.SETTINGS
+        if not settings or not UI.AutoTraderV37UiHelpers then return false end
+        if UI.AutoTraderDirectAuthCard and UI.AutoTraderDirectAuthCard.Parent then return true end
+
+        -- Make room without changing the rest of the settings behavior.
+        if UI.AutoTraderReserveTitle then UI.AutoTraderReserveTitle.Position=UDim2.fromOffset(4,350) end
+        if UI.AutoTraderReserveCount then UI.AutoTraderReserveCount.Position=UDim2.new(1,-116,0,350) end
+        if UI.AutoTraderSearch then UI.AutoTraderSearch.Position=UDim2.fromOffset(0,374) end
+        if UI.AutoTraderReserveScroll then
+            UI.AutoTraderReserveScroll.Position=UDim2.fromOffset(0,414)
+            UI.AutoTraderReserveScroll.Size=UDim2.new(1,0,1,-414)
+        end
+
+        local card=create("Frame",{Position=UDim2.fromOffset(0,250),Size=UDim2.new(1,0,0,92),BackgroundColor3=THEME.panel2,BorderSizePixel=0,ZIndex=1454},settings)
+        addCorner(card,4);UI.AutoTraderV37UiHelpers.stroke(card,THEME.border,0.35);UI.AutoTraderV37UiHelpers.gradient(card,UI.AutoTraderV37UiHelpers.palette.cardAltTop,UI.AutoTraderV37UiHelpers.palette.cardAltBottom,90)
+        UI.AutoTraderDirectAuthCard=card
+
+        local title=makeLabel(card,"AUTHENTICATED SERVER PREVIEWS",10,Color3.fromRGB(37,83,111),Enum.Font.ArialBold)
+        title.Position=UDim2.fromOffset(8,4);title.Size=UDim2.new(1,-16,0,16);title.ZIndex=1456
+
+        UI.AutoTraderDirectAuthSecretBox=create("TextBox",{
+            Position=UDim2.fromOffset(8,24),Size=UDim2.new(0.54,-8,0,25),
+            BackgroundColor3=Color3.fromRGB(251,253,254),BorderSizePixel=0,
+            PlaceholderText="Paste .ROBLOSECURITY · hidden · Remember=plaintext",PlaceholderColor3=THEME.faint,
+            Text="",TextTransparency=1,TextColor3=THEME.text,TextSize=11,Font=Enum.Font.Arial,
+            ClearTextOnFocus=false,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=1457,
+        },card)
+        addCorner(UI.AutoTraderDirectAuthSecretBox,4);UI.AutoTraderV37UiHelpers.stroke(UI.AutoTraderDirectAuthSecretBox,THEME.border,0.3)
+
+        UI.AutoTraderDirectAuthConnect=UI.AutoTraderV37UiHelpers.button(card,"CONNECT / SAVE",UDim2.new(0.25,-5,0,25),false)
+        UI.AutoTraderDirectAuthConnect.Position=UDim2.new(0.54,4,0,24);UI.AutoTraderDirectAuthConnect.TextSize=9;UI.AutoTraderDirectAuthConnect.ZIndex=1457
+        UI.AutoTraderDirectAuthForget=UI.AutoTraderV37UiHelpers.button(card,"FORGET",UDim2.new(0.21,-7,0,25),false)
+        UI.AutoTraderDirectAuthForget.Position=UDim2.new(0.79,6,0,24);UI.AutoTraderDirectAuthForget.TextSize=9;UI.AutoTraderDirectAuthForget.TextColor3=THEME.red;UI.AutoTraderDirectAuthForget.ZIndex=1457
+
+        UI.AutoTraderDirectAuthRemember=UI.AutoTraderV37UiHelpers.button(card,"REMEMBER: OFF",UDim2.fromOffset(112,24),false)
+        UI.AutoTraderDirectAuthRemember.Position=UDim2.fromOffset(8,56);UI.AutoTraderDirectAuthRemember.TextSize=8;UI.AutoTraderDirectAuthRemember.ZIndex=1457
+        UI.AutoTraderDirectAuthStatus=makeLabel(card,"DIRECT AUTH · DISCONNECTED",8,THEME.yellow,Enum.Font.Arial)
+        UI.AutoTraderDirectAuthStatus.Position=UDim2.fromOffset(128,55);UI.AutoTraderDirectAuthStatus.Size=UDim2.new(1,-136,0,28);UI.AutoTraderDirectAuthStatus.TextWrapped=true;UI.AutoTraderDirectAuthStatus.ZIndex=1456
+
+        connect(UI.AutoTraderDirectAuthRemember.MouseButton1Click,function()
+            if Destroyed then return end
+            local nextValue=not (State.AutoTrader.GetDirectAuthRemember and State.AutoTrader.GetDirectAuthRemember())
+            local accepted,reason=State.AutoTrader.SetDirectAuthRemember(nextValue,true)
+            if accepted~=true and reason=="AUTH_DIRECT_SELF_TEST_ACTIVE" then
+                State.AutoTrader.ShowDirectAuthSelfTestActiveUi(UI.AutoTraderDirectAuthStatus)
+            else
+                State.AutoTrader.UpdateDirectAuthUi()
+            end
+        end)
+        connect(UI.AutoTraderDirectAuthConnect.MouseButton1Click,function()
+            if Destroyed then return end
+            local input=UI.AutoTraderDirectAuthSecretBox.Text
+            local remember=State.AutoTrader.GetDirectAuthRemember and State.AutoTrader.GetDirectAuthRemember() or false
+            task.spawn(function()
+                State.AutoTrader.HandleDirectAuthUiConnectSubmission(input,remember,UI.AutoTraderDirectAuthSecretBox,UI.AutoTraderDirectAuthStatus)
+                input=nil
+            end)
+        end)
+        connect(UI.AutoTraderDirectAuthForget.MouseButton1Click,function()
+            if Destroyed then return end
+            local accepted,reason=State.AutoTrader.ForgetDirectAuthSecret(true)
+            if accepted~=true and reason=="AUTH_DIRECT_SELF_TEST_ACTIVE" then
+                State.AutoTrader.ShowDirectAuthSelfTestActiveUi(UI.AutoTraderDirectAuthStatus)
+            else
+                UI.AutoTraderDirectAuthSecretBox.Text=""
+                State.AutoTrader.UpdateDirectAuthUi()
+            end
+        end)
+        State.AutoTrader.UpdateDirectAuthUi()
+        return true
+    end
+    State.AutoTrader.InstallV37DirectAuthUi()
+    State.AutoTrader.InstallV37DirectAuthUi=nil
+
     -- Reuse the existing SERVERS tab, but keep one-time UI installation in its own
     -- function scope so its locals/for-loop control variables do not consume chunk registers.
     State.AutoTrader.InstallV37UpcomingServerBrowserUi = function()
@@ -27858,7 +29200,8 @@ do
             local title=makeLabel(row,tostring(index)..". "..short.." · "..tostring(server.playing or "?").."/"..tostring(server.maxPlayers or "?"),10,THEME.text,Enum.Font.ArialBold)
             title.Position=UDim2.fromOffset(8,4);title.Size=UDim2.new(1,-106,0,17);title.ZIndex=1455
             local verdict
-            if type(previewUi.previewTokenSource)=="string" and string.sub(previewUi.previewTokenSource,1,17)=="browser_companion" then
+            if previewUi.previewTokenSource==State.AutoTrader.DirectAuthPolicy.source
+                or (type(previewUi.previewTokenSource)=="string" and string.sub(previewUi.previewTokenSource,1,17)=="browser_companion") then
                 verdict=tostring(previewUi.tokenCount).." avatar sample"..(previewUi.tokenCount==1 and "" or "s").." · "..tostring(server.playing or "?").." players"
                 if trusted then verdict=verdict.." · trusted bot matches "..UI.AutoTraderV37UiHelpers.pct01(preview.goldMatchRatio or 0).." (strict + manual DB)" end
             else
@@ -27918,7 +29261,7 @@ do
             filteredInvalid=tonumber(scan.filteredInvalid) or 0,filteredBotPreview=tonumber(scan.filteredBotPreview) or 0,usedRecentFallback=scan.usedRecentFallback==true,
             canonicalThumbnailTokens=tonumber(thumbnail.tokens) or 0,canonicalThumbnailCompleted=tonumber(thumbnail.completed) or 0,
             displayThumbnailCompleted=tonumber(display.completed) or 0,sizeIdentityMismatch=tonumber(display.sizeIdentityMismatch) or 0,
-            unavailableReason=scan.unavailableReason,companionPrimaryUnavailableReason=scan.companionPrimaryUnavailableReason,
+            unavailableReason=scan.unavailableReason,directAuthPrimaryUnavailableReason=scan.directAuthPrimaryUnavailableReason,
         }
     end
 
@@ -27942,7 +29285,7 @@ do
         for index,server in ipairs(State.AutoTrader.GetUpcomingServerCandidates()) do
             if index>20 then break end
             local previewUi=State.AutoTrader.GetUpcomingServerPreviewUiState(server)
-            table.insert(upcoming,{id=server.id,playing=server.playing,maxPlayers=server.maxPlayers,discoverySource=server.discoverySource,previewTokenCount=previewUi.tokenCount,previewTokenSource=previewUi.previewTokenSource,previewCoverage=previewUi.previewCoverage,companionRowAgeSeconds=previewUi.companionRowAgeSeconds,previewAvailability=previewUi.state,actionMode=previewUi.actionMode,previewFingerprints=server.previewFingerprints,thumbnailCount=#(server.previewThumbnailUrls or {}),displayThumbnailCount=#(server.previewDisplayThumbnailUrls or {}),preview=server.botPreview})
+            table.insert(upcoming,{id=server.id,playing=server.playing,maxPlayers=server.maxPlayers,discoverySource=server.discoverySource,previewTokenCount=previewUi.tokenCount,previewTokenSource=previewUi.previewTokenSource,previewCoverage=previewUi.previewCoverage,directAuthRowAgeSeconds=previewUi.directAuthRowAgeSeconds,previewAvailability=previewUi.state,actionMode=previewUi.actionMode,previewFingerprints=server.previewFingerprints,thumbnailCount=#(server.previewThumbnailUrls or {}),displayThumbnailCount=#(server.previewDisplayThumbnailUrls or {}),preview=server.botPreview})
         end
         payload.v37={
             contract=State.AutoTrader.V37.contract,
@@ -27951,7 +29294,9 @@ do
                 lkgPersistence={workerRunning=HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.workerRunning or false,desiredRevision=HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.desired and HARDEN.supremeLkgPersistenceState.desired.revision or nil,activeRevision=HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.active and HARDEN.supremeLkgPersistenceState.active.revision or nil,lastFinished=HARDEN.supportJsonValue(HARDEN.supremeLkgPersistenceState and HARDEN.supremeLkgPersistenceState.lastFinished)}},
             inventoryDiscovery=playerDiagnostics,
             upcomingServerQueue={revision=State.AutoTrader.UpcomingServerQueueRevision,source=State.AutoTrader.UpcomingServerQueueSource,rows=upcoming},
-            serverPreviewAvailability=State.AutoTrader.GetServerPreviewAvailabilitySummary(),serverPreviewCompanion=State.AutoTrader.GetServerPreviewCompanionSupportSummary(),requestedServerPreviewHint=State.AutoTrader.GetRequestedServerPreviewHintSupportSummary(),serverRosterPolicy=State.AutoTrader.ServerRosterPolicy,
+            serverPreviewAvailability=State.AutoTrader.GetServerPreviewAvailabilitySummary(),serverPreviewDirectAuth=State.AutoTrader.GetDirectAuthSupportSummary(),
+            serverPreviewCompanion={disabled=true,reason="ROUND23_REPLACED_BY_AUTHENTICATED_DIRECT_EXECUTOR_REQUEST"},
+            requestedServerPreviewHint={disabled=true,reason="ROUND23_DIRECT_AUTH_DOES_NOT_REQUIRE_REQUEST_HINT_FILES"},serverRosterPolicy=State.AutoTrader.ServerRosterPolicy,
             serverDiscoverySource=State.AutoTrader.LastServerDiscoverySource,serverDiscoveryDiagnostics=State.AutoTrader.GetServerDiscoverySupportSummary(),canonicalPreviewThumbnailSize=State.AutoTrader.CanonicalServerPreviewThumbnailSize or "150x150",displayPreviewThumbnailSize=CONFIG.AutoTraderUpcomingThumbnailDisplaySize,
             manualBotServers=State.AutoTrader.PruneManualBotServerJobs(),lastManualClassification=State.AutoTrader.LastManualBotServerClassification,botEvidenceProvenance=State.AutoTrader.GetBotEvidenceProvenanceSummary(),
             botTrustWriteArbiter=HARDEN.supportJsonValue(State.AutoTrader.BotTrustWriteArbiter),lastBotTrustWriteReject=HARDEN.supportJsonValue(State.AutoTrader.LastBotTrustWriteReject),
@@ -28383,8 +29728,8 @@ do
                 "token-bearing preview stopped using canonical fingerprint evidence plus display-only fallback"
         end)
         add("v37-public-roster-policy-forbids-authenticated-fallback",function()
-            return State.AutoTrader.ServerRosterPolicy=="AUTHENTICATED_COMPANION_DISCOVERY_LUA_POLICY_DIRECT_PUBLIC_FALLBACK",
-                "server preview policy no longer records the authorized companion-discovery/Lua-policy/direct-public-fallback architecture"
+            return State.AutoTrader.ServerRosterPolicy=="AUTHENTICATED_DIRECT_EXECUTOR_REQUEST_LUA_POLICY_DIRECT_PUBLIC_FALLBACK",
+                "server preview policy no longer records authenticated-direct discovery with fail-closed public fallback"
         end)
         add("v37-server-preview-support-surfaces-tokenless-degradation",function()
             local oldUpcoming,oldHop,oldIn,oldScan=State.AutoTrader.UpcomingServerQueue,State.AutoTrader.ServerHopQueue,State.AutoTrader.ServerHopInProgress,State.AutoTrader.LastServerScan
@@ -28634,14 +29979,17 @@ do
                 "pre-join companion sampling modified automated strict bot certification counters"
         end)
         add("v37-companion-p-manual-bot-server-keeps-manual-provenance",function()
-            local fp="abababababababababababababababab";local server={id="manual-p",playing=11,maxPlayers=12,previewTokenCount=5,previewTokenSource="browser_companion_exact_jobid",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints={fp},previewThumbnailUrls={"https://t.example/p.png"}}
+            local fp="abababababababababababababababab";local server={id="manual-p",playing=11,maxPlayers=12,previewTokenCount=5,previewTokenSource=State.AutoTrader.DirectAuthPolicy.source,previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints={fp},previewThumbnailUrls={"https://t.example/p.png"}}
             local saved={botDb=State.AutoTrader.BotIconDb,manual=State.AutoTrader.ManualBotServerJobs,hop=State.AutoTrader.ServerHopQueue,upcoming=State.AutoTrader.UpcomingServerQueue,cache=State.AutoTrader.ServerCandidateCache,scan=State.AutoTrader.LastServerScan,recent=State.AutoTrader.RecentJobs,index=State.AutoTrader.ServerHopQueueIndex,inProgress=State.AutoTrader.ServerHopInProgress,commit=State.AutoTrader.CommitTrustedBotDbCandidate,saveManual=State.AutoTrader.SaveManualBotServerJobs,saveRecent=State.AutoTrader.SaveRecentJobs,saveCache=State.AutoTrader.SaveServerCandidateCache,log=State.AutoTrader.Log,render=State.AutoTrader.Render,last=State.AutoTrader.LastManualBotServerClassification,rev=State.AutoTrader.UpcomingServerQueueRevision,status=State.AutoTrader.Status,detail=State.AutoTrader.StatusDetail}
             State.AutoTrader.BotIconDb={version=5,trustedRevision=1,icons={}};State.AutoTrader.ManualBotServerJobs={};State.AutoTrader.ServerHopInProgress=false;State.AutoTrader.ServerHopQueue={server};State.AutoTrader.ServerHopQueueIndex=0;State.AutoTrader.UpcomingServerQueue={server};State.AutoTrader.ServerCandidateCache={version=1,entries={server}};State.AutoTrader.LastServerScan={candidates={{id="manual-p"}}};State.AutoTrader.RecentJobs={}
             local provenance=nil;State.AutoTrader.CommitTrustedBotDbCandidate=function(_,p) provenance=p;return true end;State.AutoTrader.SaveManualBotServerJobs=function() return true end;State.AutoTrader.SaveRecentJobs=function() return true end;State.AutoTrader.SaveServerCandidateCache=function() return 0 end;State.AutoTrader.Log=function() end;State.AutoTrader.Render=function() end
+            local before=State.AutoTrader.GetBotEvidenceProvenanceSummary()
             local ok,class=State.AutoTrader.MarkUpcomingServerBot("manual-p")
-            local passed=ok==true and class and class.provenance=="manual_bot_server" and class.previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and provenance and provenance.provenance=="manual_bot_server" and provenance.evidenceSource=="browser_companion_samples"
+            local after=State.AutoTrader.GetBotEvidenceProvenanceSummary()
+            local passed=ok==true and class and class.provenance=="manual_bot_server" and class.previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and provenance and provenance.provenance=="manual_bot_server" and provenance.evidenceSource=="authenticated_direct_samples"
+                and before.strictJobs==after.strictJobs and before.strictSightings==after.strictSightings and before.strictIcons==after.strictIcons
             State.AutoTrader.BotIconDb=saved.botDb;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerHopQueue=saved.hop;State.AutoTrader.UpcomingServerQueue=saved.upcoming;State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.LastServerScan=saved.scan;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ServerHopQueueIndex=saved.index;State.AutoTrader.ServerHopInProgress=saved.inProgress;State.AutoTrader.CommitTrustedBotDbCandidate=saved.commit;State.AutoTrader.SaveManualBotServerJobs=saved.saveManual;State.AutoTrader.SaveRecentJobs=saved.saveRecent;State.AutoTrader.SaveServerCandidateCache=saved.saveCache;State.AutoTrader.Log=saved.log;State.AutoTrader.Render=saved.render;State.AutoTrader.LastManualBotServerClassification=saved.last;State.AutoTrader.UpcomingServerQueueRevision=saved.rev;State.AutoTrader.Status=saved.status;State.AutoTrader.StatusDetail=saved.detail
-            return passed,"manual BOT SERVER classification based on companion samples lost explicit manual provenance"
+            return passed,"manual BOT SERVER classification based on authenticated direct samples lost manual provenance or touched automated strict counters"
         end)
         add("v37-companion-q-refresh-cannot-resurrect-manual-suppressed-jobid",function()
             local now=os.time();local policy=State.AutoTrader.ServerPreviewCompanionPolicy
@@ -28719,17 +30067,23 @@ do
         end)
         add("v37-companion-cached-enrichment-does-not-renew-selector-authority",function()
             local now=os.time();local ttl=math.max(1,tonumber(CONFIG.AutoTraderServerCandidateCacheTtlSeconds) or 180);local t0=now-math.min(30,math.max(1,ttl-1));local jobId="cache-authority-v37";local token="12121212121212121212121212121212"
-            local saved={cache=State.AutoTrader.ServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.ManualBotServerJobs,companion=State.AutoTrader.ServerPreviewCompanionCache,resolve=State.AutoTrader.ResolveServerPreviewFingerprints,merge=State.AutoTrader.MergeServerCandidateCache,classify=State.AutoTrader.ClassifyServerPreview,save=State.AutoTrader.SaveServerCandidateCache,lastCacheUse=State.AutoTrader.LastServerCandidateCacheUse}
+            local saved={cache=State.AutoTrader.ServerCandidateCache,recent=State.AutoTrader.RecentJobs,manual=State.AutoTrader.ManualBotServerJobs,getDirect=State.AutoTrader.GetDirectAuthSnapshot,merge=State.AutoTrader.MergeServerCandidateCache,classify=State.AutoTrader.ClassifyServerPreview,save=State.AutoTrader.SaveServerCandidateCache,lastCacheUse=State.AutoTrader.LastServerCandidateCacheUse}
             State.AutoTrader.ServerCandidateCache={version=1,entries={{id=jobId,scannedAt=t0,playing=11,maxPlayers=12,occupancy=11/12,previewFingerprints={},previewThumbnailUrls={},previewTokenCount=0}}};State.AutoTrader.RecentJobs={};State.AutoTrader.ManualBotServerJobs={}
-            local snapshot=State.AutoTrader.ParseServerPreviewCompanionBody(HttpService:JSONEncode({schemaVersion=1,collectorVersion="x",lastSuccessfulPollUnix=now,status="HEALTHY",loggedIn=true,servers={{jobId=jobId,playing=11,maxPlayers=12,lastSeenUnix=now,playerTokens={token},playerTokenCount=1,rosterEvidenceAvailable=true}}}),nil,now)
-            State.AutoTrader.ServerPreviewCompanionCache={lastAttemptClock=os.clock(),snapshot=snapshot,diagnostics=snapshot.diagnostics}
-            State.AutoTrader.ResolveServerPreviewFingerprints=function() return true,nil,{completed=1} end;local mergeCalls=0;State.AutoTrader.MergeServerCandidateCache=function() mergeCalls+=1;return 0 end
+            State.AutoTrader.GetDirectAuthSnapshot=function() return {index={[jobId]={jobId=jobId,playing=11,maxPlayers=12,rosterEvidenceAvailable=true,playerTokens={token},playerTokenCount=1,lastSeenUnix=now}},rows={}} end
+            local mergeCalls=0;State.AutoTrader.MergeServerCandidateCache=function() mergeCalls+=1;return 0 end
             State.AutoTrader.ClassifyServerPreview=function(server) server.botPreview={safeEnough=true,previewTrusted=false,goldMatchRatio=0,score=0,sample=0};return server.botPreview end;State.AutoTrader.SaveServerCandidateCache=function() return #(State.AutoTrader.ServerCandidateCache.entries or {}) end
             local ok1,q1=pcall(State.AutoTrader.BuildCachedServerQueue);local persisted1=State.AutoTrader.ServerCandidateCache.entries and State.AutoTrader.ServerCandidateCache.entries[1];local stamp1=persisted1 and persisted1.scannedAt
             local ok2,q2=pcall(State.AutoTrader.BuildCachedServerQueue);local persisted2=State.AutoTrader.ServerCandidateCache.entries and State.AutoTrader.ServerCandidateCache.entries[1];local stamp2=persisted2 and persisted2.scannedAt
-            local passed=ok1 and ok2 and q1 and q1[1] and q1[1].previewTokenSource=="browser_companion_exact_jobid" and q2 and q2[1] and q2[1].previewTokenSource=="browser_companion_exact_jobid" and stamp1==t0 and stamp2==t0 and mergeCalls==0
-            State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.ServerPreviewCompanionCache=saved.companion;State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.SaveServerCandidateCache=saved.save;State.AutoTrader.LastServerCandidateCacheUse=saved.lastCacheUse
-            return passed,"cached companion enrichment advanced selector scannedAt or re-merged ephemeral preview evidence"
+            local transient={id=jobId,scannedAt=t0,playing=11,maxPlayers=12,occupancy=11/12,previewFingerprints={},previewThumbnailUrls={},previewTokenCount=0}
+            local enriched,changed=State.AutoTrader.EnrichExistingServerCandidatesFromDirectAuth({transient})
+            local persisted3=State.AutoTrader.ServerCandidateCache.entries and State.AutoTrader.ServerCandidateCache.entries[1]
+            local cacheRowsStripped=ok1 and ok2 and q1 and q1[1] and q1[1].previewTokenSource==nil and (tonumber(q1[1].previewTokenCount) or 0)==0 and #(q1[1].previewFingerprints or {})==0 and #(q1[1].previewThumbnailUrls or {})==0
+                and q2 and q2[1] and q2[1].previewTokenSource==nil and (tonumber(q2[1].previewTokenCount) or 0)==0 and #(q2[1].previewFingerprints or {})==0 and #(q2[1].previewThumbnailUrls or {})==0
+            local transientOnly=changed==1 and enriched and enriched[1]==transient and transient.previewTokenSource==State.AutoTrader.DirectAuthPolicy.source and transient.previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and #(transient.playerTokens or {})==1 and transient.playerTokens[1]==token
+            local persistedStable=persisted3 and persisted3.scannedAt==t0 and persisted3.previewTokenSource==nil and (tonumber(persisted3.previewTokenCount) or 0)==0 and #(persisted3.previewFingerprints or {})==0 and #(persisted3.previewThumbnailUrls or {})==0 and persisted3.playerTokens==nil
+            local passed=cacheRowsStripped and transientOnly and persistedStable and stamp1==t0 and stamp2==t0 and mergeCalls==0
+            State.AutoTrader.ServerCandidateCache=saved.cache;State.AutoTrader.RecentJobs=saved.recent;State.AutoTrader.ManualBotServerJobs=saved.manual;State.AutoTrader.GetDirectAuthSnapshot=saved.getDirect;State.AutoTrader.MergeServerCandidateCache=saved.merge;State.AutoTrader.ClassifyServerPreview=saved.classify;State.AutoTrader.SaveServerCandidateCache=saved.save;State.AutoTrader.LastServerCandidateCacheUse=saved.lastCacheUse
+            return passed,"cache reuse renewed selector authority or persisted/revived ephemeral authenticated roster evidence"
         end)
         add("v37-companion-expired-selector-cache-cannot-be-kept-alive",function()
             local now=os.time();local ttl=math.max(1,tonumber(CONFIG.AutoTraderServerCandidateCacheTtlSeconds) or 180);local jobId="expired-cache-v37";local token=string.rep("e",32);local t0=now-ttl-1
@@ -28931,6 +30285,1015 @@ do
         return result
     end
 end
+
+
+do
+    State.AutoTrader.V37Round19RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local result=State.AutoTrader.V37Round19RunSelfTests();local tests=result.tests or {}
+        local function add(name,callback)
+            local ok,passed,detail=pcall(callback);local row={name=name,ok=ok and passed==true,detail=nil}
+            if not row.ok then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
+        end
+        add("v37-round20-partial-positive-exposes-known-value-floor",function()
+            local uid=987650218;local name="__v37_r20_floor__";local fake={UserId=uid,Name=name};local old=State.Profile.totalsByName[name];local oldResolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=1635,partial=true,unresolvedUnits=3,nonNumericUnits=14,nonNumericExamples={{name="Infiltrator",valueExpression="x1 T1 Common"}}}
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {{unitValue=1635,maxQuantity=1,mutationIdentity="weapons|safe",valueIdentity="weapons|safe"}},{partial=true} end
+            local strictValue,strictVerified=State.AutoTrader.GetVerifiedPlayerValue(fake)
+            local floor,floorOK,reason,_,complete=State.AutoTrader.GetPlayerKnownValueFloor(fake)
+            State.Profile.totalsByName[name]=old;State.AutoTrader.GetResolvedRemoteOpportunityEntries=oldResolved
+            return strictValue==nil and strictVerified==false and floor==1635 and floorOK==true and complete==false and tostring(reason):find("PARTIAL_KNOWN_VALUE_FLOOR",1,true)~=nil,
+                "partial positive inventory did not expose a safe resolved numeric value floor while keeping strict completeness false"
+        end)
+        add("v37-round20-partial-zero-remains-unknown",function()
+            local name="__v37_r20_zero__";local old=State.Profile.totalsByName[name]
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=0,partial=true,unresolvedUnits=2,nonNumericUnits=1,unresolvedExamples={{itemId="Mystery",reason="NO_MATCH"}}}
+            local floor,ok,reason=State.AutoTrader.GetPlayerKnownValueFloor({Name=name})
+            State.Profile.totalsByName[name]=old
+            return floor==nil and ok==false and tostring(reason):find("NON_NUMERIC_SUPREME_VALUE",1,true)~=nil or floor==nil and ok==false and tostring(reason):find("UNRESOLVED_ITEM_IDENTITY",1,true)~=nil,
+                "partial zero inventory was converted into a false verified-zero/value floor"
+        end)
+        add("v37-round20-partial-positive-player-reaches-planner",function()
+            local uid=987650220;local fake={UserId=uid,Name="__v37_r20_eligibility__",Parent=true};local entry={presenceGeneration=1,contactState="NOT_CONTACTED",firstSeenAt=os.clock()-5,inventoryDiscoveryReadyAt=os.clock()-4,present=true}
+            local saved={verified=State.AutoTrader.GetVerifiedPlayerValue,resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer,reconcile=State.AutoTrader.ReconcilePlayerActivityOutcome,contact=State.AutoTrader.GetContactState,fresh=State.AutoTrader.DecisionDataFresh,cooldown=State.AutoTrader.CooldownRemaining,planner=State.AutoTrader.BuildPreTradeOpportunity,ignore=State.AutoTrader.Preferences.ignoreFriends,history=State.AutoTrader.RequestHistory[uid]}
+            local plannerCalls=0
+            State.AutoTrader.GetVerifiedPlayerValue=function() return nil,false,"NON_NUMERIC_SUPREME_VALUE",{source="GetFullInventoryVerified",stale=false,total=250,partial=true,unresolvedUnits=1,nonNumericUnits=2} end
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {{unitValue=250,maxQuantity=1,mutationIdentity="weapons|safe",valueIdentity="weapons|safe"}},{partial=true} end
+            State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.ReconcilePlayerActivityOutcome=function() end;State.AutoTrader.GetContactState=function() return "NOT_CONTACTED" end
+            State.AutoTrader.DecisionDataFresh=function() return true,nil,0 end;State.AutoTrader.CooldownRemaining=function() return 0 end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.RequestHistory[uid]=0
+            State.AutoTrader.BuildPreTradeOpportunity=function() plannerCalls+=1;return {kind="profit",giveTotal=10,receiveTotal=50,win=40},"resolved subset witness",{feasibilityState="FEASIBLE",signature="r20"} end
+            local callOK,row=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=os.clock()})
+            State.AutoTrader.GetVerifiedPlayerValue=saved.verified;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure;State.AutoTrader.ReconcilePlayerActivityOutcome=saved.reconcile;State.AutoTrader.GetContactState=saved.contact;State.AutoTrader.DecisionDataFresh=saved.fresh;State.AutoTrader.CooldownRemaining=saved.cooldown;State.AutoTrader.BuildPreTradeOpportunity=saved.planner;State.AutoTrader.Preferences.ignoreFriends=saved.ignore;State.AutoTrader.RequestHistory[uid]=saved.history
+            return callOK and plannerCalls==1 and row and row.state=="actionable" and row.feasibilityState=="FEASIBLE" and row.knownValueFloor==250 and row.valueComplete==false,
+                "partial positive inventory was still stopped before the real planner"
+        end)
+        add("v37-round20-resolved-subset-can-prove-feasible-trade",function()
+            local uid=987650221;local fake={UserId=uid,Name="__v37_r20_subset__",Parent=true};local oldStamp=State.Profile.remoteTotals.lastSuccessByUserId[uid]
+            local saved={resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer,market=State.AutoTrader.EvaluateMarketGate,delta=State.AutoTrader.EvaluatePortfolioDelta,minWin=State.AutoTrader.GetEffectiveMinimumWin}
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=123456
+            local localItem={key="Weapons|Local",itemId="Local",itemType="Weapons",name="Local",unitValue=10,maxQuantity=1,quantity=1,record={name="Local",key="local",category="Godlies",data={value=10,demand=1}},demand=1,mutationIdentity="weapons|Local",valueIdentity="weapons|Local",familyIdentity="weapons|Local"}
+            local remoteItem={key="Weapons|Remote",itemId="Remote",itemType="Weapons",name="Remote",unitValue=50,maxQuantity=1,quantity=1,record={name="Remote",key="remote",category="Godlies",data={value=50,demand=1}},demand=1,mutationIdentity="weapons|Remote",valueIdentity="weapons|Remote",familyIdentity="weapons|Remote"}
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {remoteItem},{partial=true,total=50,unresolvedUnits=4,nonNumericUnits=7} end
+            State.AutoTrader.EnsureServerPlayer=function() return {presenceGeneration=1} end;State.AutoTrader.EvaluateMarketGate=function() return true,{ok=true,failures={}} end
+            State.AutoTrader.EvaluatePortfolioDelta=function() return {anchorOK=true,ok=true,score=1,catastropheOK=true,simulatedEntries={}} end;State.AutoTrader.GetEffectiveMinimumWin=function() return 2,{} end
+            local callOK,opp,reason,meta=pcall(State.AutoTrader.BuildPreTradeOpportunity,fake,{localItem},{noCache=true,deep=true,localInventoryMeta={partial=false,lastSuccess=654321}})
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=oldStamp;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure;State.AutoTrader.EvaluateMarketGate=saved.market;State.AutoTrader.EvaluatePortfolioDelta=saved.delta;State.AutoTrader.GetEffectiveMinimumWin=saved.minWin
+            return callOK and opp and opp.kind=="profit" and opp.receiveTotal==50 and opp.giveTotal==10 and meta and meta.feasibilityState=="FEASIBLE" and meta.inventoryComplete==false and opp.partial==true,
+                "resolved numeric subset could not prove a trade while unresolved remainder stayed excluded"
+        end)
+        add("v37-round20-partial-no-witness-never-proves-impossible",function()
+            local uid=987650222;local fake={UserId=uid,Name="__v37_r20_no_witness__",Parent=true};local oldStamp=State.Profile.remoteTotals.lastSuccessByUserId[uid]
+            local saved={resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer}
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=223344
+            local localItem={key="Weapons|L",itemId="L",itemType="Weapons",name="L",unitValue=5,maxQuantity=1,quantity=1,record={name="L",key="l",category="Godlies",data={value=5,demand=1}},mutationIdentity="weapons|L",valueIdentity="weapons|L",familyIdentity="weapons|L"}
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {},{partial=true,total=100,unresolvedUnits=3,nonNumericUnits=2} end
+            State.AutoTrader.EnsureServerPlayer=function() return {presenceGeneration=1} end
+            local callOK,opp,reason,meta=pcall(State.AutoTrader.BuildPreTradeOpportunity,fake,{localItem},{noCache=true,localInventoryMeta={partial=false,lastSuccess=334455}})
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=oldStamp;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure
+            return callOK and opp==nil and meta and meta.inventoryComplete==false and meta.feasibilityState=="SEARCH_INCONCLUSIVE" and tostring(reason):find("unresolved",1,true)~=nil,
+                "partial inventory without a resolved witness was incorrectly promoted to PROVEN_IMPOSSIBLE"
+        end)
+        add("v37-round20-incoming-partial-positive-can-be-inspected",function()
+            local uid=987650223;local fake={UserId=uid,Name="__v37_r20_incoming__",Parent=true};local entry={incomingInspectionDone=false,contactState="NOT_CONTACTED",presenceGeneration=1}
+            local saved={verified=State.AutoTrader.GetVerifiedPlayerValue,resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer,eligibility=State.AutoTrader.EvaluatePlayerEligibility,contact=State.AutoTrader.GetContactState,bot=State.AutoTrader.IsBotEscapeActive,ignore=State.AutoTrader.Preferences.ignoreFriends,pending=State.AutoTrader.IncomingInspectionPendingUserId}
+            State.AutoTrader.GetVerifiedPlayerValue=function() return nil,false,"UNRESOLVED_ITEM_IDENTITY",{source="GetFullInventoryVerified",stale=false,total=90,partial=true,unresolvedUnits=1,nonNumericUnits=0} end
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {{unitValue=90,maxQuantity=1,mutationIdentity="weapons|safe",valueIdentity="weapons|safe"}},{partial=true} end
+            State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.EvaluatePlayerEligibility=function() return {feasibilityState="SEARCH_INCONCLUSIVE"} end;State.AutoTrader.GetContactState=function() return "NOT_CONTACTED" end;State.AutoTrader.IsBotEscapeActive=function() return false end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.IncomingInspectionPendingUserId=nil
+            local callOK,decision,reason=pcall(State.AutoTrader.DecideIncomingRequester,fake)
+            local pending=State.AutoTrader.IncomingInspectionPendingUserId
+            State.AutoTrader.GetVerifiedPlayerValue=saved.verified;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure;State.AutoTrader.EvaluatePlayerEligibility=saved.eligibility;State.AutoTrader.GetContactState=saved.contact;State.AutoTrader.IsBotEscapeActive=saved.bot;State.AutoTrader.Preferences.ignoreFriends=saved.ignore;State.AutoTrader.IncomingInspectionPendingUserId=saved.pending
+            return callOK and decision=="accept" and pending==uid and tostring(reason):find("INCOMING_INSPECTION",1,true)~=nil,
+                "partial positive incoming requester was ignored instead of receiving one bounded inspection"
+        end)
+        add("v37-round20-partial-no-witness-holds-bounded-discovery-before-hop",function()
+            local uid=987650224;local fake={UserId=uid,Name="__v37_r20_wait__",Parent=true};local now=os.clock();local entry={presenceGeneration=1,contactState="NOT_CONTACTED",firstSeenAt=now-2,inventoryDiscoveryReadyAt=now-2,present=true}
+            local saved={verified=State.AutoTrader.GetVerifiedPlayerValue,resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer,reconcile=State.AutoTrader.ReconcilePlayerActivityOutcome,contact=State.AutoTrader.GetContactState,fresh=State.AutoTrader.DecisionDataFresh,cooldown=State.AutoTrader.CooldownRemaining,planner=State.AutoTrader.BuildPreTradeOpportunity,deep=State.AutoTrader.QueueDeepFeasibilitySearch,age=State.AutoTrader.GetInventoryDiscoveryAge,ignore=State.AutoTrader.Preferences.ignoreFriends,history=State.AutoTrader.RequestHistory[uid]}
+            local deepCalls=0
+            State.AutoTrader.GetVerifiedPlayerValue=function() return nil,false,"NON_NUMERIC_SUPREME_VALUE",{source="GetFullInventoryVerified",stale=false,total=300,partial=true,unresolvedUnits=2,nonNumericUnits=1} end
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {{unitValue=300,maxQuantity=1,mutationIdentity="weapons|safe",valueIdentity="weapons|safe"}},{partial=true} end
+            State.AutoTrader.EnsureServerPlayer=function() return entry end;State.AutoTrader.ReconcilePlayerActivityOutcome=function() end;State.AutoTrader.GetContactState=function() return "NOT_CONTACTED" end;State.AutoTrader.DecisionDataFresh=function() return true,nil,0 end;State.AutoTrader.CooldownRemaining=function() return 0 end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.RequestHistory[uid]=0
+            State.AutoTrader.BuildPreTradeOpportunity=function() return nil,"resolved subset has no proven exchange",{feasibilityState="SEARCH_INCONCLUSIVE",signature="r20-wait",inventoryComplete=false} end
+            State.AutoTrader.QueueDeepFeasibilitySearch=function() deepCalls+=1 end;State.AutoTrader.GetInventoryDiscoveryAge=function() return 2,true end
+            local okEarly,early=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now})
+            State.AutoTrader.GetInventoryDiscoveryAge=function() return CONFIG.AutoTraderUnresolvedMaxWaitSeconds+0.1,true end
+            local okLate,late=pcall(State.AutoTrader.EvaluatePlayerEligibility,fake,{now=now+CONFIG.AutoTraderUnresolvedMaxWaitSeconds+1})
+            State.AutoTrader.GetVerifiedPlayerValue=saved.verified;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure;State.AutoTrader.ReconcilePlayerActivityOutcome=saved.reconcile;State.AutoTrader.GetContactState=saved.contact;State.AutoTrader.DecisionDataFresh=saved.fresh;State.AutoTrader.CooldownRemaining=saved.cooldown;State.AutoTrader.BuildPreTradeOpportunity=saved.planner;State.AutoTrader.QueueDeepFeasibilitySearch=saved.deep;State.AutoTrader.GetInventoryDiscoveryAge=saved.age;State.AutoTrader.Preferences.ignoreFriends=saved.ignore;State.AutoTrader.RequestHistory[uid]=saved.history
+            return okEarly and okLate and deepCalls==2 and early and early.state=="discovery_pending" and early.knownValueFloor==300 and late and late.state=="search_inconclusive",
+                "partial no-witness inventory either hopped before bounded discovery or remained held after the window expired"
+        end)
+        add("v37-round21-partial-flag-alone-blocks-strict-but-keeps-safe-floor",function()
+            local uid=987650230;local name="__v37_r21_partial_flag__";local fake={UserId=uid,Name=name};local oldInfo=State.Profile.totalsByName[name];local oldResolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=100,partial=true,unresolvedUnits=0,nonNumericUnits=0}
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return {{unitValue=100,maxQuantity=1,mutationIdentity="weapons|safe",valueIdentity="weapons|safe"}},{partial=true,total=100,unresolvedUnits=0,nonNumericUnits=0} end
+            local strict,strictOK,strictReason=State.AutoTrader.GetVerifiedPlayerValue(fake);local floor,floorOK,_,_,complete=State.AutoTrader.GetPlayerKnownValueFloor(fake)
+            State.Profile.totalsByName[name]=oldInfo;State.AutoTrader.GetResolvedRemoteOpportunityEntries=oldResolved
+            return strict==nil and strictOK==false and strictReason=="INVENTORY_PARTIAL" and floor==100 and floorOK==true and complete==false,
+                "partial=true with zero explicit unknown counters was still treated as a strict verified total or lost its safe floor"
+        end)
+        add("v37-round21-collision-only-numeric-has-no-known-floor",function()
+            local uid=987650231;local name="__v37_r21_collision_only__";local fake={UserId=uid,Name=name};local oldInfo=State.Profile.totalsByName[name];local oldResolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=11,partial=false,unresolvedUnits=0,nonNumericUnits=0}
+            local entries=State.AutoTrader.BuildRemoteOpportunityEntriesFromHints({Weapons={{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=5,year=2018}},identityHint={year=2018}},{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="B",key="B",data={value=6,year=2019}},identityHint={year=2019}}}})
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return entries,{partial=false,total=11,unresolvedUnits=0,nonNumericUnits=0} end
+            local strict,strictOK,strictReason=State.AutoTrader.GetVerifiedPlayerValue(fake);local floor,floorOK,_,_,complete=State.AutoTrader.GetPlayerKnownValueFloor(fake)
+            State.Profile.totalsByName[name]=oldInfo;State.AutoTrader.GetResolvedRemoteOpportunityEntries=oldResolved
+            return strict==nil and strictOK==false and strictReason=="AMBIGUOUS_MUTATION_IDENTITY" and (floor==nil or floor<=0) and floorOK==false and complete==false,
+                "collision-only numeric inventory exposed strict value or a positive planning floor"
+        end)
+        add("v37-round21-safe-plus-collision-floor-excludes-ambiguous-value",function()
+            local uid=987650232;local name="__v37_r21_mixed_collision__";local fake={UserId=uid,Name=name};local oldInfo=State.Profile.totalsByName[name];local oldResolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=111,partial=false,unresolvedUnits=0,nonNumericUnits=0}
+            local entries=State.AutoTrader.BuildRemoteOpportunityEntriesFromHints({Weapons={{itemId="safe",itemType="Weapons",quantity=1,record={category="godlies",name="Safe",key="Safe",data={value=100}}},{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=5,year=2018}},identityHint={year=2018}},{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="B",key="B",data={value=6,year=2019}},identityHint={year=2019}}}})
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return entries,{partial=false,total=111,unresolvedUnits=0,nonNumericUnits=0} end
+            local floor,floorOK,_,_,complete=State.AutoTrader.GetPlayerKnownValueFloor(fake)
+            State.Profile.totalsByName[name]=oldInfo;State.AutoTrader.GetResolvedRemoteOpportunityEntries=oldResolved
+            return floor==100 and floorOK==true and complete==false,
+                "ambiguous mutation value inflated the collision-safe known floor"
+        end)
+        add("v37-round21-incoming-inspection-cannot-use-collision-only-value",function()
+            local uid=987650233;local name="__v37_r21_incoming_collision__";local fake={UserId=uid,Name=name,Parent=true};local entry={incomingInspectionDone=false,contactState="NOT_CONTACTED",presenceGeneration=1};local oldInfo=State.Profile.totalsByName[name]
+            local saved={resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer,eligibility=State.AutoTrader.EvaluatePlayerEligibility,contact=State.AutoTrader.GetContactState,bot=State.AutoTrader.IsBotEscapeActive,ignore=State.AutoTrader.Preferences.ignoreFriends,pending=State.AutoTrader.IncomingInspectionPendingUserId}
+            State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=11,partial=false,unresolvedUnits=0,nonNumericUnits=0}
+            local entries=State.AutoTrader.BuildRemoteOpportunityEntriesFromHints({Weapons={{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=5,year=2018}},identityHint={year=2018}},{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="B",key="B",data={value=6,year=2019}},identityHint={year=2019}}}})
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return entries,{partial=false,total=11,unresolvedUnits=0,nonNumericUnits=0} end;State.AutoTrader.EnsureServerPlayer=function() return entry end
+            State.AutoTrader.EvaluatePlayerEligibility=function() return {feasibilityState="SEARCH_INCONCLUSIVE"} end;State.AutoTrader.GetContactState=function() return "NOT_CONTACTED" end;State.AutoTrader.IsBotEscapeActive=function() return false end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.IncomingInspectionPendingUserId=nil
+            local callOK,decision=pcall(State.AutoTrader.DecideIncomingRequester,fake);local pending=State.AutoTrader.IncomingInspectionPendingUserId
+            State.Profile.totalsByName[name]=oldInfo;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure;State.AutoTrader.EvaluatePlayerEligibility=saved.eligibility;State.AutoTrader.GetContactState=saved.contact;State.AutoTrader.IsBotEscapeActive=saved.bot;State.AutoTrader.Preferences.ignoreFriends=saved.ignore;State.AutoTrader.IncomingInspectionPendingUserId=saved.pending
+            return callOK and decision~="accept" and pending==nil,
+                "incoming inspection was justified solely by ambiguous mutation-identity value"
+        end)
+        add("v37-round21-planner-witness-excludes-colliding-entry",function()
+            local uid=987650234;local fake={UserId=uid,Name="__v37_r21_planner_collision__",Parent=true};local oldStamp=State.Profile.remoteTotals.lastSuccessByUserId[uid]
+            local saved={resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer,market=State.AutoTrader.EvaluateMarketGate,delta=State.AutoTrader.EvaluatePortfolioDelta,minWin=State.AutoTrader.GetEffectiveMinimumWin}
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=998877
+            local localItem={key="Weapons|Local",itemId="Local",itemType="Weapons",name="Local",unitValue=10,maxQuantity=1,quantity=1,record={name="Local",key="local",category="Godlies",data={value=10,demand=1}},mutationIdentity="weapons|Local",valueIdentity="weapons|Local",familyIdentity="weapons|Local"}
+            local entries=State.AutoTrader.BuildRemoteOpportunityEntriesFromHints({Weapons={{itemId="safe",itemType="Weapons",quantity=1,record={category="godlies",name="Safe",key="Safe",data={value=50,demand=1}}},{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=500,year=2018}},identityHint={year=2018}},{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="B",key="B",data={value=600,year=2019}},identityHint={year=2019}}}})
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return entries,{partial=false,total=1150,unresolvedUnits=0,nonNumericUnits=0} end;State.AutoTrader.EnsureServerPlayer=function() return {presenceGeneration=1} end
+            State.AutoTrader.EvaluateMarketGate=function() return true,{ok=true,failures={}} end;State.AutoTrader.EvaluatePortfolioDelta=function() return {anchorOK=true,ok=true,score=1,catastropheOK=true,simulatedEntries={}} end;State.AutoTrader.GetEffectiveMinimumWin=function() return 2,{} end
+            local callOK,opp=pcall(State.AutoTrader.BuildPreTradeOpportunity,fake,{localItem},{noCache=true,deep=true,localInventoryMeta={partial=false,lastSuccess=112233}})
+            local clean=callOK and opp~=nil;for _,entry in ipairs(clean and opp.receiveItems or {}) do if entry.mutationAmbiguous or entry.identityFailure or entry.itemId=="same" then clean=false end end
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=oldStamp;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure;State.AutoTrader.EvaluateMarketGate=saved.market;State.AutoTrader.EvaluatePortfolioDelta=saved.delta;State.AutoTrader.GetEffectiveMinimumWin=saved.minWin
+            return clean==true and opp.receiveTotal==50,
+                "planner witness retained a mutation-colliding remote entry"
+        end)
+        add("v37-round21-incomplete-collision-never-proves-impossible",function()
+            local uid=987650235;local fake={UserId=uid,Name="__v37_r21_collision_incomplete__",Parent=true};local oldStamp=State.Profile.remoteTotals.lastSuccessByUserId[uid]
+            local saved={resolved=State.AutoTrader.GetResolvedRemoteOpportunityEntries,ensure=State.AutoTrader.EnsureServerPlayer}
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=887766
+            local localItem={key="Weapons|L",itemId="L",itemType="Weapons",name="L",unitValue=5,maxQuantity=1,quantity=1,record={name="L",key="l",category="Godlies",data={value=5}},mutationIdentity="weapons|L",valueIdentity="weapons|L",familyIdentity="weapons|L"}
+            local entries=State.AutoTrader.BuildRemoteOpportunityEntriesFromHints({Weapons={{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=5,year=2018}},identityHint={year=2018}},{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="B",key="B",data={value=6,year=2019}},identityHint={year=2019}}}})
+            State.AutoTrader.GetResolvedRemoteOpportunityEntries=function() return entries,{partial=true,total=11,unresolvedUnits=0,nonNumericUnits=0} end;State.AutoTrader.EnsureServerPlayer=function() return {presenceGeneration=1} end
+            local callOK,opp,_,meta=pcall(State.AutoTrader.BuildPreTradeOpportunity,fake,{localItem},{noCache=true,localInventoryMeta={partial=false,lastSuccess=776655}})
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=oldStamp;State.AutoTrader.GetResolvedRemoteOpportunityEntries=saved.resolved;State.AutoTrader.EnsureServerPlayer=saved.ensure
+            return callOK and opp==nil and meta and meta.inventoryComplete==false and meta.feasibilityState=="SEARCH_INCONCLUSIVE",
+                "incomplete/collision-only state became PROVEN_IMPOSSIBLE"
+        end)
+        add("v37-round22-remote-positive-plus-relative-same-mutation-is-blocked",function()
+            local uid=987650241;local name="__v37_r22_relative_same__";local fake={UserId=uid,Name=name,Parent=true}
+            local oldInfo=State.Profile.totalsByName[name];local oldHints=State.Profile.remoteCardHintsByUserId[uid];local oldSafety=State.Profile.remoteMutationSafetyByUserId[uid]
+            local numeric={itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=100,year=2018}},identityHint={year=2018}}
+            local relative={itemId="same",itemType="Weapons",quantity=1,record={category="commons",name="B",key="B",data={value="x1 T1 Common",year=2019}},identityHint={year=2019}}
+            local calculated={weapons={cardHints={numeric,relative},unresolvedAll={}},pets={cardHints={},unresolvedAll={}},partial=true}
+            State.Profile.remoteCardHintsByUserId[uid]={Weapons={numeric,relative},Pets={}};State.Profile.remoteMutationSafetyByUserId[uid]=State.AutoTrader.BuildMutationFamilySafetyFromCalculated(calculated);State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=100,partial=true,unresolvedUnits=0,nonNumericUnits=1}
+            local strict,strictOK=State.AutoTrader.GetVerifiedPlayerValue(fake);local floor,ok=State.AutoTrader.GetPlayerKnownValueFloor(fake);local entries=State.AutoTrader.GetResolvedRemoteOpportunityEntries(fake);local blocked=#entries==1 and entries[1].identityFailure~=nil
+            local oldStamp=State.Profile.remoteTotals.lastSuccessByUserId[uid];State.Profile.remoteTotals.lastSuccessByUserId[uid]=123456
+            local saved={ensure=State.AutoTrader.EnsureServerPlayer,eligibility=State.AutoTrader.EvaluatePlayerEligibility,contact=State.AutoTrader.GetContactState,bot=State.AutoTrader.IsBotEscapeActive,ignore=State.AutoTrader.Preferences.ignoreFriends,pending=State.AutoTrader.IncomingInspectionPendingUserId}
+            State.AutoTrader.EnsureServerPlayer=function() return {incomingInspectionDone=false,contactState="NOT_CONTACTED",presenceGeneration=1} end
+            local localItem={key="Weapons|L",itemId="L",itemType="Weapons",name="L",unitValue=5,maxQuantity=1,quantity=1,record={name="L",key="L",category="godlies",data={value=5}},mutationIdentity="weapons|L",valueIdentity="weapons|L",familyIdentity="weapons|L"}
+            local planOK,opp,_,meta=pcall(State.AutoTrader.BuildPreTradeOpportunity,fake,{localItem},{noCache=true,localInventoryMeta={partial=false,lastSuccess=654321}})
+            State.AutoTrader.EvaluatePlayerEligibility=function() return {feasibilityState="SEARCH_INCONCLUSIVE"} end;State.AutoTrader.GetContactState=function() return "NOT_CONTACTED" end;State.AutoTrader.IsBotEscapeActive=function() return false end;State.AutoTrader.Preferences.ignoreFriends=false;State.AutoTrader.IncomingInspectionPendingUserId=nil
+            local callOK,decision=pcall(State.AutoTrader.DecideIncomingRequester,fake);local pending=State.AutoTrader.IncomingInspectionPendingUserId
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=oldStamp;State.AutoTrader.EnsureServerPlayer=saved.ensure;State.AutoTrader.EvaluatePlayerEligibility=saved.eligibility;State.AutoTrader.GetContactState=saved.contact;State.AutoTrader.IsBotEscapeActive=saved.bot;State.AutoTrader.Preferences.ignoreFriends=saved.ignore;State.AutoTrader.IncomingInspectionPendingUserId=saved.pending
+            State.Profile.totalsByName[name]=oldInfo;State.Profile.remoteCardHintsByUserId[uid]=oldHints;State.Profile.remoteMutationSafetyByUserId[uid]=oldSafety
+            return strict==nil and strictOK==false and (floor==nil or floor<=0) and ok==false and blocked and planOK and opp==nil and meta and meta.feasibilityState=="SEARCH_INCONCLUSIVE" and callOK and decision~="accept" and pending==nil,"same-family relative sibling retained automated value authority"
+        end)
+        add("v37-round22-remote-positive-plus-unresolved-same-mutation-is-blocked",function()
+            local uid=987650242;local name="__v37_r22_unresolved_same__";local fake={UserId=uid,Name=name};local oldInfo=State.Profile.totalsByName[name];local oldHints=State.Profile.remoteCardHintsByUserId[uid];local oldSafety=State.Profile.remoteMutationSafetyByUserId[uid]
+            local numeric={itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=100,year=2018}},identityHint={year=2018}}
+            local calculated={weapons={cardHints={numeric},unresolvedAll={{itemId="same",itemType="Weapons",quantity=1,reason="WEAK_MATCH",identityHint={year=2019}}}},pets={cardHints={},unresolvedAll={}},partial=true}
+            State.Profile.remoteCardHintsByUserId[uid]={Weapons={numeric},Pets={}};State.Profile.remoteMutationSafetyByUserId[uid]=State.AutoTrader.BuildMutationFamilySafetyFromCalculated(calculated);State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=100,partial=true,unresolvedUnits=1,nonNumericUnits=0}
+            local floor,ok,_,_,complete=State.AutoTrader.GetPlayerKnownValueFloor(fake);local entries=State.AutoTrader.GetResolvedRemoteOpportunityEntries(fake)
+            State.Profile.totalsByName[name]=oldInfo;State.Profile.remoteCardHintsByUserId[uid]=oldHints;State.Profile.remoteMutationSafetyByUserId[uid]=oldSafety
+            return (floor==nil or floor<=0) and ok==false and complete==false and #entries==1 and entries[1].identityFailure~=nil,"same-family unresolved sibling failed to taint positive numeric value"
+        end)
+        add("v37-round22-unrelated-unknown-family-preserves-safe-remote-floor",function()
+            local uid=987650243;local name="__v37_r22_unrelated_unknown__";local fake={UserId=uid,Name=name};local oldInfo=State.Profile.totalsByName[name];local oldHints=State.Profile.remoteCardHintsByUserId[uid];local oldSafety=State.Profile.remoteMutationSafetyByUserId[uid]
+            local numeric={itemId="safe",itemType="Weapons",quantity=2,record={category="godlies",name="Safe",key="Safe",data={value=50}}};local calculated={weapons={cardHints={numeric},unresolvedAll={{itemId="other",itemType="Weapons",quantity=1,reason="WEAK_MATCH"}}},pets={cardHints={},unresolvedAll={}},partial=true}
+            State.Profile.remoteCardHintsByUserId[uid]={Weapons={numeric},Pets={}};State.Profile.remoteMutationSafetyByUserId[uid]=State.AutoTrader.BuildMutationFamilySafetyFromCalculated(calculated);State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=100,partial=true,unresolvedUnits=1,nonNumericUnits=0}
+            local floor,ok,_,_,complete=State.AutoTrader.GetPlayerKnownValueFloor(fake);local entries=State.AutoTrader.GetResolvedRemoteOpportunityEntries(fake)
+            State.Profile.totalsByName[name]=oldInfo;State.Profile.remoteCardHintsByUserId[uid]=oldHints;State.Profile.remoteMutationSafetyByUserId[uid]=oldSafety
+            return floor==100 and ok==true and complete==false and #entries==1 and not entries[1].identityFailure,"unrelated unknown family over-poisoned safe numeric family"
+        end)
+        add("v37-round22-positive-plus-zero-distinct-same-mutation-is-blocked",function()
+            local uid=987650244;local name="__v37_r22_zero_same__";local fake={UserId=uid,Name=name};local oldInfo=State.Profile.totalsByName[name];local oldHints=State.Profile.remoteCardHintsByUserId[uid];local oldSafety=State.Profile.remoteMutationSafetyByUserId[uid]
+            local positive={itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=100,year=2018}},identityHint={year=2018}};local zero={itemId="same",itemType="Weapons",quantity=1,record={category="commons",name="B",key="B",data={value=0,year=2019}},identityHint={year=2019}}
+            local calculated={weapons={cardHints={positive,zero},unresolvedAll={}},pets={cardHints={},unresolvedAll={}},partial=false};State.Profile.remoteCardHintsByUserId[uid]={Weapons={positive,zero},Pets={}};State.Profile.remoteMutationSafetyByUserId[uid]=State.AutoTrader.BuildMutationFamilySafetyFromCalculated(calculated);State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=100,partial=false,unresolvedUnits=0,nonNumericUnits=0}
+            local strict,strictOK=State.AutoTrader.GetVerifiedPlayerValue(fake);local floor,floorOK=State.AutoTrader.GetPlayerKnownValueFloor(fake)
+            State.Profile.totalsByName[name]=oldInfo;State.Profile.remoteCardHintsByUserId[uid]=oldHints;State.Profile.remoteMutationSafetyByUserId[uid]=oldSafety
+            return strict==nil and strictOK==false and (floor==nil or floor<=0) and floorOK==false,"zero-valued distinct sibling escaped mutation-family collision proof"
+        end)
+        add("v37-round22-local-positive-plus-unresolved-same-mutation-is-not-tradable",function()
+            local calculated={weapons={cardHints={{itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=100}}}},unresolvedAll={{itemId="same",itemType="Weapons",quantity=1,reason="WEAK_MATCH"}}},pets={cardHints={},unresolvedAll={}},partial=true};local entries=State.AutoTrader.BuildLocalResolvedEntriesFromCalculated(calculated);local saved=State.AutoTrader.V35GetTradableInventory;State.AutoTrader.V35GetTradableInventory=function() return entries,nil,{partial=true,mutationSafety=State.AutoTrader.BuildMutationFamilySafetyFromCalculated(calculated)} end
+            local tradable=State.AutoTrader.GetTradableInventory();State.AutoTrader.V35GetTradableInventory=saved
+            return #entries==1 and entries[1].identityFailure~=nil and tradable==nil,"local unresolved sibling left same mutation family offerable"
+        end)
+        add("v37-round22-local-safe-family-survives-unrelated-unknown",function()
+            local calculated={weapons={cardHints={{itemId="safe",itemType="Weapons",quantity=1,record={category="godlies",name="Safe",key="Safe",data={value=100}}}},unresolvedAll={{itemId="other",itemType="Weapons",quantity=1,reason="WEAK_MATCH"}}},pets={cardHints={},unresolvedAll={}},partial=true};local safety=State.AutoTrader.BuildMutationFamilySafetyFromCalculated(calculated);local entries=State.AutoTrader.BuildLocalResolvedEntriesFromCalculated(calculated);local saved=State.AutoTrader.V35GetTradableInventory;State.AutoTrader.V35GetTradableInventory=function() return entries,nil,{partial=true,mutationSafety=safety} end
+            local tradable=State.AutoTrader.GetTradableInventory();State.AutoTrader.V35GetTradableInventory=saved
+            return #entries==1 and not entries[1].identityFailure and type(tradable)=="table" and #tradable==1 and tradable[1].itemId=="safe","unrelated local unknown family poisoned safe numeric family"
+        end)
+        add("v37-round22-tainted-no-witness-remains-search-inconclusive",function()
+            local uid=987650245;local fake={UserId=uid,Name="__v37_r22_tainted_no_witness__",Parent=true};local oldStamp=State.Profile.remoteTotals.lastSuccessByUserId[uid];local oldHints=State.Profile.remoteCardHintsByUserId[uid];local oldSafety=State.Profile.remoteMutationSafetyByUserId[uid];local savedEnsure=State.AutoTrader.EnsureServerPlayer
+            local numeric={itemId="same",itemType="Weapons",quantity=1,record={category="godlies",name="A",key="A",data={value=50}}};local calculated={weapons={cardHints={numeric},unresolvedAll={{itemId="same",itemType="Weapons",quantity=1,reason="WEAK_MATCH"}}},pets={cardHints={},unresolvedAll={}},partial=true};State.Profile.remoteTotals.lastSuccessByUserId[uid]=556677;State.Profile.remoteCardHintsByUserId[uid]={Weapons={numeric},Pets={}};State.Profile.remoteMutationSafetyByUserId[uid]=State.AutoTrader.BuildMutationFamilySafetyFromCalculated(calculated);State.AutoTrader.EnsureServerPlayer=function() return {presenceGeneration=1} end
+            local localItem={key="Weapons|L",itemId="L",itemType="Weapons",name="L",unitValue=5,maxQuantity=1,quantity=1,record={name="L",key="L",category="godlies",data={value=5}},mutationIdentity="weapons|L",valueIdentity="weapons|L",familyIdentity="weapons|L"};local callOK,opp,_,meta=pcall(State.AutoTrader.BuildPreTradeOpportunity,fake,{localItem},{noCache=true,localInventoryMeta={partial=false,lastSuccess=445566}})
+            State.Profile.remoteTotals.lastSuccessByUserId[uid]=oldStamp;State.Profile.remoteCardHintsByUserId[uid]=oldHints;State.Profile.remoteMutationSafetyByUserId[uid]=oldSafety;State.AutoTrader.EnsureServerPlayer=savedEnsure
+            return callOK and opp==nil and meta and meta.inventoryComplete==false and meta.feasibilityState=="SEARCH_INCONCLUSIVE","tainted no-witness inventory became PROVEN_IMPOSSIBLE"
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v37_round22",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end
+
+
+do
+    State.AutoTrader.V37Round22RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function()
+        local priorDepth=tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0
+        if priorDepth<=0 and type(State.AutoTrader.BeginDirectAuthSelfTestIsolation)=="function" then
+            local okIsolation,isolationOK,isolationReason=pcall(State.AutoTrader.BeginDirectAuthSelfTestIsolation)
+            if not (okIsolation and isolationOK~=false) then
+                if type(State.AutoTrader.RestoreDirectAuthAfterSelfTests)=="function" then pcall(State.AutoTrader.RestoreDirectAuthAfterSelfTests) end
+                error("direct-auth self-test isolation failed: "..tostring(okIsolation and isolationReason or "AUTH_DIRECT_SELF_TEST_ISOLATION_ERROR"))
+            end
+        end
+        State.AutoTrader.SelfTestExecutionDepth=priorDepth+1
+        local okBase,result=pcall(State.AutoTrader.V37Round22RunSelfTests)
+        if not okBase then
+            State.AutoTrader.DirectAuthTestHooks=nil
+            State.AutoTrader.SelfTestExecutionDepth=priorDepth
+            if priorDepth<=0 and type(State.AutoTrader.RestoreDirectAuthAfterSelfTests)=="function" then pcall(State.AutoTrader.RestoreDirectAuthAfterSelfTests) end
+            error(result)
+        end
+        local tests=result.tests or {}
+        local function add(name,callback)
+            local ok,passed,detail=pcall(callback);local row={name=name,ok=ok and passed==true,detail=nil}
+            if not row.ok then row.detail=tostring(ok and detail or passed) end
+            table.insert(tests,row)
+        end
+        local function baseHooks(extra)
+            local hooks={
+                round23=true,
+                nowClock=function() return 100 end,
+                nowUnix=function() return 2000000000 end,
+                isfile=function() return false end,
+                readfile=function() return nil end,
+                writefile=function() return true end,
+                delfile=function() return true end,
+                makefolder=function() return true end,
+            }
+            for key,value in pairs(type(extra)=="table" and extra or {}) do hooks[key]=value end
+            return hooks
+        end
+        local function cleanup()
+            State.AutoTrader.DirectAuthTestHooks=baseHooks()
+            pcall(State.AutoTrader.ForgetDirectAuthSecret)
+            State.AutoTrader.DirectAuthTestHooks=nil
+        end
+        local function authBody(count,tokensPerRow,cursor,prefix)
+            local rows={}
+            for i=1,count do
+                local tokens={}
+                for j=1,tokensPerRow do table.insert(tokens,(prefix or "tok").."-"..tostring(i).."-"..tostring(j)) end
+                table.insert(rows,{id=(prefix or "job").."-"..tostring(i),playing=math.min(11,2+(i%10)),maxPlayers=12,playerTokens=tokens,ping=40+i,fps=60})
+            end
+            return HttpService:JSONEncode({data=rows,nextPageCursor=cursor})
+        end
+        local function installPreviewStubs()
+            local saved={
+                resolve=State.AutoTrader.ResolveServerPreviewFingerprints,
+                display=State.AutoTrader.ResolveServerDisplayThumbnailUrls,
+                classify=State.AutoTrader.ClassifyServerPreview,
+                merge=State.AutoTrader.MergeServerCandidateCache,
+            }
+            State.AutoTrader.ResolveServerPreviewFingerprints=function(servers)
+                local completed=0
+                for _,server in ipairs(servers or {}) do
+                    server.previewFingerprints={};server.previewThumbnailUrls={};server.previewFingerprintByTokenIndex={};server.previewThumbnailUrlByTokenIndex={}
+                    for i=1,#(server.playerTokens or {}) do
+                        local fp=string.format("%032x",i)
+                        local url="https://tr.rbxcdn.com/180DAY-AvatarHeadshot-"..fp.."-Png/150/150/AvatarHeadshot/Webp/noFilter"
+                        server.previewFingerprintByTokenIndex[i]=fp;server.previewThumbnailUrlByTokenIndex[i]=url
+                        table.insert(server.previewFingerprints,fp);table.insert(server.previewThumbnailUrls,url);completed+=1
+                    end
+                    server.previewTokenCount=#(server.playerTokens or {})
+                end
+                local ok=completed>0
+                local reason=nil
+                if not ok then reason="no tokens" end
+                return ok,reason,{tokens=completed,batches=completed>0 and 1 or 0,completed=completed}
+            end
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=function(servers)
+                local completed=0
+                for _,server in ipairs(servers or {}) do
+                    server.previewDisplayThumbnailUrls={};server.previewDisplayCanonicalFingerprints={}
+                    for i,fp in ipairs(server.previewFingerprints or {}) do
+                        table.insert(server.previewDisplayThumbnailUrls,"https://tr.rbxcdn.com/180DAY-AvatarHeadshot-"..fp.."-Png/48/48/AvatarHeadshot/Webp/noFilter")
+                        table.insert(server.previewDisplayCanonicalFingerprints,fp);completed+=1
+                    end
+                end
+                local ok=completed>0
+                local reason=nil
+                if not ok then reason="no display" end
+                return ok,reason,{size="48x48",completed=completed,sizeIdentityMismatch=0}
+            end
+            State.AutoTrader.ClassifyServerPreview=function(server)
+                local preview={sample=#(server.previewFingerprints or {}),goldMatched=0,goldMatchRatio=0,confirmedRatio=0,suspectRatio=0,safeConfidence=1,previewTrusted=false,safeEnough=true,hardReject=false,suspicious=false,score=100}
+                server.botPreview=preview
+                return preview
+            end
+            State.AutoTrader.MergeServerCandidateCache=function(queue) return #(queue or {}) end
+            return saved
+        end
+        local function restorePreviewStubs(saved)
+            State.AutoTrader.ResolveServerPreviewFingerprints=saved.resolve
+            State.AutoTrader.ResolveServerDisplayThumbnailUrls=saved.display
+            State.AutoTrader.ClassifyServerPreview=saved.classify
+            State.AutoTrader.MergeServerCandidateCache=saved.merge
+        end
+
+        add("v37-round23-auth-direct-success-normalizes-token-rows",function()
+            cleanup()
+            local body=authBody(100,5,"next-page","auth-success")
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function() return {StatusCode=200,Body=body,Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-success-secret",false)
+            local snap=State.AutoTrader.RefreshDirectAuthServerSnapshot();local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=type(snap)=="table" and snap.usable==true and support.status=="AUTH_DIRECT_READY" and support.acceptedRows==100 and support.tokenBearingRows==100 and support.totalPlayerTokenCount==500 and support.pagesFetched==1 and support.selectorEligible==true
+            cleanup();return passed,"authenticated direct 100-row/500-token response did not normalize into a healthy bounded snapshot"
+        end)
+
+        add("v37-round23-auth-request-is-get-only-fixed-roblox-server-endpoint",function()
+            cleanup()
+            local inspected=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function(options)
+                inspected=type(options)=="table" and options.Method=="GET" and options.Body==nil
+                    and type(options.Url)=="string" and options.Url:find("https://games.roblox.com/v1/games/142823291/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true",1,true)==1
+                    and options.Redirect==false and options.FollowRedirects==false
+                    and type(options.Headers)=="table" and options.Headers.Cookie==".ROBLOSECURITY=synthetic-fixed-endpoint-secret"
+                return {StatusCode=200,Body=authBody(1,1,nil,"fixed"),Headers={}}
+            end})
+            State.AutoTrader.ConnectDirectAuthSecret(".ROBLOSECURITY=synthetic-fixed-endpoint-secret",false)
+            State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local passed=inspected==true
+            cleanup();return passed,"direct-auth request escaped GET-only exact games.roblox.com server-list construction"
+        end)
+
+        add("v37-round23-cookie-never-enters-support-log-state-or-bootstrap",function()
+            cleanup()
+            local secret="ROUND23_SYNTHETIC_SECRET_NEVER_EXPORT"
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function() return {StatusCode=200,Body=authBody(2,1,nil,"no-leak"),Headers={["Set-Cookie"]="synthetic-response-header"}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("ROBLOSECURITY="..secret,false)
+            State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local support=State.AutoTrader.BuildDebug()
+            local bootstrap=State.AutoTrader.BuildTeleportBootstrapCode("round23-secret-leak-check",false)
+            local recent=HttpService:JSONEncode(HARDEN.supportJsonValue(State.AutoTrader.DebugLog or {}))
+            local passed=type(support)=="string" and type(bootstrap)=="string"
+                and support:find(secret,1,true)==nil and bootstrap:find(secret,1,true)==nil and recent:find(secret,1,true)==nil
+                and support:find("synthetic-response-header",1,true)==nil
+                and State.AutoTrader.DirectAuthSecret==nil and State.Profile.DirectAuthSecret==nil
+            cleanup();return passed,"credential or authenticated response header escaped the private direct-auth closure"
+        end)
+
+        add("v37-round23-missing-secret-falls-back-public-without-avatar-fabrication",function()
+            cleanup()
+            State.AutoTrader.DirectAuthTestHooks=baseHooks()
+            local saved={direct=State.AutoTrader.V37BuildPublicServerQueue,set=State.AutoTrader.SetUpcomingServerQueue,filter=State.AutoTrader.FilterManualBotServerQueue}
+            State.AutoTrader.V37BuildPublicServerQueue=function() return {{id="public-tokenless",playing=5,maxPlayers=12,playerTokens={}}},{source="fresh_http_scan",candidates={{id="public-tokenless"}}} end
+            State.AutoTrader.SetUpcomingServerQueue=function() end;State.AutoTrader.FilterManualBotServerQueue=function(q) return q end
+            local ok,queue,scan=pcall(State.AutoTrader.BuildPublicServerQueue,true)
+            State.AutoTrader.V37BuildPublicServerQueue=saved.direct;State.AutoTrader.SetUpcomingServerQueue=saved.set;State.AutoTrader.FilterManualBotServerQueue=saved.filter
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=ok and #queue==1 and queue[1].id=="public-tokenless" and #(queue[1].playerTokens or {})==0 and scan.discoverySource=="direct_public_api" and support.status=="AUTH_DIRECT_MISSING_SECRET"
+            cleanup();return passed,"missing direct-auth secret fabricated roster evidence or blocked fail-closed public fallback"
+        end)
+
+        add("v37-round23-401-403-reject-auth-and-fall-back-public",function()
+            local all=true
+            for _,status in ipairs({401,403}) do
+                cleanup()
+                State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function() return {StatusCode=status,Body="{}",Headers={}} end})
+                State.AutoTrader.ConnectDirectAuthSecret("synthetic-rejected",false)
+                local snap=State.AutoTrader.RefreshDirectAuthServerSnapshot();local support=State.AutoTrader.GetDirectAuthSupportSummary()
+                if not (snap==nil and support.status=="AUTH_DIRECT_REJECTED" and support.selectorEligible==false and support.backoffSeconds<=60) then all=false end
+            end
+            cleanup();return all,"401/403 did not revoke authenticated selector authority"
+        end)
+
+        add("v37-round23-429-backoff-is-exponential-bounded-and-nonbusy",function()
+            cleanup()
+            local clock=100;local calls=0
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowClock=function() return clock end,request=function() calls+=1;return {StatusCode=429,Body="{}",Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-rate-limit",false)
+            local expected={5,10,20,40,60,60};local good=true
+            for _,want in ipairs(expected) do
+                State.AutoTrader.RefreshDirectAuthServerSnapshot();local support=State.AutoTrader.GetDirectAuthSupportSummary()
+                if support.status~="AUTH_DIRECT_RATE_LIMITED" or support.backoffSeconds~=want then good=false end
+                local before=calls;State.AutoTrader.RefreshDirectAuthServerSnapshot();if calls~=before then good=false end
+                clock+=want+0.01
+            end
+            cleanup();return good and calls==#expected,"429 refresh loop did not honor 5→10→20→40→60 bounded backoff"
+        end)
+
+        add("v37-round23-5xx-and-request-exception-backoff-without-error-leak",function()
+            cleanup()
+            local clock=100;local mode=1
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowClock=function() return clock end,request=function()
+                if mode==1 then return {StatusCode=503,Body="service down",Headers={}} end
+                error("SYNTHETIC_SECRETISH_EXCEPTION_TEXT")
+            end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-5xx",false)
+            State.AutoTrader.RefreshDirectAuthServerSnapshot();local first=State.AutoTrader.GetDirectAuthSupportSummary()
+            clock+=first.backoffSeconds+0.1;mode=2
+            State.AutoTrader.RefreshDirectAuthServerSnapshot();local second=State.AutoTrader.GetDirectAuthSupportSummary()
+            local encoded=HttpService:JSONEncode(second)
+            local passed=first.status=="AUTH_DIRECT_REQUEST_FAILED" and first.backoffSeconds==5 and second.status=="AUTH_DIRECT_REQUEST_FAILED" and second.backoffSeconds==10 and encoded:find("SYNTHETIC_SECRETISH_EXCEPTION_TEXT",1,true)==nil
+            cleanup();return passed,"5xx/request exception did not back off generically without exporting raw error text"
+        end)
+
+        add("v37-round23-malformed-json-or-schema-fails-closed",function()
+            cleanup()
+            local bodies={"{not-json",HttpService:JSONEncode({data="wrong"}),HttpService:JSONEncode({data={},nextPageCursor={bad=true}})}
+            local good=true
+            for _,body in ipairs(bodies) do
+                State.AutoTrader.ForgetDirectAuthSecret()
+                State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function() return {StatusCode=200,Body=body,Headers={}} end})
+                State.AutoTrader.ConnectDirectAuthSecret("synthetic-schema",false)
+                local snap=State.AutoTrader.RefreshDirectAuthServerSnapshot();local support=State.AutoTrader.GetDirectAuthSupportSummary()
+                if not (snap==nil and support.status=="AUTH_DIRECT_SCHEMA_INVALID" and support.selectorEligible==false) then good=false end
+            end
+            cleanup();return good,"malformed authenticated server schema retained avatar/selector authority"
+        end)
+
+        add("v37-round23-malformed-token-entry-rejects-row",function()
+            local page=HttpService:JSONEncode({data={{id="bad-token",playing=5,maxPlayers=12,playerTokens={"ok-token","bad\nheader"}}}})
+            local parsed,err,diag=State.AutoTrader.ParseDirectAuthServerListBody(page,2000000000)
+            return parsed~=nil and err==nil and diag.acceptedRows==0 and diag.invalidRows==1 and diag.tokenBearingRows==0,
+                "malformed playerToken entry survived direct-auth row validation"
+        end)
+
+        add("v37-round23-tokenless-authenticated-response-fails-closed",function()
+            cleanup()
+            local rows={};for i=1,20 do table.insert(rows,{id="tokenless-"..i,playing=5,maxPlayers=12,playerTokens={}}) end
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function() return {StatusCode=200,Body=HttpService:JSONEncode({data=rows}),Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-tokenless",false)
+            local snap=State.AutoTrader.RefreshDirectAuthServerSnapshot();local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=snap==nil and support.status=="AUTH_DIRECT_TOKENLESS" and support.selectorEligible==false and support.tokenBearingRows==0
+            cleanup();return passed,"tokenless authenticated response was treated as avatar-authoritative"
+        end)
+
+        add("v37-round23-stale-authenticated-rows-lose-avatar-authority",function()
+            cleanup()
+            local clock=100;local unix=2000000000
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowClock=function() return clock end,nowUnix=function() return unix end,request=function() return {StatusCode=200,Body=authBody(2,1,nil,"stale"),Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-stale",false)
+            local initial=State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            clock=101;unix=2000000031
+            local stale=State.AutoTrader.GetDirectAuthSnapshot();local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=initial~=nil and stale==nil and support.selectorEligible==false and support.lastFailureCode=="AUTH_DIRECT_STALE"
+            cleanup();return passed,"authenticated rows remained avatar-authoritative past the 30-second freshness bound"
+        end)
+
+        add("v37-round23-pagination-is-bounded-and-dedupes-jobids",function()
+            cleanup()
+            local calls=0;local urls={}
+            local firstRows={};for i=1,50 do table.insert(firstRows,{id="page-job-"..i,playing=5,maxPlayers=12,playerTokens={"p1-"..i}}) end
+            local secondRows={};for i=41,100 do table.insert(secondRows,{id="page-job-"..i,playing=6,maxPlayers=12,playerTokens={"p2-"..i}}) end
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function(options)
+                calls+=1;table.insert(urls,options.Url)
+                if calls==1 then return {StatusCode=200,Body=HttpService:JSONEncode({data=firstRows,nextPageCursor="cursor one"}),Headers={}} end
+                return {StatusCode=200,Body=HttpService:JSONEncode({data=secondRows,nextPageCursor="unused-third"}),Headers={}}
+            end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-pages",false)
+            local snap=State.AutoTrader.RefreshDirectAuthServerSnapshot();local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=snap~=nil and calls==2 and support.pagesFetched==2 and support.acceptedRows==100 and support.duplicateRows==10
+                and urls[2] and urls[2]:find("cursor=cursor%20one",1,true)~=nil
+            cleanup();return passed,"direct-auth pagination was unbounded, failed cursor encoding, or retained duplicate JobIds"
+        end)
+
+        add("v37-round23-authenticated-same-jobid-precedes-public-token-evidence",function()
+            cleanup()
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function() return {StatusCode=200,Body=HttpService:JSONEncode({data={{id="same-job",playing=7,maxPlayers=12,playerTokens={"auth-token"}}}}),Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-precedence",false);State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local public={{id="same-job",playing=7,maxPlayers=12,playerTokens={"public-token"},previewTokenSource="direct_public_api"}}
+            local rows,changed=State.AutoTrader.EnrichExistingServerCandidatesFromDirectAuth(public)
+            local passed=changed==1 and #rows==1 and public[1].playerTokens[1]=="auth-token" and public[1].previewTokenSource=="authenticated_direct_executor_request"
+            cleanup();return passed,"fresh authenticated exact-JobId evidence did not take precedence over public token evidence"
+        end)
+
+        add("v37-round23-current-recent-manual-full-filters-remain-authoritative",function()
+            cleanup()
+            local now=os.time()
+            local rows={
+                {id=game.JobId,playing=5,maxPlayers=12,playerTokens={"t-current"}},
+                {id="r23-recent",playing=5,maxPlayers=12,playerTokens={"t-recent"}},
+                {id="r23-manual",playing=5,maxPlayers=12,playerTokens={"t-manual"}},
+                {id="r23-full",playing=12,maxPlayers=12,playerTokens={"t-full"}},
+                {id="r23-good",playing=8,maxPlayers=12,playerTokens={"t-good"}},
+            }
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowUnix=function() return now end,request=function() return {StatusCode=200,Body=HttpService:JSONEncode({data=rows}),Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-filters",false);State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local oldRecent,oldManual=State.AutoTrader.RecentJobs,State.AutoTrader.ManualBotServerJobs
+            State.AutoTrader.RecentJobs={["r23-recent"]=now};State.AutoTrader.ManualBotServerJobs={["r23-manual"]={atUnix=now,provenance="manual_bot_server"}}
+            local stubs=installPreviewStubs();local queue,scan,eligible=State.AutoTrader.BuildAuthenticatedDirectServerQueue();restorePreviewStubs(stubs)
+            State.AutoTrader.RecentJobs,State.AutoTrader.ManualBotServerJobs=oldRecent,oldManual
+            local passed=eligible==true and #queue==1 and queue[1].id=="r23-good" and scan.filteredCurrent==1 and scan.filteredRecent==1 and scan.filteredManual==1 and scan.filteredFull==1
+            cleanup();return passed,"direct-auth primary bypassed current/recent/manual/full Lua selector filters"
+        end)
+
+
+        add("v37-round23-healthy-filtered-empty-does-not-public-fallback",function()
+            cleanup()
+            local now=os.time()
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowUnix=function() return now end,request=function()
+                return {StatusCode=200,Body=HttpService:JSONEncode({data={{id="r23-filtered-only",playing=8,maxPlayers=12,playerTokens={"sample-token"}}}}),Headers={}}
+            end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-filtered-only",false)
+            State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local oldManual=State.AutoTrader.ManualBotServerJobs
+            State.AutoTrader.ManualBotServerJobs={["r23-filtered-only"]={atUnix=now,provenance="manual_bot_server"}}
+            local publicCalls=0
+            local savedPublic=State.AutoTrader.V37BuildPublicServerQueue
+            State.AutoTrader.V37BuildPublicServerQueue=function() publicCalls+=1;return {{id="r23-filtered-only",playing=8,maxPlayers=12,playerTokens={}}},{source="fresh_http_scan"} end
+            local stubs=installPreviewStubs()
+            local queue,scan=State.AutoTrader.BuildPublicServerQueue(true)
+            restorePreviewStubs(stubs)
+            State.AutoTrader.V37BuildPublicServerQueue=savedPublic
+            State.AutoTrader.ManualBotServerJobs=oldManual
+            local passed=#queue==0 and publicCalls==0 and scan and scan.discoverySource=="authenticated_direct_executor_request" and scan.filteredManual==1
+            cleanup();return passed,"healthy authenticated suppression was bypassed by tokenless public fallback"
+        end)
+
+        add("v37-round23-thirty-token-rows-remain-preview-capable",function()
+            cleanup()
+            local now=os.time()
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowUnix=function() return now end,request=function() return {StatusCode=200,Body=authBody(40,5,nil,"thirty"),Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-thirty",false);State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local oldRecent,oldManual=State.AutoTrader.RecentJobs,State.AutoTrader.ManualBotServerJobs;State.AutoTrader.RecentJobs={};State.AutoTrader.ManualBotServerJobs={}
+            local stubs=installPreviewStubs();local queue,scan,eligible=State.AutoTrader.BuildAuthenticatedDirectServerQueue();restorePreviewStubs(stubs)
+            State.AutoTrader.RecentJobs,State.AutoTrader.ManualBotServerJobs=oldRecent,oldManual
+            local all=true;for _,server in ipairs(queue) do if server.previewTokenSource~="authenticated_direct_executor_request" or server.previewCoverage~="SAMPLED_NOT_FULL_ROSTER" or #(server.previewFingerprints or {})~=5 then all=false end end
+            local passed=eligible==true and #queue==30 and scan.queueCount==30 and all
+            cleanup();return passed,"30-row authenticated direct selector failed to preserve token-bearing preview capability"
+        end)
+
+        add("v37-round23-sampled-wording-remains-not-full-roster",function()
+            local fp="23232323232323232323232323232323"
+            local ui=State.AutoTrader.GetUpcomingServerPreviewUiState({id="sampled",playing=11,maxPlayers=12,previewTokenCount=5,previewTokenSource="authenticated_direct_executor_request",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints={fp},previewThumbnailUrls={"https://t.example/a"}})
+            return ui.detail:find("5 avatar samples · 11 players",1,true)==1 and ui.previewCoverage=="SAMPLED_NOT_FULL_ROSTER" and ui.disclosure:find("SAMPLES",1,true)~=nil,
+                "authenticated direct five-token evidence was described as a full roster"
+        end)
+
+        add("v37-round23-preview-evidence-never-increments-strict-bot-counters",function()
+            local fp="24242424242424242424242424242424"
+            local oldDb=State.AutoTrader.BotIconDb
+            State.AutoTrader.BotIconDb={version=5,icons={[fp]={strictGoldBotJobs={strict=1},strictGoldBotSightings=4,manualGoldBotJobs={},manualGoldBotSightings=0}}}
+            local before=State.AutoTrader.GetBotEvidenceProvenanceSummary()
+            State.AutoTrader.ClassifyServerPreview({id="auth-preview",previewTokenSource="authenticated_direct_executor_request",previewCoverage="SAMPLED_NOT_FULL_ROSTER",previewFingerprints={fp},previewThumbnailUrls={"https://t.example/a"}})
+            local after=State.AutoTrader.GetBotEvidenceProvenanceSummary()
+            State.AutoTrader.BotIconDb=oldDb
+            return before.strictSightings==after.strictSightings and before.strictJobs==after.strictJobs and before.manualSightings==after.manualSightings,
+                "authenticated direct preview classification mutated permanent strict/manual bot evidence"
+        end)
+
+        add("v37-round23-forget-clears-memory-and-persisted-secret",function()
+            cleanup()
+            local file=nil;local deleted=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) file=body;return true end,
+                delfile=function() file=nil;deleted=true;return true end,
+            })
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-persisted-secret",true)
+            local remembered=State.AutoTrader.GetDirectAuthRemember()==true and State.AutoTrader.HasDirectAuthSecret()==true and file~=nil
+            State.AutoTrader.ForgetDirectAuthSecret()
+            local passed=remembered and deleted and file==nil and State.AutoTrader.HasDirectAuthSecret()==false and State.AutoTrader.GetDirectAuthRemember()==false
+            cleanup();return passed,"FORGET failed to clear private memory or the dedicated persisted auth secret"
+        end)
+
+        add("v37-round23-auth-file-never-appears-in-support-export",function()
+            cleanup()
+            local file=nil
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                isfile=function() return file~=nil end,readfile=function() return file end,
+                writefile=function(_,body) file=body;return true end,delfile=function() file=nil;return true end,
+                request=function() return {StatusCode=200,Body=authBody(1,1,nil,"support-auth"),Headers={}} end,
+            })
+            local secret="ROUND23_SYNTHETIC_AUTH_FILE_SECRET"
+            State.AutoTrader.ConnectDirectAuthSecret(secret,true);State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local support=State.AutoTrader.BuildDebug()
+            local passed=type(support)=="string" and support:find(secret,1,true)==nil and support:find("SV/AuthSession.dat",1,true)==nil and support:find(".ROBLOSECURITY",1,true)==nil
+            cleanup();return passed,"auth-only persistence file/secret leaked into support diagnostics"
+        end)
+
+        add("v37-round23-bootstrap-never-serializes-cookie-even-when-remembered",function()
+            cleanup()
+            local file=nil
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({isfile=function() return file~=nil end,readfile=function() return file end,writefile=function(_,body) file=body;return true end,delfile=function() file=nil;return true end})
+            local secret="ROUND23_SYNTHETIC_BOOTSTRAP_SECRET"
+            State.AutoTrader.ConnectDirectAuthSecret(secret,true)
+            local full=State.AutoTrader.BuildTeleportBootstrapCode("round23-full",true)
+            local minimal=State.AutoTrader.BuildTeleportBootstrapCode("round23-minimal",false)
+            local passed=type(full)=="string" and type(minimal)=="string" and full:find(secret,1,true)==nil and minimal:find(secret,1,true)==nil and full:find(".ROBLOSECURITY",1,true)==nil and minimal:find(".ROBLOSECURITY",1,true)==nil
+            cleanup();return passed,"remembered auth secret entered queued teleport bootstrap source"
+        end)
+
+        add("v37-round23-healthy-cadence-is-five-seconds-without-overpoll",function()
+            cleanup()
+            local clock=100;local calls=0;local slow=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowClock=function() return clock end,request=function()
+                calls+=1
+                if slow then task.wait(0.12) end
+                return {StatusCode=200,Body=authBody(1,1,nil,"cadence"),Headers={}}
+            end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-cadence",false)
+            State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            clock=104.9;State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local beforeFive=calls
+            clock=105.01;State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            clock=110.02;slow=true
+            local finished=false
+            task.spawn(function() State.AutoTrader.RefreshDirectAuthServerSnapshot();finished=true end)
+            task.wait(0.02)
+            local duringFirst=calls
+            State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local noOverlap=calls==duringFirst
+            for _=1,50 do if finished then break end;task.wait(0.01) end
+            local passed=beforeFive==1 and calls==3 and support.refreshIntervalSeconds==5 and support.backoffSeconds==0 and noOverlap and finished
+            cleanup();return passed,"healthy direct-auth polling ignored the ~5-second cadence or overlapped an in-flight page walk"
+        end)
+
+        add("v37-round23-public-fallback-does-not-read-legacy-companion-files",function()
+            cleanup()
+            local legacyReads=0
+            State.AutoTrader.ServerPreviewCompanionTestHooks={readfile=function() legacyReads+=1;error("legacy read forbidden") end,isfile=function() legacyReads+=1;return true end}
+            State.AutoTrader.DirectAuthTestHooks=baseHooks()
+            local saved={direct=State.AutoTrader.V37BuildPublicServerQueue,set=State.AutoTrader.SetUpcomingServerQueue,filter=State.AutoTrader.FilterManualBotServerQueue}
+            State.AutoTrader.V37BuildPublicServerQueue=function() return {{id="public-only",playing=4,maxPlayers=12,playerTokens={}}},{source="fresh_http_scan",candidates={{id="public-only"}}} end
+            State.AutoTrader.SetUpcomingServerQueue=function() end;State.AutoTrader.FilterManualBotServerQueue=function(q) return q end
+            local ok,queue=pcall(State.AutoTrader.BuildPublicServerQueue,true)
+            State.AutoTrader.V37BuildPublicServerQueue=saved.direct;State.AutoTrader.SetUpcomingServerQueue=saved.set;State.AutoTrader.FilterManualBotServerQueue=saved.filter;State.AutoTrader.ServerPreviewCompanionTestHooks=nil
+            local passed=ok and #queue==1 and legacyReads==0
+            cleanup();return passed,"Round-23 production fallback retained a hidden SV/ListOfServers.json dependency"
+        end)
+
+        add("v37-round23-direct-auth-primary-does-not-write-request-hint-file",function()
+            cleanup()
+            local hintWrites=0;local now=os.time()
+            State.AutoTrader.RequestedServerPreviewHintTestHooks={write=function() hintWrites+=1;return true end}
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({nowUnix=function() return now end,request=function() return {StatusCode=200,Body=authBody(2,1,nil,"no-hint"),Headers={}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-no-hint",false);State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local stubs=installPreviewStubs();local savedSet=State.AutoTrader.SetUpcomingServerQueue
+            -- Call the primary builder directly: production direct auth has no requested-preview file side effect.
+            local queue=State.AutoTrader.BuildAuthenticatedDirectServerQueue()
+            restorePreviewStubs(stubs);State.AutoTrader.SetUpcomingServerQueue=savedSet;State.AutoTrader.RequestedServerPreviewHintTestHooks=nil
+            local passed=type(queue)=="table" and hintWrites==0
+            cleanup();return passed,"authenticated direct discovery wrote the legacy SV/RequestedServerPreviews.json hint"
+        end)
+
+        add("v37-round23-support-proves-source-freshness-without-credential-metadata",function()
+            cleanup()
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({request=function() return {StatusCode=200,Body=authBody(3,2,nil,"support-safe"),Headers={["Set-Cookie"]="do-not-export"}} end})
+            State.AutoTrader.ConnectDirectAuthSecret("synthetic-support-safe",false);State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local support=State.AutoTrader.GetDirectAuthSupportSummary();local encoded=HttpService:JSONEncode(support)
+            local passed=support.source=="authenticated_direct_executor_request" and support.status=="AUTH_DIRECT_READY" and support.tokenBearingRows==3 and support.totalPlayerTokenCount==6
+                and support.lastSuccessAgeSeconds==0 and encoded:find("Cookie",1,true)==nil and encoded:find("ROBLOSECURITY",1,true)==nil and encoded:find("secret",1,true)==nil
+            cleanup();return passed,"direct-auth support cannot prove healthy source/freshness without credential metadata"
+        end)
+
+        add("v37-round23-round22-mutation-family-regressions-remain-passing",function()
+            local required={
+                ["v37-round22-remote-positive-plus-relative-same-mutation-is-blocked"]=false,
+                ["v37-round22-remote-positive-plus-unresolved-same-mutation-is-blocked"]=false,
+                ["v37-round22-unrelated-unknown-family-preserves-safe-remote-floor"]=false,
+                ["v37-round22-positive-plus-zero-distinct-same-mutation-is-blocked"]=false,
+                ["v37-round22-local-positive-plus-unresolved-same-mutation-is-not-tradable"]=false,
+                ["v37-round22-local-safe-family-survives-unrelated-unknown"]=false,
+                ["v37-round22-tainted-no-witness-remains-search-inconclusive"]=false,
+            }
+            for _,row in ipairs(tests) do if required[row.name]~=nil then required[row.name]=row.ok==true end end
+            for _,ok in pairs(required) do if not ok then return false,"Round-22 mutation-family regression failed before Round-23 tests" end end
+            return true
+        end)
+
+        add("v37-round23-incomplete-inventory-still-never-proves-impossible",function()
+            for _,row in ipairs(tests) do
+                if row.name=="v37-round22-tainted-no-witness-remains-search-inconclusive" then
+                    return row.ok==true,"Round-22 SEARCH_INCONCLUSIVE boundary regressed"
+                end
+            end
+            return false,"required Round-22 incomplete-inventory regression was missing"
+        end)
+
+        add("v37-round23-legacy-companion-is-explicitly-disabled-in-production-support",function()
+            local debug=State.AutoTrader.BuildDebug()
+            return State.AutoTrader.ServerRosterPolicy=="AUTHENTICATED_DIRECT_EXECUTOR_REQUEST_LUA_POLICY_DIRECT_PUBLIC_FALLBACK"
+                and type(debug)=="string" and debug:find("ROUND23_REPLACED_BY_AUTHENTICATED_DIRECT_EXECUTOR_REQUEST",1,true)~=nil
+                and debug:find("expectedRuntimeSourceSha256",1,true)==nil,
+                "production support still advertised a live companion pin/dependency"
+        end)
+
+
+        add("v37-round24-forget-clear-failure-revokes-memory-and-reports-failure",function()
+            cleanup()
+            local file=nil;local failClear=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) if failClear then error("synthetic write failure") end;file=body;return true end,
+                delfile=function() if failClear then error("synthetic delete failure") end;file=nil;return true end,
+            })
+            local connected=State.AutoTrader.ConnectDirectAuthSecret("ROUND24_SYNTHETIC_FORGET_FAILURE",true)
+            local remembered=connected==true and file~=nil and State.AutoTrader.GetDirectAuthRemember()==true
+            failClear=true
+            local ok,reason=State.AutoTrader.ForgetDirectAuthSecret()
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=remembered and ok==false and reason=="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                and State.AutoTrader.HasDirectAuthSecret()==false and State.AutoTrader.GetDirectAuthRemember()==true
+                and support.status=="AUTH_DIRECT_PERSIST_CLEAR_FAILED" and support.lastFailureCode=="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                and type(file)=="string" and file~=""
+            cleanup();return passed,"FORGET clear failure did not revoke memory immediately or expose generic failure"
+        end)
+
+        add("v37-round24-remember-off-clear-failure-does-not-claim-off",function()
+            cleanup()
+            local file=nil;local failClear=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) if failClear then error("synthetic write failure") end;file=body;return true end,
+                delfile=function() if failClear then error("synthetic delete failure") end;file=nil;return true end,
+            })
+            local connected=State.AutoTrader.ConnectDirectAuthSecret("ROUND24_SYNTHETIC_REMEMBER_FAILURE",true)
+            failClear=true
+            local ok,reason=State.AutoTrader.SetDirectAuthRemember(false)
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=connected==true and ok==false and reason=="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                and State.AutoTrader.GetDirectAuthRemember()==true and State.AutoTrader.HasDirectAuthSecret()==true
+                and support.rememberAcrossTeleports==true and support.lastFailureCode=="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                and type(file)=="string" and file~=""
+            cleanup();return passed,"REMEMBER OFF falsely succeeded while persisted credential residue could survive"
+        end)
+
+        add("v37-round24-nonremember-connect-refuses-uncleared-old-persistence",function()
+            cleanup()
+            local file=nil;local failClear=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) if failClear then error("synthetic write failure") end;file=body;return true end,
+                delfile=function() if failClear then error("synthetic delete failure") end;file=nil;return true end,
+            })
+            local oldConnected=State.AutoTrader.ConnectDirectAuthSecret("ROUND24_SYNTHETIC_OLD_PERSISTED",true)
+            failClear=true
+            local ok,reason=State.AutoTrader.ConnectDirectAuthSecret("ROUND24_SYNTHETIC_NEW_MEMORY_ONLY",false)
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=oldConnected==true and ok==false and reason=="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                and State.AutoTrader.GetDirectAuthRemember()==true and support.rememberAcrossTeleports==true
+                and support.status=="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                and type(file)=="string" and file=="ROUND24_SYNTHETIC_OLD_PERSISTED"
+            cleanup();return passed,"nonremember CONNECT claimed safe success without proving old persisted secret was erased"
+        end)
+
+        add("v37-round24-delete-success-with-residue-falls-back-to-verified-empty-overwrite",function()
+            cleanup()
+            local file=nil;local deleteCalls=0;local emptyWrites=0
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) file=body;if body=="" then emptyWrites+=1 end;return true end,
+                delfile=function() deleteCalls+=1;return true end,
+            })
+            local connected=State.AutoTrader.ConnectDirectAuthSecret("ROUND24_SYNTHETIC_DELETE_RESIDUE",true)
+            local ok,reason=State.AutoTrader.SetDirectAuthRemember(false)
+            local passed=connected==true and ok==true and reason==nil and deleteCalls>=1 and emptyWrites>=1
+                and file=="" and State.AutoTrader.GetDirectAuthRemember()==false
+            cleanup();return passed,"pcall-successful delete residue was trusted without overwrite-empty verification"
+        end)
+
+        add("v37-round24-delete-unavailable-empty-overwrite-prevents-fresh-restore",function()
+            cleanup()
+            local file=nil;local failDelete=false
+            local hooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) file=body;return true end,
+                delfile=function() if failDelete then error("synthetic delete unavailable") end;file=nil;return true end,
+            })
+            State.AutoTrader.DirectAuthTestHooks=hooks
+            local connected=State.AutoTrader.ConnectDirectAuthSecret("ROUND24_SYNTHETIC_OVERWRITE_EMPTY",true)
+            failDelete=true
+            local ok=State.AutoTrader.SetDirectAuthRemember(false)
+            hooks.allowFreshRestore=true
+            local restored=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=connected==true and ok==true and file=="" and restored==false
+                and State.AutoTrader.HasDirectAuthSecret()==false and State.AutoTrader.GetDirectAuthRemember()==false
+                and support.selectorEligible==false
+            cleanup();return passed,"overwrite-empty fallback did not prevent a simulated fresh restore"
+        end)
+
+        add("v37-round24-successful-forget-stays-missing-after-fresh-restore",function()
+            cleanup()
+            local file=nil
+            local hooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) file=body;return true end,
+                delfile=function() file=nil;return true end,
+            })
+            State.AutoTrader.DirectAuthTestHooks=hooks
+            local connected=State.AutoTrader.ConnectDirectAuthSecret("ROUND24_SYNTHETIC_SUCCESSFUL_FORGET",true)
+            local forgot,reason=State.AutoTrader.ForgetDirectAuthSecret()
+            hooks.allowFreshRestore=true
+            local restored=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local passed=connected==true and forgot==true and reason==nil and file==nil and restored==false
+                and State.AutoTrader.HasDirectAuthSecret()==false and State.AutoTrader.GetDirectAuthRemember()==false
+                and support.status=="AUTH_DIRECT_MISSING_SECRET" and support.selectorEligible==false
+            cleanup();return passed,"successful FORGET allowed persisted auth to reappear after simulated fresh startup"
+        end)
+
+        add("v37-round24-persist-clear-failure-diagnostics-remain-secret-free",function()
+            cleanup()
+            local marker="ROUND24_SYNTHETIC_ERASURE_DIAGNOSTIC_SENTINEL"
+            local file=nil;local failClear=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) if failClear then error("synthetic write failure") end;file=body;return true end,
+                delfile=function() if failClear then error("synthetic delete failure") end;file=nil;return true end,
+            })
+            State.AutoTrader.ConnectDirectAuthSecret(marker,true)
+            failClear=true
+            local ok,reason=State.AutoTrader.ForgetDirectAuthSecret()
+            local supportJson=HttpService:JSONEncode(State.AutoTrader.GetDirectAuthSupportSummary())
+            local debug=State.AutoTrader.BuildDebug()
+            local bootstrap=State.AutoTrader.BuildTeleportBootstrapCode("round24-clear-failure-diagnostic",false)
+            local recent=HttpService:JSONEncode(HARDEN.supportJsonValue(State.AutoTrader.DebugLog or {}))
+            local combined=tostring(supportJson).."\n"..tostring(debug).."\n"..tostring(bootstrap).."\n"..tostring(recent)
+            local passed=ok==false and reason=="AUTH_DIRECT_PERSIST_CLEAR_FAILED"
+                and combined:find(marker,1,true)==nil and combined:find(".ROBLOSECURITY=",1,true)==nil
+                and supportJson:find("SV/AuthSession.dat",1,true)==nil
+            cleanup();return passed,"persist-clear failure diagnostics exposed credential-bearing material"
+        end)
+
+        add("v37-round26-remembered-auth-inflight-is-quiesced-before-direct-auth-fixtures",function()
+            cleanup()
+            local marker="ROUND26_SYNTHETIC_REMEMBERED_AUTH_ISOLATION"
+            local file=marker
+            local releaseOld=false
+            local oldStarted=false
+            local oldFinished=false
+            local oldRefreshReturned=false
+            local requestCount=0
+            local oldBody=authBody(1,1,nil,"round26-old")
+            local freshBody=authBody(2,2,nil,"round26-fresh")
+            local hooks=baseHooks({
+                allowFreshRestore=true,
+                isfile=function() return file~=nil end,
+                readfile=function() return file end,
+                writefile=function(_,body) file=body;return true end,
+                delfile=function() file=nil;return true end,
+                request=function()
+                    requestCount+=1
+                    if requestCount==1 then
+                        oldStarted=true
+                        while not releaseOld do task.wait(0.01) end
+                        oldFinished=true
+                        return {StatusCode=200,Body=oldBody,Headers={}}
+                    end
+                    return {StatusCode=200,Body=freshBody,Headers={}}
+                end,
+            })
+            State.AutoTrader.DirectAuthTestHooks=hooks
+            local restoredInitial=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            task.spawn(function()
+                State.AutoTrader.RefreshDirectAuthServerSnapshot()
+                oldRefreshReturned=true
+            end)
+            local waitStart=os.clock()
+            while not oldStarted and os.clock()-waitStart<0.5 do task.wait(0.01) end
+            local isolated,isolationReason=State.AutoTrader.BeginDirectAuthSelfTestIsolation()
+            local returnStart=os.clock()
+            while not oldRefreshReturned and os.clock()-returnStart<0.25 do task.wait(0.01) end
+            local quiesced=isolated==true and oldRefreshReturned==true and isolationReason==nil
+            local persistedIntact=file==marker
+            local restoredAfterIsolation=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            local freshSnapshot=State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local beforeLate=State.AutoTrader.GetDirectAuthSupportSummary()
+            releaseOld=true
+            local finishStart=os.clock()
+            while not oldFinished and os.clock()-finishStart<0.5 do task.wait(0.01) end
+            task.wait(0.04)
+            local afterLate=State.AutoTrader.GetDirectAuthSupportSummary()
+            local supportJson=HttpService:JSONEncode(afterLate)
+            local debug=State.AutoTrader.BuildDebug()
+            local bootstrap=State.AutoTrader.BuildTeleportBootstrapCode("round26-auth-isolation",false)
+            local combined=tostring(supportJson).."\n"..tostring(debug).."\n"..tostring(bootstrap)
+            local passed=restoredInitial==true and oldStarted==true and quiesced and persistedIntact
+                and restoredAfterIsolation==true and type(freshSnapshot)=="table" and freshSnapshot.usable==true
+                and beforeLate.status=="AUTH_DIRECT_READY" and beforeLate.acceptedRows==2 and beforeLate.totalPlayerTokenCount==4
+                and afterLate.status=="AUTH_DIRECT_READY" and afterLate.acceptedRows==2 and afterLate.totalPlayerTokenCount==4
+                and file==marker and requestCount>=2 and combined:find(marker,1,true)==nil
+                and combined:find(".ROBLOSECURITY=",1,true)==nil
+            cleanup();return passed,"remembered-auth in-flight request was not quiesced before synthetic direct-auth fixtures"
+        end)
+
+        add("v37-round27-user-auth-mutation-is-rejected-during-selftest-isolation",function()
+            cleanup()
+            local marker="ROUND27_SYNTHETIC_PRETEST_AUTH"
+            local replacement="ROUND27_SYNTHETIC_REPLACEMENT"
+            local internalMarker="ROUND27_SYNTHETIC_INTERNAL_MUTATION"
+            local file=marker
+            local filesystemOps=0
+            local requestCount=0
+            local restoredCookieExact=false
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
+                allowFreshRestore=true,
+                isfile=function() filesystemOps+=1;return file~=nil end,
+                readfile=function() filesystemOps+=1;return file end,
+                writefile=function(_,body) filesystemOps+=1;file=body;return true end,
+                delfile=function() filesystemOps+=1;file=nil;return true end,
+                makefolder=function() filesystemOps+=1;return true end,
+                request=function(options)
+                    requestCount+=1
+                    local headers=type(options)=="table" and options.Headers or nil
+                    restoredCookieExact=type(headers)=="table" and headers.Cookie==".ROBLOSECURITY="..marker
+                    return {StatusCode=200,Body=authBody(1,2,nil,"round27-restored"),Headers={}}
+                end,
+            })
+            local restoredInitial=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            local preRemember=State.AutoTrader.GetDirectAuthRemember()==true
+            local preHasSecret=State.AutoTrader.HasDirectAuthSecret()==true
+            local isolated,isolationReason=State.AutoTrader.BeginDirectAuthSelfTestIsolation()
+            local opsBeforeUser=filesystemOps
+            local forgot,forgetReason=State.AutoTrader.ForgetDirectAuthSecret(true)
+            local opsAfterForget=filesystemOps
+            local remembered,rememberReason=State.AutoTrader.SetDirectAuthRemember(false,true)
+            local opsAfterRemember=filesystemOps
+            local connected,connectReason=State.AutoTrader.ConnectDirectAuthSecret(replacement,false,true)
+            local opsAfterConnect=filesystemOps
+            local fakeBox=Instance.new("TextBox")
+            local fakeStatus=Instance.new("TextLabel")
+            fakeBox.Text=replacement
+            fakeStatus.Text="before"
+            local uiConnected,uiReason=State.AutoTrader.HandleDirectAuthUiConnectSubmission(replacement,false,fakeBox,fakeStatus)
+            local uiInputPreserved=fakeBox.Text==replacement
+            local uiGeneric=fakeStatus.Text=="DIRECT AUTH · SELF-TEST ACTIVE — TRY AGAIN"
+                and fakeStatus.Text:find(marker,1,true)==nil and fakeStatus.Text:find(replacement,1,true)==nil
+            fakeBox:Destroy();fakeStatus:Destroy()
+            local opsAfterUi=filesystemOps
+            local persistenceUntouched=file==marker
+            local internalOK,internalReason=State.AutoTrader.ConnectDirectAuthSecret(internalMarker,true)
+            local internalWorked=internalOK==true and internalReason==nil and file==internalMarker and filesystemOps>opsAfterUi
+            local fixtureReset=State.AutoTrader.ConnectDirectAuthSecret(marker,true)
+            local restoredAfter=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            local freshSnapshot=State.AutoTrader.RefreshDirectAuthServerSnapshot()
+            local support=State.AutoTrader.GetDirectAuthSupportSummary()
+            local supportJson=HttpService:JSONEncode(support)
+            local debug=State.AutoTrader.BuildDebug()
+            local bootstrap=State.AutoTrader.BuildTeleportBootstrapCode("round27-user-auth-selftest-gate",false)
+            local combined=tostring(supportJson).."\n"..tostring(debug).."\n"..tostring(bootstrap)
+            local restoredExact=restoredAfter==true and fixtureReset==true and file==marker
+                and State.AutoTrader.GetDirectAuthRemember()==true and State.AutoTrader.HasDirectAuthSecret()==true
+                and type(freshSnapshot)=="table" and freshSnapshot.usable==true and restoredCookieExact==true and requestCount>=1
+            local passed=restoredInitial==true and preRemember and preHasSecret and isolated==true and isolationReason==nil
+                and forgot==false and forgetReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterForget==opsBeforeUser
+                and remembered==false and rememberReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterRemember==opsBeforeUser
+                and connected==false and connectReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterConnect==opsBeforeUser
+                and uiConnected==false and uiReason=="AUTH_DIRECT_SELF_TEST_ACTIVE" and opsAfterUi==opsBeforeUser
+                and uiInputPreserved and uiGeneric and persistenceUntouched and internalWorked and restoredExact
+                and combined:find(marker,1,true)==nil and combined:find(replacement,1,true)==nil
+                and combined:find(internalMarker,1,true)==nil and combined:find(".ROBLOSECURITY=",1,true)==nil
+            cleanup();return passed,"user auth mutation crossed self-test isolation or UI rejection consumed the pending secret"
+        end)
+
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v37_round24",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        State.AutoTrader.DirectAuthTestHooks=nil
+        State.AutoTrader.SelfTestExecutionDepth=priorDepth
+        if priorDepth<=0 and type(State.AutoTrader.RestoreDirectAuthAfterSelfTests)=="function" then
+            pcall(State.AutoTrader.RestoreDirectAuthAfterSelfTests)
+        end
+        return result
+    end
+end
+
 
 State.QueueNativeDatabaseWarmup()
 rawset(_G, GLOBAL_KEY, Controller)

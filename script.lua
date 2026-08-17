@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.29-public-auto-trader-v37-round32-supervised-canary-one-target-safety",
+    version = "18.69.32-public-auto-trader-v37-round35-decision-journal-register-scope-fix",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -162,8 +162,13 @@ local CONFIG = {
     AutoTraderRecoverySameReasonCooldownSeconds = 8,
     AutoTraderDiskLogMaxBytes = 524288,
     AutoTraderDiskLogFlushEveryEvents = 12,
-    AutoTraderSessionHistoryLimit = 3,
+    -- Round 34 keeps a longer internal cross-server record for one supervised AUTO observation run.
+    -- Support still includes only the newest three prior sessions in full; older retained sessions contribute compact decisions only.
+    AutoTraderSessionHistoryLimit = 12,
+    AutoTraderSessionSupportFullLimit = 3,
     AutoTraderSessionEventLimit = 64,
+    -- Round 34 observability: meaningful decision transitions only; unchanged scan loops are deduplicated.
+    AutoTraderDecisionJournalLimit = 240,
     AutoTraderSessionHistorySaveDelaySeconds = 0.75,
     AutoTraderIncomingActionTimeoutSeconds = 2.5,
     -- v34: an input API returning successfully is not a trade acknowledgement.
@@ -281,8 +286,8 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "8af0d997f163d52ff3f3c5456d860249be3f5a499d8460dc592cbc771f30c3f9",
-    readyGlobalCurrent = "__SV_AUTO_TRADER_V32_READY",
+    distributionNormalizedSha256 = "96263c1b597e19ae187a7801d003221542cf6cb4c2168d3afae2e02374dc178b",
+    readyGlobalCurrent = "__SV_AUTO_TRADER_V34_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
     guiDiscovery = {mainCalls=0,tradeCalls=0,tradeCacheHits=0,tradeSuccess=0,inventoryScans=0,totalTradeSeconds=0,maxTradeSeconds=0,totalInventorySeconds=0,maxInventorySeconds=0},
@@ -321,6 +326,8 @@ local function validateConfigRelationships()
     need(CONFIG.AutoTraderUpcomingServerUiLimit >= 1 and CONFIG.AutoTraderUpcomingServerUiLimit <= 30, "upcoming server UI limit is invalid")
     need(CONFIG.AutoTraderUpcomingServerPreviewIconLimit >= 1 and CONFIG.AutoTraderUpcomingServerPreviewIconLimit <= 8, "upcoming server icon limit is invalid")
     need(CONFIG.AutoTraderSessionHistoryLimit >= 1 and CONFIG.AutoTraderSessionEventLimit >= 8, "session history limits are invalid")
+    need(CONFIG.AutoTraderSessionSupportFullLimit >= 1 and CONFIG.AutoTraderSessionSupportFullLimit <= CONFIG.AutoTraderSessionHistoryLimit, "full session support limit is invalid")
+    need(CONFIG.AutoTraderDecisionJournalLimit >= 64 and CONFIG.AutoTraderDecisionJournalLimit <= 1000, "decision journal limit is invalid")
     need(CONFIG.RemoteTimeoutSeconds > 0 and CONFIG.AutoTraderHttpTimeoutSeconds > 0, "remote/http timeouts must be positive")
     need(CONFIG.AutoTraderBootstrapMaxAttempts > 0 and CONFIG.AutoTraderBootstrapInitialRetrySeconds > 0, "bootstrap retry policy is invalid")
     need(CONFIG.AutoTraderBootstrapHttpAttemptTimeoutSeconds > 0 and CONFIG.AutoTraderBootstrapExecutionTimeoutSeconds > 0, "bootstrap operation timeouts must be positive")
@@ -6872,6 +6879,11 @@ State.AutoTrader = {
     OtherSummary = nil,
     ProtectedSearch = "",
     DebugLog = {},
+    DecisionJournal = {},
+    DecisionJournalLastSignature = {},
+    DecisionJournalSequence = 0,
+    DecisionJournalDropped = 0,
+    DecisionJournalStartedAt = os.clock(),
     LastPlannerReason = nil,
     LastMarketGate = nil,
     LastEffectiveMinimumWin = nil,
@@ -7932,9 +7944,22 @@ State.AutoTrader.ScheduleSessionHistorySave = function(reason)
     return true
 end
 State.AutoTrader.BuildSessionHistorySupport = function()
+    local sessions = State.AutoTrader.SessionHistory.sessions or {}
+    local full = {}
+    local decisionSessions = {}
+    for index, row in ipairs(sessions) do
+        if index <= CONFIG.AutoTraderSessionSupportFullLimit then table.insert(full, row) end
+        if type(row) == "table" then
+            table.insert(decisionSessions, {
+                controllerVersion = row.controllerVersion, sessionId = row.sessionId, jobId = row.jobId, placeId = row.placeId,
+                startedAtUnix = row.startedAtUnix, checkpointAtUnix = row.checkpointAtUnix, runtimeSeconds = row.runtimeSeconds,
+                status = row.status, statusDetail = row.statusDetail, decisionJournal = row.decisionJournal,
+            })
+        end
+    end
     return {historySchema=1,current=State.AutoTrader.BuildSessionHistoryRecord("support_snapshot"),
-        previousSessions=HARDEN.supportJsonValue(State.AutoTrader.SessionHistory.sessions or {}),
-        previousSessionLimit=CONFIG.AutoTraderSessionHistoryLimit,historyFile=State.AutoTrader.SessionHistoryFile}
+        previousSessions=HARDEN.supportJsonValue(full),decisionSessions=HARDEN.supportJsonValue(decisionSessions),
+        previousSessionLimit=CONFIG.AutoTraderSessionHistoryLimit,fullPreviousSessionLimit=CONFIG.AutoTraderSessionSupportFullLimit,historyFile=State.AutoTrader.SessionHistoryFile}
 end
 State.AutoTrader.LoadSessionHistory()
 State.AutoTrader.ScheduleSessionHistorySave("startup")
@@ -17031,6 +17056,7 @@ State.AutoTrader.BuildDebug = function()
             strategyConfigSnapshot = State.AutoTrader.TargetStats.configSnapshot,
         },
         recentLog = State.AutoTrader.DebugLog,
+        decisionJournal = State.AutoTrader.BuildDecisionJournalSupport and State.AutoTrader.BuildDecisionJournalSupport() or nil,
         sessionHistory = State.AutoTrader.BuildSessionHistorySupport(),
         tradeTransport = HARDEN.supportJsonValue(State.AutoTrader.TradeTransport),
     }
@@ -26172,7 +26198,14 @@ do
             end
         end
         State.AutoTrader.Log("request_cancel_confirmed",{userId=pending.userId,name=pending.name,outcome=outcome,reason=pending.cancelReason,age=os.clock()-(pending.sentAt or os.clock()),recoveryAfterCleanup=recovery,contactAcknowledged=pending.contactAcknowledged==true})
+        local completedUserId=pending.userId
+        local completedName=pending.name
+        local completedReason=pending.cancelReason or outcome or "request terminal"
         State.AutoTrader.PendingRequest=nil;State.AutoTrader.RequestLifecycle="idle";State.AutoTrader.NextRequestAt=os.clock()+CONFIG.AutoTraderRequestCancelQuietSeconds;State.AutoTrader.RequestConfirmGeneration+=1
+        State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(
+            completedUserId,
+            "supervised target request ended before trade: "..tostring(completedName or completedUserId).." · "..tostring(completedReason)
+        )
         if recovery then State.AutoTrader.RequestRecoveryTeleport(recoveryReason or "repeated outgoing request transport failures")
         else local _,receiving=State.AutoTrader.GetIncomingRequestUi();if receiving and State.AutoTrader.IsGuiShown(receiving) then task.defer(State.AutoTrader.HandleIncomingRequest) end end
         return true
@@ -26191,8 +26224,14 @@ do
             State.AutoTrader.SetContactState(player,"TERMINAL_THIS_PRESENCE","authoritative decline consumed this presence contact")
         end
         State.AutoTrader.Log("request_declined_confirmed",{userId=pending.userId,name=pending.name,observedAt=pending.declineObservedAt,reason=reason,contactAcknowledgedAt=pending.contactAcknowledgedAt})
+        local completedUserId=pending.userId
+        local completedName=pending.name
         State.AutoTrader.PendingRequest=nil;State.AutoTrader.RequestConfirmGeneration+=1;State.AutoTrader.RequestLifecycle="idle";State.AutoTrader.NextRequestAt=os.clock()+CONFIG.AutoTraderRequestCancelQuietSeconds
         State.AutoTrader.Status="COOLDOWN · DECLINED";State.AutoTrader.StatusDetail=player and (player.Name.." declined; moving on after the short clean-state spacing.") or "Request was declined."
+        State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(
+            completedUserId,
+            "supervised target declined the outgoing request: "..tostring(completedName or completedUserId)
+        )
         State.AutoTrader.Render();return true
     end
 
@@ -31827,6 +31866,76 @@ do
             return passed,"supervised canary terminal stop fired for the wrong target or failed to keep AUTO off for the locked target"
         end)
 
+        add("v37-round33-final-cancellation-finalizer-stops-locked-canary",function()
+            local saved={
+                pending=State.AutoTrader.PendingRequest,
+                requestLifecycle=State.AutoTrader.RequestLifecycle,
+                nextRequestAt=State.AutoTrader.NextRequestAt,
+                requestConfirmGeneration=State.AutoTrader.RequestConfirmGeneration,
+                classify=State.AutoTrader.ClassifyPendingCancellation,
+                stop=State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle,
+                getIncoming=State.AutoTrader.GetIncomingRequestUi,
+                requestRecovery=State.AutoTrader.RequestRecoveryTeleport,
+            }
+            local captured=nil
+            State.AutoTrader.ClassifyPendingCancellation=function(_,outcome) return outcome end
+            State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle=function(userId,reason)
+                captured={userId=userId,reason=reason}
+                return true
+            end
+            State.AutoTrader.GetIncomingRequestUi=function() return nil,nil end
+            State.AutoTrader.RequestRecoveryTeleport=function() return false end
+            local pending={userId=909001,name="Round33Cancel",cancelOutcome="transport_deferred",cancelReason="fixture timeout",sentAt=os.clock(),recoveryAfterCleanup=false,contactAcknowledged=false}
+            State.AutoTrader.PendingRequest=pending
+            local ok=State.AutoTrader.FinalizePendingCancellation(pending)
+            local passed=ok==true and type(captured)=="table" and captured.userId==909001
+                and tostring(captured.reason):find("supervised target request ended before trade",1,true)~=nil
+                and State.AutoTrader.PendingRequest==nil and State.AutoTrader.RequestLifecycle=="idle"
+            State.AutoTrader.PendingRequest=saved.pending
+            State.AutoTrader.RequestLifecycle=saved.requestLifecycle
+            State.AutoTrader.NextRequestAt=saved.nextRequestAt
+            State.AutoTrader.RequestConfirmGeneration=saved.requestConfirmGeneration
+            State.AutoTrader.ClassifyPendingCancellation=saved.classify
+            State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle=saved.stop
+            State.AutoTrader.GetIncomingRequestUi=saved.getIncoming
+            State.AutoTrader.RequestRecoveryTeleport=saved.requestRecovery
+            return passed,"final outgoing cancellation override bypassed the supervised-canary terminal stop"
+        end)
+
+        add("v37-round33-final-decline-finalizer-stops-locked-canary",function()
+            local saved={
+                pending=State.AutoTrader.PendingRequest,
+                requestLifecycle=State.AutoTrader.RequestLifecycle,
+                nextRequestAt=State.AutoTrader.NextRequestAt,
+                requestConfirmGeneration=State.AutoTrader.RequestConfirmGeneration,
+                status=State.AutoTrader.Status,
+                statusDetail=State.AutoTrader.StatusDetail,
+                stop=State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle,
+                render=State.AutoTrader.Render,
+            }
+            local captured=nil
+            State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle=function(userId,reason)
+                captured={userId=userId,reason=reason}
+                return true
+            end
+            State.AutoTrader.Render=function() end
+            local pending={userId=909002,name="Round33Decline",sentAt=os.clock(),contactAcknowledged=true,contactAcknowledgedAt=os.clock(),declineObservedAt=os.clock()}
+            State.AutoTrader.PendingRequest=pending
+            local ok=State.AutoTrader.FinalizePendingDecline(pending,"fixture decline")
+            local passed=ok==true and type(captured)=="table" and captured.userId==909002
+                and tostring(captured.reason):find("supervised target declined the outgoing request",1,true)~=nil
+                and State.AutoTrader.PendingRequest==nil and State.AutoTrader.RequestLifecycle=="idle"
+            State.AutoTrader.PendingRequest=saved.pending
+            State.AutoTrader.RequestLifecycle=saved.requestLifecycle
+            State.AutoTrader.NextRequestAt=saved.nextRequestAt
+            State.AutoTrader.RequestConfirmGeneration=saved.requestConfirmGeneration
+            State.AutoTrader.Status=saved.status
+            State.AutoTrader.StatusDetail=saved.statusDetail
+            State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle=saved.stop
+            State.AutoTrader.Render=saved.render
+            return passed,"final outgoing decline override bypassed the supervised-canary terminal stop"
+        end)
+
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
         result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.tests=tests;result.controllerVersion=CONTROLLER_VERSION;State.AutoTrader.SelfTest=result
         State.AutoTrader.Log("self_test_v37_round24",{passed=passed,total=#tests,ok=result.ok,tests=tests})
@@ -31838,6 +31947,309 @@ do
         return result
     end
 end
+
+
+-- Round 34/35: bounded decision-journal observability.
+-- Round 35 installs this telemetry inside a nested function scope so the already-large
+-- controller chunk does not consume Luau's 200-local-register ceiling. This is a
+-- compiler-scope fix only; planner, transport, trade, audit, hop, and teleport authority
+-- are unchanged.
+(function()
+    local function round34Short(value, maxLen)
+        if value == nil then return nil end
+        local text = tostring(value)
+        maxLen = tonumber(maxLen) or 700
+        if #text > maxLen then return string.sub(text, 1, maxLen) .. "…" end
+        return text
+    end
+
+    local function round34Rounded(value, places)
+        value = tonumber(value)
+        if not value then return nil end
+        local scale = 10 ^ (tonumber(places) or 4)
+        return math.floor(value * scale + 0.5) / scale
+    end
+
+    local function round34OpportunitySummary(opportunity)
+        if type(opportunity) ~= "table" then return nil end
+        return {
+            kind = opportunity.kind,
+            strategicSubkind = opportunity.strategicSubkind,
+            giveTotal = tonumber(opportunity.giveTotal),
+            receiveTotal = tonumber(opportunity.receiveTotal),
+            win = tonumber(opportunity.win),
+            minWin = tonumber(opportunity.minWin),
+            expectedRate = round34Rounded(opportunity.expectedRate, 6),
+            searchComplete = opportunity.searchComplete == true,
+            reason = round34Short(opportunity.reason, 600),
+            give = State.AutoTrader.FormatOpportunityItems and State.AutoTrader.FormatOpportunityItems(opportunity.giveItems) or nil,
+            receive = State.AutoTrader.FormatOpportunityItems and State.AutoTrader.FormatOpportunityItems(opportunity.receiveItems) or nil,
+            marketGateOk = type(opportunity.marketGate) == "table" and opportunity.marketGate.ok == true or nil,
+            portfolioReason = type(opportunity.portfolioDelta) == "table" and round34Short(opportunity.portfolioDelta.reason, 500) or nil,
+        }
+    end
+
+    State.AutoTrader.RecordDecisionJournalEntry = function(kind, data, dedupeKey, signature, force)
+        if force ~= true and (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) > 0 then return false end
+        State.AutoTrader.DecisionJournal = State.AutoTrader.DecisionJournal or {}
+        State.AutoTrader.DecisionJournalLastSignature = State.AutoTrader.DecisionJournalLastSignature or {}
+        if dedupeKey and signature and State.AutoTrader.DecisionJournalLastSignature[dedupeKey] == signature then return false end
+        if dedupeKey and signature then State.AutoTrader.DecisionJournalLastSignature[dedupeKey] = signature end
+        State.AutoTrader.DecisionJournalSequence = (tonumber(State.AutoTrader.DecisionJournalSequence) or 0) + 1
+        local entry = {
+            seq = State.AutoTrader.DecisionJournalSequence,
+            t = os.clock(),
+            unix = os.time(),
+            kind = tostring(kind or "decision"),
+            data = HARDEN.supportJsonValue(data),
+        }
+        table.insert(State.AutoTrader.DecisionJournal, entry)
+        local limit = math.max(64, tonumber(CONFIG.AutoTraderDecisionJournalLimit) or 240)
+        while #State.AutoTrader.DecisionJournal > limit do
+            table.remove(State.AutoTrader.DecisionJournal, 1)
+            State.AutoTrader.DecisionJournalDropped = (tonumber(State.AutoTrader.DecisionJournalDropped) or 0) + 1
+        end
+        return true
+    end
+
+    State.AutoTrader.BuildDecisionJournalSupport = function()
+        local journal = State.AutoTrader.DecisionJournal or {}
+        local first = journal[1]
+        local last = journal[#journal]
+        return {
+            schema = 1,
+            policy = "meaningful-transition journal; unchanged eligibility scans are deduplicated",
+            capacity = tonumber(CONFIG.AutoTraderDecisionJournalLimit) or 240,
+            count = #journal,
+            dropped = tonumber(State.AutoTrader.DecisionJournalDropped) or 0,
+            startedAt = State.AutoTrader.DecisionJournalStartedAt,
+            firstAt = first and first.t or nil,
+            lastAt = last and last.t or nil,
+            firstUnix = first and first.unix or nil,
+            lastUnix = last and last.unix or nil,
+            entries = table.clone(journal),
+        }
+    end
+
+    State.AutoTrader.RecordEligibilityDecision = function(row, bestRow)
+        if type(row) ~= "table" then return false end
+        local player = row.player
+        local userId = player and tonumber(player.UserId) or (row.entry and tonumber(row.entry.userId))
+        local name = player and tostring(player.Name) or (row.entry and tostring(row.entry.name)) or "?"
+        if not userId then return false end
+        local queuePosition = tonumber(row.queuePosition)
+        local decision
+        if row.state == "actionable" then
+            decision = queuePosition == 1 and "SELECTED_QUEUE_HEAD" or "ACTIONABLE_QUEUED"
+        elseif row.state == "retry_later" or row.state == "transport_deferred" then
+            decision = "DEFERRED"
+        elseif row.state == "active_request" or row.state == "active_trade" then
+            decision = "ACTIVE"
+        elseif row.state == "terminal" then
+            decision = "TERMINAL_THIS_PRESENCE"
+        elseif row.state == "discovery_pending" or row.state == "friend_pending" or row.state == "decision_data_stale" or row.state == "search_inconclusive" then
+            decision = "WAITING_FOR_EVIDENCE"
+        else
+            decision = "SKIPPED"
+        end
+        local opportunity = round34OpportunitySummary(row.opportunity)
+        local bestName = bestRow and bestRow.player and bestRow.player.Name or nil
+        local data = {
+            userId = userId,
+            name = name,
+            decision = decision,
+            state = row.state,
+            feasibilityState = row.feasibilityState,
+            contactState = row.contactState,
+            knownValueFloor = tonumber(row.knownValueFloor or row.verifiedTotal),
+            valueComplete = row.valueComplete == true,
+            score = round34Rounded(row.score, 6),
+            queuePosition = queuePosition,
+            queueHead = bestName,
+            retryInAtDecision = round34Rounded(row.retryIn, 3),
+            reason = round34Short(row.reason, 900),
+            opportunity = opportunity,
+        }
+        local signature = table.concat({
+            tostring(data.decision), tostring(data.state), tostring(data.feasibilityState), tostring(data.contactState),
+            tostring(data.knownValueFloor), tostring(data.valueComplete), tostring(data.score), tostring(data.queuePosition),
+            tostring(data.queueHead), tostring(data.reason), opportunity and tostring(opportunity.kind) or "",
+            opportunity and tostring(opportunity.giveTotal) or "", opportunity and tostring(opportunity.receiveTotal) or "",
+            opportunity and tostring(opportunity.win) or "", opportunity and tostring(opportunity.give) or "",
+            opportunity and tostring(opportunity.receive) or "",
+        }, "|")
+        return State.AutoTrader.RecordDecisionJournalEntry("eligibility_decision", data, "player:" .. tostring(userId), signature)
+    end
+
+    State.AutoTrader.RecordDecisionLifecycleEvent = function(kind, data)
+        kind = tostring(kind or "")
+        local capture = kind:find("request_", 1, true) == 1
+            or kind == "trade_started" or kind == "trade_declined" or kind == "idle_trade_decline"
+            or kind == "absolute_trade_timeout" or kind == "stale_trade_gui_timeout"
+            or kind == "owned_trade_completed" or kind:find("post_trade_audit_", 1, true) == 1
+            or kind == "plan_ready" or kind == "plan_rejected" or kind == "plan_none" or kind == "auto_accept_sent"
+            or kind:find("server_hop_", 1, true) == 1 or kind:find("teleport_", 1, true) == 1
+            or kind:find("server_player_presence_", 1, true) == 1 or kind == "feasibility_deep_search_finished" or kind == "contact_state_changed"
+            or kind == "incoming_request_decision" or kind == "incoming_request_authoritative_ack" or kind == "incoming_request_transport_failed"
+        if not capture then return false end
+        data = type(data) == "table" and data or {}
+        local userId = tonumber(data.userId or data.partnerUserId)
+        local name = data.name or data.partnerName
+        local summary = {
+            event = kind,
+            userId = userId,
+            name = name,
+            reason = round34Short(data.reason or data.detail, 900),
+            outcome = data.outcome or data.result,
+            phase = data.phase,
+            state = data.state,
+            feasibilityState = data.feasibilityState,
+            generation = data.generation,
+            correlationId = data.correlationId,
+            source = data.source,
+            seconds = tonumber(data.seconds),
+            giveTotal = tonumber(data.giveTotal),
+            receiveTotal = tonumber(data.receiveTotal),
+            win = tonumber(data.win),
+            result = data.result,
+            receiveKnownFloor = tonumber(data.receiveKnownFloor),
+            give = tonumber(data.give),
+            targetProfit = tonumber(data.targetProfit),
+            negotiationStage = tonumber(data.negotiationStage),
+            negotiationMargin = tonumber(data.negotiationMargin),
+            proactiveAccept = data.proactiveAccept == true,
+            strategicKind = data.strategicKind,
+        }
+        if kind == "plan_ready" then
+            summary.partner = State.AutoTrader.LastTradePartner and State.AutoTrader.LastTradePartner.Name or nil
+            summary.planner = HARDEN.supportJsonValue(State.AutoTrader.LastPlannerReason)
+            summary.plan = HARDEN.supportJsonValue(State.AutoTrader.Plan)
+        elseif kind == "plan_rejected" or kind == "plan_none" then
+            summary.planner = HARDEN.supportJsonValue(State.AutoTrader.LastPlannerReason)
+            summary.safety = HARDEN.supportJsonValue(State.AutoTrader.Safety)
+        elseif kind == "owned_trade_completed" or kind:find("post_trade_audit_", 1, true) == 1 then
+            summary.audit = HARDEN.supportJsonValue(State.AutoTrader.LastAuditDetail)
+        end
+        local signature = table.concat({kind,tostring(userId),tostring(name),tostring(summary.reason),tostring(summary.outcome),tostring(summary.phase),tostring(summary.state),tostring(summary.feasibilityState),tostring(summary.generation),tostring(summary.correlationId),tostring(summary.result),
+            tostring(summary.receiveKnownFloor),tostring(summary.give),tostring(summary.win),tostring(summary.targetProfit),tostring(summary.negotiationStage),tostring(summary.negotiationMargin),tostring(summary.proactiveAccept),tostring(summary.strategicKind)}, "|")
+        return State.AutoTrader.RecordDecisionJournalEntry("lifecycle", summary, "lifecycle:" .. kind .. ":" .. tostring(userId or name or "global"), signature)
+    end
+
+    -- Wrap the final eligibility-snapshot function. The original result is returned
+    -- untouched; journaling happens only after queue ordering has already completed.
+    local round34BuildEligibilitySnapshot = State.AutoTrader.BuildEligibilitySnapshot
+    State.AutoTrader.BuildEligibilitySnapshot = function(...)
+        local snapshot = round34BuildEligibilitySnapshot(...)
+        if type(snapshot) == "table" and (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) <= 0 then
+            local bestRow = snapshot.bestRow or (snapshot.queue and snapshot.queue[1])
+            for _, row in ipairs(snapshot.rows or {}) do
+                State.AutoTrader.RecordEligibilityDecision(row, bestRow)
+            end
+            local head = bestRow and bestRow.player
+            local queueData = {
+                queueLength = #(snapshot.queue or {}),
+                headName = head and head.Name or nil,
+                headUserId = head and head.UserId or nil,
+                headScore = round34Rounded(bestRow and bestRow.score, 6),
+                queueSignature = snapshot.queueSignature,
+            }
+            local queueSignature = table.concat({tostring(queueData.queueLength),tostring(queueData.headUserId),tostring(queueData.headScore),tostring(queueData.queueSignature)}, "|")
+            State.AutoTrader.RecordDecisionJournalEntry("queue_decision", queueData, "queue:head", queueSignature)
+        end
+        return snapshot
+    end
+
+    -- Preserve key request/trade/hop events independently of the 120-entry recentLog.
+    local round34Log = State.AutoTrader.Log
+    State.AutoTrader.Log = function(kind, data)
+        round34Log(kind, data)
+        State.AutoTrader.RecordDecisionLifecycleEvent(kind, data)
+    end
+
+    -- Record server-level WAIT/HOP conclusions only when the conclusion changes.
+    local round34GetServerDisposition = State.AutoTrader.GetServerDisposition
+    State.AutoTrader.GetServerDisposition = function(...)
+        local disposition, counts = round34GetServerDisposition(...)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) <= 0 then
+            local compactCounts = type(counts) == "table" and {
+                total = counts.total, actionable = counts.actionable, retryLater = counts.retryLater,
+                transportDeferred = counts.transportDeferred, discoveryPending = counts.discoveryPending,
+                friendPending = counts.friendPending, searchInconclusive = counts.searchInconclusive,
+                deepSearchPending = counts.deepSearchPending, provenImpossible = counts.provenImpossible,
+                unresolvable = counts.unresolvable, exhausted = counts.exhausted,
+                earliestRetry = round34Rounded(counts.earliestRetry, 3),
+            } or nil
+            local signature = tostring(disposition) .. "|" .. tostring(compactCounts and compactCounts.actionable) .. "|"
+                .. tostring(compactCounts and compactCounts.retryLater) .. "|" .. tostring(compactCounts and compactCounts.discoveryPending)
+                .. "|" .. tostring(compactCounts and compactCounts.friendPending) .. "|" .. tostring(compactCounts and compactCounts.deepSearchPending)
+                .. "|" .. tostring(compactCounts and compactCounts.exhausted)
+            State.AutoTrader.RecordDecisionJournalEntry("server_disposition", {disposition=disposition,counts=compactCounts}, "server:disposition", signature)
+        end
+        return disposition, counts
+    end
+
+    -- Thread the compact journal through the already persisted cross-teleport history.
+    local round34BuildSessionHistoryRecord = State.AutoTrader.BuildSessionHistoryRecord
+    State.AutoTrader.BuildSessionHistoryRecord = function(reason)
+        local record = round34BuildSessionHistoryRecord(reason)
+        if type(record) == "table" then record.decisionJournal = State.AutoTrader.BuildDecisionJournalSupport() end
+        return record
+    end
+
+    -- Extend the existing runtime suite with telemetry-only invariants.
+    local round34RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function(...)
+        local result = round34RunSelfTests(...)
+        result = type(result) == "table" and result or {tests={},passed=0,total=0,ok=false}
+        local tests = type(result.tests) == "table" and result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+
+        add("v37-round34-decision-journal-deduplicates-unchanged-eligibility", function()
+            local savedJournal=State.AutoTrader.DecisionJournal
+            local savedLast=State.AutoTrader.DecisionJournalLastSignature
+            local savedSeq=State.AutoTrader.DecisionJournalSequence
+            local savedDropped=State.AutoTrader.DecisionJournalDropped
+            State.AutoTrader.DecisionJournal={};State.AutoTrader.DecisionJournalLastSignature={};State.AutoTrader.DecisionJournalSequence=0;State.AutoTrader.DecisionJournalDropped=0
+            local fake={UserId=340001,Name="Round34Journal"}
+            local row={state="actionable",feasibilityState="FEASIBLE",contactState="NOT_CONTACTED",player=fake,actionable=true,verifiedTotal=100,knownValueFloor=100,valueComplete=true,score=0.25,queuePosition=1,reason="safe fixture",opportunity={kind="profit",giveTotal=10,receiveTotal=100,win=90,reason="fixture win",giveItems={},receiveItems={}}}
+            local first=State.AutoTrader.RecordEligibilityDecision(row,row)
+            local duplicate=State.AutoTrader.RecordEligibilityDecision(row,row)
+            row.queuePosition=2
+            local changed=State.AutoTrader.RecordEligibilityDecision(row,nil)
+            local passed=first==true and duplicate==false and changed==true and #State.AutoTrader.DecisionJournal==2
+                and State.AutoTrader.DecisionJournal[1].data.decision=="SELECTED_QUEUE_HEAD"
+                and State.AutoTrader.DecisionJournal[2].data.decision=="ACTIONABLE_QUEUED"
+            State.AutoTrader.DecisionJournal=savedJournal;State.AutoTrader.DecisionJournalLastSignature=savedLast;State.AutoTrader.DecisionJournalSequence=savedSeq;State.AutoTrader.DecisionJournalDropped=savedDropped
+            return passed,"unchanged eligibility scans were not deduplicated or queue-rank changes were lost"
+        end)
+
+        add("v37-round34-support-and-session-history-preserve-decision-reasons", function()
+            local savedJournal=State.AutoTrader.DecisionJournal
+            local savedLast=State.AutoTrader.DecisionJournalLastSignature
+            local savedSeq=State.AutoTrader.DecisionJournalSequence
+            local savedDropped=State.AutoTrader.DecisionJournalDropped
+            State.AutoTrader.DecisionJournal={};State.AutoTrader.DecisionJournalLastSignature={};State.AutoTrader.DecisionJournalSequence=0;State.AutoTrader.DecisionJournalDropped=0
+            State.AutoTrader.RecordDecisionJournalEntry("eligibility_decision",{userId=340002,name="Round34Reason",decision="SKIPPED",reason="fixture reason retained"},"player:340002","fixture",true)
+            local support=State.AutoTrader.BuildDecisionJournalSupport()
+            local history=State.AutoTrader.BuildSessionHistoryRecord("round34-selftest")
+            local passed=support.count==1 and support.entries[1].data.reason=="fixture reason retained"
+                and type(history)=="table" and type(history.decisionJournal)=="table" and history.decisionJournal.count==1
+                and history.decisionJournal.entries[1].data.reason=="fixture reason retained"
+            State.AutoTrader.DecisionJournal=savedJournal;State.AutoTrader.DecisionJournalLastSignature=savedLast;State.AutoTrader.DecisionJournalSequence=savedSeq;State.AutoTrader.DecisionJournalDropped=savedDropped
+            return passed,"decision reason did not survive support/cross-session serialization"
+        end)
+
+        local passed=0
+        for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.tests=tests;result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.controllerVersion=CONTROLLER_VERSION
+        State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v37_round34",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end)()
 
 
 State.QueueNativeDatabaseWarmup()

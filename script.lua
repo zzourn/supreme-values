@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.26-public-auto-trader-v37-round30-native-trade-observability-candidate",
+    version = "18.69.28-public-auto-trader-v37-round31-supervised-canary-safety-ui-fixed",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -281,7 +281,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "73eef86c27df5fac5d115b4f7ac626a7c6a78e2558bc742227646939c6fb60b9",
+    distributionNormalizedSha256 = "43e43e8e996f2d644b91a9e4a09f2a48ba0354e09eefcb5426ec44d57cc8573b",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -6981,6 +6981,11 @@ State.AutoTrader = {
     QueueProjectionCache = nil,
     LastLocalInventoryDiagnostics = nil,
     AuditedTradesThisServer = 0,
+    SupervisedCanaryArmed = false,
+    SupervisedCanaryStarted = false,
+    SupervisedCanaryArmedAt = 0,
+    SupervisedCanaryStartedAt = 0,
+    SupervisedCanaryStopReason = nil,
     TeleportQueued = false,
     TeleportQueueOutcome = nil,
     TeleportBootstrapSerial = 0,
@@ -7567,18 +7572,70 @@ State.AutoTrader.FlushTargetStats = function()
 end
 State.AutoTrader.LoadTargetStats()
 State.AutoTrader.WinPresets = {1, 2, 3, 5}
+State.AutoTrader.IsSupervisedCanaryArmed = function()
+    return State.AutoTrader.SupervisedCanaryArmed == true
+end
+State.AutoTrader.GetTeleportAutomationCarry = function()
+    return State.AutoTrader.Preferences.automation == true
+        and not State.AutoTrader.IsSupervisedCanaryArmed()
+end
 State.AutoTrader.SavePreferences = function()
     State.AutoTrader.Preferences = normalizePreferences(State.AutoTrader.Preferences)
     AutoPrefs = State.AutoTrader.Preferences
-    rawset(_G, State.AutoTrader.PreferencesKey, State.AutoTrader.Preferences)
+    local persistedPreferences = State.AutoTrader.Preferences
+    if State.AutoTrader.IsSupervisedCanaryArmed() then
+        persistedPreferences = normalizePreferences(State.AutoTrader.Preferences)
+        persistedPreferences.automation = false
+    end
+    rawset(_G, State.AutoTrader.PreferencesKey, persistedPreferences)
     local ok, encoded = pcall(function()
-        return HttpService:JSONEncode({version = 1, controllerVersion = CONTROLLER_VERSION, preferences = State.AutoTrader.Preferences})
+        return HttpService:JSONEncode({version = 1, controllerVersion = CONTROLLER_VERSION, preferences = persistedPreferences})
     end)
     if not ok or type(encoded) ~= "string" then
         notePersistence(State.AutoTrader.PreferencesFile, false, "encode", encoded)
         return false
     end
     return HARDEN.atomicWriteTextFileBestEffort(State.AutoTrader.PreferencesFile, encoded)
+end
+State.AutoTrader.SetSupervisedCanaryArmed = function(armed)
+    armed = armed == true
+    if State.AutoTrader.Preferences.automation then
+        return false, "AUTO_MUST_BE_OFF"
+    end
+    if armed and (State.AutoTrader.TeleportInProgress or State.AutoTrader.ServerHopInProgress or State.AutoTrader.TeleportQueued) then
+        return false, "TELEPORT_ACTIVITY_PRESENT"
+    end
+    State.AutoTrader.SupervisedCanaryArmed = armed
+    State.AutoTrader.SupervisedCanaryStarted = false
+    State.AutoTrader.SupervisedCanaryArmedAt = armed and os.clock() or 0
+    State.AutoTrader.SupervisedCanaryStartedAt = 0
+    State.AutoTrader.SupervisedCanaryStopReason = nil
+    State.AutoTrader.SavePreferences()
+    State.AutoTrader.Log(armed and "supervised_canary_armed" or "supervised_canary_disarmed", {
+        mode = "ONE_SHOT_NO_HOP",
+    })
+    if State.AutoTrader.UpdateControls then State.AutoTrader.UpdateControls() end
+    if State.AutoTrader.Render then State.AutoTrader.Render() end
+    return true
+end
+State.AutoTrader.StopSupervisedCanaryAutomation = function(reason)
+    if not State.AutoTrader.IsSupervisedCanaryArmed() then return false end
+    local text = tostring(reason or "supervised canary safety stop")
+    State.AutoTrader.Preferences.automation = false
+    State.AutoTrader.ActionGeneration += 1
+    State.AutoTrader.AutoAcceptGeneration += 1
+    State.AutoTrader.ActionInFlight = nil
+    State.AutoTrader.AutoAcceptScheduledKey = nil
+    State.AutoTrader.FastBotHopActive = false
+    State.AutoTrader.FastBotHopReason = nil
+    State.AutoTrader.SupervisedCanaryStopReason = text
+    State.AutoTrader.SavePreferences()
+    State.AutoTrader.Status = "CANARY STOP · AUTO OFF"
+    State.AutoTrader.StatusDetail = text .. " · no script-initiated hop/teleport was allowed; canary remains armed and must be explicitly re-armed before another AUTO window."
+    State.AutoTrader.Log("supervised_canary_auto_stopped", {reason = text})
+    if State.AutoTrader.UpdateControls then State.AutoTrader.UpdateControls() end
+    if State.AutoTrader.Render then State.AutoTrader.Render() end
+    return true
 end
 local function compactDebugValue(value, depth, seen)
     depth = depth or 0
@@ -9579,7 +9636,7 @@ State.AutoTrader.BuildTeleportBootstrapCode = function(reason, includeBotDb)
         expectedNormalizedSha256 = HARDEN.distributionNormalizedSha256,
         reason = tostring(reason or "teleport"),
         preferences = {
-            automation = State.AutoTrader.Preferences.automation == true,
+            automation = State.AutoTrader.GetTeleportAutomationCarry(),
             ignoreFriends = State.AutoTrader.Preferences.ignoreFriends == true,
             openingAnchor = State.AutoTrader.Preferences.openingAnchor == true,
             preferDuplicates = State.AutoTrader.Preferences.preferDuplicates == true,
@@ -11373,6 +11430,10 @@ State.AutoTrader.FindPublicServer = function()
     return queue[1], scan
 end
 State.AutoTrader.BeginTeleport = function(reason, sameJob, commitStrictGold)
+    if State.AutoTrader.IsSupervisedCanaryArmed() then
+        State.AutoTrader.StopSupervisedCanaryAutomation("blocked internal teleport request: " .. tostring(reason or "teleport"))
+        return false
+    end
     if State.AutoTrader.TeleportInProgress then return false end
     local queued, queueError = State.AutoTrader.QueueTeleportScript(reason)
     if not queued then
@@ -11503,6 +11564,11 @@ State.AutoTrader.TryRateLimitBlindHopFallback = function(reason)
     return State.AutoTrader.BeginTeleport("server_rate_limit_blind_fallback", false, true)
 end
 State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
+    if State.AutoTrader.IsSupervisedCanaryArmed() then
+        State.AutoTrader.StopSupervisedCanaryAutomation("blocked server-hop candidate teleport")
+        State.AutoTrader.AbortServerHop("supervised canary no-hop boundary")
+        return false
+    end
     if Destroyed
         or not State.AutoTrader.ServerHopInProgress
         or queueGeneration ~= State.AutoTrader.ServerHopQueueGeneration then
@@ -11732,6 +11798,10 @@ State.AutoTrader.TryNextServerHopCandidate = function(queueGeneration)
     return true
 end
 State.AutoTrader.TryServerHop = function(disposition, counts)
+    if State.AutoTrader.IsSupervisedCanaryArmed() then
+        State.AutoTrader.StopSupervisedCanaryAutomation("blocked automatic server hop: " .. tostring(disposition or "unknown"))
+        return false
+    end
     if not CONFIG.AutoTraderServerHopEnabled
         or State.AutoTrader.ServerHopInProgress
         or State.AutoTrader.TeleportInProgress then
@@ -11875,6 +11945,9 @@ end)
 connect(LocalPlayer.OnTeleport, function(teleportState)
     if teleportState == Enum.TeleportState.Started then
         State.AutoTrader.TeleportInProgress = true
+        if State.AutoTrader.IsSupervisedCanaryArmed() then
+            State.AutoTrader.StopSupervisedCanaryAutomation("external teleport started while supervised canary was armed")
+        end
         if State.AutoTrader.TeleportAttemptStartedAt <= 0 then
             State.AutoTrader.TeleportAttemptStartedAt = os.clock()
             State.AutoTrader.TeleportAttemptOriginJobId = game.JobId
@@ -13651,6 +13724,10 @@ State.AutoTrader.RequestRecoveryTeleport = function(reason)
     State.AutoTrader.RecoveryTeleportReason=text
     State.AutoTrader.LastRecoveryReason=text
     State.AutoTrader.LastSafetyEvent = {at=os.clock(), unix=os.time(), severity="recoverable", kind="recovery", reason=text}
+    if State.AutoTrader.IsSupervisedCanaryArmed() then
+        State.AutoTrader.StopSupervisedCanaryAutomation("blocked recovery teleport requirement: " .. text)
+        return false
+    end
     if not State.AutoTrader.Preferences.automation or State.AutoTrader.TeleportInProgress or State.AutoTrader.ServerHopInProgress then return false end
     local now=os.clock()
     if now-(State.AutoTrader.RecoveryTeleportLastAttemptAt or 0)<CONFIG.AutoTraderRecoveryRetrySeconds then return false end
@@ -16848,6 +16925,15 @@ State.AutoTrader.BuildDebug = function()
         backgroundSuppressed = false,
         managedTradeLifecycleMarker = State.AutoTrader.BackgroundSuppressed,
         nativeTradeUiPolicy = "VISIBLE_DURING_AUTOMATION",
+        supervisedCanary = {
+            mode = "ONE_SHOT_NO_HOP",
+            armed = State.AutoTrader.SupervisedCanaryArmed == true,
+            started = State.AutoTrader.SupervisedCanaryStarted == true,
+            armedAt = State.AutoTrader.SupervisedCanaryArmedAt,
+            startedAt = State.AutoTrader.SupervisedCanaryStartedAt,
+            stopReason = State.AutoTrader.SupervisedCanaryStopReason,
+            teleportAutomationCarry = State.AutoTrader.GetTeleportAutomationCarry(),
+        },
         postTradeAuditPending = State.AutoTrader.PostTradeAuditPending,
         lastAcceptAudit = State.AutoTrader.LastAcceptAudit,
         lastAuditDetail = State.AutoTrader.LastAuditDetail,
@@ -17592,42 +17678,47 @@ UI.AutoTraderEnabled = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 42), true
 UI.AutoTraderEnabled.Position = UDim2.fromOffset(0, 28)
 UI.AutoTraderEnabled.TextSize = 12
 UI.AutoTraderEnabled.ZIndex = 1454
-UI.AutoTraderIgnoreFriends = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
-UI.AutoTraderIgnoreFriends.Position = UDim2.fromOffset(0, 78)
+-- Round-31 UI hotfix: keep operator/support controls above the v37 auth card at y=250.
+UI.AutoTraderIgnoreFriends = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderIgnoreFriends.Position = UDim2.fromOffset(0, 76)
 UI.AutoTraderIgnoreFriends.ZIndex = 1454
-UI.AutoTraderOpeningAnchor = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
-UI.AutoTraderOpeningAnchor.Position = UDim2.new(0.5, 4, 0, 78)
+UI.AutoTraderOpeningAnchor = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderOpeningAnchor.Position = UDim2.new(0.5, 4, 0, 76)
 UI.AutoTraderOpeningAnchor.ZIndex = 1454
-UI.AutoTraderUnknownTheir = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
-UI.AutoTraderUnknownTheir.Position = UDim2.fromOffset(0, 120)
+UI.AutoTraderUnknownTheir = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderUnknownTheir.Position = UDim2.fromOffset(0, 110)
 UI.AutoTraderUnknownTheir.ZIndex = 1454
-UI.AutoTraderPreferDuplicates = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 34), false)
-UI.AutoTraderPreferDuplicates.Position = UDim2.new(0.5, 4, 0, 120)
+UI.AutoTraderPreferDuplicates = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderPreferDuplicates.Position = UDim2.new(0.5, 4, 0, 110)
 UI.AutoTraderPreferDuplicates.ZIndex = 1454
-UI.AutoTraderProfit = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 36), false)
-UI.AutoTraderProfit.Position = UDim2.fromOffset(0, 162)
+UI.AutoTraderProfit = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 28), false)
+UI.AutoTraderProfit.Position = UDim2.fromOffset(0, 144)
 UI.AutoTraderProfit.ZIndex = 1454
-UI.AutoTraderSkipTarget = aeroButton(settingsPage, "SKIP CURRENT TARGET", UDim2.new(0.5, -4, 0, 36), false)
-UI.AutoTraderSkipTarget.Position = UDim2.fromOffset(0, 206)
+UI.AutoTraderCanary = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 30), false)
+UI.AutoTraderCanary.Position = UDim2.fromOffset(0, 178)
+UI.AutoTraderCanary.TextSize = 11
+UI.AutoTraderCanary.ZIndex = 1454
+UI.AutoTraderSkipTarget = aeroButton(settingsPage, "SKIP CURRENT TARGET", UDim2.new(0.5, -4, 0, 30), false)
+UI.AutoTraderSkipTarget.Position = UDim2.fromOffset(0, 214)
 UI.AutoTraderSkipTarget.TextColor3 = THEME.yellow
 UI.AutoTraderSkipTarget.ZIndex = 1454
-UI.AutoTraderCopyDebug = aeroButton(settingsPage, "COPY FULL SUPPORT SNAPSHOT", UDim2.new(0.5, -4, 0, 36), false)
-UI.AutoTraderCopyDebug.Position = UDim2.new(0.5, 4, 0, 206)
+UI.AutoTraderCopyDebug = aeroButton(settingsPage, "COPY FULL SUPPORT SNAPSHOT", UDim2.new(0.5, -4, 0, 30), false)
+UI.AutoTraderCopyDebug.Position = UDim2.new(0.5, 4, 0, 214)
 UI.AutoTraderCopyDebug.TextColor3 = THEME.blue
 UI.AutoTraderCopyDebug.ZIndex = 1454
 
 UI.AutoTraderReserveTitle = makeLabel(settingsPage, "INVENTORY RESERVES", 10, Color3.fromRGB(37, 83, 111), Enum.Font.ArialBold)
-UI.AutoTraderReserveTitle.Position = UDim2.fromOffset(4, 254)
+UI.AutoTraderReserveTitle.Position = UDim2.fromOffset(4, 298)
 UI.AutoTraderReserveTitle.Size = UDim2.new(1, -120, 0, 18)
 UI.AutoTraderReserveTitle.ZIndex = 1454
 UI.AutoTraderReserveCount = makeLabel(settingsPage, "0 reserves", 10, THEME.muted, Enum.Font.Arial)
-UI.AutoTraderReserveCount.Position = UDim2.new(1, -116, 0, 254)
+UI.AutoTraderReserveCount.Position = UDim2.new(1, -116, 0, 298)
 UI.AutoTraderReserveCount.Size = UDim2.fromOffset(112, 18)
 UI.AutoTraderReserveCount.TextXAlignment = Enum.TextXAlignment.Right
 UI.AutoTraderReserveCount.ZIndex = 1454
 
 UI.AutoTraderSearch = create("TextBox", {
-    Position = UDim2.fromOffset(0, 278),
+    Position = UDim2.fromOffset(0, 322),
     Size = UDim2.new(1, 0, 0, 32),
     BackgroundColor3 = Color3.fromRGB(251, 253, 254),
     BorderSizePixel = 0,
@@ -17645,8 +17736,8 @@ addCorner(UI.AutoTraderSearch, 4)
 aeroStroke(UI.AutoTraderSearch, THEME.border, 0.3)
 
 UI.AutoTraderReserveScroll = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(0, 318),
-    Size = UDim2.new(1, 0, 1, -318),
+    Position = UDim2.fromOffset(0, 362),
+    Size = UDim2.new(1, 0, 1, -362),
     BackgroundColor3 = AERO.recessed,
     BorderSizePixel = 0,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
@@ -17730,6 +17821,17 @@ State.AutoTrader.UpdateControls = function()
     UI.AutoTraderUnknownTheir.TextColor3 = prefs.unknownTheirZero and THEME.green or THEME.muted
     UI.AutoTraderPreferDuplicates.Text = prefs.preferDuplicates and "Prefer Duplicates: ON" or "Prefer Duplicates: OFF"
     UI.AutoTraderPreferDuplicates.TextColor3 = prefs.preferDuplicates and THEME.green or THEME.muted
+    if UI.AutoTraderCanary then
+        if State.AutoTrader.SupervisedCanaryArmed then
+            UI.AutoTraderCanary.Text = State.AutoTrader.SupervisedCanaryStarted
+                and "SUPERVISED CANARY · USED · DISARM/RE-ARM"
+                or "SUPERVISED CANARY · ARMED · ONE-SHOT NO-HOP"
+            UI.AutoTraderCanary.TextColor3 = State.AutoTrader.SupervisedCanaryStarted and THEME.yellow or THEME.green
+        else
+            UI.AutoTraderCanary.Text = "SUPERVISED CANARY · DISARMED"
+            UI.AutoTraderCanary.TextColor3 = THEME.muted
+        end
+    end
     local minWin = State.AutoTrader.GetMinimumWin()
     local summary = State.AutoTrader.OtherSummary
     if summary and (tonumber(summary.knownFloor) or 0) > 0 then
@@ -19345,9 +19447,33 @@ end)
 connect(UI.AutoTraderClose.MouseButton1Click, function()
     UI.AutoTraderPanel.Visible = false
 end)
+connect(UI.AutoTraderCanary.MouseButton1Click, function()
+    local targetArmed = not State.AutoTrader.SupervisedCanaryArmed
+    local ok, reason = State.AutoTrader.SetSupervisedCanaryArmed(targetArmed)
+    if not ok then
+        State.AutoTrader.Status = "CANARY ARM BLOCKED"
+        State.AutoTrader.StatusDetail = reason == "AUTO_MUST_BE_OFF"
+            and "Turn AUTO OFF before arming or disarming the supervised one-shot no-hop canary."
+            or "Wait until all hop/teleport activity is idle before arming the supervised canary."
+        State.AutoTrader.Render()
+    end
+end)
 connect(UI.AutoTraderEnabled.MouseButton1Click, function()
+    if not State.AutoTrader.Preferences.automation
+        and State.AutoTrader.SupervisedCanaryArmed
+        and State.AutoTrader.SupervisedCanaryStarted then
+        State.AutoTrader.Status = "CANARY USED · RE-ARM REQUIRED"
+        State.AutoTrader.StatusDetail = "This supervised canary arm already opened one AUTO window. Disarm and re-arm explicitly before another supervised window."
+        State.AutoTrader.Render()
+        return
+    end
     State.AutoTrader.Preferences.automation = not State.AutoTrader.Preferences.automation
     if State.AutoTrader.Preferences.automation then
+        if State.AutoTrader.SupervisedCanaryArmed then
+            State.AutoTrader.SupervisedCanaryStarted = true
+            State.AutoTrader.SupervisedCanaryStartedAt = os.clock()
+            State.AutoTrader.SupervisedCanaryStopReason = nil
+        end
         State.AutoTrader.SessionFrozen = nil
         State.AutoTrader.FatalIntegrityStop = false
         State.AutoTrader.OperationalFreezeAt = 0
@@ -19372,6 +19498,10 @@ connect(UI.AutoTraderEnabled.MouseButton1Click, function()
         State.AutoTrader.ManagedPartnerUserId = nil
         State.AutoTrader.LastManagedLocalHash = nil
         State.AutoTrader.RestoreTradeVisuals()
+        if State.AutoTrader.SupervisedCanaryArmed and State.AutoTrader.SupervisedCanaryStarted
+            and not State.AutoTrader.SupervisedCanaryStopReason then
+            State.AutoTrader.SupervisedCanaryStopReason = "operator disabled AUTO"
+        end
         State.AutoTrader.Log("automation_disabled", {})
     end
     State.AutoTrader.SavePreferences()
@@ -31404,6 +31534,121 @@ do
             State.AutoTrader.SessionFrozen=savedFrozen
             State.AutoTrader.BackgroundSuppressed=savedMarker
             return stateSame and readOnly,"observability patch changed planner/transport/audit/hop state or introduced an interactive trade-status control"
+        end)
+
+        add("v37-round31-supervised-canary-blocks-hop-and-recovery-teleport",function()
+            local saved={
+                automation=State.AutoTrader.Preferences.automation,
+                armed=State.AutoTrader.SupervisedCanaryArmed,
+                started=State.AutoTrader.SupervisedCanaryStarted,
+                armedAt=State.AutoTrader.SupervisedCanaryArmedAt,
+                startedAt=State.AutoTrader.SupervisedCanaryStartedAt,
+                stopReason=State.AutoTrader.SupervisedCanaryStopReason,
+                savePreferences=State.AutoTrader.SavePreferences,
+                queueTeleport=State.AutoTrader.QueueTeleportScript,
+                serverHopInProgress=State.AutoTrader.ServerHopInProgress,
+                teleportInProgress=State.AutoTrader.TeleportInProgress,
+                teleportQueued=State.AutoTrader.TeleportQueued,
+                recoveryRequired=State.AutoTrader.RecoveryTeleportRequired,
+                recoveryReason=State.AutoTrader.RecoveryTeleportReason,
+                lastRecoveryReason=State.AutoTrader.LastRecoveryReason,
+                lastSafetyEvent=State.AutoTrader.LastSafetyEvent,
+                fastBotHopActive=State.AutoTrader.FastBotHopActive,
+                fastBotHopReason=State.AutoTrader.FastBotHopReason,
+                actionGeneration=State.AutoTrader.ActionGeneration,
+                autoAcceptGeneration=State.AutoTrader.AutoAcceptGeneration,
+                actionInFlight=State.AutoTrader.ActionInFlight,
+                autoAcceptScheduledKey=State.AutoTrader.AutoAcceptScheduledKey,
+                status=State.AutoTrader.Status,
+                statusDetail=State.AutoTrader.StatusDetail,
+            }
+            local queueCalls=0
+            State.AutoTrader.SavePreferences=function() return true end
+            State.AutoTrader.QueueTeleportScript=function() queueCalls+=1;return true end
+            State.AutoTrader.SupervisedCanaryArmed=true
+            State.AutoTrader.SupervisedCanaryStarted=true
+            State.AutoTrader.Preferences.automation=true
+            State.AutoTrader.ServerHopInProgress=false
+            State.AutoTrader.TeleportInProgress=false
+            State.AutoTrader.TeleportQueued=false
+            State.AutoTrader.RecoveryTeleportRequired=false
+            State.AutoTrader.RecoveryTeleportReason=nil
+            local hopStarted=State.AutoTrader.TryServerHop("ROUND31_CANARY_SELFTEST",{})
+            local directStarted=State.AutoTrader.BeginTeleport("round31-canary-direct",false)
+            State.AutoTrader.Preferences.automation=true
+            local recoveryStarted=State.AutoTrader.RequestRecoveryTeleport("round31-canary-recovery")
+            local passed=hopStarted==false and directStarted==false and recoveryStarted==false
+                and queueCalls==0 and State.AutoTrader.Preferences.automation==false
+                and State.AutoTrader.SupervisedCanaryArmed==true and State.AutoTrader.SupervisedCanaryStarted==true
+                and State.AutoTrader.ServerHopInProgress==false and State.AutoTrader.TeleportInProgress==false
+                and State.AutoTrader.RecoveryTeleportRequired==true
+                and tostring(State.AutoTrader.SupervisedCanaryStopReason):find("blocked recovery teleport requirement",1,true)~=nil
+            State.AutoTrader.Preferences.automation=saved.automation
+            State.AutoTrader.SupervisedCanaryArmed=saved.armed
+            State.AutoTrader.SupervisedCanaryStarted=saved.started
+            State.AutoTrader.SupervisedCanaryArmedAt=saved.armedAt
+            State.AutoTrader.SupervisedCanaryStartedAt=saved.startedAt
+            State.AutoTrader.SupervisedCanaryStopReason=saved.stopReason
+            State.AutoTrader.SavePreferences=saved.savePreferences
+            State.AutoTrader.QueueTeleportScript=saved.queueTeleport
+            State.AutoTrader.ServerHopInProgress=saved.serverHopInProgress
+            State.AutoTrader.TeleportInProgress=saved.teleportInProgress
+            State.AutoTrader.TeleportQueued=saved.teleportQueued
+            State.AutoTrader.RecoveryTeleportRequired=saved.recoveryRequired
+            State.AutoTrader.RecoveryTeleportReason=saved.recoveryReason
+            State.AutoTrader.LastRecoveryReason=saved.lastRecoveryReason
+            State.AutoTrader.LastSafetyEvent=saved.lastSafetyEvent
+            State.AutoTrader.FastBotHopActive=saved.fastBotHopActive
+            State.AutoTrader.FastBotHopReason=saved.fastBotHopReason
+            State.AutoTrader.ActionGeneration=saved.actionGeneration
+            State.AutoTrader.AutoAcceptGeneration=saved.autoAcceptGeneration
+            State.AutoTrader.ActionInFlight=saved.actionInFlight
+            State.AutoTrader.AutoAcceptScheduledKey=saved.autoAcceptScheduledKey
+            State.AutoTrader.Status=saved.status
+            State.AutoTrader.StatusDetail=saved.statusDetail
+            return passed,"supervised canary allowed an internal hop/recovery teleport or failed to turn AUTO off"
+        end)
+
+        add("v37-round31-supervised-canary-never-persists-auto-through-teleport",function()
+            local saved={
+                preferences=State.AutoTrader.Preferences,
+                armed=State.AutoTrader.SupervisedCanaryArmed,
+                started=State.AutoTrader.SupervisedCanaryStarted,
+                atomicWrite=HARDEN.atomicWriteTextFileBestEffort,
+                globalPreferences=rawget(_G,State.AutoTrader.PreferencesKey),
+            }
+            local captured=nil
+            HARDEN.atomicWriteTextFileBestEffort=function(path,body)
+                if path==State.AutoTrader.PreferencesFile then captured=body end
+                return true
+            end
+            local testPreferences=normalizePreferences(saved.preferences)
+            testPreferences.automation=true
+            State.AutoTrader.Preferences=testPreferences
+            State.AutoTrader.SupervisedCanaryArmed=true
+            State.AutoTrader.SupervisedCanaryStarted=true
+            local saveArmed=State.AutoTrader.SavePreferences()
+            local armedDecoded=captured and HttpService:JSONDecode(captured) or nil
+            local armedGlobal=rawget(_G,State.AutoTrader.PreferencesKey)
+            local armedCarry=State.AutoTrader.GetTeleportAutomationCarry()
+            State.AutoTrader.SupervisedCanaryArmed=false
+            captured=nil
+            local saveUnarmed=State.AutoTrader.SavePreferences()
+            local unarmedDecoded=captured and HttpService:JSONDecode(captured) or nil
+            local unarmedCarry=State.AutoTrader.GetTeleportAutomationCarry()
+            local passed=saveArmed==true and type(armedDecoded)=="table"
+                and type(armedDecoded.preferences)=="table" and armedDecoded.preferences.automation==false
+                and type(armedGlobal)=="table" and armedGlobal.automation==false
+                and State.AutoTrader.Preferences.automation==true and armedCarry==false
+                and saveUnarmed==true and type(unarmedDecoded)=="table"
+                and type(unarmedDecoded.preferences)=="table" and unarmedDecoded.preferences.automation==true
+                and unarmedCarry==true
+            State.AutoTrader.Preferences=saved.preferences
+            State.AutoTrader.SupervisedCanaryArmed=saved.armed
+            State.AutoTrader.SupervisedCanaryStarted=saved.started
+            HARDEN.atomicWriteTextFileBestEffort=saved.atomicWrite
+            rawset(_G,State.AutoTrader.PreferencesKey,saved.globalPreferences)
+            return passed,"armed supervised canary persisted automation=true or changed the normal unarmed continuation behavior"
         end)
 
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end

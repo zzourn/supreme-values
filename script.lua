@@ -302,7 +302,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "b3c2dff8f9bc984466f5ada0abeb064499f7a39f50c56d3da0955de76bc54b02",
+    distributionNormalizedSha256 = "7926e907719fb37499cb75aebab0227935a98f6e7b3fb27d422e1b119ef11581",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -37043,6 +37043,59 @@ end)()
             })
         end
 
+        -- v42 teleport-continuity regressions live INSIDE the already-scoped
+        -- v41 test wrapper. Do not add another outer-chunk `local previousRunner`:
+        -- this distribution has historically reached Luau's 200-register limit.
+        local function addV42Regression(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {
+                name=name,
+                ok=ok and passed==true,
+                detail=(ok and passed==true) and nil or tostring(ok and detail or passed),
+            })
+        end
+        addV42Regression("v42-stale-bootstrap-without-auth-cannot-carry-auto", function()
+            local bootstrap={bootstrapId="stale",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
+            local allowed=State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,nil,os.time(),game.JobId)
+            return allowed==false, "bootstrap without one-shot authorization was accepted"
+        end)
+        addV42Regression("v42-bootstrap-auth-is-job-and-id-bound", function()
+            local now=os.time()
+            local bootstrap={bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
+            local auth={armed=true,bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,destinationJobId=game.JobId,armedAtUnix=now}
+            local good=State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,auth,now,game.JobId)
+            local wrongId=table.clone(auth);wrongId.bootstrapId="other"
+            local wrongJob=table.clone(auth);wrongJob.destinationJobId=tostring(game.JobId).."-other"
+            return good==true
+                and State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,wrongId,now,game.JobId)==false
+                and State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,wrongJob,now,game.JobId)==false,
+                "bootstrap authorization was not one-shot identity/destination bound"
+        end)
+        addV42Regression("v42-bootstrap-auth-expires", function()
+            local now=os.time()
+            local bootstrap={bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
+            local auth={armed=true,bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,destinationJobId=game.JobId,armedAtUnix=now-121}
+            return State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,auth,now,game.JobId)==false,
+                "expired teleport AUTO authorization was accepted"
+        end)
+        addV42Regression("v42-bootstrap-arms-auto-only-after-verified-compile", function()
+            local oldRecent=State.AutoTrader.RecentJobs
+            State.AutoTrader.RecentJobs={}
+            local code=State.AutoTrader.BuildTeleportBootstrapCode("v42-order-test",false)
+            State.AutoTrader.RecentJobs=oldRecent
+            if type(code)~="string" then return false,"bootstrap code was not built" end
+            local compileAt=string.find(code,"local f,e=LS(b)",1,true)
+            local armAt=string.find(code,"armedAtUnix=os.time()",1,true)
+            local sourceFailAt=string.find(code,"no verified current-build script available",1,true)
+            return compileAt and armAt and sourceFailAt and sourceFailAt<compileAt and compileAt<armAt,
+                "AUTO carry was armed before source verification/compilation"
+        end)
+        addV42Regression("v42-current-source-canonicalizer-rejects-wrong-version", function()
+            local fake='local CONFIG={version="not-this-build"}\\nlocal HARDEN={distributionNormalizedSha256="'..string.rep("0",64)..'"}\\n'..string.rep("--x\\n",300)
+            local canonical=State.AutoTrader.CanonicalizeCapturedDistributionSource(fake)
+            return canonical==nil, "foreign source was accepted as current teleport continuation"
+        end)
+
         local passed = 0
         for _, row in ipairs(tests) do if row.ok then passed += 1 end end
         baseResult.tests = tests
@@ -37081,76 +37134,11 @@ end)()
 end)()
 
 ---------------------------------------------------------------------------
--- v42 teleport-continuity regressions.
+-- REGISTER-SAFETY HARD INVARIANT:
+-- Future revision test layers must be added inside a scoped IIFE/function frame.
+-- Never allocate `local previousRunSelfTests = ...` in this outer distribution
+-- chunk; Luau caps a function/chunk at 200 local registers.
 ---------------------------------------------------------------------------
-do
-    local v41RunSelfTests = State.AutoTrader.RunSelfTests
-    State.AutoTrader.RunSelfTests = function(...)
-        local result = v41RunSelfTests(...)
-        result = type(result)=="table" and result or {tests={},passed=0,total=0,ok=false}
-        local tests = type(result.tests)=="table" and result.tests or {}
-        local function add(name, callback)
-            local ok, passed, detail = pcall(callback)
-            table.insert(tests, {
-                name=name,
-                ok=ok and passed==true,
-                detail=(ok and passed==true) and nil or tostring(ok and detail or passed),
-            })
-        end
-        add("v42-stale-bootstrap-without-auth-cannot-carry-auto", function()
-            local bootstrap={bootstrapId="stale",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
-            local allowed=State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,nil,os.time(),game.JobId)
-            return allowed==false, "bootstrap without one-shot authorization was accepted"
-        end)
-        add("v42-bootstrap-auth-is-job-and-id-bound", function()
-            local now=os.time()
-            local bootstrap={bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
-            local auth={armed=true,bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,destinationJobId=game.JobId,armedAtUnix=now}
-            local good=State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,auth,now,game.JobId)
-            local wrongId=table.clone(auth);wrongId.bootstrapId="other"
-            local wrongJob=table.clone(auth);wrongJob.destinationJobId=tostring(game.JobId).."-other"
-            return good==true
-                and State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,wrongId,now,game.JobId)==false
-                and State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,wrongJob,now,game.JobId)==false,
-                "bootstrap authorization was not one-shot identity/destination bound"
-        end)
-        add("v42-bootstrap-auth-expires", function()
-            local now=os.time()
-            local bootstrap={bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
-            local auth={armed=true,bootstrapId="fresh",controllerVersion=CONTROLLER_VERSION,destinationJobId=game.JobId,armedAtUnix=now-121}
-            return State.AutoTrader.IsAuthorizedTeleportBootstrap(bootstrap,auth,now,game.JobId)==false,
-                "expired teleport AUTO authorization was accepted"
-        end)
-        add("v42-bootstrap-arms-auto-only-after-verified-compile", function()
-            local oldRecent=State.AutoTrader.RecentJobs
-            State.AutoTrader.RecentJobs={}
-            local code=State.AutoTrader.BuildTeleportBootstrapCode("v42-order-test",false)
-            State.AutoTrader.RecentJobs=oldRecent
-            if type(code)~="string" then return false,"bootstrap code was not built" end
-            local compileAt=string.find(code,"local f,e=LS(b)",1,true)
-            local armAt=string.find(code,"armedAtUnix=os.time()",1,true)
-            local sourceFailAt=string.find(code,"no verified current-build script available",1,true)
-            return compileAt and armAt and sourceFailAt and sourceFailAt<compileAt and compileAt<armAt,
-                "AUTO carry was armed before source verification/compilation"
-        end)
-        add("v42-current-source-canonicalizer-rejects-wrong-version", function()
-            local fake='local CONFIG={version="not-this-build"}\\nlocal HARDEN={distributionNormalizedSha256="'..string.rep("0",64)..'"}\\n'..string.rep("--x\\n",300)
-            local canonical=State.AutoTrader.CanonicalizeCapturedDistributionSource(fake)
-            return canonical==nil, "foreign source was accepted as current teleport continuation"
-        end)
-        local passed=0
-        for _, row in ipairs(tests) do if row.ok then passed+=1 end end
-        result.tests=tests
-        result.passed=passed
-        result.total=#tests
-        result.ok=passed==#tests
-        result.controllerVersion=CONTROLLER_VERSION
-        State.AutoTrader.SelfTest=result
-        State.AutoTrader.Log("self_test_v42",{passed=passed,total=#tests,ok=result.ok,tests=tests})
-        return result
-    end
-end
-
 rawset(_G, HARDEN.readyGlobalCurrent, true)
 rawset(ExecutorEnvironment, HARDEN.readyGlobalCurrent, true)
 -- Legacy ready alias is intentionally retained for old loaders; user-facing versioning is canonical.

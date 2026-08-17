@@ -1,7 +1,7 @@
--- SV AutoTrader v44 launcher
+-- SV AutoTrader v45 launcher
 -- This launcher preserves the exact verified runtime source across executor teleports.
 local __sv_source = [====[local CONFIG = {
-    version = "18.69.42-public-auto-trader-v44-representation-invariance-tests",
+    version = "18.69.43-public-auto-trader-v45-selftest-cleanup",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -304,7 +304,7 @@ local __sv_source = [====[local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "8021b0dd60c864dc3ee7138c5afbe903bae353be2d4f3ee382dc0f494c5f872e",
+    distributionNormalizedSha256 = "ffa18f1f6b635bda6a8241211e7fb32472ab25a74327188d165982951d1a125e",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -8100,13 +8100,18 @@ State.AutoTrader.RunSelfTests = function()
         local generation = State.AutoTrader.PlanGeneration
         local received = {key="selftest-received",itemId="selftest-received",itemType="Weapons",name="received-market",unitValue=20,maxQuantity=1,quantity=1,demand=5,reserve=0,record={name="received-market",data={value=20,demand=5}}}
         local incoming = {knownFloor=20,totalValue=20,unknownCount=0,demand=5,demandCoverage=1,flip=nil,flipCoverage=0,stability=nil,stabilityCoverage=0,stabilityShares={},entries={received}}
-        local high = {key="selftest-high",itemId="selftest-high",itemType="Weapons",name="high-market",unitValue=15,maxQuantity=1,quantity=1,demand=10,reserve=0,record={name="high-market",data={value=15,demand=10}}}
-        local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=15,maxQuantity=1,quantity=1,demand=4,reserve=0,record={name="safe-market",data={value=15,demand=4}}}
+        -- Spare copies keep the hard Reach4 catastrophe rule satisfied; this
+        -- regression is about Pareto preservation, not denomination liquidation.
+        local high = {key="selftest-high",itemId="selftest-high",itemType="Weapons",name="high-market",unitValue=15,maxQuantity=2,quantity=2,demand=10,reserve=0,record={name="high-market",data={value=15,demand=10}}}
+        local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=15,maxQuantity=2,quantity=2,demand=4,reserve=0,record={name="safe-market",data={value=15,demand=4}}}
         local anchor = {key="selftest-anchor",itemId="selftest-anchor",itemType="Weapons",name="anchor-market",unitValue=100,maxQuantity=1,quantity=1,demand=5,reserve=0,record={name="anchor-market",data={value=100,demand=5}}}
         local oldBudgets = State.AutoTrader.GetCurrentServerReachBudgets
+        local oldCurrent = State.AutoTrader.GetCurrentLocalEntries
         State.AutoTrader.GetCurrentServerReachBudgets = function() return {} end
+        State.AutoTrader.GetCurrentLocalEntries = function() return {} end
         local ok, plan = pcall(State.AutoTrader.FindPlan, incoming, {anchor,high,safe}, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
         State.AutoTrader.GetCurrentServerReachBudgets = oldBudgets
+        State.AutoTrader.GetCurrentLocalEntries = oldCurrent
         return ok and plan and plan.items and plan.items[1] and plan.items[1].name=="safe-market", "equal-value market-safe planner state was lost during dominance pruning"
     end)
     run("portfolio-liquidity", function()
@@ -18316,6 +18321,9 @@ local function setActiveAutoTraderTab(tabName)
     end
     if State.AutoTrader.Render then State.AutoTrader.Render() end
 end
+-- v45: expose the exact production tab switcher so late-scoped self-tests can
+-- exercise the real UI path without depending on an out-of-scope lexical local.
+State.AutoTrader.SetActiveTab = setActiveAutoTraderTab
 for name, button in pairs(UI.AutoTraderTabButtons) do
     local tabName = name
     connect(button.MouseButton1Click, function()
@@ -31929,7 +31937,7 @@ do
         add("v37-round26-remembered-auth-inflight-is-quiesced-before-direct-auth-fixtures",function()
             cleanup()
             local marker="ROUND26_SYNTHETIC_REMEMBERED_AUTH_ISOLATION"
-            local file=marker
+            local file=nil
             local releaseOld=false
             local oldStarted=false
             local oldFinished=false
@@ -31937,7 +31945,7 @@ do
             local requestCount=0
             local oldBody=authBody(1,1,nil,"round26-old")
             local freshBody=authBody(2,2,nil,"round26-fresh")
-            local hooks=baseHooks({
+            State.AutoTrader.DirectAuthTestHooks=baseHooks({
                 allowFreshRestore=true,
                 isfile=function() return file~=nil end,
                 readfile=function() return file end,
@@ -31954,38 +31962,43 @@ do
                     return {StatusCode=200,Body=freshBody,Headers={}}
                 end,
             })
-            State.AutoTrader.DirectAuthTestHooks=hooks
-            local restoredInitial=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            local seeded,seedReason=State.AutoTrader.ConnectDirectAuthSecret(marker,true,false)
             task.spawn(function()
                 State.AutoTrader.RefreshDirectAuthServerSnapshot()
                 oldRefreshReturned=true
             end)
             local waitStart=os.clock()
-            while not oldStarted and os.clock()-waitStart<1.25 do task.wait(0.01) end
+            while not oldStarted and os.clock()-waitStart<2.0 do task.wait(0.01) end
             local isolated,isolationReason=State.AutoTrader.BeginDirectAuthSelfTestIsolation()
             local returnStart=os.clock()
-            while not oldRefreshReturned and os.clock()-returnStart<1.25 do task.wait(0.01) end
-            local quiesced=isolated==true and oldRefreshReturned==true and isolationReason==nil
+            while not oldRefreshReturned and os.clock()-returnStart<2.0 do task.wait(0.01) end
+            local quiesced=isolated==true and isolationReason==nil and oldRefreshReturned==true and oldFinished==false
             local persistedIntact=file==marker
-            local restoredAfterIsolation=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
+            local reconnected,reconnectReason=State.AutoTrader.ConnectDirectAuthSecret(marker,true,false)
             local freshSnapshot=State.AutoTrader.RefreshDirectAuthServerSnapshot()
             local beforeLate=State.AutoTrader.GetDirectAuthSupportSummary()
             releaseOld=true
             local finishStart=os.clock()
-            while not oldFinished and os.clock()-finishStart<1.25 do task.wait(0.01) end
+            while not oldFinished and os.clock()-finishStart<2.0 do task.wait(0.01) end
             task.wait(0.10)
             local afterLate=State.AutoTrader.GetDirectAuthSupportSummary()
             local supportJson=HttpService:JSONEncode(afterLate)
             local debug=State.AutoTrader.BuildDebug()
             local bootstrap=State.AutoTrader.BuildTeleportBootstrapCode("round26-auth-isolation",false)
             local combined=tostring(supportJson).."\n"..tostring(debug).."\n"..tostring(bootstrap)
-            local passed=restoredInitial==true and oldStarted==true and quiesced and persistedIntact
-                and restoredAfterIsolation==true and type(freshSnapshot)=="table" and freshSnapshot.usable==true
+            local passed=seeded==true and seedReason==nil and oldStarted==true and quiesced and persistedIntact
+                and reconnected==true and reconnectReason==nil and type(freshSnapshot)=="table" and freshSnapshot.usable==true
                 and beforeLate.status=="AUTH_DIRECT_READY" and beforeLate.acceptedRows==2 and beforeLate.totalPlayerTokenCount==4
                 and afterLate.status=="AUTH_DIRECT_READY" and afterLate.acceptedRows==2 and afterLate.totalPlayerTokenCount==4
-                and file==marker and requestCount>=2 and combined:find(marker,1,true)==nil
+                and oldFinished==true and file==marker and requestCount>=2 and combined:find(marker,1,true)==nil
                 and combined:find(".ROBLOSECURITY=",1,true)==nil
-            cleanup();return passed,"remembered-auth in-flight request was not quiesced before synthetic direct-auth fixtures"
+            local detail="seed="..tostring(seeded)..":"..tostring(seedReason)
+                .." oldStarted="..tostring(oldStarted).." isolated="..tostring(isolated)..":"..tostring(isolationReason)
+                .." returned="..tostring(oldRefreshReturned).." oldFinished="..tostring(oldFinished)
+                .." reconnect="..tostring(reconnected)..":"..tostring(reconnectReason).." requests="..tostring(requestCount)
+                .." before="..tostring(beforeLate.status).."/"..tostring(beforeLate.acceptedRows).."/"..tostring(beforeLate.totalPlayerTokenCount)
+                .." after="..tostring(afterLate.status).."/"..tostring(afterLate.acceptedRows).."/"..tostring(afterLate.totalPlayerTokenCount)
+            cleanup();return passed,detail
         end)
 
         add("v37-round27-user-auth-mutation-is-rejected-during-selftest-isolation",function()
@@ -32017,15 +32030,21 @@ do
                 and fakeStatus.Text:find(marker,1,true)==nil and fakeStatus.Text:find(replacementSecret,1,true)==nil
             fakeBox:Destroy();fakeStatus:Destroy()
             local noFilesystemMutation=filesystemOps==opsBefore and file==marker
-            local restoredAfter=State.AutoTrader.RestoreDirectAuthAfterSelfTests()
             local passed=isolated==true and isolationReason==nil
                 and forgot==false and forgetReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
                 and remembered==false and rememberReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
                 and connected==false and connectReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
                 and uiConnected==false and uiReason=="AUTH_DIRECT_SELF_TEST_ACTIVE"
-                and uiInputPreserved and uiGeneric and noFilesystemMutation and restoredAfter==true
+                and uiInputPreserved and uiGeneric and noFilesystemMutation
+                and (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0
+            local detail="isolated="..tostring(isolated)..":"..tostring(isolationReason)
+                .." forget="..tostring(forgot)..":"..tostring(forgetReason)
+                .." remember="..tostring(remembered)..":"..tostring(rememberReason)
+                .." connect="..tostring(connected)..":"..tostring(connectReason)
+                .." ui="..tostring(uiConnected)..":"..tostring(uiReason)
+                .." fs="..tostring(filesystemOps).."/"..tostring(opsBefore)
             cleanup()
-            return passed,"user-initiated auth mutation crossed the self-test isolation fence or isolation did not restore"
+            return passed,detail
         end)
 
         add("v37-round30-native-trade-gui-remains-visible-during-auto-observability",function()
@@ -36109,12 +36128,14 @@ end)()
                 function()
                     local remote=fixtureItem("R",20);local localItem=fixtureItem("L",15);local anchor=fixtureItem("Anchor",100)
                     local row={player={UserId=350001,Name="Profit"},opportunity={kind="profit",receiveItems={remote},feasibilityWitness={kind="profit",receiveItems={remote},giveItems={fixtureItem("tiny",2)},giveTotal=2,receiveTotal=20}},feasibility={signature="x"}}
+                    localItem.maxQuantity=3;localItem.quantity=3
                     local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{anchor,localItem},{lastSuccess=1},0.18)
                     return type(intent)=="table" and intent.giveTotal>=14.8 and intent.giveTotal<=18,"profit outbound opening was not built through stage-1 planner"
                 end,
                 function()
                     local r1=fixtureItem("R1",10);local r2=fixtureItem("R2",10);local g=fixtureItem("G",19.5);local anchor=fixtureItem("Anchor",100)
                     local row={player={UserId=350002,Name="Liquidity"},opportunity={kind="liquidity",strategicKind="liquidity",receiveItems={r1,r2},strategicWitness={kind="liquidity",strategicKind="liquidity",receiveItems={r1,r2},giveItems={g},giveTotal=19.5,receiveTotal=20}},feasibility={signature="y"}}
+                    g.maxQuantity=2;g.quantity=2
                     local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{anchor,g},{lastSuccess=1},0.18)
                     return type(intent)=="table" and intent.strategicKind=="liquidity","strategic outbound opening did not use liquidity planner"
                 end,
@@ -36127,6 +36148,7 @@ end)()
                 function()
                     local remote=fixtureItem("R",20);local localItem=fixtureItem("L",15);local anchor=fixtureItem("Anchor",100)
                     local row={player={UserId=350004,Name="Intent"},opportunity={kind="profit",receiveItems={remote},feasibilityWitness={kind="profit",receiveItems={remote},giveItems={fixtureItem("tiny2",2)},giveTotal=2,receiveTotal=20}},feasibility={signature="w"}}
+                    localItem.maxQuantity=3;localItem.quantity=3
                     local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{anchor,localItem},{lastSuccess=1},0.18)
                     return intent and intent.giveItems and intent.giveItems[1] and intent.giveItems[1].itemId=="L","TargetIntent give side did not come from constructible plan"
                 end,
@@ -36135,15 +36157,15 @@ end)()
         elseif cid == 37 then
             return choose(ord,{
                 function()
-                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("L",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("L",15,3)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     return plan and plan.win>=State.AutoTrader.GetMinimumWin(),"profit plan violated minimum win"
                 end,
                 function()
-                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("L",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("L",15,3)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     return plan and plan.total<=plan.receiveTotal,"profit plan gives more than receive"
                 end,
                 function()
-                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("L",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("L",15,3)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     return plan and #plan.items<=CONFIG.MaxOfferSlots,"profit plan exceeded slot limit"
                 end,
                 function()
@@ -36152,7 +36174,7 @@ end)()
                     return plan==nil,"profit planner consumed unavailable/reserved quantity"
                 end,
                 function()
-                    local s=fixtureSummary({fixtureItem("R",20)});local inv={fixtureItem("Anchor",100),fixtureItem("L",15)}
+                    local s=fixtureSummary({fixtureItem("R",20)});local inv={fixtureItem("Anchor",100),fixtureItem("L",15,3)}
                     local a=State.AutoTrader.FindPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     local b=State.AutoTrader.FindPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     return a and b and a.total==b.total and a.items[1].itemId==b.items[1].itemId,"profit planner was nondeterministic"
@@ -36162,7 +36184,7 @@ end)()
             return choose(ord,{
                 function()
                     local s=fixtureSummary({fixtureItem("R1",10),fixtureItem("R2",10)})
-                    local p=State.AutoTrader.FindLiquidityPlan(s,{fixtureItem("Anchor",100),fixtureItem("G",19.5)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
+                    local p=State.AutoTrader.FindLiquidityPlan(s,{fixtureItem("Anchor",100),fixtureItem("G",19.5,2)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
                     return p and p.win<=0.5+0.000001,"approved small liquidity gap was rejected"
                 end,
                 function()
@@ -36177,7 +36199,7 @@ end)()
                 end,
                 function() return type(State.AutoTrader.EvaluatePortfolioDelta)=="function","liquidity improvement authority missing" end,
                 function()
-                    local s=fixtureSummary({fixtureItem("R1",10),fixtureItem("R2",10)});local inv={fixtureItem("Anchor",100),fixtureItem("G",19.5)}
+                    local s=fixtureSummary({fixtureItem("R1",10),fixtureItem("R2",10)});local inv={fixtureItem("Anchor",100),fixtureItem("G",19.5,2)}
                     local a=State.AutoTrader.FindLiquidityPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
                     local b=State.AutoTrader.FindLiquidityPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
                     return (a==nil and b==nil) or (a and b and a.total==b.total),"liquidity planner was nondeterministic"
@@ -36187,7 +36209,7 @@ end)()
             return choose(ord,{
                 function()
                     local received=fixtureItem("R",20);local incoming=fixtureSummary({received})
-                    local high=fixtureItem("High",15,1,10);local safe=fixtureItem("Safe",15,1,4)
+                    local high=fixtureItem("High",15,2,10);local safe=fixtureItem("Safe",15,2,4)
                     local p=State.AutoTrader.FindPlan(incoming,{high,safe},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     return p and p.items[1].name=="Safe","dominance pruning lost market-safe equal-value state"
                 end,
@@ -36227,7 +36249,7 @@ end)()
                     return type(ok)=="boolean" and type(diag)=="table","missing metric coverage was not handled deterministically"
                 end,
                 function()
-                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20,1,5)}),{fixtureItem("Anchor",100,1,5),fixtureItem("High",15,1,10),fixtureItem("Safe",15,1,4)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20,1,5)}),{fixtureItem("Anchor",100,1,5),fixtureItem("High",15,2,10),fixtureItem("Safe",15,2,4)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     return p and p.items[1].name=="Safe","market-safe alternative was not selected"
                 end,
                 function()
@@ -36288,7 +36310,7 @@ end)()
         elseif cid == 44 then
             return choose(ord,{
                 function()
-                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("G",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("G",15,3)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
                     return p~=nil,"opening inside plausibility cap was rejected"
                 end,
                 function()
@@ -36296,7 +36318,7 @@ end)()
                     return p==nil and tostring(reason):find("overshoot",1,true)~=nil,"extreme proactive underpay was not rejected"
                 end,
                 function()
-                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("A",7),fixtureItem("B",8)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("Anchor",100),fixtureItem("A",7,3),fixtureItem("B",8,3)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=5,final=false})
                     return p and p.total==15,"proposal plausibility ignored real denominations"
                 end,
                 function()
@@ -36989,7 +37011,7 @@ end)()
 
 
     ---------------------------------------------------------------------------
-    -- v44 representation-invariance / render-purity self-tests.
+    -- v45 cleanup over v44 representation-invariance / render-purity self-tests.
     -- REGISTER SAFETY: this entire tranche lives in its own function frame.
     ---------------------------------------------------------------------------
     State.AutoTrader.RunV44InvariantSelfTests = function(tests)
@@ -37066,9 +37088,12 @@ end)()
 
         local function withNoServerBudgets(callback)
             local old=State.AutoTrader.GetCurrentServerReachBudgets
+            local oldCurrent=State.AutoTrader.GetCurrentLocalEntries
             State.AutoTrader.GetCurrentServerReachBudgets=function() return {} end
+            State.AutoTrader.GetCurrentLocalEntries=function() return {} end
             local packed=table.pack(pcall(callback))
             State.AutoTrader.GetCurrentServerReachBudgets=old
+            State.AutoTrader.GetCurrentLocalEntries=oldCurrent
             if not packed[1] then error(packed[2]) end
             return table.unpack(packed,2,packed.n)
         end
@@ -37235,20 +37260,20 @@ end)()
         add("v44-tab-cycle-does-not-add-root-connections",function()
             local before=#Connections
             local old=State.AutoTrader.ActiveTab
-            for _,name in ipairs({"HOME","TRADE","PEOPLE","SERVERS","SETTINGS","HOME"}) do setActiveAutoTraderTab(name) end
-            setActiveAutoTraderTab(old)
+            for _,name in ipairs({"HOME","TRADE","PEOPLE","SERVERS","SETTINGS","HOME"}) do State.AutoTrader.SetActiveTab(name) end
+            State.AutoTrader.SetActiveTab(old)
             return #Connections==before,"tab switching accumulated root event connections"
         end)
         add("v44-tab-cycle-has-exactly-one-visible-page",function()
             local old=State.AutoTrader.ActiveTab
             local ok=true
             for _,name in ipairs({"HOME","TRADE","PEOPLE","SERVERS","SETTINGS"}) do
-                setActiveAutoTraderTab(name)
+                State.AutoTrader.SetActiveTab(name)
                 local visible=0
                 for _,page in pairs(UI.AutoTraderPages) do if page.Visible then visible+=1 end end
                 if visible~=1 or not UI.AutoTraderPages[name].Visible then ok=false;break end
             end
-            setActiveAutoTraderTab(old)
+            State.AutoTrader.SetActiveTab(old)
             return ok,"tab render left zero or multiple main pages visible"
         end)
         add("v44-updatecontrols-preserves-auto-preference",function()
@@ -37437,7 +37462,7 @@ end)()
         end)
         add("v44-constructible-profit-intent-uses-planner-not-witness",function()
             return withNoServerBudgets(function()
-                local remote=fixtureItem("R",20);local localItem=fixtureItem("L",15);local anchor=fixtureItem("Anchor",100)
+                local remote=fixtureItem("R",20);local localItem=fixtureItem("L",15,3);local anchor=fixtureItem("Anchor",100)
                 local row={player={UserId=440003,Name="Intent"},opportunity={kind="profit",receiveItems={remote},feasibilityWitness={kind="profit",receiveItems={remote},giveItems={fixtureItem("Tiny",2)},giveTotal=2,receiveTotal=20}},feasibility={signature="v44"}}
                 local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{anchor,localItem},{lastSuccess=1},0.18)
                 return intent and intent.giveTotal>=14.8 and intent.giveItems and intent.giveItems[1] and intent.giveItems[1].itemId=="L",
@@ -37447,9 +37472,9 @@ end)()
         add("v44-findplan-reordering-inventory-does-not-change-economic-plan",function()
             return withNoServerBudgets(function()
                 local s=fixtureSummary({fixtureItem("R",20)})
-                local a=fixtureItem("A",7);local b=fixtureItem("B",8);local anchor=fixtureItem("Anchor",100)
-                local p1=State.AutoTrader.FindPlan(s,{anchor,a,b},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
-                local p2=State.AutoTrader.FindPlan(s,{b,anchor,a},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                local a=fixtureItem("A",7,3);local b=fixtureItem("B",8,3);local anchor=fixtureItem("Anchor",100)
+                local p1=State.AutoTrader.FindPlan(s,{anchor,a,b},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=5,final=false})
+                local p2=State.AutoTrader.FindPlan(s,{b,anchor,a},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=5,final=false})
                 return p1 and p2 and p1.total==p2.total and State.AutoTrader.GetPortfolioIdentitySignature(p1.items)==State.AutoTrader.GetPortfolioIdentitySignature(p2.items),
                     "planner result changed when equivalent inventory table order changed"
             end)
@@ -37508,8 +37533,8 @@ end)()
         end)
         add("v44-tab-test-restores-original-active-tab",function()
             local old=State.AutoTrader.ActiveTab
-            setActiveAutoTraderTab(old=="HOME" and "TRADE" or "HOME")
-            setActiveAutoTraderTab(old)
+            State.AutoTrader.SetActiveTab(old=="HOME" and "TRADE" or "HOME")
+            State.AutoTrader.SetActiveTab(old)
             return State.AutoTrader.ActiveTab==old and UI.AutoTraderPages[old] and UI.AutoTraderPages[old].Visible==true,
                 "UI fixture did not restore the original active tab"
         end)
@@ -37620,11 +37645,14 @@ end)()
                 lastTeleportBootstrapId = State.AutoTrader.LastTeleportBootstrapId,
             }
             local savedServerReachBudgets = State.AutoTrader.GetCurrentServerReachBudgets
+            local savedCurrentLocalEntries = State.AutoTrader.GetCurrentLocalEntries
             if case.category >= 35 and case.category <= 44 then
                 State.AutoTrader.GetCurrentServerReachBudgets = function() return {} end
+                State.AutoTrader.GetCurrentLocalEntries = function() return {} end
             end
             local ok, passed, detail = pcall(semanticProbe, case)
             State.AutoTrader.GetCurrentServerReachBudgets = savedServerReachBudgets
+            State.AutoTrader.GetCurrentLocalEntries = savedCurrentLocalEntries
             State.AutoTrader.LastMarketGate = isolation.lastMarketGate
             State.AutoTrader.LastEffectiveMinimumWin = isolation.lastMinimumWin
             State.AutoTrader.LastOtherHash = isolation.lastOtherHash
@@ -37740,13 +37768,13 @@ end)()
         baseResult.expandedCatalogVersion = EXPANDED_CATALOG_VERSION
         baseResult.expandedCatalogAdded = added
         baseResult.expandedCatalogExpected = EXPANDED_EXPECTED_ADDITIONS
-        baseResult.v44InvariantVersion = 1
+        baseResult.v44InvariantVersion = 2
         baseResult.v44InvariantExpected = 72
         State.AutoTrader.SelfTest = baseResult
         State.AutoTrader.Log("self_test_expanded_catalog", {
             passed=passed,total=#tests,ok=baseResult.ok,added=added,
             expectedAdded=EXPANDED_EXPECTED_ADDITIONS,catalogVersion=EXPANDED_CATALOG_VERSION,
-            v44InvariantVersion=1,v44InvariantExpected=72,
+            v44InvariantVersion=2,v44InvariantExpected=72,
         })
         return baseResult
     end
@@ -37754,7 +37782,7 @@ end)()
     State.AutoTrader.ExpandedSelfTestCatalog = catalog
     State.AutoTrader.ExpandedSelfTestCatalogVersion = EXPANDED_CATALOG_VERSION
     State.AutoTrader.ExpandedSelfTestExpectedAdditions = EXPANDED_EXPECTED_ADDITIONS
-    State.AutoTrader.V44InvariantSelfTestVersion = 1
+    State.AutoTrader.V44InvariantSelfTestVersion = 2
     State.AutoTrader.V44InvariantSelfTestExpected = 72
 
     -- Startup's original self-test call can happen before this late UI/test-only

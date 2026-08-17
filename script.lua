@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.28-public-auto-trader-v37-round31-supervised-canary-safety-ui-fixed",
+    version = "18.69.29-public-auto-trader-v37-round32-supervised-canary-one-target-safety",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -281,8 +281,8 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "43e43e8e996f2d644b91a9e4a09f2a48ba0354e09eefcb5426ec44d57cc8573b",
-    readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
+    distributionNormalizedSha256 = "8af0d997f163d52ff3f3c5456d860249be3f5a499d8460dc592cbc771f30c3f9",
+    readyGlobalCurrent = "__SV_AUTO_TRADER_V32_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
     guiDiscovery = {mainCalls=0,tradeCalls=0,tradeCacheHits=0,tradeSuccess=0,inventoryScans=0,totalTradeSeconds=0,maxTradeSeconds=0,totalInventorySeconds=0,maxInventorySeconds=0},
@@ -6986,6 +6986,9 @@ State.AutoTrader = {
     SupervisedCanaryArmedAt = 0,
     SupervisedCanaryStartedAt = 0,
     SupervisedCanaryStopReason = nil,
+    SupervisedCanaryTargetUserId = nil,
+    SupervisedCanaryTargetName = nil,
+    SupervisedCanaryTargetAttemptStartedAt = 0,
     TeleportQueued = false,
     TeleportQueueOutcome = nil,
     TeleportBootstrapSerial = 0,
@@ -7575,6 +7578,43 @@ State.AutoTrader.WinPresets = {1, 2, 3, 5}
 State.AutoTrader.IsSupervisedCanaryArmed = function()
     return State.AutoTrader.SupervisedCanaryArmed == true
 end
+State.AutoTrader.LockSupervisedCanaryTarget = function(target)
+    if not State.AutoTrader.IsSupervisedCanaryArmed()
+        or State.AutoTrader.SupervisedCanaryStarted ~= true then
+        return true
+    end
+    local userId = target and tonumber(target.UserId) or nil
+    if not userId then return false, "SUPERVISED_CANARY_TARGET_UNRESOLVED" end
+    local lockedUserId = tonumber(State.AutoTrader.SupervisedCanaryTargetUserId)
+    if lockedUserId then
+        if lockedUserId == userId then return true end
+        State.AutoTrader.StopSupervisedCanaryAutomation(
+            "blocked second supervised-canary target " .. tostring(target.Name or userId)
+                .. "; first target remains " .. tostring(State.AutoTrader.SupervisedCanaryTargetName or lockedUserId)
+        )
+        return false, "SUPERVISED_CANARY_TARGET_LOCKED"
+    end
+    State.AutoTrader.SupervisedCanaryTargetUserId = userId
+    State.AutoTrader.SupervisedCanaryTargetName = tostring(target.Name or userId)
+    State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt = os.clock()
+    State.AutoTrader.Log("supervised_canary_target_locked", {
+        userId = userId,
+        name = State.AutoTrader.SupervisedCanaryTargetName,
+        mode = "ONE_TARGET_NO_HOP",
+    })
+    return true
+end
+State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle = function(userId, reason)
+    if not State.AutoTrader.IsSupervisedCanaryArmed()
+        or State.AutoTrader.SupervisedCanaryStarted ~= true then
+        return false
+    end
+    local lockedUserId = tonumber(State.AutoTrader.SupervisedCanaryTargetUserId)
+    if not lockedUserId or tonumber(userId) ~= lockedUserId then return false end
+    return State.AutoTrader.StopSupervisedCanaryAutomation(
+        tostring(reason or "supervised canary target lifecycle ended")
+    )
+end
 State.AutoTrader.GetTeleportAutomationCarry = function()
     return State.AutoTrader.Preferences.automation == true
         and not State.AutoTrader.IsSupervisedCanaryArmed()
@@ -7610,9 +7650,12 @@ State.AutoTrader.SetSupervisedCanaryArmed = function(armed)
     State.AutoTrader.SupervisedCanaryArmedAt = armed and os.clock() or 0
     State.AutoTrader.SupervisedCanaryStartedAt = 0
     State.AutoTrader.SupervisedCanaryStopReason = nil
+    State.AutoTrader.SupervisedCanaryTargetUserId = nil
+    State.AutoTrader.SupervisedCanaryTargetName = nil
+    State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt = 0
     State.AutoTrader.SavePreferences()
     State.AutoTrader.Log(armed and "supervised_canary_armed" or "supervised_canary_disarmed", {
-        mode = "ONE_SHOT_NO_HOP",
+        mode = "ONE_TARGET_NO_HOP",
     })
     if State.AutoTrader.UpdateControls then State.AutoTrader.UpdateControls() end
     if State.AutoTrader.Render then State.AutoTrader.Render() end
@@ -15137,10 +15180,17 @@ State.AutoTrader.FinalizePendingCancellation = function(pending)
         reason = pending.cancelReason, age = os.clock() - (pending.sentAt or os.clock()),
         recoveryAfterCleanup = recoveryAfterCleanup,
     })
+    local completedUserId = pending.userId
+    local completedName = pending.name
     State.AutoTrader.PendingRequest = nil
     State.AutoTrader.RequestLifecycle = "idle"
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestCancelQuietSeconds
     State.AutoTrader.RequestConfirmGeneration += 1
+    State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(
+        completedUserId,
+        "supervised target request ended before trade: " .. tostring(completedName or completedUserId)
+            .. " · " .. tostring(pending.cancelReason or outcome or "request terminal")
+    )
     if recoveryAfterCleanup then
         State.AutoTrader.RequestRecoveryTeleport(recoveryReason or "repeated outgoing request transport failures")
     else
@@ -15192,6 +15242,10 @@ State.AutoTrader.FinalizePendingDecline = function(pending, reason)
     State.AutoTrader.StatusDetail = player
         and (player.Name .. " declined; moving on after the short clean-state spacing.")
         or "Request was declined."
+    State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(
+        pending.userId,
+        "supervised target declined the outgoing request: " .. tostring(pending.name or pending.userId)
+    )
     State.AutoTrader.Render()
     return true
 end
@@ -15696,6 +15750,8 @@ State.AutoTrader.TrySendRequest = function()
         State.AutoTrader.Log("request_blocked_decision_data_preinvoke",{userId=target.UserId,name=target.Name,reasonCode=freshness.reasonCode or "VALUE_DB_STALE",reason=decisionReason,ageSeconds=freshness.ageSeconds,liveRefreshStage=HARDEN.supremeLiveRefreshStage})
         return blocked((freshness.reasonCode or "VALUE_DB_STALE") .. " · " .. tostring(decisionReason or "decision data became stale before contact"))
     end
+    local canaryTargetOk, canaryTargetReason = State.AutoTrader.LockSupervisedCanaryTarget(target)
+    if not canaryTargetOk then return blocked(canaryTargetReason or "supervised canary target lock") end
     State.AutoTrader.NextRequestAt = os.clock() + CONFIG.AutoTraderRequestSpacingSeconds
     if State.AutoTrader.SetContactState then
         State.AutoTrader.SetContactState(target, "TRANSPORT_ATTEMPTING", "local SendRequest invocation started; awaiting correlated MM2 acknowledgement")
@@ -15837,6 +15893,19 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         return
     end
     State.AutoTrader.UnresolvedTradePartnerSince = 0
+    if State.AutoTrader.Preferences.automation
+        and State.AutoTrader.IsSupervisedCanaryArmed()
+        and State.AutoTrader.SupervisedCanaryStarted then
+        local canaryTargetOk, canaryTargetReason = State.AutoTrader.LockSupervisedCanaryTarget(partner)
+        if not canaryTargetOk then
+            State.AutoTrader.SetManagedPartner(nil)
+            State.AutoTrader.RestoreTradeVisuals()
+            State.AutoTrader.Status = "CANARY STOP · DIFFERENT TARGET"
+            State.AutoTrader.StatusDetail = tostring(canaryTargetReason or "A second target appeared during the supervised canary.")
+            State.AutoTrader.Render()
+            return
+        end
+    end
     if State.AutoTrader.PendingRequest and State.AutoTrader.PendingRequest.userId == partner.UserId then
         State.AutoTrader.AcknowledgeOutgoingTransport(State.AutoTrader.PendingRequest, "trade_state")
         State.AutoTrader.TradeRequestStartedAt = State.AutoTrader.PendingRequest.contactAcknowledgedAt or State.AutoTrader.TradeRequestStartedAt or os.clock()
@@ -16926,12 +16995,15 @@ State.AutoTrader.BuildDebug = function()
         managedTradeLifecycleMarker = State.AutoTrader.BackgroundSuppressed,
         nativeTradeUiPolicy = "VISIBLE_DURING_AUTOMATION",
         supervisedCanary = {
-            mode = "ONE_SHOT_NO_HOP",
+            mode = "ONE_TARGET_NO_HOP",
             armed = State.AutoTrader.SupervisedCanaryArmed == true,
             started = State.AutoTrader.SupervisedCanaryStarted == true,
             armedAt = State.AutoTrader.SupervisedCanaryArmedAt,
             startedAt = State.AutoTrader.SupervisedCanaryStartedAt,
             stopReason = State.AutoTrader.SupervisedCanaryStopReason,
+            targetUserId = State.AutoTrader.SupervisedCanaryTargetUserId,
+            targetName = State.AutoTrader.SupervisedCanaryTargetName,
+            targetAttemptStartedAt = State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt,
             teleportAutomationCarry = State.AutoTrader.GetTeleportAutomationCarry(),
         },
         postTradeAuditPending = State.AutoTrader.PostTradeAuditPending,
@@ -17825,7 +17897,7 @@ State.AutoTrader.UpdateControls = function()
         if State.AutoTrader.SupervisedCanaryArmed then
             UI.AutoTraderCanary.Text = State.AutoTrader.SupervisedCanaryStarted
                 and "SUPERVISED CANARY · USED · DISARM/RE-ARM"
-                or "SUPERVISED CANARY · ARMED · ONE-SHOT NO-HOP"
+                or "SUPERVISED CANARY · ARMED · ONE-TARGET NO-HOP"
             UI.AutoTraderCanary.TextColor3 = State.AutoTrader.SupervisedCanaryStarted and THEME.yellow or THEME.green
         else
             UI.AutoTraderCanary.Text = "SUPERVISED CANARY · DISARMED"
@@ -18793,6 +18865,10 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                     or (partner
                         and (partner.Name .. " ended the trade; ignoring them for about 2 minutes.")
                         or "Trade ended.")
+                State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(
+                    observedPartnerUserId or (partner and partner.UserId),
+                    "supervised target trade ended: " .. tostring(partner and partner.Name or observedPartnerUserId or "unknown")
+                )
                 State.AutoTrader.Render()
             end)
         end)
@@ -18875,6 +18951,10 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                     State.AutoTrader.ClearTradeRuntime()
                     State.AutoTrader.Status = "TRADE COMPLETED"
                     State.AutoTrader.StatusDetail = "Server confirmed the owned automated trade. Starting repeated fresh-inventory verification."
+                    State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(
+                        tx.partnerUserId,
+                        "supervised target trade completed; post-trade audit continues with AUTO OFF"
+                    )
                     State.AutoTrader.Render()
                     State.AutoTrader.ShowSuccessNotification(partner, completedPlan, "Server completion confirmed")
                     State.AutoTrader.RunPostTradeAudit(audit, receivedItems, partner, completedPlan, tradeSeconds, requestToCompletionSeconds, {owner = {generation = tx.generation, partnerUserId = tx.partnerUserId}})
@@ -19473,6 +19553,9 @@ connect(UI.AutoTraderEnabled.MouseButton1Click, function()
             State.AutoTrader.SupervisedCanaryStarted = true
             State.AutoTrader.SupervisedCanaryStartedAt = os.clock()
             State.AutoTrader.SupervisedCanaryStopReason = nil
+            State.AutoTrader.SupervisedCanaryTargetUserId = nil
+            State.AutoTrader.SupervisedCanaryTargetName = nil
+            State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt = 0
         end
         State.AutoTrader.SessionFrozen = nil
         State.AutoTrader.FatalIntegrityStop = false
@@ -31649,6 +31732,99 @@ do
             HARDEN.atomicWriteTextFileBestEffort=saved.atomicWrite
             rawset(_G,State.AutoTrader.PreferencesKey,saved.globalPreferences)
             return passed,"armed supervised canary persisted automation=true or changed the normal unarmed continuation behavior"
+        end)
+
+        add("v37-round32-supervised-canary-locks-first-target-and-blocks-second",function()
+            local saved={
+                automation=State.AutoTrader.Preferences.automation,
+                armed=State.AutoTrader.SupervisedCanaryArmed,
+                started=State.AutoTrader.SupervisedCanaryStarted,
+                targetUserId=State.AutoTrader.SupervisedCanaryTargetUserId,
+                targetName=State.AutoTrader.SupervisedCanaryTargetName,
+                targetAttemptStartedAt=State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt,
+                stopReason=State.AutoTrader.SupervisedCanaryStopReason,
+                savePreferences=State.AutoTrader.SavePreferences,
+                actionGeneration=State.AutoTrader.ActionGeneration,
+                autoAcceptGeneration=State.AutoTrader.AutoAcceptGeneration,
+                status=State.AutoTrader.Status,
+                statusDetail=State.AutoTrader.StatusDetail,
+            }
+            State.AutoTrader.SavePreferences=function() return true end
+            State.AutoTrader.Preferences.automation=true
+            State.AutoTrader.SupervisedCanaryArmed=true
+            State.AutoTrader.SupervisedCanaryStarted=true
+            State.AutoTrader.SupervisedCanaryTargetUserId=nil
+            State.AutoTrader.SupervisedCanaryTargetName=nil
+            State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt=0
+            State.AutoTrader.SupervisedCanaryStopReason=nil
+            local firstOk=State.AutoTrader.LockSupervisedCanaryTarget({UserId=101,Name="Round32A"})
+            local sameOk=State.AutoTrader.LockSupervisedCanaryTarget({UserId=101,Name="Round32A"})
+            local secondOk,secondReason=State.AutoTrader.LockSupervisedCanaryTarget({UserId=202,Name="Round32B"})
+            local passed=firstOk==true and sameOk==true and secondOk==false
+                and secondReason=="SUPERVISED_CANARY_TARGET_LOCKED"
+                and State.AutoTrader.SupervisedCanaryTargetUserId==101
+                and State.AutoTrader.SupervisedCanaryTargetName=="Round32A"
+                and State.AutoTrader.Preferences.automation==false
+                and tostring(State.AutoTrader.SupervisedCanaryStopReason):find("blocked second supervised%-canary target")~=nil
+            State.AutoTrader.Preferences.automation=saved.automation
+            State.AutoTrader.SupervisedCanaryArmed=saved.armed
+            State.AutoTrader.SupervisedCanaryStarted=saved.started
+            State.AutoTrader.SupervisedCanaryTargetUserId=saved.targetUserId
+            State.AutoTrader.SupervisedCanaryTargetName=saved.targetName
+            State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt=saved.targetAttemptStartedAt
+            State.AutoTrader.SupervisedCanaryStopReason=saved.stopReason
+            State.AutoTrader.SavePreferences=saved.savePreferences
+            State.AutoTrader.ActionGeneration=saved.actionGeneration
+            State.AutoTrader.AutoAcceptGeneration=saved.autoAcceptGeneration
+            State.AutoTrader.Status=saved.status
+            State.AutoTrader.StatusDetail=saved.statusDetail
+            return passed,"supervised canary failed to lock the first target or allowed a second target while the same arm was active"
+        end)
+
+        add("v37-round32-supervised-canary-terminal-target-stop-is-idempotent",function()
+            local saved={
+                automation=State.AutoTrader.Preferences.automation,
+                armed=State.AutoTrader.SupervisedCanaryArmed,
+                started=State.AutoTrader.SupervisedCanaryStarted,
+                targetUserId=State.AutoTrader.SupervisedCanaryTargetUserId,
+                targetName=State.AutoTrader.SupervisedCanaryTargetName,
+                targetAttemptStartedAt=State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt,
+                stopReason=State.AutoTrader.SupervisedCanaryStopReason,
+                savePreferences=State.AutoTrader.SavePreferences,
+                actionGeneration=State.AutoTrader.ActionGeneration,
+                autoAcceptGeneration=State.AutoTrader.AutoAcceptGeneration,
+                status=State.AutoTrader.Status,
+                statusDetail=State.AutoTrader.StatusDetail,
+            }
+            State.AutoTrader.SavePreferences=function() return true end
+            State.AutoTrader.Preferences.automation=true
+            State.AutoTrader.SupervisedCanaryArmed=true
+            State.AutoTrader.SupervisedCanaryStarted=true
+            State.AutoTrader.SupervisedCanaryTargetUserId=303
+            State.AutoTrader.SupervisedCanaryTargetName="Round32Terminal"
+            State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt=os.clock()
+            State.AutoTrader.SupervisedCanaryStopReason=nil
+            local wrongStopped=State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(404,"wrong target")
+            local stillOn=State.AutoTrader.Preferences.automation==true and State.AutoTrader.SupervisedCanaryStopReason==nil
+            local rightStopped=State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(303,"target lifecycle ended")
+            local stopped=State.AutoTrader.Preferences.automation==false
+                and tostring(State.AutoTrader.SupervisedCanaryStopReason):find("target lifecycle ended",1,true)~=nil
+            local repeated=State.AutoTrader.StopSupervisedCanaryAfterTargetLifecycle(303,"target lifecycle ended again")
+            local passed=wrongStopped==false and stillOn and rightStopped==true and stopped and repeated==true
+                and State.AutoTrader.Preferences.automation==false
+            State.AutoTrader.Preferences.automation=saved.automation
+            State.AutoTrader.SupervisedCanaryArmed=saved.armed
+            State.AutoTrader.SupervisedCanaryStarted=saved.started
+            State.AutoTrader.SupervisedCanaryTargetUserId=saved.targetUserId
+            State.AutoTrader.SupervisedCanaryTargetName=saved.targetName
+            State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt=saved.targetAttemptStartedAt
+            State.AutoTrader.SupervisedCanaryStopReason=saved.stopReason
+            State.AutoTrader.SavePreferences=saved.savePreferences
+            State.AutoTrader.ActionGeneration=saved.actionGeneration
+            State.AutoTrader.AutoAcceptGeneration=saved.autoAcceptGeneration
+            State.AutoTrader.Status=saved.status
+            State.AutoTrader.StatusDetail=saved.statusDetail
+            return passed,"supervised canary terminal stop fired for the wrong target or failed to keep AUTO off for the locked target"
         end)
 
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end

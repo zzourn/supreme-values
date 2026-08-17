@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.36-public-auto-trader-v39-seven-change-strategy",
+    version = "18.69.37-public-auto-trader-v40-runtime-evidence-corrections",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -301,9 +301,9 @@ local CONFIG = {
 }
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
-    supportFormat = "SV_AUTO_TRADER_SUPPORT_V39",
-    distributionNormalizedSha256 = "6a8881655233314407a47f92e8f120798cccabce7019413cee8223d7fa63eb93",
-    readyGlobalCurrent = "__SV_AUTO_TRADER_V39_READY",
+    supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
+    distributionNormalizedSha256 = "0d078a2ef42da2884a34210b28410277854bebe4c150c38b2f1d1a74abac9655",
+    readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
     guiDiscovery = {mainCalls=0,tradeCalls=0,tradeCacheHits=0,tradeSuccess=0,inventoryScans=0,totalTradeSeconds=0,maxTradeSeconds=0,totalInventorySeconds=0,maxInventorySeconds=0},
@@ -8046,8 +8046,8 @@ State.AutoTrader.RunSelfTests = function()
         local generation = State.AutoTrader.PlanGeneration
         local received = {key="selftest-received",itemId="selftest-received",itemType="Weapons",name="received-market",unitValue=20,maxQuantity=1,quantity=1,demand=5,reserve=0,record={name="received-market",data={value=20,demand=5}}}
         local incoming = {knownFloor=20,totalValue=20,unknownCount=0,demand=5,demandCoverage=1,flip=nil,flipCoverage=0,stability=nil,stabilityCoverage=0,stabilityShares={},entries={received}}
-        local high = {key="selftest-high",itemId="selftest-high",itemType="Weapons",name="high-market",unitValue=10,maxQuantity=1,quantity=1,demand=10,reserve=0,record={name="high-market",data={value=10,demand=10}}}
-        local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=10,maxQuantity=1,quantity=1,demand=4,reserve=0,record={name="safe-market",data={value=10,demand=4}}}
+        local high = {key="selftest-high",itemId="selftest-high",itemType="Weapons",name="high-market",unitValue=15,maxQuantity=1,quantity=1,demand=10,reserve=0,record={name="high-market",data={value=15,demand=10}}}
+        local safe = {key="selftest-safe",itemId="selftest-safe",itemType="Weapons",name="safe-market",unitValue=15,maxQuantity=1,quantity=1,demand=4,reserve=0,record={name="safe-market",data={value=15,demand=4}}}
         local plan = State.AutoTrader.FindPlan(incoming, {high,safe}, generation, {stage=1,margin=0.18,targetProfit=3.6,final=false})
         return plan and plan.items and plan.items[1] and plan.items[1].name=="safe-market", "equal-value market-safe planner state was lost during dominance pruning"
     end)
@@ -16901,11 +16901,11 @@ State.AutoTrader.BuildDebug = function()
                 minMovingSamples = CONFIG.AutoTraderGoldMinMovingSamples,
                 minMovementSpanSeconds = CONFIG.AutoTraderGoldMinMovementSpanSeconds,
                 minRemotePlayers = CONFIG.AutoTraderGoldMinRemotePlayers,
-                automatedPermanentLearningRule = "100% of current remote players must pass physical certification; membership must remain identical through teleport commit",
+                automatedPermanentLearningRule = "any MoveDirection > epsilon immediately marks the JobId regular; 100% of current remote players must pass RootPart travel/fixed-facing certification; membership must remain identical through teleport commit",
                 suspectedHopRatio = CONFIG.AutoTraderSuspectedBotHopRatio,
                 suspectedHopMinPassed = CONFIG.AutoTraderSuspectedBotHopMinPassed,
                 suspectedHopObserveSeconds = CONFIG.AutoTraderSuspectedBotHopObserveSeconds,
-                suspectedHopLearningRule = "escape only; teaches ZERO permanent bot hashes",
+                suspectedHopLearningRule = "disabled by v40 all-or-nothing bot-server policy; partial-pass ratios never trigger bot-server escape or learning",
                 manualCertification = {enabled=true, confirmSeconds=CONFIG.AutoTraderManualBotConfirmSeconds, provenance="manual_user_certification", allOrNothingAvatarResolution=true},
             },
             negotiationMargins = {
@@ -17918,19 +17918,32 @@ create("UIPadding", {
 
 -- SETTINGS ---------------------------------------------------------------
 local settingsPage = UI.AutoTraderPages.SETTINGS
-local settingsHint = makeLabel(
-    settingsPage,
-    "These are the controls that change behavior. Diagnostic/support export remains one click away.",
-    9,
-    THEME.faint,
-    Enum.Font.Arial
+
+-- Compact health strip: keep the most important startup signal visible without
+-- consuming the reserve-list space below.
+UI.AutoTraderSelfTestCard = create("Frame", {
+    Position = UDim2.fromOffset(0, 0),
+    Size = UDim2.new(1, -146, 0, 22),
+    BackgroundColor3 = AERO.recessed,
+    BorderSizePixel = 0,
+    ZIndex = 1454,
+}, settingsPage)
+addCorner(UI.AutoTraderSelfTestCard, 3)
+aeroStroke(UI.AutoTraderSelfTestCard, THEME.border, 0.34)
+UI.AutoTraderSelfTests = makeLabel(
+    UI.AutoTraderSelfTestCard,
+    "SELF TESTS · RUNNING…",
+    10,
+    THEME.yellow,
+    Enum.Font.ArialBold
 )
-settingsHint.Position = UDim2.fromOffset(4, 0)
-settingsHint.Size = UDim2.new(1, -176, 0, 20)
-settingsHint.ZIndex = 1454
-UI.AutoTraderResetPosition = aeroButton(settingsPage, "RESET WINDOW", UDim2.fromOffset(164, 22), false)
-UI.AutoTraderResetPosition.Position = UDim2.new(1, -164, 0, 0)
-UI.AutoTraderResetPosition.TextSize = 11
+UI.AutoTraderSelfTests.Position = UDim2.fromOffset(8, 1)
+UI.AutoTraderSelfTests.Size = UDim2.new(1, -16, 1, -2)
+UI.AutoTraderSelfTests.ZIndex = 1455
+
+UI.AutoTraderResetPosition = aeroButton(settingsPage, "RESET WINDOW", UDim2.fromOffset(138, 22), false)
+UI.AutoTraderResetPosition.Position = UDim2.new(1, -138, 0, 0)
+UI.AutoTraderResetPosition.TextSize = 10
 UI.AutoTraderResetPosition.ZIndex = 1454
 connect(UI.AutoTraderResetPosition.MouseButton1Click, function()
     if Destroyed then return end
@@ -17940,59 +17953,70 @@ connect(UI.AutoTraderResetPosition.MouseButton1Click, function()
     task.defer(function() clampAutoTraderPanelPosition(true) end)
 end)
 
-UI.AutoTraderEnabled = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 42), true)
+UI.AutoTraderEnabled = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 34), true)
 UI.AutoTraderEnabled.Position = UDim2.fromOffset(0, 28)
 UI.AutoTraderEnabled.TextSize = 12
 UI.AutoTraderEnabled.ZIndex = 1454
--- Round-31 UI hotfix: keep operator/support controls above the v37 auth card at y=250.
-UI.AutoTraderIgnoreFriends = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
-UI.AutoTraderIgnoreFriends.Position = UDim2.fromOffset(0, 76)
+
+UI.AutoTraderIgnoreFriends = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 26), false)
+UI.AutoTraderIgnoreFriends.Position = UDim2.fromOffset(0, 68)
+UI.AutoTraderIgnoreFriends.TextSize = 10
 UI.AutoTraderIgnoreFriends.ZIndex = 1454
-UI.AutoTraderOpeningAnchor = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
-UI.AutoTraderOpeningAnchor.Position = UDim2.new(0.5, 4, 0, 76)
+UI.AutoTraderOpeningAnchor = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 26), false)
+UI.AutoTraderOpeningAnchor.Position = UDim2.new(0.5, 4, 0, 68)
+UI.AutoTraderOpeningAnchor.TextSize = 10
 UI.AutoTraderOpeningAnchor.ZIndex = 1454
-UI.AutoTraderUnknownTheir = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
-UI.AutoTraderUnknownTheir.Position = UDim2.fromOffset(0, 110)
+UI.AutoTraderUnknownTheir = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 26), false)
+UI.AutoTraderUnknownTheir.Position = UDim2.fromOffset(0, 100)
+UI.AutoTraderUnknownTheir.TextSize = 10
 UI.AutoTraderUnknownTheir.ZIndex = 1454
-UI.AutoTraderPreferDuplicates = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
-UI.AutoTraderPreferDuplicates.Position = UDim2.new(0.5, 4, 0, 110)
+UI.AutoTraderPreferDuplicates = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 26), false)
+UI.AutoTraderPreferDuplicates.Position = UDim2.new(0.5, 4, 0, 100)
+UI.AutoTraderPreferDuplicates.TextSize = 10
 UI.AutoTraderPreferDuplicates.ZIndex = 1454
-UI.AutoTraderProfit = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 28), false)
-UI.AutoTraderProfit.Position = UDim2.fromOffset(0, 144)
+
+-- Put the frequently-read win policy and the supervised-canary state on one
+-- balanced row instead of spending two full-width rows on short status controls.
+UI.AutoTraderProfit = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderProfit.Position = UDim2.fromOffset(0, 132)
+UI.AutoTraderProfit.TextSize = 10
 UI.AutoTraderProfit.ZIndex = 1454
-UI.AutoTraderCanary = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 30), false)
-UI.AutoTraderCanary.Position = UDim2.fromOffset(0, 178)
-UI.AutoTraderCanary.TextSize = 11
+UI.AutoTraderCanary = aeroButton(settingsPage, "", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderCanary.Position = UDim2.new(0.5, 4, 0, 132)
+UI.AutoTraderCanary.TextSize = 10
 UI.AutoTraderCanary.ZIndex = 1454
-UI.AutoTraderSkipTarget = aeroButton(settingsPage, "SKIP CURRENT TARGET", UDim2.new(0.5, -4, 0, 30), false)
-UI.AutoTraderSkipTarget.Position = UDim2.fromOffset(0, 214)
+
+UI.AutoTraderSkipTarget = aeroButton(settingsPage, "SKIP CURRENT TARGET", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderSkipTarget.Position = UDim2.fromOffset(0, 166)
+UI.AutoTraderSkipTarget.TextSize = 10
 UI.AutoTraderSkipTarget.TextColor3 = THEME.yellow
 UI.AutoTraderSkipTarget.ZIndex = 1454
-UI.AutoTraderCopyDebug = aeroButton(settingsPage, "COPY FULL SUPPORT SNAPSHOT", UDim2.new(0.5, -4, 0, 30), false)
-UI.AutoTraderCopyDebug.Position = UDim2.new(0.5, 4, 0, 214)
+UI.AutoTraderCopyDebug = aeroButton(settingsPage, "COPY SUPPORT SNAPSHOT", UDim2.new(0.5, -4, 0, 28), false)
+UI.AutoTraderCopyDebug.Position = UDim2.new(0.5, 4, 0, 166)
+UI.AutoTraderCopyDebug.TextSize = 10
 UI.AutoTraderCopyDebug.TextColor3 = THEME.blue
 UI.AutoTraderCopyDebug.ZIndex = 1454
 
 UI.AutoTraderReserveTitle = makeLabel(settingsPage, "INVENTORY RESERVES", 10, Color3.fromRGB(37, 83, 111), Enum.Font.ArialBold)
-UI.AutoTraderReserveTitle.Position = UDim2.fromOffset(4, 298)
-UI.AutoTraderReserveTitle.Size = UDim2.new(1, -120, 0, 18)
+UI.AutoTraderReserveTitle.Position = UDim2.fromOffset(4, 288)
+UI.AutoTraderReserveTitle.Size = UDim2.new(1, -206, 0, 18)
 UI.AutoTraderReserveTitle.ZIndex = 1454
-UI.AutoTraderReserveCount = makeLabel(settingsPage, "0 reserves", 10, THEME.muted, Enum.Font.Arial)
-UI.AutoTraderReserveCount.Position = UDim2.new(1, -116, 0, 298)
-UI.AutoTraderReserveCount.Size = UDim2.fromOffset(112, 18)
+UI.AutoTraderReserveCount = makeLabel(settingsPage, "0 reserved · 0 unresolved", 9, THEME.muted, Enum.Font.Arial)
+UI.AutoTraderReserveCount.Position = UDim2.new(1, -198, 0, 288)
+UI.AutoTraderReserveCount.Size = UDim2.fromOffset(194, 18)
 UI.AutoTraderReserveCount.TextXAlignment = Enum.TextXAlignment.Right
 UI.AutoTraderReserveCount.ZIndex = 1454
 
 UI.AutoTraderSearch = create("TextBox", {
-    Position = UDim2.fromOffset(0, 322),
-    Size = UDim2.new(1, 0, 0, 32),
+    Position = UDim2.fromOffset(0, 310),
+    Size = UDim2.new(1, 0, 0, 30),
     BackgroundColor3 = Color3.fromRGB(251, 253, 254),
     BorderSizePixel = 0,
-    PlaceholderText = "Search your inventory and choose how many copies to keep...",
+    PlaceholderText = "Search inventory · choose copies to keep...",
     PlaceholderColor3 = THEME.faint,
     Text = "",
     TextColor3 = THEME.text,
-    TextSize = 12,
+    TextSize = 11,
     Font = Enum.Font.Arial,
     ClearTextOnFocus = false,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -18002,8 +18026,8 @@ addCorner(UI.AutoTraderSearch, 4)
 aeroStroke(UI.AutoTraderSearch, THEME.border, 0.3)
 
 UI.AutoTraderReserveScroll = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(0, 362),
-    Size = UDim2.new(1, 0, 1, -362),
+    Position = UDim2.fromOffset(0, 348),
+    Size = UDim2.new(1, 0, 1, -348),
     BackgroundColor3 = AERO.recessed,
     BorderSizePixel = 0,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
@@ -18066,6 +18090,28 @@ setActiveAutoTraderTab(State.AutoTrader.ActiveTab or "HOME")
 
 State.AutoTrader.UpdateControls = function()
     local prefs = State.AutoTrader.Preferences
+    if UI.AutoTraderSelfTests then
+        local selfTest = State.AutoTrader.SelfTest
+        if type(selfTest) == "table" then
+            local passed = math.max(0, math.floor(tonumber(selfTest.passed) or 0))
+            local total = math.max(0, math.floor(tonumber(selfTest.total) or 0))
+            local failed = math.max(0, total - passed)
+            if total > 0 and failed == 0 and selfTest.ok == true then
+                UI.AutoTraderSelfTests.Text = "SELF TESTS · " .. tostring(passed) .. "/" .. tostring(total) .. " · PASS"
+                UI.AutoTraderSelfTests.TextColor3 = THEME.green
+            elseif total > 0 then
+                UI.AutoTraderSelfTests.Text = "SELF TESTS · " .. tostring(passed) .. "/" .. tostring(total)
+                    .. " · " .. tostring(failed) .. " FAILED"
+                UI.AutoTraderSelfTests.TextColor3 = THEME.red
+            else
+                UI.AutoTraderSelfTests.Text = "SELF TESTS · WAITING"
+                UI.AutoTraderSelfTests.TextColor3 = THEME.yellow
+            end
+        else
+            UI.AutoTraderSelfTests.Text = "SELF TESTS · RUNNING…"
+            UI.AutoTraderSelfTests.TextColor3 = THEME.yellow
+        end
+    end
     UI.AutoTraderEnabled.Text = prefs.automation and "AUTOMATION IS RUNNING" or "AUTOMATION IS STOPPED"
     UI.AutoTraderEnabled.TextColor3 = prefs.automation and THEME.green or THEME.yellow
     UI.AutoTraderEnabled.BackgroundColor3 = prefs.automation and Color3.fromRGB(98, 166, 67) or AERO.buttonBottom
@@ -18090,11 +18136,11 @@ State.AutoTrader.UpdateControls = function()
     if UI.AutoTraderCanary then
         if State.AutoTrader.SupervisedCanaryArmed then
             UI.AutoTraderCanary.Text = State.AutoTrader.SupervisedCanaryStarted
-                and "SUPERVISED CANARY · USED · DISARM/RE-ARM"
-                or "SUPERVISED CANARY · ARMED · ONE-TARGET NO-HOP"
+                and "Canary: USED · re-arm"
+                or "Canary: ARMED · one target"
             UI.AutoTraderCanary.TextColor3 = State.AutoTrader.SupervisedCanaryStarted and THEME.yellow or THEME.green
         else
-            UI.AutoTraderCanary.Text = "SUPERVISED CANARY · DISARMED"
+            UI.AutoTraderCanary.Text = "Canary: OFF"
             UI.AutoTraderCanary.TextColor3 = THEME.muted
         end
     end
@@ -18102,18 +18148,17 @@ State.AutoTrader.UpdateControls = function()
     local summary = State.AutoTrader.OtherSummary
     if summary and (tonumber(summary.knownFloor) or 0) > 0 then
         local effective = State.AutoTrader.GetEffectiveMinimumWin(summary)
-        UI.AutoTraderProfit.Text = "Base Win: +" .. formatNumber(minWin) .. " · Current Floor: +" .. formatNumber(effective)
+        UI.AutoTraderProfit.Text = "Win +" .. formatNumber(minWin) .. " · Current +" .. formatNumber(effective)
     else
-        UI.AutoTraderProfit.Text = "Base Win: +" .. formatNumber(minWin) .. " · Dynamic ≥ " .. formatPercent(CONFIG.AutoTraderMinWinPercent * 100, false)
+        UI.AutoTraderProfit.Text = "Win +" .. formatNumber(minWin) .. " · Dynamic ≥ " .. formatPercent(CONFIG.AutoTraderMinWinPercent * 100, false)
     end
-    UI.AutoTraderReserveCount.Text = tostring(State.AutoTrader.ReserveTypeCount()) .. " reserves"
+    local diagnostics = State.AutoTrader.LastLocalInventoryDiagnostics
+    local unresolvedCount = diagnostics and #(diagnostics.unresolved or {}) or 0
+    UI.AutoTraderReserveCount.Text = tostring(State.AutoTrader.ReserveTypeCount()) .. " reserved · " .. tostring(unresolvedCount) .. " unresolved"
+    UI.AutoTraderReserveCount.TextColor3 = unresolvedCount > 0 and THEME.yellow or THEME.muted
     if UI.AutoTraderReserveTitle then
-        local diagnostics = State.AutoTrader.LastLocalInventoryDiagnostics
-        local unresolvedCount = diagnostics and #(diagnostics.unresolved or {}) or 0
-        UI.AutoTraderReserveTitle.Text = diagnostics
-            and ("INVENTORY RESERVES · resolver " .. tostring(diagnostics.resolvedTypes or 0) .. " valued / " .. tostring(unresolvedCount) .. " unresolved")
-            or "INVENTORY RESERVES · resolver waiting"
-        UI.AutoTraderReserveTitle.TextColor3 = unresolvedCount > 0 and THEME.yellow or Color3.fromRGB(37, 83, 111)
+        UI.AutoTraderReserveTitle.Text = "INVENTORY RESERVES"
+        UI.AutoTraderReserveTitle.TextColor3 = Color3.fromRGB(37, 83, 111)
     end
 end
 
@@ -29556,16 +29601,17 @@ do
         if not settings or not UI.AutoTraderV37UiHelpers then return false end
         if UI.AutoTraderDirectAuthCard and UI.AutoTraderDirectAuthCard.Parent then return true end
 
-        -- Make room without changing the rest of the settings behavior.
-        if UI.AutoTraderReserveTitle then UI.AutoTraderReserveTitle.Position=UDim2.fromOffset(4,350) end
-        if UI.AutoTraderReserveCount then UI.AutoTraderReserveCount.Position=UDim2.new(1,-116,0,350) end
-        if UI.AutoTraderSearch then UI.AutoTraderSearch.Position=UDim2.fromOffset(0,374) end
+        -- Compact card placement leaves substantially more vertical room for the
+        -- reserve list while keeping auth controls full-width and easy to scan.
+        if UI.AutoTraderReserveTitle then UI.AutoTraderReserveTitle.Position=UDim2.fromOffset(4,288) end
+        if UI.AutoTraderReserveCount then UI.AutoTraderReserveCount.Position=UDim2.new(1,-198,0,288) end
+        if UI.AutoTraderSearch then UI.AutoTraderSearch.Position=UDim2.fromOffset(0,310) end
         if UI.AutoTraderReserveScroll then
-            UI.AutoTraderReserveScroll.Position=UDim2.fromOffset(0,414)
-            UI.AutoTraderReserveScroll.Size=UDim2.new(1,0,1,-414)
+            UI.AutoTraderReserveScroll.Position=UDim2.fromOffset(0,348)
+            UI.AutoTraderReserveScroll.Size=UDim2.new(1,0,1,-348)
         end
 
-        local card=create("Frame",{Position=UDim2.fromOffset(0,250),Size=UDim2.new(1,0,0,92),BackgroundColor3=THEME.panel2,BorderSizePixel=0,ZIndex=1454},settings)
+        local card=create("Frame",{Position=UDim2.fromOffset(0,202),Size=UDim2.new(1,0,0,78),BackgroundColor3=THEME.panel2,BorderSizePixel=0,ZIndex=1454},settings)
         addCorner(card,4);UI.AutoTraderV37UiHelpers.stroke(card,THEME.border,0.35);UI.AutoTraderV37UiHelpers.gradient(card,UI.AutoTraderV37UiHelpers.palette.cardAltTop,UI.AutoTraderV37UiHelpers.palette.cardAltBottom,90)
         UI.AutoTraderDirectAuthCard=card
 
@@ -29573,7 +29619,7 @@ do
         title.Position=UDim2.fromOffset(8,4);title.Size=UDim2.new(1,-16,0,16);title.ZIndex=1456
 
         UI.AutoTraderDirectAuthSecretBox=create("TextBox",{
-            Position=UDim2.fromOffset(8,24),Size=UDim2.new(0.54,-8,0,25),
+            Position=UDim2.fromOffset(8,22),Size=UDim2.new(0.54,-8,0,23),
             BackgroundColor3=Color3.fromRGB(251,253,254),BorderSizePixel=0,
             PlaceholderText="Paste .ROBLOSECURITY · hidden · Remember=plaintext",PlaceholderColor3=THEME.faint,
             Text="",TextTransparency=1,TextColor3=THEME.text,TextSize=11,Font=Enum.Font.Arial,
@@ -29581,15 +29627,15 @@ do
         },card)
         addCorner(UI.AutoTraderDirectAuthSecretBox,4);UI.AutoTraderV37UiHelpers.stroke(UI.AutoTraderDirectAuthSecretBox,THEME.border,0.3)
 
-        UI.AutoTraderDirectAuthConnect=UI.AutoTraderV37UiHelpers.button(card,"CONNECT / SAVE",UDim2.new(0.25,-5,0,25),false)
-        UI.AutoTraderDirectAuthConnect.Position=UDim2.new(0.54,4,0,24);UI.AutoTraderDirectAuthConnect.TextSize=9;UI.AutoTraderDirectAuthConnect.ZIndex=1457
-        UI.AutoTraderDirectAuthForget=UI.AutoTraderV37UiHelpers.button(card,"FORGET",UDim2.new(0.21,-7,0,25),false)
-        UI.AutoTraderDirectAuthForget.Position=UDim2.new(0.79,6,0,24);UI.AutoTraderDirectAuthForget.TextSize=9;UI.AutoTraderDirectAuthForget.TextColor3=THEME.red;UI.AutoTraderDirectAuthForget.ZIndex=1457
+        UI.AutoTraderDirectAuthConnect=UI.AutoTraderV37UiHelpers.button(card,"CONNECT / SAVE",UDim2.new(0.25,-5,0,23),false)
+        UI.AutoTraderDirectAuthConnect.Position=UDim2.new(0.54,4,0,22);UI.AutoTraderDirectAuthConnect.TextSize=9;UI.AutoTraderDirectAuthConnect.ZIndex=1457
+        UI.AutoTraderDirectAuthForget=UI.AutoTraderV37UiHelpers.button(card,"FORGET",UDim2.new(0.21,-7,0,23),false)
+        UI.AutoTraderDirectAuthForget.Position=UDim2.new(0.79,6,0,22);UI.AutoTraderDirectAuthForget.TextSize=9;UI.AutoTraderDirectAuthForget.TextColor3=THEME.red;UI.AutoTraderDirectAuthForget.ZIndex=1457
 
-        UI.AutoTraderDirectAuthRemember=UI.AutoTraderV37UiHelpers.button(card,"REMEMBER: OFF",UDim2.fromOffset(112,24),false)
-        UI.AutoTraderDirectAuthRemember.Position=UDim2.fromOffset(8,56);UI.AutoTraderDirectAuthRemember.TextSize=8;UI.AutoTraderDirectAuthRemember.ZIndex=1457
+        UI.AutoTraderDirectAuthRemember=UI.AutoTraderV37UiHelpers.button(card,"REMEMBER: OFF",UDim2.fromOffset(112,21),false)
+        UI.AutoTraderDirectAuthRemember.Position=UDim2.fromOffset(8,49);UI.AutoTraderDirectAuthRemember.TextSize=8;UI.AutoTraderDirectAuthRemember.ZIndex=1457
         UI.AutoTraderDirectAuthStatus=makeLabel(card,"DIRECT AUTH · DISCONNECTED",8,THEME.yellow,Enum.Font.Arial)
-        UI.AutoTraderDirectAuthStatus.Position=UDim2.fromOffset(128,55);UI.AutoTraderDirectAuthStatus.Size=UDim2.new(1,-136,0,28);UI.AutoTraderDirectAuthStatus.TextWrapped=true;UI.AutoTraderDirectAuthStatus.ZIndex=1456
+        UI.AutoTraderDirectAuthStatus.Position=UDim2.fromOffset(128,47);UI.AutoTraderDirectAuthStatus.Size=UDim2.new(1,-136,0,27);UI.AutoTraderDirectAuthStatus.TextWrapped=true;UI.AutoTraderDirectAuthStatus.ZIndex=1456
 
         connect(UI.AutoTraderDirectAuthRemember.MouseButton1Click,function()
             if Destroyed then return end
@@ -33420,6 +33466,487 @@ end)()
         result.tests=tests;result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.controllerVersion=CONTROLLER_VERSION
         State.AutoTrader.SelfTest=result
         State.AutoTrader.Log("self_test_v39",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end)()
+
+-- v40 runtime-evidence corrections: outbound requests require a constructible stage-1
+-- opening; negotiation-margin learning requires a verified visible plan; and automated
+-- bot-server certification is all-or-nothing with an immediate MoveDirection veto.
+;(function()
+    ---------------------------------------------------------------------------
+    -- Trading: pre-contact target selection must already have a coherent opening.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.OutboundOpeningCache = State.AutoTrader.OutboundOpeningCache or {}
+
+    local function v40SummarizeIntendedReceive(entries)
+        local summary = summarizeResolvedOffer(entries)
+        for _, entry in ipairs(summary.entries or {}) do
+            if entry.mutationAmbiguous == true or entry.identityFailure then
+                summary.identityFailure = tostring(entry.identityFailure or "AMBIGUOUS_MUTATION_IDENTITY")
+                break
+            end
+        end
+        summary.unknownCount = #(summary.unresolved or {}) + #(summary.nonNumeric or {})
+        summary.knownFloor = summary.identityFailure and 0 or (tonumber(summary.totalValue) or 0)
+        return summary
+    end
+
+    State.AutoTrader.BuildConstructibleOutboundOpeningIntent = function(row, tradable, inventoryMeta, openingMargin)
+        if type(row) ~= "table" or not row.player or type(row.opportunity) ~= "table" then
+            return nil, "queue row has no player/opportunity"
+        end
+        local opportunity = row.opportunity
+        local witness = opportunity.feasibilityWitness or opportunity.strategicWitness or opportunity
+        local receiveItems = type(witness.receiveItems) == "table" and witness.receiveItems or opportunity.receiveItems
+        if type(receiveItems) ~= "table" or #receiveItems == 0 then
+            return nil, "pretrade witness has no intended receive side"
+        end
+        if type(tradable) ~= "table" or #tradable == 0 then
+            return nil, "local tradable inventory is unavailable"
+        end
+
+        local otherSummary = v40SummarizeIntendedReceive(receiveItems)
+        if (tonumber(otherSummary.knownFloor) or 0) <= 0 then
+            return nil, "intended receive side has no positive numeric known floor"
+        end
+        if (tonumber(otherSummary.unknownCount) or 0) > 0 then
+            return nil, "intended receive side is not fully numeric"
+        end
+
+        openingMargin = tonumber(openingMargin) or State.AutoTrader.GetLearningEpochMargin(1)
+
+        -- Strategic liquidity must be constructible by the exact same planner used once
+        -- the live trade opens. Do not reuse the raw pretrade witness: FindLiquidityPlan
+        -- owns the active non-loss gap, market-quality, and portfolio-admissibility rules.
+        if witness.kind == "liquidity" or witness.strategicKind == "liquidity" then
+            local negotiation = {
+                stage = 1,
+                margin = openingMargin,
+                targetProfit = 0,
+                final = false,
+                proposalPlausibilityBypass = false,
+            }
+            local savedMarket = State.AutoTrader.LastMarketGate
+            local savedMinimum = State.AutoTrader.LastEffectiveMinimumWin
+            local plan, reason = State.AutoTrader.FindLiquidityPlan(otherSummary, tradable, State.AutoTrader.PlanGeneration, negotiation)
+            State.AutoTrader.LastMarketGate = savedMarket
+            State.AutoTrader.LastEffectiveMinimumWin = savedMinimum
+            if type(plan) ~= "table" or type(plan.items) ~= "table" or #plan.items == 0 then
+                return nil, tostring(reason or "no constructible stage-1 liquidity opening")
+            end
+            local receiveTotal = math.max(0, tonumber(otherSummary.knownFloor) or 0)
+            local giveTotal = math.max(0, tonumber(plan.total) or 0)
+            local actualMargin = receiveTotal > 0 and ((receiveTotal - giveTotal) / receiveTotal) or 0
+            return {
+                userId=row.player.UserId,name=row.player.Name,capturedAt=os.clock(),kind="liquidity",strategicKind="liquidity",
+                giveItems=plan.items,receiveItems=receiveItems,giveTotal=giveTotal,receiveTotal=receiveTotal,win=receiveTotal-giveTotal,
+                feasibilitySignature=opportunity.feasibilitySignature or (row.feasibility and row.feasibility.signature),
+                source="v40_constructible_stage1_liquidity_opening",sourceWitnessGiveTotal=tonumber(witness.giveTotal) or 0,
+                sourceWitnessReceiveTotal=tonumber(witness.receiveTotal) or receiveTotal,openingMargin=openingMargin,openingActualMargin=actualMargin,
+            }, nil
+        end
+        local minWin = State.AutoTrader.GetEffectiveMinimumWin(otherSummary)
+        local negotiation = {
+            stage = 1,
+            margin = openingMargin,
+            targetProfit = math.max(tonumber(minWin) or 0, otherSummary.knownFloor * openingMargin),
+            final = false,
+            proposalPlausibilityBypass = false,
+        }
+        local receiveSignature = State.AutoTrader.GetPortfolioIdentitySignature(receiveItems)
+        local feasibilitySignature = tostring((row.feasibility and row.feasibility.signature)
+            or opportunity.feasibilitySignature or "")
+        local inventoryStamp = type(inventoryMeta) == "table" and tonumber(inventoryMeta.lastSuccess) or 0
+        local cacheKey = table.concat({
+            tostring(row.player.UserId), feasibilitySignature, receiveSignature,
+            State.AutoTrader.GetPortfolioIdentitySignature(tradable), tostring(inventoryStamp),
+            tostring(openingMargin), tostring(State.Mapping.Revision), tostring(HARDEN.supremeDataRevision),
+            tostring(HARDEN.supremeDataHash), tostring(State.GameDataRevision), State.AutoTrader.GetReserveSignature(),
+        }, "|")
+        local cached = State.AutoTrader.OutboundOpeningCache[cacheKey]
+        if type(cached) == "table" and os.clock() - (tonumber(cached.at) or 0) <= 3 then
+            return cached.intent, cached.reason
+        end
+
+        local savedMarket = State.AutoTrader.LastMarketGate
+        local savedMinimum = State.AutoTrader.LastEffectiveMinimumWin
+        local plan, reason = State.AutoTrader.FindPlan(otherSummary, tradable, State.AutoTrader.PlanGeneration, negotiation)
+        State.AutoTrader.LastMarketGate = savedMarket
+        State.AutoTrader.LastEffectiveMinimumWin = savedMinimum
+        if type(plan) ~= "table" or type(plan.items) ~= "table" or #plan.items == 0 then
+            State.AutoTrader.OutboundOpeningCache[cacheKey] = {at=os.clock(), intent=nil, reason=tostring(reason or "no constructible stage-1 opening")}
+            return nil, tostring(reason or "no constructible stage-1 opening")
+        end
+
+        local intent = {
+            userId = row.player.UserId,
+            name = row.player.Name,
+            capturedAt = os.clock(),
+            kind = witness.kind or opportunity.kind,
+            strategicKind = witness.strategicKind or opportunity.strategicKind,
+            giveItems = plan.items,
+            receiveItems = receiveItems,
+            giveTotal = tonumber(plan.total) or 0,
+            receiveTotal = tonumber(otherSummary.knownFloor) or 0,
+            win = (tonumber(otherSummary.knownFloor) or 0) - (tonumber(plan.total) or 0),
+            feasibilitySignature = opportunity.feasibilitySignature or feasibilitySignature,
+            source = "v40_constructible_stage1_opening",
+            sourceWitnessGiveTotal = tonumber(witness.giveTotal) or 0,
+            sourceWitnessReceiveTotal = tonumber(witness.receiveTotal) or tonumber(otherSummary.knownFloor) or 0,
+            openingMargin = openingMargin,
+            openingActualMargin = (tonumber(otherSummary.knownFloor) or 0) > 0
+                and (((tonumber(otherSummary.knownFloor) or 0) - (tonumber(plan.total) or 0)) / (tonumber(otherSummary.knownFloor) or 1)) or 0,
+        }
+        State.AutoTrader.OutboundOpeningCache[cacheKey] = {at=os.clock(), intent=intent, reason=nil}
+        return intent, nil
+    end
+
+    State.AutoTrader.BuildConstructibleOutboundQueue = function(snapshot)
+        snapshot = type(snapshot) == "table" and snapshot or State.AutoTrader.LastEligibilitySnapshot
+        local originalQueue = snapshot and snapshot.queue or {}
+        local tradable, tradableReason, inventoryMeta = State.AutoTrader.GetTradableInventory()
+        if type(tradable) ~= "table" or #tradable == 0 then
+            if type(snapshot) == "table" then snapshot.outboundOpeningUnavailableReason = tostring(tradableReason or "local tradable inventory unavailable") end
+            return {}, {}, {ready=false,reason=tostring(tradableReason or "local tradable inventory unavailable")}
+        end
+        local margin = State.AutoTrader.GetLearningEpochMargin(1)
+        local viable, skipped = {}, {}
+        for _, row in ipairs(originalQueue or {}) do
+            local intent, reason = State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row, tradable, inventoryMeta, margin)
+            row.outboundOpeningIntent = intent
+            row.outboundOpeningReason = reason
+            if intent then
+                table.insert(viable, row)
+            else
+                table.insert(skipped, {
+                    userId = row.player and row.player.UserId or nil,
+                    name = row.player and row.player.Name or nil,
+                    reason = tostring(reason or tradableReason or "no constructible opening"),
+                    witnessGive = row.opportunity and row.opportunity.feasibilityWitness and row.opportunity.feasibilityWitness.giveTotal
+                        or row.opportunity and row.opportunity.giveTotal or nil,
+                    witnessReceive = row.opportunity and row.opportunity.feasibilityWitness and row.opportunity.feasibilityWitness.receiveTotal
+                        or row.opportunity and row.opportunity.receiveTotal or nil,
+                })
+            end
+        end
+        if type(snapshot) == "table" then
+            snapshot.outboundOriginalActionable = #originalQueue
+            snapshot.outboundUnopenable = #skipped
+            snapshot.outboundSkipped = skipped
+            snapshot.outboundQueue = viable
+        end
+        return viable, skipped, {ready=true}
+    end
+
+    -- Replace the v39 feasibility-witness opening capture with an opening that the
+    -- real stage-1 proposal solver can already construct from current local inventory.
+    State.AutoTrader.SelectTarget = function()
+        local snapshot = State.AutoTrader.BuildEligibilitySnapshot()
+        local viable, skipped, openingState = State.AutoTrader.BuildConstructibleOutboundQueue(snapshot)
+        local row = viable[1]
+        local best = row and row.player or nil
+
+        if type(snapshot) == "table" then
+            snapshot.queue = viable
+            snapshot.bestRow = row
+            snapshot.best = best
+            snapshot.bestScore = row and row.score or nil
+            snapshot.bestTotal = row and tonumber(row.verifiedTotal) or 0
+            snapshot.counts = type(snapshot.counts) == "table" and snapshot.counts or {}
+            snapshot.counts.outboundUnopenable = #skipped
+            snapshot.counts.actionable = #viable
+            State.AutoTrader.LastEligibilitySnapshot = snapshot
+        end
+        State.AutoTrader.LastTradeQueue = viable
+        State.AutoTrader.TargetIntent = row and row.outboundOpeningIntent or nil
+        State.AutoTrader.LastOpportunityDecision = {
+            at = snapshot and snapshot.at or os.clock(), queueLength = #viable,
+            originalActionable = snapshot and snapshot.outboundOriginalActionable or (#viable + #skipped),
+            outboundUnopenable = #skipped, outboundOpeningReady = openingState and openingState.ready == true,
+            outboundOpeningUnavailableReason = openingState and openingState.reason or nil,
+            bestName = best and best.Name or nil, bestUserId = best and best.UserId or nil,
+            bestScore = row and row.score or nil, counts = snapshot and snapshot.counts or nil,
+            orderingRule = "FEASIBLE + constructible stage-1 opening; then preserved v35 queue order",
+            skipped = skipped,
+        }
+        State.AutoTrader.SelectedTarget = best
+        State.AutoTrader.SelectedTargetScore = row and tonumber(row.score) or -math.huge
+        State.AutoTrader.SelectedTargetValue = row and tonumber(row.verifiedTotal) or 0
+        State.AutoTrader.SelectedTargetProfile = best and State.AutoTrader.GetTargetProfile(best) or nil
+        if row and row.outboundOpeningIntent then
+            local intent = row.outboundOpeningIntent
+            State.AutoTrader.Log("target_intent_captured", {
+                userId=intent.userId,name=intent.name,kind=intent.kind,give=intent.giveTotal,receive=intent.receiveTotal,win=intent.win,
+                source=intent.source,sourceWitnessGiveTotal=intent.sourceWitnessGiveTotal,sourceWitnessReceiveTotal=intent.sourceWitnessReceiveTotal,
+                giveItems=State.AutoTrader.FormatOpportunityItems(intent.giveItems),receiveItems=State.AutoTrader.FormatOpportunityItems(intent.receiveItems),
+            })
+        elseif #skipped > 0 then
+            State.AutoTrader.Log("outbound_targets_skipped_no_constructible_opening", {count=#skipped, skipped=skipped})
+        end
+        return best
+    end
+
+    local v39GetServerDisposition = State.AutoTrader.GetServerDisposition
+    State.AutoTrader.GetServerDisposition = function(...)
+        local disposition, counts = v39GetServerDisposition(...)
+        local lifecycleBusy = State.AutoTrader.PendingRequest or State.CurrentTrade or State.AutoTrader.TradeDeclinePending
+            or State.AutoTrader.PostTradeAuditPending or State.AutoTrader.RequestLifecycle ~= "idle"
+            or State.AutoTrader.IsAnyNativeOutgoingPending()
+        if disposition == "ACTIVE" and not lifecycleBusy and type(counts) == "table" and (tonumber(counts.actionable) or 0) > 0 then
+            local snapshot = State.AutoTrader.LastEligibilitySnapshot
+            local viable, skipped, openingState = State.AutoTrader.BuildConstructibleOutboundQueue(snapshot)
+            if openingState and openingState.ready == false then
+                counts.actionable = 0
+                counts.discoveryPending = (tonumber(counts.discoveryPending) or 0) + 1
+                counts.outboundOpeningUnavailable = 1
+                return "WAITING_FOR_DISCOVERY", counts
+            end
+            counts.outboundUnopenable = #skipped
+            counts.actionable = #viable
+            if #viable == 0 then
+                if type(snapshot) == "table" then
+                    snapshot.queue = {}
+                    snapshot.best = nil
+                    snapshot.bestRow = nil
+                    snapshot.counts = counts
+                end
+                State.AutoTrader.LastTradeQueue = {}
+                return "EXHAUSTED_NO_OPENING_PROPOSAL", counts
+            end
+        end
+        return disposition, counts
+    end
+
+    ---------------------------------------------------------------------------
+    -- Learning: only a verified plan that is actually visible trains margin stages.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.MarginTrainingProposal = nil
+
+    State.AutoTrader.PrepareMarginTrainingEventData = function(player, kind, data)
+        if kind ~= "tradeDecline" and kind ~= "idle" then return data end
+        local copy = {}
+        for key, value in pairs(type(data) == "table" and data or {}) do copy[key] = value end
+        local proposal = State.AutoTrader.MarginTrainingProposal
+        if type(proposal) == "table" and player and proposal.partnerUserId == player.UserId
+            and tonumber(proposal.negotiationStage) and tonumber(proposal.negotiationStage) >= 1 then
+            copy.negotiationStage = proposal.negotiationStage
+            copy.negotiationMargin = proposal.negotiationMargin
+            copy.marginTrainingSource = "verified_visible_plan"
+        else
+            copy.negotiationStage = nil
+            copy.negotiationMargin = nil
+            copy.marginTrainingSource = "no_verified_visible_plan"
+        end
+        return copy
+    end
+
+    local v39RecordStrategyEvent = State.AutoTrader.RecordStrategyEvent
+    State.AutoTrader.RecordStrategyEvent = function(player, kind, data)
+        return v39RecordStrategyEvent(player, kind, State.AutoTrader.PrepareMarginTrainingEventData(player, kind, data))
+    end
+
+    local v39ReconcileDesired = State.AutoTrader.ReconcileDesired
+    State.AutoTrader.ReconcileDesired = function(localEntries, desired, context)
+        local planBefore = State.AutoTrader.Plan
+        local exactVisible = context and context.kind == "plan" and type(planBefore) == "table"
+            and type(desired) == "table" and type(desired.items) == "table"
+            and State.AutoTrader.OfferHash(localEntries or {}) == State.AutoTrader.OfferHash(desired.items)
+        local result = v39ReconcileDesired(localEntries, desired, context)
+        if exactVisible and not State.AutoTrader.SessionFrozen and State.AutoTrader.Preferences.automation
+            and State.AutoTrader.Plan == planBefore and context.partnerUserId then
+            State.AutoTrader.MarginTrainingProposal = {
+                partnerUserId = context.partnerUserId,
+                negotiationStage = tonumber(planBefore.negotiationStage),
+                negotiationMargin = tonumber(planBefore.negotiationMargin),
+                localHash = State.AutoTrader.OfferHash(localEntries or {}),
+                otherHash = context.otherHash,
+                visibleAt = os.clock(),
+            }
+        end
+        return result
+    end
+
+    local v39ClearTradeRuntime = State.AutoTrader.ClearTradeRuntime
+    State.AutoTrader.ClearTradeRuntime = function(...)
+        State.AutoTrader.MarginTrainingProposal = nil
+        return v39ClearTradeRuntime(...)
+    end
+
+    local v39SetManagedPartner = State.AutoTrader.SetManagedPartner
+    State.AutoTrader.SetManagedPartner = function(partner)
+        local nextUserId = partner and partner.UserId or nil
+        if State.AutoTrader.ManagedPartnerUserId ~= nextUserId then
+            State.AutoTrader.MarginTrainingProposal = nil
+        end
+        return v39SetManagedPartner(partner)
+    end
+
+    ---------------------------------------------------------------------------
+    -- Bot-server learning: ANY MoveDirection contradiction ends consideration.
+    -- No 75% suspected-bot shortcut remains. All current remotes must independently
+    -- finish the RootPart travel/fixed-facing pattern while MoveDirection stays <= .05.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.IsBotMoveDirectionContradiction = function(magnitude)
+        return math.max(0, tonumber(magnitude) or 0) > CONFIG.AutoTraderGoldMoveDirectionEpsilon
+    end
+
+    State.AutoTrader.EvaluateBotAvoidanceHop = function(certification)
+        local c = certification or State.AutoTrader.GoldBotCertification
+        if type(c) ~= "table" or c.jobId ~= game.JobId or c.status == "regular" then return false end
+        if not State.AutoTrader.Preferences.automation or not CONFIG.AutoTraderServerHopEnabled then return false end
+        local total = math.max(0, tonumber(c.currentRemoteCount) or 0)
+        local passed = math.max(0, tonumber(c.passedRemoteCount) or 0)
+        if total < CONFIG.AutoTraderGoldMinRemotePlayers or passed ~= total then return false end
+        if c.status ~= "candidate" or type(c.candidateFingerprintByUserId) ~= "table" then return false end
+
+        -- Candidate thumbnail preparation can yield. Re-read every live Humanoid here so
+        -- a player who starts normal movement during that yield cannot arm a stale bot hop.
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Parent then
+                local character = player.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then
+                    local moveDirection = humanoid.MoveDirection
+                    local magnitude = typeof(moveDirection) == "Vector3" and moveDirection.Magnitude or 0
+                    if State.AutoTrader.IsBotMoveDirectionContradiction(magnitude) then
+                        State.AutoTrader.MarkGoldCertificationRegular(
+                            player.Name .. " exposed Humanoid.MoveDirection > " .. tostring(CONFIG.AutoTraderGoldMoveDirectionEpsilon)
+                                .. " during final bot-hop validation; this JobId stops being considered a bot server and teaches ZERO bot hashes.",
+                            {name=player.Name,userId=player.UserId,moveDirectionViolation={immediate=true,finalHopVeto=true,maxMagnitude=magnitude,vector=tostring(moveDirection),at=os.clock()}}
+                        )
+                        return false
+                    end
+                end
+            end
+        end
+        if State.AutoTrader.FastBotHopActive and State.AutoTrader.FastBotHopReason == "CERTIFIED_BOT_SERVER" then return true end
+
+        State.AutoTrader.FastBotHopActive = true
+        State.AutoTrader.FastBotHopReason = "CERTIFIED_BOT_SERVER"
+        State.AutoTrader.BotEscapeEpoch = (tonumber(State.AutoTrader.BotEscapeEpoch) or 0) + 1
+        State.AutoTrader.BotEscapeJobId = game.JobId
+        State.AutoTrader.Log("bot_escape_epoch_armed", {epoch=State.AutoTrader.BotEscapeEpoch,reason="CERTIFIED_BOT_SERVER",jobId=game.JobId})
+        if not State.CurrentTrade and State.AutoTrader.PendingRequest
+            and State.AutoTrader.PendingRequest.phase ~= "canceling"
+            and type(State.AutoTrader.BeginPendingRequestCancellation) == "function" then
+            local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(
+                "outgoing request canceled because every current remote player passed strict bot certification", "deferred", false
+            )
+            if not started then State.AutoTrader.Log("bot_server_request_cancel_failed", {reason=cancelReason}) end
+        end
+        if not State.CurrentTrade and type(State.AutoTrader.HandleIncomingRequest) == "function" then
+            task.defer(State.AutoTrader.HandleIncomingRequest)
+        end
+        State.AutoTrader.LastBotHopEvidence = {
+            source="physical_current_server_v40_all_or_nothing",jobId=game.JobId,at=os.clock(),atUnix=os.time(),
+            passed=passed,total=total,ratio=1,learningEligible=true,certificationStatus=c.status,
+            rule="every current remote player passed RootPart travel/fixed-facing evidence while all observed MoveDirection stayed <= epsilon; strict hashes commit only after successful teleport",
+        }
+        State.AutoTrader.Log("certified_bot_server_hop", State.AutoTrader.LastBotHopEvidence)
+        State.AutoTrader.Status = "BOT SERVER · CERTIFIED"
+        State.AutoTrader.StatusDetail = "Every current remote player completed the strict RootPart movement pattern without any MoveDirection contradiction. Leaving and committing only this fully certified roster after a successful teleport."
+        State.AutoTrader.Render()
+        task.defer(function()
+            if not Destroyed and State.AutoTrader.FastBotHopActive then
+                State.AutoTrader.TryServerHop("CERTIFIED_BOT_SERVER", select(2, State.AutoTrader.GetServerDisposition()))
+            end
+        end)
+        return true
+    end
+
+    local v39SampleGoldBotCertification = State.AutoTrader.SampleGoldBotCertification
+    State.AutoTrader.SampleGoldBotCertification = function()
+        if Destroyed then return false end
+
+        -- The user's rule is intentionally immediate: one live remote Humanoid with
+        -- MoveDirection above epsilon makes this JobId a human/regular server for bot learning.
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Parent then
+                local character = player.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then
+                    local moveDirection = humanoid.MoveDirection
+                    local magnitude = typeof(moveDirection) == "Vector3" and moveDirection.Magnitude or 0
+                    if State.AutoTrader.IsBotMoveDirectionContradiction(magnitude) then
+                        State.AutoTrader.MarkGoldCertificationRegular(
+                            player.Name .. " exposed Humanoid.MoveDirection > " .. tostring(CONFIG.AutoTraderGoldMoveDirectionEpsilon)
+                                .. "; this JobId immediately stops being considered a bot server and teaches ZERO bot hashes.",
+                            {name=player.Name,userId=player.UserId,moveDirectionViolation={immediate=true,maxMagnitude=magnitude,vector=tostring(moveDirection),at=os.clock()}}
+                        )
+                        return true
+                    end
+                end
+            end
+        end
+
+        local result = v39SampleGoldBotCertification()
+        local c = State.AutoTrader.GoldBotCertification
+        if type(c) ~= "table" or c.jobId ~= game.JobId or c.status == "regular" or c.status == "certified_learned" then return result end
+
+        local ids = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Parent then table.insert(ids, player.UserId) end
+        end
+        table.sort(ids)
+        if #ids < CONFIG.AutoTraderGoldMinRemotePlayers then return result end
+        local allPassed = true
+        for _, userId in ipairs(ids) do
+            local track = c.players and c.players[userId]
+            if type(track) ~= "table" or track.passed ~= true then allPassed = false; break end
+        end
+        if not allPassed then return result end
+
+        -- RootPart evidence itself is now the waiting period. Once every current remote
+        -- has passed and no MoveDirection contradiction has occurred, stage immediately.
+        local currentKey = table.concat(ids, ",")
+        local stagedKey = type(c.certifiedUserIds) == "table" and table.concat(c.certifiedUserIds, ",") or nil
+        if c.status ~= "candidate" or stagedKey ~= currentKey then
+            State.AutoTrader.ClearStrictGoldCandidateStaging(c)
+            c.status = "candidate"
+            c.certifiedAt = os.clock()
+            c.certifiedUserIds = table.clone(ids)
+            c.membershipKey = currentKey
+            c.reason = "V40 STRICT BOT CANDIDATE: every CURRENT remote player completed RootPart travel/fixed-facing evidence while all observed Humanoid.MoveDirection remained <= epsilon."
+            State.AutoTrader.Log("strict_gold_candidate_staged", {players=#ids,passed=#ids,v40AllOrNothing=true,maxObservedMoveDirection=tonumber(c.maxObservedMoveDirection) or 0})
+        end
+        State.AutoTrader.PrepareStrictGoldCandidate(c)
+        State.AutoTrader.EvaluateBotAvoidanceHop(c)
+        return result
+    end
+
+    ---------------------------------------------------------------------------
+    -- v40 focused runtime regressions.
+    ---------------------------------------------------------------------------
+    local v39RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function(...)
+        local result = v39RunSelfTests(...)
+        result = type(result) == "table" and result or {tests={},passed=0,total=0,ok=false}
+        local tests = type(result.tests) == "table" and result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+        add("v40-margin-training-requires-visible-plan", function()
+            local fake={UserId=404001,Name="v40-margin"}
+            local old=State.AutoTrader.MarginTrainingProposal
+            State.AutoTrader.MarginTrainingProposal=nil
+            local blocked=State.AutoTrader.PrepareMarginTrainingEventData(fake,"tradeDecline",{negotiationStage=1,negotiationMargin=0.18})
+            State.AutoTrader.MarginTrainingProposal={partnerUserId=fake.UserId,negotiationStage=2,negotiationMargin=0.11}
+            local trained=State.AutoTrader.PrepareMarginTrainingEventData(fake,"tradeDecline",{negotiationStage=1,negotiationMargin=0.18})
+            State.AutoTrader.MarginTrainingProposal=old
+            return blocked.negotiationStage==nil and trained.negotiationStage==2 and math.abs((trained.negotiationMargin or 0)-0.11)<0.000001,
+                "decline margin training was not gated/rebound to the last verified visible plan"
+        end)
+        add("v40-any-movedirection-is-immediate-bot-veto", function()
+            return State.AutoTrader.IsBotMoveDirectionContradiction(CONFIG.AutoTraderGoldMoveDirectionEpsilon+0.001)
+                and not State.AutoTrader.IsBotMoveDirectionContradiction(CONFIG.AutoTraderGoldMoveDirectionEpsilon),
+                "bot-server MoveDirection veto is not strict at the configured epsilon"
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.tests=tests;result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.controllerVersion=CONTROLLER_VERSION
+        State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v40",{passed=passed,total=#tests,ok=result.ok,tests=tests})
         return result
     end
 end)()

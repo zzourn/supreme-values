@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.37-public-auto-trader-v40-runtime-evidence-corrections",
+    version = "18.69.39-public-auto-trader-v41-expanded-selftests",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -302,7 +302,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "0d078a2ef42da2884a34210b28410277854bebe4c150c38b2f1d1a74abac9655",
+    distributionNormalizedSha256 = "2452bc2f6316bfd1702b1041128426a26af4107d4e163a114f9e35f32c0c1bfd",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -7484,6 +7484,9 @@ State.AutoTrader.Preferences = normalizePreferences(loadedPreferences)
 local AutoPrefs = State.AutoTrader.Preferences
 do
     local bootstrap = State.AutoTrader.TeleportBootstrap
+    local teleportAutomationCarry = type(bootstrap) == "table"
+        and type(bootstrap.preferences) == "table"
+        and bootstrap.preferences.automation == true
     if type(bootstrap) == "table" and type(bootstrap.preferences) == "table" then
         local merged = {}
         for k,v in pairs(AutoPrefs) do merged[k] = v end
@@ -7493,6 +7496,11 @@ do
         State.AutoTrader.Preferences = normalizePreferences(merged)
         AutoPrefs = State.AutoTrader.Preferences
     end
+    -- AUTO is session/teleport state, never a manual-launch preference. A normal
+    -- user execution always starts OFF; only the explicit queue_on_teleport bootstrap
+    -- may carry AUTO=true into the destination server.
+    State.AutoTrader.Preferences.automation = teleportAutomationCarry
+    AutoPrefs = State.AutoTrader.Preferences
     rawset(ExecutorEnvironment, State.AutoTrader.TeleportBootstrapKey, nil)
     rawset(_G, State.AutoTrader.TeleportBootstrapKey, nil)
 end
@@ -7664,11 +7672,11 @@ end
 State.AutoTrader.SavePreferences = function()
     State.AutoTrader.Preferences = normalizePreferences(State.AutoTrader.Preferences)
     AutoPrefs = State.AutoTrader.Preferences
-    local persistedPreferences = State.AutoTrader.Preferences
-    if State.AutoTrader.IsSupervisedCanaryArmed() then
-        persistedPreferences = normalizePreferences(State.AutoTrader.Preferences)
-        persistedPreferences.automation = false
-    end
+    -- Never persist AUTO=true. Automatic continuation across a script-initiated
+    -- teleport is carried only by BuildTeleportBootstrapCode/GetTeleportAutomationCarry.
+    -- This guarantees every manual script execution starts with AUTO off.
+    local persistedPreferences = normalizePreferences(State.AutoTrader.Preferences)
+    persistedPreferences.automation = false
     rawset(_G, State.AutoTrader.PreferencesKey, persistedPreferences)
     local ok, encoded = pcall(function()
         return HttpService:JSONEncode({version = 1, controllerVersion = CONTROLLER_VERSION, preferences = persistedPreferences})
@@ -34182,6 +34190,2684 @@ do
         "trade-recovery"
     )
 end
+
+-- v40 UI polish: plain-English top-center AUTO thought feed.
+-- UI/observability only. It reads existing controller state and never changes
+-- planner, transport, learning, bot classification, mutation, or safety decisions.
+;(function()
+    local FEED_MAX = 4
+    local FEED_Z = 1960
+    State.AutoTrader.ThoughtFeedEntries = type(State.AutoTrader.ThoughtFeedEntries) == "table"
+        and State.AutoTrader.ThoughtFeedEntries or {}
+    State.AutoTrader.ThoughtFeedSerial = tonumber(State.AutoTrader.ThoughtFeedSerial) or 0
+    State.AutoTrader.ThoughtFeedLastKey = State.AutoTrader.ThoughtFeedLastKey
+    State.AutoTrader.ThoughtFeedAutomationWasOn = false
+
+    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent then
+        UI.AutoTraderThoughtFeed:Destroy()
+    end
+    UI.AutoTraderThoughtFeed = create("Frame", {
+        Name = "SV_AutoTraderThoughtFeed",
+        AnchorPoint = Vector2.new(0.5, 0),
+        Position = UDim2.new(0.5, 0, 0, 10),
+        Size = UDim2.fromOffset(660, 150),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Visible = false,
+        Active = false,
+        ZIndex = FEED_Z,
+    }, UI.RootGui)
+
+    local function trimText(value)
+        local s = tostring(value or "")
+        s = s:gsub("[%c]+", " "):gsub("%s+", " ")
+        s = s:gsub("^%s+", ""):gsub("%s+$", "")
+        return s
+    end
+
+    local function itemDisplayName(entry)
+        if type(entry) ~= "table" then return nil end
+        local name = entry.name
+            or (entry.record and entry.record.name)
+            or entry.itemId
+        name = trimText(name)
+        return name ~= "" and name or nil
+    end
+
+    local function itemNames(items, limit)
+        local names, seen = {}, {}
+        limit = math.max(1, math.floor(tonumber(limit) or 3))
+        for _, entry in ipairs(type(items) == "table" and items or {}) do
+            local name = itemDisplayName(entry)
+            if name and not seen[name] then
+                seen[name] = true
+                table.insert(names, name)
+            end
+        end
+        if #names == 0 then return nil end
+        local shown = {}
+        for i = 1, math.min(#names, limit) do shown[i] = names[i] end
+        local text
+        if #shown == 1 then
+            text = shown[1]
+        elseif #shown == 2 then
+            text = shown[1] .. " and " .. shown[2]
+        else
+            text = table.concat(shown, ", ", 1, #shown - 1) .. ", and " .. shown[#shown]
+        end
+        if #names > limit then text = text .. " and " .. tostring(#names - limit) .. " more" end
+        return text
+    end
+
+    local function tween(instance, properties)
+        if not instance or not instance.Parent then return end
+        pcall(function()
+            TweenService:Create(
+                instance,
+                TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                properties
+            ):Play()
+        end)
+    end
+
+    State.AutoTrader.LayoutThoughtFeed = function(immediate)
+        local feed = State.AutoTrader.ThoughtFeedEntries
+        local bottom = 144
+        for index = 1, #feed do
+            local entry = feed[index]
+            local frame = entry and entry.frame
+            local label = entry and entry.label
+            if frame and frame.Parent and label and label.Parent then
+                local age = index - 1
+                local height = math.max(22, 38 - age * 4)
+                local width = math.max(390, 620 - age * 52)
+                local y = bottom - height
+                local bgTransparency = math.min(0.90, 0.10 + age * 0.20)
+                local textTransparency = math.min(0.82, age * 0.18)
+                local textSize = math.max(10, 16 - age * 2)
+                local targetPosition = UDim2.new(0.5, 0, 0, y)
+                local targetSize = UDim2.fromOffset(width, height)
+                if immediate then
+                    frame.Position = targetPosition
+                    frame.Size = targetSize
+                    frame.BackgroundTransparency = bgTransparency
+                    label.TextTransparency = textTransparency
+                    label.TextSize = textSize
+                    if entry.stroke then entry.stroke.Transparency = math.min(0.95, 0.52 + age * 0.12) end
+                else
+                    tween(frame, {
+                        Position = targetPosition,
+                        Size = targetSize,
+                        BackgroundTransparency = bgTransparency,
+                    })
+                    tween(label, {
+                        TextTransparency = textTransparency,
+                        TextSize = textSize,
+                    })
+                    if entry.stroke then
+                        tween(entry.stroke, {Transparency = math.min(0.95, 0.52 + age * 0.12)})
+                    end
+                end
+                bottom = y - 6
+            end
+        end
+    end
+
+    State.AutoTrader.ClearThoughtFeed = function(immediate)
+        State.AutoTrader.ThoughtFeedLastKey = nil
+        local feed = State.AutoTrader.ThoughtFeedEntries
+        for index = #feed, 1, -1 do
+            local entry = feed[index]
+            local frame = entry and entry.frame
+            local label = entry and entry.label
+            table.remove(feed, index)
+            if frame and frame.Parent then
+                if immediate then
+                    frame:Destroy()
+                else
+                    tween(frame, {BackgroundTransparency = 1})
+                    if label and label.Parent then tween(label, {TextTransparency = 1}) end
+                    task.delay(0.24, function()
+                        if frame and frame.Parent then frame:Destroy() end
+                    end)
+                end
+            end
+        end
+        if UI.AutoTraderThoughtFeed then UI.AutoTraderThoughtFeed.Visible = false end
+    end
+
+    State.AutoTrader.PushThought = function(message, key)
+        if not State.AutoTrader.Preferences.automation then return false end
+        message = trimText(message)
+        if message == "" then return false end
+        key = trimText(key ~= nil and key or message)
+        if State.AutoTrader.ThoughtFeedLastKey == key then return false end
+        State.AutoTrader.ThoughtFeedLastKey = key
+        State.AutoTrader.ThoughtFeedSerial += 1
+        local frame = create("Frame", {
+            Name = "Thought_" .. tostring(State.AutoTrader.ThoughtFeedSerial),
+            AnchorPoint = Vector2.new(0.5, 0),
+            Position = UDim2.new(0.5, 0, 0, 118),
+            Size = UDim2.fromOffset(620, 38),
+            BackgroundColor3 = Color3.fromRGB(8, 15, 22),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Active = false,
+            ZIndex = FEED_Z + 1,
+        }, UI.AutoTraderThoughtFeed)
+        addCorner(frame, 8)
+        local stroke = addStroke(frame, THEME.blue, 1, 1)
+        local label = makeLabel(frame, message, 16, THEME.text, Enum.Font.ArialBold)
+        label.Position = UDim2.fromOffset(12, 2)
+        label.Size = UDim2.new(1, -24, 1, -4)
+        label.TextWrapped = true
+        label.TextXAlignment = Enum.TextXAlignment.Center
+        label.TextYAlignment = Enum.TextYAlignment.Center
+        label.TextTransparency = 1
+        label.ZIndex = FEED_Z + 2
+        table.insert(State.AutoTrader.ThoughtFeedEntries, 1, {
+            frame = frame,
+            label = label,
+            stroke = stroke,
+            key = key,
+        })
+        UI.AutoTraderThoughtFeed.Visible = true
+        while #State.AutoTrader.ThoughtFeedEntries > FEED_MAX do
+            local old = table.remove(State.AutoTrader.ThoughtFeedEntries)
+            if old and old.frame and old.frame.Parent then
+                tween(old.frame, {BackgroundTransparency = 1})
+                if old.label and old.label.Parent then tween(old.label, {TextTransparency = 1}) end
+                task.delay(0.24, function()
+                    if old.frame and old.frame.Parent then old.frame:Destroy() end
+                end)
+            end
+        end
+        State.AutoTrader.LayoutThoughtFeed(false)
+        -- Newest thought fades into the fixed bottom slot while previous thoughts
+        -- simultaneously move upward, shrink, and fade.
+        tween(frame, {BackgroundTransparency = 0.10})
+        tween(label, {TextTransparency = 0})
+        tween(stroke, {Transparency = 0.52})
+        return true
+    end
+
+    local function currentName()
+        local partner = State.AutoTrader.LastTradePartner
+        if partner then return partner.Name, partner.UserId end
+        local pending = State.AutoTrader.PendingRequest
+        if type(pending) == "table" then return pending.name, pending.userId end
+        -- Terminal status text often survives after ClearTradeRuntime clears the
+        -- partner. Prefer that exact just-finished name over a newly selected Q1.
+        local detail = tostring(State.AutoTrader.StatusDetail or "")
+        local parsed = detail:match("^([^·;]+) declined")
+            or detail:match("^([^·;]+) ended the trade")
+            or detail:match("^([^·;]+) timed out")
+        if parsed then return trimText(parsed), nil end
+        local selected = State.AutoTrader.SelectedTarget
+        if selected then return selected.Name, selected.UserId end
+        return nil, nil
+    end
+
+    local function wantedItems()
+        local summary = State.AutoTrader.OtherSummary
+        local live = summary and itemNames(summary.entries, 3)
+        if live then return live end
+        local pending = State.AutoTrader.PendingRequest
+        local intent = State.AutoTrader.ActiveTargetIntent
+            or (type(pending) == "table" and pending.targetIntent)
+            or State.AutoTrader.TargetIntent
+        return intent and itemNames(intent.receiveItems, 3) or nil
+    end
+
+    State.AutoTrader.UpdateThoughtFeedFromState = function()
+        if not State.AutoTrader.Preferences.automation then
+            State.AutoTrader.ThoughtFeedAutomationWasOn = false
+            State.AutoTrader.ClearThoughtFeed(false)
+            return
+        end
+        if not State.AutoTrader.ThoughtFeedAutomationWasOn then
+            State.AutoTrader.ThoughtFeedAutomationWasOn = true
+            State.AutoTrader.PushThought(
+                "Auto trade is on. Looking for a safe trade...",
+                "auto-enabled"
+            )
+        end
+
+        local status = tostring(State.AutoTrader.Status or "")
+        local name, userId = currentName()
+        local who = name or "this player"
+        local wanted = wantedItems()
+        local text, key
+
+        if status:find("BOT SERVER", 1, true) then
+            text = "Everyone here looks automated. Leaving for another server..."
+            key = "bot-server-leave"
+        elseif status == "SERVER EXHAUSTED" then
+            text = "I've checked everyone here. Looking for another server..."
+            key = "server-exhausted"
+        elseif status == "WAIT · DISCOVERY" then
+            text = "Checking everyone's inventories for a good trade..."
+            key = "inventory-discovery"
+        elseif status == "WAIT · FEASIBILITY SEARCH" then
+            text = "Taking a closer look at a few inventories before deciding who to trade..."
+            key = "feasibility-search"
+        elseif status == "WAIT · FRIEND CHECK" then
+            text = name
+                and ("Checking whether " .. name .. " is a friend before trading...")
+                or "Checking friend status before choosing the next trade..."
+            key = "friend-check:" .. tostring(userId or name or "")
+        elseif status == "QUEUE Q1" or status == "REQUEST · ATTEMPTING" then
+            text = "Trying to trade " .. who .. "..."
+            key = "trying-request:" .. tostring(userId or name or "")
+        elseif status == "REQUEST PENDING" then
+            text = "Waiting for " .. who .. " to answer the trade request..."
+            key = "request-pending:" .. tostring(userId or name or "")
+        elseif status == "REQUEST · VERIFYING" then
+            text = "Making sure the trade request to " .. who .. " went through..."
+            key = "request-verifying:" .. tostring(userId or name or "")
+        elseif status == "REQUEST TIMEOUT · CANCELING" then
+            text = who .. " isn't responding to the trade request. Moving on..."
+            key = "request-timeout:" .. tostring(userId or name or "")
+        elseif status == "REQUEST · CLEANING UP" then
+            text = who .. " left. Cleaning up the request, then moving on..."
+            key = "request-cleanup:" .. tostring(userId or name or "")
+        elseif status == "COOLDOWN · DECLINED" then
+            text = who .. " denied the trade. Onto the next person..."
+            key = "request-denied:" .. tostring(userId or name or "")
+        elseif status == "INTENT OPENING" or status == "INTENT OPENING READY" then
+            text = wanted
+                and ("Trying to obtain " .. wanted .. " from " .. who .. "...")
+                or ("Opening a trade with " .. who .. "...")
+            key = "intent-opening:" .. tostring(userId or name or "") .. ":" .. tostring(wanted or "")
+        elseif status == "WAIT · TARGET INTENT" or status == "WAIT · THEIR OFFER" then
+            text = "Waiting for " .. who .. " to make the first offer..."
+            key = "wait-first-offer:" .. tostring(userId or name or "")
+        elseif status == "WAIT · KNOWN VALUE" then
+            text = "Waiting for " .. who .. " to offer something I can value..."
+            key = "wait-known-value:" .. tostring(userId or name or "")
+        elseif status == "CALCULATING" then
+            text = "Looking at " .. who .. "'s offer and figuring out what I can safely give..."
+            key = "calculating:" .. tostring(userId or name or "")
+        elseif status == "PLAN VERIFIED" or status == "NEGOTIATING · HOLDING MARGIN" then
+            text = wanted
+                and ("Trying to obtain " .. wanted .. " from " .. who .. "...")
+                or ("I found a safe offer for " .. who .. ". Waiting to see what they do...")
+            local stage = State.AutoTrader.Plan and State.AutoTrader.Plan.negotiationStage or ""
+            key = "plan:" .. tostring(userId or name or "") .. ":" .. tostring(wanted or "") .. ":" .. tostring(stage)
+        elseif status == "NO SAFE COMBINATION" then
+            text = "I can't make a safe deal with " .. who .. "'s current offer. Waiting for them to change it..."
+            key = "no-safe-plan:" .. tostring(userId or name or "")
+        elseif status == "OFFER READY · AUTO ACCEPT"
+            or status == "AUTO ACCEPT · COOLDOWN"
+            or status:find("AUTO ACCEPTED", 1, true)
+            or status == "AUTO ACCEPT · COMPLETING" then
+            text = who .. "'s offer works. Accepting the trade..."
+            key = "accepting:" .. tostring(userId or name or "")
+        elseif status == "IDLE TRADE · DECLINING" then
+            text = who .. " is unresponsive, ending the trade..."
+            key = "idle-ending:" .. tostring(userId or name or "")
+        elseif status == "COOLDOWN · TRADE ENDED" then
+            text = who .. " ended the trade. Onto the next person..."
+            key = "trade-ended:" .. tostring(userId or name or "")
+        elseif status == "DECLINING · DISALLOWED TRADE" then
+            text = "Ending the trade with " .. who .. " because it isn't eligible for auto trading..."
+            key = "disallowed-ending:" .. tostring(userId or name or "")
+        elseif status == "INCOMING · RESOLVING" or status == "INCOMING · INSPECTING" or status == "INCOMING · CHECKING" then
+            text = who .. " sent a trade request. Checking their inventory..."
+            key = "incoming-check:" .. tostring(userId or name or "")
+        elseif status == "TRADE COMPLETED" or status == "TRADE SETTLEMENT · VERIFYING" or status == "AUDITING TRADE" then
+            text = "The trade finished. Verifying exactly what was exchanged..."
+            key = "verifying-completed-trade"
+        elseif status:find("FROZEN", 1, true) or status:find("SAFETY STOP", 1, true) then
+            text = "Something doesn't look safe. Pausing automated actions..."
+            key = "safety-pause:" .. status
+        elseif status:find("RECOVER", 1, true) or status:find("REJOIN", 1, true) then
+            text = "Something got stuck. Moving to a fresh server so auto trading can continue..."
+            key = "recovery:" .. status
+        end
+
+        if text then State.AutoTrader.PushThought(text, key) end
+    end
+
+    -- Preserve the existing Render implementation and add observability after it.
+    local thoughtFeedRender = State.AutoTrader.Render
+    State.AutoTrader.Render = function(...)
+        local results = table.pack(thoughtFeedRender(...))
+        State.AutoTrader.UpdateThoughtFeedFromState()
+        return table.unpack(results, 1, results.n)
+    end
+
+    -- UpdateControls is called immediately when AUTO is toggled, so this makes
+    -- AUTO OFF an immediate kill fence for the on-screen thought history too.
+    local thoughtFeedUpdateControls = State.AutoTrader.UpdateControls
+    State.AutoTrader.UpdateControls = function(...)
+        local results = table.pack(thoughtFeedUpdateControls(...))
+        if not State.AutoTrader.Preferences.automation then
+            State.AutoTrader.ThoughtFeedAutomationWasOn = false
+            State.AutoTrader.ClearThoughtFeed(false)
+        end
+        return table.unpack(results, 1, results.n)
+    end
+
+    -- The accepted-request moment has no dedicated status string. Surface it
+    -- explicitly before OnTradeState advances into opening/negotiation state.
+    local thoughtFeedOnTradeState = State.AutoTrader.OnTradeState
+    State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, otherEntries)
+        local partner = State.AutoTrader.GetPlayerFromSide(otherSide)
+        local pending = State.AutoTrader.PendingRequest
+        if State.AutoTrader.Preferences.automation
+            and partner
+            and type(pending) == "table"
+            and pending.userId == partner.UserId then
+            State.AutoTrader.PushThought(
+                partner.Name .. " accepted the trade.",
+                "trade-accepted:" .. tostring(partner.UserId) .. ":" .. tostring(pending.correlationId or pending.generation or "")
+            )
+        end
+        return thoughtFeedOnTradeState(localSide, otherSide, localEntries, otherEntries)
+    end
+
+    -- Keep the existing corner success card; also put the completion in the
+    -- chronological thought stream.
+    local thoughtFeedShowSuccess = State.AutoTrader.ShowSuccessNotification
+    State.AutoTrader.ShowSuccessNotification = function(partner, plan, auditText)
+        local result = thoughtFeedShowSuccess(partner, plan, auditText)
+        if State.AutoTrader.Preferences.automation then
+            local who = partner and partner.Name or "the other player"
+            local profit = plan and tonumber(plan.win)
+            State.AutoTrader.PushThought(
+                profit and ("Trade with " .. who .. " completed. Verified profit: +" .. formatCompact(profit) .. ".")
+                    or ("Trade with " .. who .. " completed successfully."),
+                "trade-success:" .. tostring(partner and partner.UserId or who) .. ":" .. tostring(State.AutoTrader.NotificationSerial)
+            )
+        end
+        return result
+    end
+
+    -- If AUTO was restored only through the explicit teleport bootstrap, install
+    -- the feed against whatever state already exists after startup.
+    State.AutoTrader.UpdateThoughtFeedFromState()
+end)()
+
+
+-- v41 self-test expansion: comprehensive catalog integration.
+-- This layer is test-only. It does not change trading, value, bot, transport,
+-- persistence, learning, teleport, or UI decision behavior. Existing tests run
+-- first; catalog tests are appended afterwards with guarded fixtures.
+;(function()
+    local EXPANDED_CATALOG_VERSION = 1
+    local EXPANDED_EXPECTED_ADDITIONS = 569
+
+    local catalog = {
+        {id=1,category=1,ordinal=1,name="selftest-count-matches-registered-tests",purpose="Verifies self-test count matches registered tests.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=2,category=1,ordinal=2,name="selftest-failure-count-is-accurate",purpose="Verifies self-test failure count is accurate.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=3,category=1,ordinal=3,name="selftest-exception-becomes-failure",purpose="Verifies self-test exception becomes failure.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=4,category=1,ordinal=4,name="selftest-mutated-state-restores",purpose="Verifies self-test mutated state restores.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=5,category=1,ordinal=5,name="selftest-failure-does-not-stop-suite",purpose="Verifies self-test failure does not stop suite.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=6,category=2,ordinal=1,name="startup-manual-auto-always-off",purpose="Verifies startup manual auto always off.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=7,category=2,ordinal=2,name="startup-teleport-bootstrap-can-carry-auto",purpose="Verifies startup teleport bootstrap can carry auto.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=8,category=2,ordinal=3,name="startup-waits-for-local-player",purpose="Verifies startup waits for local player.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=9,category=2,ordinal=4,name="startup-waits-for-player-gui",purpose="Verifies startup waits for player GUI.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=10,category=2,ordinal=5,name="startup-initialization-order-stable",purpose="Verifies startup initialization order stable.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=11,category=3,ordinal=1,name="destroy-disconnects-all-connections",purpose="Verifies destroy disconnects all connections.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=12,category=3,ordinal=2,name="destroy-stops-background-workers",purpose="Verifies destroy stops background workers.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=13,category=3,ordinal=3,name="reinjection-destroys-prior-instance",purpose="Verifies reinjection destroys prior instance.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=14,category=3,ordinal=4,name="delayed-callback-after-destroy-is-inert",purpose="Verifies delayed callback after destroy is inert.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=15,category=3,ordinal=5,name="reinjection-does-not-duplicate-remote-listeners",purpose="Verifies reinjection does not duplicate remote listeners.",status="NEW LIVE-ONLY",priority="P1",mode="LIVE-ONLY"},
+        {id=16,category=4,ordinal=1,name="config-negotiation-times-monotonic",purpose="Verifies config negotiation times monotonic.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=17,category=4,ordinal=2,name="config-margin-ladder-monotonic",purpose="Verifies config margin ladder monotonic.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=18,category=4,ordinal=3,name="config-timeouts-positive",purpose="Verifies config timeouts positive.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=19,category=4,ordinal=4,name="config-planner-limits-valid",purpose="Verifies config planner limits valid.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=20,category=4,ordinal=5,name="config-bot-thresholds-coherent",purpose="Verifies config bot thresholds coherent.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=21,category=5,ordinal=1,name="preferences-defaults-complete",purpose="Verifies preferences defaults complete.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=22,category=5,ordinal=2,name="preferences-malformed-file-falls-back",purpose="Verifies preferences malformed file falls back.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=23,category=5,ordinal=3,name="preferences-roundtrip-preserves-supported-values",purpose="Verifies preferences roundtrip preserves supported values.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=24,category=5,ordinal=4,name="preferences-unknown-fields-ignored",purpose="Verifies preferences unknown fields ignored.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=25,category=5,ordinal=5,name="preferences-auto-true-never-normal-persisted",purpose="Verifies preferences auto true never normal persisted.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=26,category=6,ordinal=1,name="ui-root-created-once",purpose="Verifies UI root created once.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=27,category=6,ordinal=2,name="ui-root-parented-correctly",purpose="Verifies UI root parented correctly.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=28,category=6,ordinal=3,name="ui-close-hides-or-destroys-cleanly",purpose="Verifies UI close hides or destroys cleanly.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=29,category=6,ordinal=4,name="ui-reopen-restores-valid-layout",purpose="Verifies UI reopen restores valid layout.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=30,category=6,ordinal=5,name="ui-zindex-root-order-valid",purpose="Verifies UI zindex root order valid.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=31,category=7,ordinal=1,name="ui-controls-stay-inside-parent-bounds",purpose="Verifies UI controls stay inside parent bounds.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=32,category=7,ordinal=2,name="ui-no-critical-control-overlaps",purpose="Verifies UI no critical control overlaps.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=33,category=7,ordinal=3,name="ui-click-targets-have-minimum-size",purpose="Verifies UI click targets have minimum size.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=34,category=7,ordinal=4,name="ui-scroll-content-fits-canvas",purpose="Verifies UI scroll content fits canvas.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=35,category=7,ordinal=5,name="ui-diagnostic-text-does-not-crush-controls",purpose="Verifies UI diagnostic text does not crush controls.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=36,category=8,ordinal=1,name="home-status-reflects-runtime-state",purpose="Verifies home status reflects runtime state.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=37,category=8,ordinal=2,name="home-partner-clears-after-trade",purpose="Verifies home partner clears after trade.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=38,category=8,ordinal=3,name="home-metrics-update-after-events",purpose="Verifies home metrics update after events.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=39,category=8,ordinal=4,name="home-auto-indicator-matches-preference",purpose="Verifies home auto indicator matches preference.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=40,category=8,ordinal=5,name="home-render-safe-with-empty-state",purpose="Verifies home render safe with empty state.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=41,category=9,ordinal=1,name="trade-tab-partner-matches-active-trade",purpose="Verifies trade tab partner matches active trade.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=42,category=9,ordinal=2,name="trade-tab-local-offer-matches-runtime",purpose="Verifies trade tab local offer matches runtime.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=43,category=9,ordinal=3,name="trade-tab-remote-offer-matches-runtime",purpose="Verifies trade tab remote offer matches runtime.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=44,category=9,ordinal=4,name="trade-tab-values-clear-between-trades",purpose="Verifies trade tab values clear between trades.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=45,category=9,ordinal=5,name="trade-tab-safety-status-current",purpose="Verifies trade tab safety status current.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=46,category=10,ordinal=1,name="people-adds-player-on-join",purpose="Verifies people adds player on join.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=47,category=10,ordinal=2,name="people-removes-player-on-leave",purpose="Verifies people removes player on leave.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=48,category=10,ordinal=3,name="people-contact-state-refreshes",purpose="Verifies people contact state refreshes.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=50,category=10,ordinal=5,name="people-empty-server-renders-safely",purpose="Verifies people empty server renders safely.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=51,category=11,ordinal=1,name="servers-rows-match-selector-queue",purpose="Verifies servers rows match selector queue.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=52,category=11,ordinal=2,name="servers-stale-candidates-disappear",purpose="Verifies servers stale candidates disappear.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=53,category=11,ordinal=3,name="servers-preview-labels-match-classification",purpose="Verifies servers preview labels match classification.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=54,category=11,ordinal=4,name="servers-thumbnail-binding-matches-job",purpose="Verifies servers thumbnail binding matches job.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=55,category=11,ordinal=5,name="servers-empty-queue-renders-safely",purpose="Verifies servers empty queue renders safely.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=56,category=12,ordinal=1,name="settings-selftest-strip-matches-results",purpose="Verifies settings self-test strip matches results.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=57,category=12,ordinal=2,name="settings-selftest-strip-shows-failure-count",purpose="Verifies settings self-test strip shows failure count.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=58,category=12,ordinal=3,name="settings-toggle-reflects-preference",purpose="Verifies settings toggle reflects preference.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=59,category=12,ordinal=4,name="settings-control-change-updates-state",purpose="Verifies settings control change updates state.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=60,category=12,ordinal=5,name="settings-layout-remains-nonoverlapping",purpose="Verifies settings layout remains nonoverlapping.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=61,category=13,ordinal=1,name="thought-feed-hidden-while-auto-off",purpose="Verifies thought feed hidden while auto off.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=62,category=13,ordinal=2,name="thought-feed-newest-message-primary",purpose="Verifies thought feed newest message primary.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=63,category=13,ordinal=3,name="thought-feed-older-messages-shrink-and-fade",purpose="Verifies thought feed older messages shrink and fade.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=64,category=13,ordinal=4,name="thought-feed-history-cap-enforced",purpose="Verifies thought feed history cap enforced.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=65,category=13,ordinal=5,name="thought-feed-clears-immediately-on-auto-off",purpose="Verifies thought feed clears immediately on auto off.",status="NEW LIVE-ONLY",priority="P2",mode="LIVE-ONLY"},
+        {id=66,category=14,ordinal=1,name="native-trade-gui-not-reparented",purpose="Verifies native trade GUI not reparented.",status="STRENGTHEN EXISTING",priority="P2",mode="LIVE-ONLY"},
+        {id=67,category=14,ordinal=2,name="native-trade-controls-not-mutated-by-render",purpose="Verifies native trade controls not mutated by render.",status="STRENGTHEN EXISTING",priority="P2",mode="LIVE-ONLY"},
+        {id=69,category=14,ordinal=4,name="native-gui-recreation-reacquired",purpose="Verifies native GUI recreation reacquired.",status="STRENGTHEN EXISTING",priority="P2",mode="LIVE-ONLY"},
+        {id=70,category=14,ordinal=5,name="native-gui-missing-does-not-crash-ui",purpose="Verifies native GUI missing does not crash UI.",status="STRENGTHEN EXISTING",priority="P2",mode="LIVE-ONLY"},
+        {id=71,category=15,ordinal=1,name="sync-auto-toggle-updates-all-ui",purpose="Verifies sync auto toggle updates all UI.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=72,category=15,ordinal=2,name="sync-active-partner-updates-all-tabs",purpose="Verifies sync active partner updates all tabs.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=73,category=15,ordinal=3,name="sync-selftest-completion-updates-settings",purpose="Verifies sync self-test completion updates settings.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=74,category=15,ordinal=4,name="sync-runtime-status-refreshes-thought-feed",purpose="Verifies sync runtime status refreshes thought feed.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=75,category=15,ordinal=5,name="sync-state-clear-removes-stale-ui",purpose="Verifies sync state clear removes stale UI.",status="NEW INTEGRATION",priority="P2",mode="INTEGRATION"},
+        {id=76,category=16,ordinal=1,name="supreme-valid-live-body-accepted",purpose="Verifies Supreme valid live body accepted.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=77,category=16,ordinal=2,name="supreme-invalid-live-body-rejected",purpose="Verifies Supreme invalid live body rejected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=78,category=16,ordinal=3,name="supreme-fetch-timeout-falls-back",purpose="Verifies Supreme fetch timeout falls back.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=79,category=16,ordinal=4,name="supreme-cancelled-fetch-cannot-promote",purpose="Verifies Supreme cancelled fetch cannot promote.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=80,category=16,ordinal=5,name="supreme-newer-fetch-wins-race",purpose="Verifies Supreme newer fetch wins race.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=81,category=17,ordinal=1,name="supreme-cache-hash-roundtrip",purpose="Verifies Supreme cache hash roundtrip.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=82,category=17,ordinal=2,name="supreme-corrupt-cache-rejected",purpose="Verifies Supreme corrupt cache rejected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=83,category=17,ordinal=3,name="supreme-staging-not-authoritative",purpose="Verifies Supreme staging not authoritative.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=84,category=17,ordinal=4,name="supreme-interrupted-save-preserves-lkg",purpose="Verifies Supreme interrupted save preserves LKG.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=85,category=17,ordinal=5,name="supreme-cache-revision-monotonic",purpose="Verifies Supreme cache revision monotonic.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=86,category=18,ordinal=1,name="supreme-parser-indexes-all-supported-categories",purpose="Verifies Supreme parser indexes all supported categories.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=87,category=18,ordinal=2,name="supreme-index-record-key-unique",purpose="Verifies Supreme index record key unique.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=89,category=18,ordinal=4,name="supreme-malformed-record-skipped",purpose="Verifies Supreme malformed record skipped.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=90,category=18,ordinal=5,name="supreme-duplicate-record-deterministic",purpose="Verifies Supreme duplicate record deterministic.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=91,category=19,ordinal=1,name="value-numeric-record-contributes-value",purpose="Verifies value numeric record contributes value.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=92,category=19,ordinal=2,name="value-quantity-multiplies-unit-value",purpose="Verifies value quantity multiplies unit value.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=93,category=19,ordinal=3,name="value-zero-remains-zero",purpose="Verifies value zero remains zero.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=94,category=19,ordinal=4,name="value-mixed-numeric-offer-sums-correctly",purpose="Verifies value mixed numeric offer sums correctly.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=95,category=19,ordinal=5,name="value-negative-source-never-becomes-positive",purpose="Verifies value negative source never becomes positive.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=98,category=20,ordinal=3,name="mixed-known-unknown-only-counts-known",purpose="Verifies mixed known unknown only counts known.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=100,category=20,ordinal=5,name="relative-quantity-still-zero",purpose="Verifies relative quantity still zero.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=104,category=21,ordinal=4,name="inventory-empty-metadata-tables-ignored",purpose="Verifies inventory empty metadata tables ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=105,category=21,ordinal=5,name="inventory-real-item-under-valid-container-kept",purpose="Verifies inventory real item under valid container kept.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=106,category=22,ordinal=1,name="identity-same-item-same-key",purpose="Verifies identity same item same key.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=107,category=22,ordinal=2,name="identity-different-item-different-key",purpose="Verifies identity different item different key.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=108,category=22,ordinal=3,name="identity-year-distinguishes-variants",purpose="Verifies identity year distinguishes variants.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=109,category=22,ordinal=4,name="identity-event-distinguishes-variants",purpose="Verifies identity event distinguishes variants.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=110,category=22,ordinal=5,name="identity-roundtrip-stable",purpose="Verifies identity roundtrip stable.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=111,category=23,ordinal=1,name="mutation-key-matches-native-offer-item",purpose="Verifies mutation key matches native offer item.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=114,category=23,ordinal=4,name="mutation-identity-survives-recalculation",purpose="Verifies mutation identity survives recalculation.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=115,category=23,ordinal=5,name="mutation-ambiguous-identity-freezes-action",purpose="Verifies mutation ambiguous identity freezes action.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=117,category=24,ordinal=2,name="variant-standard-not-falsely-chroma",purpose="Verifies variant standard not falsely chroma.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=118,category=24,ordinal=3,name="variant-gun-knife-distinguished",purpose="Verifies variant gun knife distinguished.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=120,category=24,ordinal=5,name="variant-conflicting-evidence-rejected",purpose="Verifies variant conflicting evidence rejected.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=121,category=25,ordinal=1,name="manual-map-valid-item-resolves",purpose="Verifies manual map valid item resolves.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=123,category=25,ordinal=3,name="manual-map-revision-invalidates-cache",purpose="Verifies manual map revision invalidates cache.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=124,category=25,ordinal=4,name="manual-map-weak-context-does-not-overreach",purpose="Verifies manual map weak context does not overreach.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=126,category=26,ordinal=1,name="local-inventory-valid-response-parsed",purpose="Verifies local inventory valid response parsed.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=127,category=26,ordinal=2,name="local-inventory-partial-marked-partial",purpose="Verifies local inventory partial marked partial.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=128,category=26,ordinal=3,name="local-inventory-retry-recovers",purpose="Verifies local inventory retry recovers.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=129,category=26,ordinal=4,name="local-inventory-stamp-changes-on-refresh",purpose="Verifies local inventory stamp changes on refresh.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=130,category=26,ordinal=5,name="local-inventory-stale-result-cannot-overwrite-new",purpose="Verifies local inventory stale result cannot overwrite new.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=131,category=27,ordinal=1,name="remote-inventory-correct-player-associated",purpose="Verifies remote inventory correct player associated.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=132,category=27,ordinal=2,name="remote-inventory-player-leave-cancels-use",purpose="Verifies remote inventory player leave cancels use.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=133,category=27,ordinal=3,name="remote-inventory-failure-is-player-local",purpose="Verifies remote inventory failure is player local.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=134,category=27,ordinal=4,name="remote-inventory-presence-generation-isolated",purpose="Verifies remote inventory presence generation isolated.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=135,category=27,ordinal=5,name="remote-inventory-malformed-data-contained",purpose="Verifies remote inventory malformed data contained.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=140,category=28,ordinal=5,name="partial-completion-recomputes-feasibility",purpose="Verifies partial completion recomputes feasibility.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=141,category=29,ordinal=1,name="cache-local-stamp-invalidates-plan",purpose="Verifies cache local stamp invalidates plan.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=142,category=29,ordinal=2,name="cache-supreme-revision-invalidates-value",purpose="Verifies cache Supreme revision invalidates value.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=143,category=29,ordinal=3,name="cache-mapping-revision-invalidates-identity",purpose="Verifies cache mapping revision invalidates identity.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=144,category=29,ordinal=4,name="cache-presence-generation-invalidates-remote",purpose="Verifies cache presence generation invalidates remote.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=145,category=29,ordinal=5,name="cache-identical-input-reuses-safe-result",purpose="Verifies cache identical input reuses safe result.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=146,category=30,ordinal=1,name="reserve-one-copy-protected",purpose="Verifies reserve one copy protected.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=147,category=30,ordinal=2,name="reserve-more-than-owned-clamped",purpose="Verifies reserve more than owned clamped.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=148,category=30,ordinal=3,name="reserve-zero-restores-tradability",purpose="Verifies reserve zero restores tradability.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=149,category=30,ordinal=4,name="reserve-persistence-roundtrip",purpose="Verifies reserve persistence roundtrip.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=150,category=30,ordinal=5,name="reserved-item-never-enters-offer",purpose="Verifies reserved item never enters offer.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=155,category=31,ordinal=5,name="feasibility-witness-values-consistent",purpose="Verifies feasibility witness values consistent.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=156,category=32,ordinal=1,name="eligibility-valued-player-eligible",purpose="Verifies eligibility valued player eligible.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=157,category=32,ordinal=2,name="eligibility-cooldown-player-blocked",purpose="Verifies eligibility cooldown player blocked.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=161,category=33,ordinal=1,name="queue-only-contains-eligible-targets",purpose="Verifies queue only contains eligible targets.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=162,category=33,ordinal=2,name="queue-opportunity-attached-to-player",purpose="Verifies queue opportunity attached to player.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=163,category=33,ordinal=3,name="queue-removes-departed-player",purpose="Verifies queue removes departed player.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=164,category=33,ordinal=4,name="queue-rebuild-reflects-inventory-change",purpose="Verifies queue rebuild reflects inventory change.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=165,category=33,ordinal=5,name="queue-empty-when-no-actionable-targets",purpose="Verifies queue empty when no actionable targets.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=166,category=34,ordinal=1,name="ranking-higher-priority-opportunity-first",purpose="Verifies ranking higher priority opportunity first.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=167,category=34,ordinal=2,name="ranking-identical-input-deterministic",purpose="Verifies ranking identical input deterministic.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=169,category=34,ordinal=4,name="ranking-strategic-priority-respected",purpose="Verifies ranking strategic priority respected.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=170,category=34,ordinal=5,name="ranking-comparator-transitive",purpose="Verifies ranking comparator transitive.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=171,category=35,ordinal=1,name="outbound-profit-requires-stage1-plan",purpose="Verifies outbound profit requires stage1 plan.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=172,category=35,ordinal=2,name="outbound-strategic-requires-liquidity-plan",purpose="Verifies outbound strategic requires liquidity plan.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=173,category=35,ordinal=3,name="outbound-unconstructible-target-skipped",purpose="Verifies outbound unconstructible target skipped.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=174,category=35,ordinal=4,name="outbound-intent-give-matches-constructible-plan",purpose="Verifies outbound intent give matches constructible plan.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=175,category=35,ordinal=5,name="outbound-constructibility-preserves-hard-safety",purpose="Verifies outbound constructibility preserves hard safety.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=176,category=36,ordinal=1,name="intent-captured-for-selected-target",purpose="Verifies intent captured for selected target.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=177,category=36,ordinal=2,name="intent-attached-to-pending-request",purpose="Verifies intent attached to pending request.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=178,category=36,ordinal=3,name="intent-promoted-on-starttrade",purpose="Verifies intent promoted on StartTrade.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=179,category=36,ordinal=4,name="intent-not-promoted-to-wrong-partner",purpose="Verifies intent not promoted to wrong partner.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=180,category=36,ordinal=5,name="intent-cleared-after-lifecycle",purpose="Verifies intent cleared after lifecycle.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=181,category=37,ordinal=1,name="profit-plan-respects-minimum-win",purpose="Verifies profit plan respects minimum win.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=182,category=37,ordinal=2,name="profit-plan-never-exceeds-receive",purpose="Verifies profit plan never exceeds receive.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=183,category=37,ordinal=3,name="profit-plan-respects-slot-limit",purpose="Verifies profit plan respects slot limit.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=184,category=37,ordinal=4,name="profit-plan-respects-reserves",purpose="Verifies profit plan respects reserves.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=185,category=37,ordinal=5,name="profit-plan-deterministic-for-identical-input",purpose="Verifies profit plan deterministic for identical input.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=186,category=38,ordinal=1,name="liquidity-plan-allows-approved-small-gap",purpose="Verifies liquidity plan allows approved small gap.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=187,category=38,ordinal=2,name="liquidity-plan-rejects-gap-over-bound",purpose="Verifies liquidity plan rejects gap over bound.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=188,category=38,ordinal=3,name="liquidity-plan-preserves-anchor-policy",purpose="Verifies liquidity plan preserves anchor policy.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=189,category=38,ordinal=4,name="liquidity-plan-requires-genuine-liquidity-improvement",purpose="Verifies liquidity plan requires genuine liquidity improvement.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=190,category=38,ordinal=5,name="liquidity-plan-deterministic",purpose="Verifies liquidity plan deterministic.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=192,category=39,ordinal=2,name="planner-beam-cap-preserves-best-known-state",purpose="Verifies planner beam cap preserves best known state.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=193,category=39,ordinal=3,name="planner-quantity-sampling-includes-critical-boundaries",purpose="Verifies planner quantity sampling includes critical boundaries.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=194,category=39,ordinal=4,name="planner-generation-cancellation-works",purpose="Verifies planner generation cancellation works.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=195,category=39,ordinal=5,name="planner-yield-does-not-change-result",purpose="Verifies planner yield does not change result.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=196,category=40,ordinal=1,name="market-gate-equal-quality-passes",purpose="Verifies market gate equal quality passes.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=197,category=40,ordinal=2,name="market-gate-material-demand-loss-rejected",purpose="Verifies market gate material demand loss rejected.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=198,category=40,ordinal=3,name="market-gate-missing-metric-coverage-handled",purpose="Verifies market gate missing metric coverage handled.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=199,category=40,ordinal=4,name="market-gate-safe-equal-value-alternative-selected",purpose="Verifies market gate safe equal value alternative selected.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=200,category=40,ordinal=5,name="market-gate-diagnostics-identify-failure",purpose="Verifies market gate diagnostics identify failure.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=202,category=41,ordinal=2,name="portfolio-redundant-anchor-can-trade",purpose="Verifies portfolio redundant anchor can trade.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=205,category=41,ordinal=5,name="portfolio-delta-metrics-consistent",purpose="Verifies portfolio delta metrics consistent.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=206,category=42,ordinal=1,name="reach-single-item-budget-correct",purpose="Verifies reach single item budget correct.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=207,category=42,ordinal=2,name="reach-multi-item-budget-correct",purpose="Verifies reach multi item budget correct.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=208,category=42,ordinal=3,name="reach-trade-improvement-detected",purpose="Verifies reach trade improvement detected.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=210,category=42,ordinal=5,name="reach-identical-inventory-deterministic",purpose="Verifies reach identical inventory deterministic.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=211,category=43,ordinal=1,name="minimum-win-default-absolute-floor",purpose="Verifies minimum win default absolute floor.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=212,category=43,ordinal=2,name="minimum-win-percentage-scales",purpose="Verifies minimum win percentage scales.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=213,category=43,ordinal=3,name="minimum-win-never-negative",purpose="Verifies minimum win never negative.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=214,category=43,ordinal=4,name="minimum-win-strategic-path-separate",purpose="Verifies minimum win strategic path separate.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=215,category=43,ordinal=5,name="minimum-win-diagnostics-state-source",purpose="Verifies minimum win diagnostics state source.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=216,category=44,ordinal=1,name="plausibility-opening-within-cap-passes",purpose="Verifies plausibility opening within cap passes.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=218,category=44,ordinal=3,name="plausibility-denomination-rounding-respected",purpose="Verifies plausibility denomination rounding respected.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=219,category=44,ordinal=4,name="plausibility-voluntary-offer-not-treated-proactive",purpose="Verifies plausibility voluntary offer not treated proactive.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=220,category=44,ordinal=5,name="plausibility-never-bypasses-hard-safety",purpose="Verifies plausibility never bypasses hard safety.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=221,category=45,ordinal=1,name="negotiation-starts-stage1",purpose="Verifies negotiation starts stage1.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=222,category=45,ordinal=2,name="negotiation-progresses-stage1-to-stage2",purpose="Verifies negotiation progresses stage1 to stage2.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=223,category=45,ordinal=3,name="negotiation-progresses-stage2-to-stage3",purpose="Verifies negotiation progresses stage2 to stage3.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=224,category=45,ordinal=4,name="negotiation-final-stage-activates",purpose="Verifies negotiation final stage activates.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=225,category=45,ordinal=5,name="negotiation-new-trade-resets-stage",purpose="Verifies negotiation new trade resets stage.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=226,category=46,ordinal=1,name="hysteresis-identical-offer-keeps-plan",purpose="Verifies hysteresis identical offer keeps plan.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=227,category=46,ordinal=2,name="hysteresis-small-change-prefers-low-mutation",purpose="Verifies hysteresis small change prefers low mutation.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=228,category=46,ordinal=3,name="hysteresis-large-economic-change-replans",purpose="Verifies hysteresis large economic change replans.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=229,category=46,ordinal=4,name="hysteresis-never-keeps-now-unsafe-plan",purpose="Verifies hysteresis never keeps now unsafe plan.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=231,category=47,ordinal=1,name="validate-plan-valid-plan-passes",purpose="Verifies validate plan valid plan passes.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=232,category=47,ordinal=2,name="validate-plan-stale-otherhash-fails",purpose="Verifies validate plan stale otherhash fails.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=233,category=47,ordinal=3,name="validate-plan-stale-inventory-stamp-fails",purpose="Verifies validate plan stale inventory stamp fails.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=234,category=47,ordinal=4,name="validate-plan-stale-mapping-revision-fails",purpose="Verifies validate plan stale mapping revision fails.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=235,category=47,ordinal=5,name="validate-plan-economic-safety-cannot-be-bypassed",purpose="Verifies validate plan economic safety cannot be bypassed.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=236,category=48,ordinal=1,name="reconcile-adds-required-items",purpose="Verifies reconcile adds required items.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=237,category=48,ordinal=2,name="reconcile-removes-extra-items",purpose="Verifies reconcile removes extra items.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=238,category=48,ordinal=3,name="reconcile-adjusts-quantity-exactly",purpose="Verifies reconcile adjusts quantity exactly.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=239,category=48,ordinal=4,name="reconcile-stale-context-cancels-mutation",purpose="Verifies reconcile stale context cancels mutation.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=240,category=48,ordinal=5,name="reconcile-completion-matches-desired-offer",purpose="Verifies reconcile completion matches desired offer.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=241,category=49,ordinal=1,name="request-valid-target-invoked-once",purpose="Verifies request valid target invoked once.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=244,category=49,ordinal=4,name="request-global-failure-counted",purpose="Verifies request global failure counted.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=245,category=49,ordinal=5,name="request-generation-prevents-stale-failure",purpose="Verifies request generation prevents stale failure.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=246,category=50,ordinal=1,name="request-native-sendingrequest-correlates-target",purpose="Verifies request native sendingrequest correlates target.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=248,category=50,ordinal=3,name="request-starttrade-can-authoritatively-ack",purpose="Verifies request StartTrade can authoritatively ack.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=249,category=50,ordinal=4,name="request-wrong-player-ack-ignored",purpose="Verifies request wrong player ack ignored.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=252,category=51,ordinal=2,name="incoming-trade-does-not-use-outbound-intent",purpose="Verifies incoming trade does not use outbound intent.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=253,category=51,ordinal=3,name="incoming-valuation-waits-for-inventory",purpose="Verifies incoming valuation waits for inventory.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=254,category=51,ordinal=4,name="incoming-trade-can-build-safe-plan",purpose="Verifies incoming trade can build safe plan.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=255,category=51,ordinal=5,name="incoming-during-outbound-pending-resolved-safely",purpose="Verifies incoming during outbound pending resolved safely.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=256,category=52,ordinal=1,name="partner-starttrade-authoritative",purpose="Verifies partner StartTrade authoritative.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=257,category=52,ordinal=2,name="partner-stale-player-instance-ignored",purpose="Verifies partner stale player instance ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=258,category=52,ordinal=3,name="partner-decline-attributed-correctly",purpose="Verifies partner decline attributed correctly.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=259,category=52,ordinal=4,name="partner-audit-attributed-correctly",purpose="Verifies partner audit attributed correctly.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=260,category=52,ordinal=5,name="partner-switch-clears-old-runtime",purpose="Verifies partner switch clears old runtime.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=261,category=53,ordinal=1,name="starttrade-initializes-tradebeganat",purpose="Verifies StartTrade initializes tradebeganat.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=262,category=53,ordinal=2,name="starttrade-promotes-matching-intent",purpose="Verifies StartTrade promotes matching intent.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=263,category=53,ordinal=3,name="starttrade-clears-pending-request",purpose="Verifies StartTrade clears pending request.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=264,category=53,ordinal=4,name="starttrade-resets-engagement-state",purpose="Verifies StartTrade resets engagement state.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=265,category=53,ordinal=5,name="starttrade-does-not-rewrite-existing-starttime",purpose="Verifies StartTrade does not rewrite existing starttime.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=266,category=54,ordinal=1,name="updatetrade-partner-change-recalculates",purpose="Verifies UpdateTrade partner change recalculates.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=267,category=54,ordinal=2,name="updatetrade-local-change-refreshes-visible-proof",purpose="Verifies UpdateTrade local change refreshes visible proof.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=268,category=54,ordinal=3,name="updatetrade-stale-generation-ignored",purpose="Verifies UpdateTrade stale generation ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=269,category=54,ordinal=4,name="updatetrade-identical-offer-no-unneeded-replan",purpose="Verifies UpdateTrade identical offer no unneeded replan.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=270,category=54,ordinal=5,name="updatetrade-zero-known-value-clears-plan",purpose="Verifies UpdateTrade zero known value clears plan.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=271,category=55,ordinal=1,name="engagement-remote-offer-change-recorded",purpose="Verifies engagement remote offer change recorded.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=272,category=55,ordinal=2,name="engagement-other-accept-recorded",purpose="Verifies engagement other accept recorded.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=274,category=55,ordinal=4,name="engagement-extension-applied-once",purpose="Verifies engagement extension applied once.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=275,category=55,ordinal=5,name="engagement-state-clears-next-trade",purpose="Verifies engagement state clears next trade.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=276,category=56,ordinal=1,name="timeout-first-offer-unengaged",purpose="Verifies timeout first offer unengaged.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=277,category=56,ordinal=2,name="timeout-first-offer-engaged-extended",purpose="Verifies timeout first offer engaged extended.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=278,category=56,ordinal=3,name="timeout-idle-active-trade",purpose="Verifies timeout idle active trade.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=279,category=56,ordinal=4,name="timeout-inventory-wait-does-not-act-unsafe",purpose="Verifies timeout inventory wait does not act unsafe.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=280,category=56,ordinal=5,name="timeout-independent-clocks-not-confused",purpose="Verifies timeout independent clocks not confused.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=281,category=57,ordinal=1,name="decline-remote-records-trade-decline",purpose="Verifies decline remote records trade decline.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=282,category=57,ordinal=2,name="decline-local-not-recorded-as-remote",purpose="Verifies decline local not recorded as remote.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=283,category=57,ordinal=3,name="decline-ambiguous-active-newer-trade-ignored",purpose="Verifies decline ambiguous active newer trade ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=284,category=57,ordinal=4,name="decline-applies-cooldown-to-correct-presence",purpose="Verifies decline applies cooldown to correct presence.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=285,category=57,ordinal=5,name="decline-clears-runtime-after-confirmation",purpose="Verifies decline clears runtime after confirmation.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=286,category=58,ordinal=1,name="accept-local-state-recorded",purpose="Verifies accept local state recorded.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=287,category=58,ordinal=2,name="accept-other-state-recorded",purpose="Verifies accept other state recorded.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=288,category=58,ordinal=3,name="accept-offer-change-invalidates-acceptance",purpose="Verifies accept offer change invalidates acceptance.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=289,category=58,ordinal=4,name="accept-both-required-before-completion-expectation",purpose="Verifies accept both required before completion expectation.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=290,category=58,ordinal=5,name="accept-state-clears-between-trades",purpose="Verifies accept state clears between trades.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=291,category=59,ordinal=1,name="completion-success-event-starts-audit",purpose="Verifies completion success event starts audit.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=292,category=59,ordinal=2,name="completion-native-gui-disappearance-reconciled",purpose="Verifies completion native GUI disappearance reconciled.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=293,category=59,ordinal=3,name="completion-false-positive-blocked",purpose="Verifies completion false positive blocked.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=294,category=59,ordinal=4,name="completion-partner-correlation-preserved",purpose="Verifies completion partner correlation preserved.",status="STRENGTHEN EXISTING",priority="P0",mode="INTEGRATION"},
+        {id=295,category=59,ordinal=5,name="completion-cannot-double-record",purpose="Verifies completion cannot double record.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=296,category=60,ordinal=1,name="audit-before-after-inventory-delta-correct",purpose="Verifies audit before after inventory delta correct.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=297,category=60,ordinal=2,name="audit-give-items-match-plan",purpose="Verifies audit give items match plan.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=298,category=60,ordinal=3,name="audit-received-items-valued-from-authoritative-data",purpose="Verifies audit received items valued from authoritative data.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=299,category=60,ordinal=4,name="audit-profit-calculation-correct",purpose="Verifies audit profit calculation correct.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=300,category=60,ordinal=5,name="audit-uncertain-result-not-marked-clean-success",purpose="Verifies audit uncertain result not marked clean success.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=301,category=61,ordinal=1,name="cooldown-decline-created",purpose="Verifies cooldown decline created.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=302,category=61,ordinal=2,name="cooldown-expiry-restores-eligibility",purpose="Verifies cooldown expiry restores eligibility.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=303,category=61,ordinal=3,name="cooldown-new-presence-isolated",purpose="Verifies cooldown new presence isolated.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=304,category=61,ordinal=4,name="history-success-recorded-once",purpose="Verifies history success recorded once.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=305,category=61,ordinal=5,name="history-bounds-enforced",purpose="Verifies history bounds enforced.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=306,category=62,ordinal=1,name="autooff-idle-clears-automation-work",purpose="Verifies AUTO OFF idle clears automation work.",status="STRENGTHEN EXISTING",priority="P0",mode="INTEGRATION"},
+        {id=308,category=62,ordinal=3,name="autooff-live-trade-stops-new-mutations",purpose="Verifies AUTO OFF live trade stops new mutations.",status="STRENGTHEN EXISTING",priority="P0",mode="INTEGRATION"},
+        {id=309,category=62,ordinal=4,name="autooff-clears-thought-feed",purpose="Verifies AUTO OFF clears thought feed.",status="STRENGTHEN EXISTING",priority="P0",mode="INTEGRATION"},
+        {id=310,category=62,ordinal=5,name="autooff-prevents-post-cleanup-retarget",purpose="Verifies AUTO OFF prevents post cleanup retarget.",status="STRENGTHEN EXISTING",priority="P0",mode="INTEGRATION"},
+        {id=311,category=63,ordinal=1,name="stats-success-increments-success",purpose="Verifies stats success increments success.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=312,category=63,ordinal=2,name="stats-decline-increments-decline",purpose="Verifies stats decline increments decline.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=313,category=63,ordinal=3,name="stats-profit-only-from-success",purpose="Verifies stats profit only from success.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=314,category=63,ordinal=4,name="stats-duration-nonnegative",purpose="Verifies stats duration nonnegative.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=315,category=63,ordinal=5,name="stats-player-attribution-correct",purpose="Verifies stats player attribution correct.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=316,category=64,ordinal=1,name="epoch-first-created-with-origin",purpose="Verifies epoch first created with origin.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=318,category=64,ordinal=3,name="epoch-completes-after-600-seconds",purpose="Verifies epoch completes after 600 seconds.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=319,category=64,ordinal=4,name="epoch-new-policy-derived-from-prior",purpose="Verifies epoch new policy derived from prior.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=320,category=64,ordinal=5,name="epoch-history-limit-enforced",purpose="Verifies epoch history limit enforced.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=321,category=65,ordinal=1,name="learning-under-min-samples-no-change",purpose="Verifies learning under min samples no change.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=323,category=65,ordinal=3,name="learning-high-success-rate-increases-margin",purpose="Verifies learning high success rate increases margin.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=324,category=65,ordinal=4,name="learning-middle-rate-keeps-margin",purpose="Verifies learning middle rate keeps margin.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=325,category=65,ordinal=5,name="learning-offset-cap-enforced",purpose="Verifies learning offset cap enforced.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=327,category=66,ordinal=2,name="learning-empty-intent-wait-not-counted",purpose="Verifies learning empty intent wait not counted.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=329,category=66,ordinal=4,name="learning-visible-plan-success-counted",purpose="Verifies learning visible plan success counted.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=330,category=66,ordinal=5,name="learning-visible-proof-cleared-on-mutation",purpose="Verifies learning visible proof cleared on mutation.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=332,category=67,ordinal=2,name="stage-clock-advance-without-new-plan-not-trained",purpose="Verifies stage clock advance without new plan not trained.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=333,category=67,ordinal=3,name="stage-new-visible-plan-updates-training-stage",purpose="Verifies stage new visible plan updates training stage.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=334,category=67,ordinal=4,name="stage-cleared-between-trades",purpose="Verifies stage cleared between trades.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=335,category=67,ordinal=5,name="stage-decline-after-empty-clear-not-trained",purpose="Verifies stage decline after empty clear not trained.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=336,category=68,ordinal=1,name="learning-save-load-roundtrip",purpose="Verifies learning save load roundtrip.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=337,category=68,ordinal=2,name="learning-corrupt-save-falls-back",purpose="Verifies learning corrupt save falls back.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=338,category=68,ordinal=3,name="learning-teleport-continuation-preserves-epoch",purpose="Verifies learning teleport continuation preserves epoch.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=339,category=68,ordinal=4,name="learning-old-schema-normalized",purpose="Verifies learning old schema normalized.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=340,category=68,ordinal=5,name="learning-history-bounds-survive-reload",purpose="Verifies learning history bounds survive reload.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=341,category=69,ordinal=1,name="learning-selftests-do-not-record-outcomes",purpose="Verifies learning selftests do not record outcomes.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=342,category=69,ordinal=2,name="learning-local-cancel-not-partner-decline",purpose="Verifies learning local cancel not partner decline.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=343,category=69,ordinal=3,name="learning-transport-failure-not-margin-outcome",purpose="Verifies learning transport failure not margin outcome.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=344,category=69,ordinal=4,name="learning-inventory-failure-not-margin-outcome",purpose="Verifies learning inventory failure not margin outcome.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=345,category=69,ordinal=5,name="learning-wrong-partner-event-ignored",purpose="Verifies learning wrong partner event ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=346,category=70,ordinal=1,name="bot-sampling-uses-configured-cadence",purpose="Verifies bot sampling uses configured cadence.",status="NEW LIVE-ONLY",priority="P0",mode="LIVE-ONLY"},
+        {id=347,category=70,ordinal=2,name="bot-sampling-waits-character-settle",purpose="Verifies bot sampling waits character settle.",status="NEW LIVE-ONLY",priority="P0",mode="LIVE-ONLY"},
+        {id=348,category=70,ordinal=3,name="bot-sampling-missing-humanoid-pauses",purpose="Verifies bot sampling missing humanoid pauses.",status="NEW LIVE-ONLY",priority="P0",mode="LIVE-ONLY"},
+        {id=349,category=70,ordinal=4,name="bot-sampling-missing-rootpart-pauses",purpose="Verifies bot sampling missing rootpart pauses.",status="NEW LIVE-ONLY",priority="P0",mode="LIVE-ONLY"},
+        {id=350,category=70,ordinal=5,name="bot-sampling-respawn-starts-fresh-segment",purpose="Verifies bot sampling respawn starts fresh segment.",status="NEW LIVE-ONLY",priority="P0",mode="LIVE-ONLY"},
+        {id=352,category=71,ordinal=2,name="bot-veto-single-human-among-bots",purpose="Verifies bot veto single human among bots.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=353,category=71,ordinal=3,name="bot-veto-marks-job-regular",purpose="Verifies bot veto marks job regular.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=354,category=71,ordinal=4,name="bot-veto-prevents-later-rehabilitation",purpose="Verifies bot veto prevents later rehabilitation.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=355,category=71,ordinal=5,name="bot-veto-teaches-zero-fingerprints",purpose="Verifies bot veto teaches zero fingerprints.",status="STRENGTHEN EXISTING",priority="P0",mode="PURE"},
+        {id=356,category=72,ordinal=1,name="bot-travel-min-total-distance-required",purpose="Verifies bot travel min total distance required.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=357,category=72,ordinal=2,name="bot-travel-min-displacement-required",purpose="Verifies bot travel min displacement required.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=358,category=72,ordinal=3,name="bot-travel-min-moving-samples-required",purpose="Verifies bot travel min moving samples required.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=359,category=72,ordinal=4,name="bot-travel-min-span-required",purpose="Verifies bot travel min span required.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=360,category=72,ordinal=5,name="bot-travel-passes-at-all-thresholds",purpose="Verifies bot travel passes at all thresholds.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=361,category=73,ordinal=1,name="bot-facing-within-fuzz-allowed",purpose="Verifies bot facing within fuzz allowed.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=362,category=73,ordinal=2,name="bot-facing-over-fuzz-resets-segment",purpose="Verifies bot facing over fuzz resets segment.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=363,category=73,ordinal=3,name="bot-facing-angle-wraparound-correct",purpose="Verifies bot facing angle wraparound correct.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=364,category=73,ordinal=4,name="bot-facing-new-rootpart-resets-reference",purpose="Verifies bot facing new rootpart resets reference.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=365,category=73,ordinal=5,name="bot-facing-threshold-boundary-stable",purpose="Verifies bot facing threshold boundary stable.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=366,category=74,ordinal=1,name="bot-certification-requires-five-remotes",purpose="Verifies bot certification requires five remotes.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=367,category=74,ordinal=2,name="bot-certification-requires-every-current-player",purpose="Verifies bot certification requires every current player.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=368,category=74,ordinal=3,name="bot-certification-one-unpassed-blocks",purpose="Verifies bot certification one unpassed blocks.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=369,category=74,ordinal=4,name="bot-certification-all-five-pass",purpose="Verifies bot certification all five pass.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=370,category=74,ordinal=5,name="bot-certification-large-roster-requires-all",purpose="Verifies bot certification large roster requires all.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=371,category=75,ordinal=1,name="bot-member-join-invalidates-ready-candidate",purpose="Verifies bot member join invalidates ready candidate.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=372,category=75,ordinal=2,name="bot-member-leave-invalidates-roster-identity",purpose="Verifies bot member leave invalidates roster identity.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=373,category=75,ordinal=3,name="bot-member-rejoin-new-segment",purpose="Verifies bot member rejoin new segment.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=374,category=75,ordinal=4,name="bot-roster-order-does-not-matter",purpose="Verifies bot roster order does not matter.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=375,category=75,ordinal=5,name="bot-membership-change-preserves-no-false-pass",purpose="Verifies bot membership change preserves no false pass.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=376,category=76,ordinal=1,name="bot-fingerprint-all-current-users-required",purpose="Verifies bot fingerprint all current users required.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=377,category=76,ordinal=2,name="bot-fingerprint-one-resolution-failure-blocks",purpose="Verifies bot fingerprint one resolution failure blocks.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=378,category=76,ordinal=3,name="bot-fingerprint-no-partial-permanent-learning",purpose="Verifies bot fingerprint no partial permanent learning.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=379,category=76,ordinal=4,name="bot-fingerprint-userid-association-correct",purpose="Verifies bot fingerprint userid association correct.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=380,category=76,ordinal=5,name="bot-fingerprint-roster-change-during-resolution-invalidates",purpose="Verifies bot fingerprint roster change during resolution invalidates.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=381,category=77,ordinal=1,name="bot-final-veto-rereads-live-humanoids",purpose="Verifies bot final veto rereads live humanoids.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=382,category=77,ordinal=2,name="bot-final-veto-after-thumbnail-yield",purpose="Verifies bot final veto after thumbnail yield.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=383,category=77,ordinal=3,name="bot-final-veto-calls-regular-path",purpose="Verifies bot final veto calls regular path.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=384,category=77,ordinal=4,name="bot-final-veto-returns-false",purpose="Verifies bot final veto returns false.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=385,category=77,ordinal=5,name="bot-final-veto-all-zero-allows-next-checks",purpose="Verifies bot final veto all zero allows next checks.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=386,category=78,ordinal=1,name="bot-no-75percent-certified-hop",purpose="Verifies bot no 75percent certified hop.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=387,category=78,ordinal=2,name="bot-no-suspected-partial-learning",purpose="Verifies bot no suspected partial learning.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=388,category=78,ordinal=3,name="bot-no-suspected-fastescape-path",purpose="Verifies bot no suspected fastescape path.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=389,category=78,ordinal=4,name="bot-four-of-five-never-certifies",purpose="Verifies bot four of five never certifies.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=390,category=78,ordinal=5,name="bot-nine-of-ten-never-certifies",purpose="Verifies bot nine of ten never certifies.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=391,category=79,ordinal=1,name="human-timing-recorded-once-per-job",purpose="Verifies human timing recorded once per job.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=392,category=79,ordinal=2,name="human-timing-history-bounded",purpose="Verifies human timing history bounded.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=393,category=79,ordinal=3,name="human-timing-does-not-create-bot-evidence",purpose="Verifies human timing does not create bot evidence.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=394,category=79,ordinal=4,name="human-timing-malformed-values-normalized",purpose="Verifies human timing malformed values normalized.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=395,category=79,ordinal=5,name="human-timing-no-longer-delays-full-proof-certification",purpose="Verifies human timing no longer delays full proof certification.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=396,category=80,ordinal=1,name="botdb-new-fingerprint-record-created",purpose="Verifies bot database new fingerprint record created.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=397,category=80,ordinal=2,name="botdb-existing-fingerprint-sighting-updated",purpose="Verifies bot database existing fingerprint sighting updated.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=398,category=80,ordinal=3,name="botdb-fingerprint-cap-enforced",purpose="Verifies bot database fingerprint cap enforced.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=399,category=80,ordinal=4,name="botdb-per-fingerprint-job-cap-enforced",purpose="Verifies bot database per fingerprint job cap enforced.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=400,category=80,ordinal=5,name="botdb-malformed-record-normalized-or-rejected",purpose="Verifies bot database malformed record normalized or rejected.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=401,category=81,ordinal=1,name="botclass-one-job-observed",purpose="Verifies bot class one job observed.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=402,category=81,ordinal=2,name="botclass-two-jobs-known",purpose="Verifies bot class two jobs known.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=403,category=81,ordinal=3,name="botclass-three-jobs-confirmed",purpose="Verifies bot class three jobs confirmed.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=404,category=81,ordinal=4,name="botclass-repeat-same-job-does-not-promote",purpose="Verifies bot class repeat same job does not promote.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=405,category=81,ordinal=5,name="botclass-confidence-matches-class",purpose="Verifies bot class confidence matches class.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=406,category=82,ordinal=1,name="botprov-strict-job-recorded-strict-only",purpose="Verifies bot provenance strict job recorded strict only.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=407,category=82,ordinal=2,name="botprov-manual-job-recorded-manual-only",purpose="Verifies bot provenance manual job recorded manual only.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=411,category=83,ordinal=1,name="bottrust-staging-write-verified",purpose="Verifies bot trust staging write verified.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=412,category=83,ordinal=2,name="bottrust-primary-write-verified",purpose="Verifies bot trust primary write verified.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=413,category=83,ordinal=3,name="bottrust-marker-write-verified",purpose="Verifies bot trust marker write verified.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=414,category=83,ordinal=4,name="bottrust-failure-before-marker-not-promoted",purpose="Verifies bot trust failure before marker not promoted.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=415,category=83,ordinal=5,name="bottrust-success-promotes-live-db",purpose="Verifies bot trust success promotes live db.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=416,category=84,ordinal=1,name="bottrust-valid-primary-marker-loads",purpose="Verifies bot trust valid primary marker loads.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=417,category=84,ordinal=2,name="bottrust-invalid-primary-valid-backup-recovers",purpose="Verifies bot trust invalid primary valid backup recovers.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=418,category=84,ordinal=3,name="bottrust-staging-alone-never-loads",purpose="Verifies bot trust staging alone never loads.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=419,category=84,ordinal=4,name="bottrust-marker-body-mismatch-rejected",purpose="Verifies bot trust marker body mismatch rejected.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=420,category=84,ordinal=5,name="bottrust-both-invalid-starts-safe",purpose="Verifies bot trust both invalid starts safe.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=423,category=85,ordinal=3,name="botarbiter-release-after-success",purpose="Verifies bot trust arbiter release after success.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=424,category=85,ordinal=4,name="botarbiter-release-after-failure",purpose="Verifies bot trust arbiter release after failure.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=426,category=86,ordinal=1,name="preview-under-five-samples-neutral",purpose="Verifies preview under five samples neutral.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=427,category=86,ordinal=2,name="preview-30percent-trusted-match-hardreject",purpose="Verifies preview 30percent trusted match hardreject.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=428,category=86,ordinal=3,name="preview-20percent-trusted-match-suspicious",purpose="Verifies preview 20percent trusted match suspicious.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=429,category=86,ordinal=4,name="preview-unknown-fingerprints-neutral",purpose="Verifies preview unknown fingerprints neutral.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=430,category=86,ordinal=5,name="preview-ratio-calculation-correct",purpose="Verifies preview ratio calculation correct.",status="NEW PURE",priority="P0",mode="PURE"},
+        {id=431,category=87,ordinal=1,name="bot-learning-ignores-inventory-value",purpose="Verifies bot learning ignores inventory value.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=432,category=87,ordinal=2,name="bot-learning-ignores-trade-declines",purpose="Verifies bot learning ignores trade declines.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=433,category=87,ordinal=3,name="bot-learning-ignores-demand",purpose="Verifies bot learning ignores demand.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=434,category=87,ordinal=4,name="bot-learning-ignores-trade-frequency",purpose="Verifies bot learning ignores trade frequency.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=435,category=87,ordinal=5,name="bot-learning-only-approved-provenance-promotes",purpose="Verifies bot learning only approved provenance promotes.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=436,category=88,ordinal=1,name="serverdiscovery-valid-row-accepted",purpose="Verifies server discovery valid row accepted.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=437,category=88,ordinal=2,name="serverdiscovery-full-row-filtered",purpose="Verifies server discovery full row filtered.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=438,category=88,ordinal=3,name="serverdiscovery-current-job-filtered",purpose="Verifies server discovery current job filtered.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=439,category=88,ordinal=4,name="serverdiscovery-malformed-row-filtered",purpose="Verifies server discovery malformed row filtered.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=440,category=88,ordinal=5,name="serverdiscovery-pagination-combines-valid-rows",purpose="Verifies server discovery pagination combines valid rows.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=444,category=89,ordinal=4,name="directauth-refresh-preserves-newest-good-data",purpose="Verifies direct authentication refresh preserves newest good data.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=445,category=89,ordinal=5,name="directauth-worker-single-instance",purpose="Verifies direct authentication worker single instance.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=446,category=90,ordinal=1,name="auth-valid-cookie-connects",purpose="Verifies auth valid cookie connects.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=447,category=90,ordinal=2,name="auth-invalid-cookie-fails-cleanly",purpose="Verifies auth invalid cookie fails cleanly.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=448,category=90,ordinal=3,name="auth-remembered-state-restores",purpose="Verifies auth remembered state restores.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=454,category=91,ordinal=4,name="privacy-cookie-never-in-error-detail",purpose="Verifies privacy cookie never in error detail.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=455,category=91,ordinal=5,name="privacy-player-tokens-not-persisted-as-secrets",purpose="Verifies privacy player tokens not persisted as secrets.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=457,category=92,ordinal=2,name="backoff-success-resets-consecutive-rate-limit",purpose="Verifies backoff success resets consecutive rate limit.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=460,category=92,ordinal=5,name="backoff-target-local-failure-does-not-trigger-server-backoff",purpose="Verifies backoff target local failure does not trigger server backoff.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=463,category=93,ordinal=3,name="candidate-bot-preview-hardreject-filtered",purpose="Verifies candidate bot preview hardreject filtered.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=465,category=93,ordinal=5,name="candidate-safe-unknown-server-still-allowed",purpose="Verifies candidate safe unknown server still allowed.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=467,category=94,ordinal=2,name="thumbnail-same-avatar-stable-fingerprint",purpose="Verifies thumbnail same avatar stable fingerprint.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=468,category=94,ordinal=3,name="thumbnail-different-image-different-fingerprint",purpose="Verifies thumbnail different image different fingerprint.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=469,category=94,ordinal=4,name="thumbnail-incomplete-response-not-fingerprinted",purpose="Verifies thumbnail incomplete response not fingerprinted.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=470,category=94,ordinal=5,name="thumbnail-token-user-association-preserved",purpose="Verifies thumbnail token user association preserved.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=471,category=95,ordinal=1,name="displaythumb-valid-url-downloads",purpose="Verifies display thumbnail valid url downloads.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=472,category=95,ordinal=2,name="displaythumb-failed-download-contained",purpose="Verifies display thumbnail failed download contained.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=473,category=95,ordinal=3,name="displaythumb-customasset-success-binds",purpose="Verifies display thumbnail customasset success binds.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=474,category=95,ordinal=4,name="displaythumb-raw-url-fallback-works",purpose="Verifies display thumbnail raw url fallback works.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=480,category=96,ordinal=5,name="thumbcache-ui-close-does-not-leak-workers",purpose="Verifies thumbnail cache UI close does not leak workers.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=481,category=97,ordinal=1,name="serverqueue-safe-preview-before-suspicious",purpose="Verifies server queue safe preview before suspicious.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=482,category=97,ordinal=2,name="serverqueue-trusted-preview-preferred",purpose="Verifies server queue trusted preview preferred.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=483,category=97,ordinal=3,name="serverqueue-lower-bot-ratio-preferred",purpose="Verifies server queue lower bot ratio preferred.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=484,category=97,ordinal=4,name="serverqueue-tie-jobid-deterministic",purpose="Verifies server queue tie jobid deterministic.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=485,category=97,ordinal=5,name="serverqueue-rebuild-removes-invalid-row",purpose="Verifies server queue rebuild removes invalid row.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=486,category=98,ordinal=1,name="disposition-waiting-while-discovery-pending",purpose="Verifies disposition waiting while discovery pending.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=487,category=98,ordinal=2,name="disposition-active-when-work-exists",purpose="Verifies disposition active when work exists.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=488,category=98,ordinal=3,name="disposition-exhausted-only-when-proven",purpose="Verifies disposition exhausted only when proven.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=489,category=98,ordinal=4,name="disposition-retry-when-temporarily-deferred",purpose="Verifies disposition retry when temporarily deferred.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=490,category=98,ordinal=5,name="disposition-recomputes-after-roster-change",purpose="Verifies disposition recomputes after roster change.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=491,category=99,ordinal=1,name="liveness-real-progress-resets-timer",purpose="Verifies liveness real progress resets timer.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=492,category=99,ordinal=2,name="liveness-player-churn-alone-not-infinite-progress",purpose="Verifies liveness player churn alone not infinite progress.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=493,category=99,ordinal=3,name="liveness-pending-discovery-has-bounded-grace",purpose="Verifies liveness pending discovery has bounded grace.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=494,category=99,ordinal=4,name="liveness-transport-defer-has-bounded-grace",purpose="Verifies liveness transport defer has bounded grace.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=495,category=99,ordinal=5,name="liveness-exhausted-server-eventually-hops",purpose="Verifies liveness exhausted server eventually hops.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=496,category=100,ordinal=1,name="hop-blocked-during-live-trade",purpose="Verifies hop blocked during live trade.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=497,category=100,ordinal=2,name="hop-blocked-during-posttrade-audit",purpose="Verifies hop blocked during posttrade audit.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=498,category=100,ordinal=3,name="hop-blocked-during-pending-request",purpose="Verifies hop blocked during pending request.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=500,category=100,ordinal=5,name="hop-allowed-after-clean-lifecycle",purpose="Verifies hop allowed after clean lifecycle.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=501,category=101,ordinal=1,name="teleport-queue-valid-destination",purpose="Verifies teleport queue valid destination.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=502,category=101,ordinal=2,name="teleport-attempt-state-set",purpose="Verifies teleport attempt state set.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=503,category=101,ordinal=3,name="teleport-start-success-clears-retry-state",purpose="Verifies teleport start success clears retry state.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=504,category=101,ordinal=4,name="teleport-failure-releases-inprogress",purpose="Verifies teleport failure releases inprogress.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=505,category=101,ordinal=5,name="teleport-timeout-allows-recovery",purpose="Verifies teleport timeout allows recovery.",status="STRENGTHEN EXISTING",priority="P1",mode="INTEGRATION"},
+        {id=506,category=102,ordinal=1,name="bootstrap-carries-approved-auto-state",purpose="Verifies bootstrap carries approved auto state.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=507,category=102,ordinal=2,name="bootstrap-manual-execution-not-mistaken-for-teleport",purpose="Verifies bootstrap manual execution not mistaken for teleport.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=510,category=102,ordinal=5,name="bootstrap-does-not-carry-stale-live-trade",purpose="Verifies bootstrap does not carry stale live trade.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=511,category=103,ordinal=1,name="strictcommit-requires-candidate-status",purpose="Verifies strict commit requires candidate status.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=512,category=103,ordinal=2,name="strictcommit-requires-exact-current-roster",purpose="Verifies strict commit requires exact current roster.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=513,category=103,ordinal=3,name="strictcommit-rechecks-all-tracks-passed",purpose="Verifies strict commit rechecks all tracks passed.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=514,category=103,ordinal=4,name="strictcommit-old-server-does-not-learn-on-failure",purpose="Verifies strict commit old server does not learn on failure.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=515,category=103,ordinal=5,name="strictcommit-destination-import-only",purpose="Verifies strict commit destination import only.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=516,category=104,ordinal=1,name="recentjob-added-after-visit",purpose="Verifies recent JobId added after visit.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=517,category=104,ordinal=2,name="recentjob-filter-prevents-immediate-return",purpose="Verifies recent JobId filter prevents immediate return.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=518,category=104,ordinal=3,name="recentjob-expiry-restores-candidate",purpose="Verifies recent JobId expiry restores candidate.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=519,category=104,ordinal=4,name="recentjob-history-bounded",purpose="Verifies recent JobId history bounded.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=520,category=104,ordinal=5,name="recentjob-teleport-persistence-roundtrip",purpose="Verifies recent JobId teleport persistence roundtrip.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=523,category=105,ordinal=3,name="selfheal-clean-probe-recovers-health",purpose="Verifies self-heal clean probe recovers health.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=525,category=105,ordinal=5,name="selfheal-single-probe-inflight",purpose="Verifies self-heal single probe inflight.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=526,category=106,ordinal=1,name="watchdog-request-hang-detected",purpose="Verifies watchdog request hang detected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=527,category=106,ordinal=2,name="watchdog-trade-stall-detected",purpose="Verifies watchdog trade stall detected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=528,category=106,ordinal=3,name="watchdog-audit-stall-detected",purpose="Verifies watchdog audit stall detected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=529,category=106,ordinal=4,name="watchdog-teleport-stall-detected",purpose="Verifies watchdog teleport stall detected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=530,category=106,ordinal=5,name="watchdog-healthy-progress-not-interrupted",purpose="Verifies watchdog healthy progress not interrupted.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=531,category=107,ordinal=1,name="recovery-hop-blocked-during-trade",purpose="Verifies recovery hop blocked during trade.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=532,category=107,ordinal=2,name="recovery-hop-blocked-during-audit",purpose="Verifies recovery hop blocked during audit.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=533,category=107,ordinal=3,name="recovery-hop-allowed-after-stale-server",purpose="Verifies recovery hop allowed after stale server.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=534,category=107,ordinal=4,name="recovery-hop-count-increments-on-real-recovery",purpose="Verifies recovery hop count increments on real recovery.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=535,category=107,ordinal=5,name="recovery-hop-does-not-loop-immediately",purpose="Verifies recovery hop does not loop immediately.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=536,category=108,ordinal=1,name="race-old-request-callback-ignored",purpose="Verifies race old request callback ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=537,category=108,ordinal=2,name="race-old-partner-decline-ignored",purpose="Verifies race old partner decline ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=538,category=108,ordinal=3,name="race-old-inventory-result-ignored",purpose="Verifies race old inventory result ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=539,category=108,ordinal=4,name="race-old-thumbnail-result-ignored",purpose="Verifies race old thumbnail result ignored.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=540,category=108,ordinal=5,name="race-old-planner-result-ignored",purpose="Verifies race old planner result ignored.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=541,category=109,ordinal=1,name="singleflight-one-pending-request",purpose="Verifies singleflight one pending request.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=542,category=109,ordinal=2,name="singleflight-one-plan-generation-current",purpose="Verifies singleflight one plan generation current.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=543,category=109,ordinal=3,name="singleflight-one-bottrust-writer",purpose="Verifies singleflight one bot trust writer.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=544,category=109,ordinal=4,name="singleflight-thumbnail-key-deduped",purpose="Verifies singleflight thumbnail key deduped.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=545,category=109,ordinal=5,name="singleflight-one-teleport-active",purpose="Verifies singleflight one teleport active.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=546,category=110,ordinal=1,name="cancel-planner-on-offer-change",purpose="Verifies cancel planner on offer change.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=547,category=110,ordinal=2,name="cancel-feasibility-on-roster-change",purpose="Verifies cancel feasibility on roster change.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=548,category=110,ordinal=3,name="cancel-thumbnail-binding-on-row-reuse",purpose="Verifies cancel thumbnail binding on row reuse.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=549,category=110,ordinal=4,name="cancel-background-actions-on-destroy",purpose="Verifies cancel background actions on destroy.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=550,category=110,ordinal=5,name="cancel-auto-work-on-autooff",purpose="Verifies cancel auto work on AUTO OFF.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=551,category=111,ordinal=1,name="capability-no-writefile-degrades-persistence",purpose="Verifies capability no writefile degrades persistence.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=552,category=111,ordinal=2,name="capability-no-readfile-degrades-load",purpose="Verifies capability no readfile degrades load.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=553,category=111,ordinal=3,name="capability-no-request-disables-directauth",purpose="Verifies capability no request disables direct authentication.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=554,category=111,ordinal=4,name="capability-no-customasset-degrades-thumbnails",purpose="Verifies capability no customasset degrades thumbnails.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=555,category=111,ordinal=5,name="capability-no-queueonteleport-degrades-continuation",purpose="Verifies capability no queueonteleport degrades continuation.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=556,category=112,ordinal=1,name="malformed-json-rejected",purpose="Verifies malformed json rejected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=557,category=112,ordinal=2,name="malformed-http-status-handled",purpose="Verifies malformed http status handled.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=558,category=112,ordinal=3,name="malformed-inventory-field-types-contained",purpose="Verifies malformed inventory field types contained.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=559,category=112,ordinal=4,name="malformed-thumbnail-response-contained",purpose="Verifies malformed thumbnail response contained.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=560,category=112,ordinal=5,name="malformed-teleport-data-rejected",purpose="Verifies malformed teleport data rejected.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=561,category=113,ordinal=1,name="isolation-one-player-inventory-failure",purpose="Verifies isolation one player inventory failure.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=562,category=113,ordinal=2,name="isolation-one-target-request-error",purpose="Verifies isolation one target request error.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=563,category=113,ordinal=3,name="isolation-one-thumbnail-failure",purpose="Verifies isolation one thumbnail failure.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=564,category=113,ordinal=4,name="isolation-one-persistence-save-failure",purpose="Verifies isolation one persistence save failure.",status="STRENGTHEN EXISTING",priority="P0",mode="FIXTURE"},
+        {id=565,category=113,ordinal=5,name="isolation-one-ui-render-error-does-not-corrupt-trade-state",purpose="Verifies isolation one UI render error does not corrupt trade state.",status="NEW FIXTURE",priority="P0",mode="FIXTURE"},
+        {id=566,category=114,ordinal=1,name="idempotent-clear-runtime-twice",purpose="Verifies idempotent clear runtime twice.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=567,category=114,ordinal=2,name="idempotent-end-presence-twice",purpose="Verifies idempotent end presence twice.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=568,category=114,ordinal=3,name="idempotent-completion-event-twice",purpose="Verifies idempotent completion event twice.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=569,category=114,ordinal=4,name="idempotent-import-same-strictcommit",purpose="Verifies idempotent import same strict commit.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=570,category=114,ordinal=5,name="idempotent-render-same-state",purpose="Verifies idempotent render same state.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=571,category=115,ordinal=1,name="longsession-history-caps-hold",purpose="Verifies longsession history caps hold.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=572,category=115,ordinal=2,name="longsession-cache-pruning-holds",purpose="Verifies longsession cache pruning holds.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=573,category=115,ordinal=3,name="longsession-repeated-hops-preserve-core-state",purpose="Verifies longsession repeated hops preserve core state.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=574,category=115,ordinal=4,name="longsession-presence-generations-increase-correctly",purpose="Verifies longsession presence generations increase correctly.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=575,category=115,ordinal=5,name="longsession-no-duplicate-workers",purpose="Verifies longsession no duplicate workers.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=576,category=116,ordinal=1,name="performance-planner-state-cap",purpose="Verifies performance planner state cap.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=577,category=116,ordinal=2,name="performance-planner-yields-within-budget",purpose="Verifies performance planner yields within budget.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=578,category=116,ordinal=3,name="performance-hashing-yields",purpose="Verifies performance hashing yields.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=579,category=116,ordinal=4,name="performance-thumbnail-concurrency-bounded",purpose="Verifies performance thumbnail concurrency bounded.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=580,category=116,ordinal=5,name="performance-support-snapshot-bounded",purpose="Verifies performance support snapshot bounded.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=581,category=117,ordinal=1,name="time-zero-age-handled",purpose="Verifies time zero age handled.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=582,category=117,ordinal=2,name="time-learning-boundary-exact",purpose="Verifies time learning boundary exact.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=583,category=117,ordinal=3,name="time-cooldown-boundary-exact",purpose="Verifies time cooldown boundary exact.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=584,category=117,ordinal=4,name="time-engagement-extension-boundary-exact",purpose="Verifies time engagement extension boundary exact.",status="STRENGTHEN EXISTING",priority="P1",mode="PURE"},
+        {id=585,category=117,ordinal=5,name="time-osclock-vs-unix-not-mixed",purpose="Verifies time osclock vs unix not mixed.",status="NEW PURE",priority="P1",mode="PURE"},
+        {id=586,category=118,ordinal=1,name="snapshot-includes-current-partner",purpose="Verifies snapshot includes current partner.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=587,category=118,ordinal=2,name="snapshot-includes-request-lifecycle",purpose="Verifies snapshot includes request lifecycle.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=588,category=118,ordinal=3,name="snapshot-includes-learning-epoch",purpose="Verifies snapshot includes learning epoch.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=589,category=118,ordinal=4,name="snapshot-includes-bot-certification-state",purpose="Verifies snapshot includes bot certification state.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=590,category=118,ordinal=5,name="snapshot-includes-selftest-summary",purpose="Verifies snapshot includes self-test summary.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=591,category=119,ordinal=1,name="snapshot-redacts-auth-secret",purpose="Verifies snapshot redacts auth secret.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=592,category=119,ordinal=2,name="snapshot-bounds-history-arrays",purpose="Verifies snapshot bounds history arrays.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=593,category=119,ordinal=3,name="snapshot-serializes-instances-safely",purpose="Verifies snapshot serializes instances safely.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=594,category=119,ordinal=4,name="snapshot-no-circular-reference-failure",purpose="Verifies snapshot no circular reference failure.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=595,category=119,ordinal=5,name="snapshot-generated-while-active-does-not-mutate-runtime",purpose="Verifies snapshot generated while active does not mutate runtime.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=596,category=120,ordinal=1,name="journal-records-target-selection",purpose="Verifies journal records target selection.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=597,category=120,ordinal=2,name="journal-records-plan-none-reason",purpose="Verifies journal records plan none reason.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=598,category=120,ordinal=3,name="journal-records-lifecycle-outcomes",purpose="Verifies journal records lifecycle outcomes.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=599,category=120,ordinal=4,name="journal-chronological-order",purpose="Verifies journal chronological order.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=601,category=121,ordinal=1,name="sessionhistory-new-server-entry-created",purpose="Verifies session history new server entry created.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=602,category=121,ordinal=2,name="sessionhistory-prior-session-preserved",purpose="Verifies session history prior session preserved.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=603,category=121,ordinal=3,name="sessionhistory-current-session-distinguished",purpose="Verifies session history current session distinguished.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=604,category=121,ordinal=4,name="sessionhistory-history-cap-enforced",purpose="Verifies session history history cap enforced.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=605,category=121,ordinal=5,name="sessionhistory-no-live-instance-persistence",purpose="Verifies session history no live instance persistence.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=606,category=122,ordinal=1,name="status-requesting-matches-pending-request",purpose="Verifies status requesting matches pending request.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=607,category=122,ordinal=2,name="status-trade-state-matches-active-trade",purpose="Verifies status trade state matches active trade.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=608,category=122,ordinal=3,name="status-plan-none-reason-current",purpose="Verifies status plan none reason current.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=609,category=122,ordinal=4,name="status-hop-reason-current",purpose="Verifies status hop reason current.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=610,category=122,ordinal=5,name="status-error-code-stable-and-specific",purpose="Verifies status error code stable and specific.",status="STRENGTHEN EXISTING",priority="P1",mode="FIXTURE"},
+        {id=611,category=123,ordinal=1,name="thought-request-message-names-target",purpose="Verifies thought request message names target.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=612,category=123,ordinal=2,name="thought-accepted-message-only-after-real-start",purpose="Verifies thought accepted message only after real start.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=613,category=123,ordinal=3,name="thought-obtain-message-uses-intended-items",purpose="Verifies thought obtain message uses intended items.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=614,category=123,ordinal=4,name="thought-unresponsive-only-on-real-timeout",purpose="Verifies thought unresponsive only on real timeout.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=615,category=123,ordinal=5,name="thought-decline-message-names-correct-partner",purpose="Verifies thought decline message names correct partner.",status="NEW FIXTURE",priority="P1",mode="FIXTURE"},
+        {id=616,category=124,ordinal=1,name="integration-inventory-to-queue",purpose="Verifies integration inventory to queue.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=617,category=124,ordinal=2,name="integration-queue-to-constructible-intent",purpose="Verifies integration queue to constructible intent.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=618,category=124,ordinal=3,name="integration-request-to-starttrade-intent",purpose="Verifies integration request to StartTrade intent.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=619,category=124,ordinal=4,name="integration-live-offer-to-validate-to-reconcile",purpose="Verifies integration live offer to validate to reconcile.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=620,category=124,ordinal=5,name="integration-success-to-audit-to-learning",purpose="Verifies integration success to audit to learning.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=621,category=125,ordinal=1,name="story-profitable-outgoing-success",purpose="Verifies story profitable outgoing success.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=622,category=125,ordinal=2,name="story-outgoing-request-declined",purpose="Verifies story outgoing request declined.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=623,category=125,ordinal=3,name="story-partner-opens-then-unresponsive",purpose="Verifies story partner opens then unresponsive.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=624,category=125,ordinal=4,name="story-partner-mutates-offer-during-negotiation",purpose="Verifies story partner mutates offer during negotiation.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=625,category=125,ordinal=5,name="story-success-event-lost-audit-recovers",purpose="Verifies story success event lost audit recovers.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=626,category=126,ordinal=1,name="serverstory-fresh-server-to-first-target",purpose="Verifies serverstory fresh server to first target.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=627,category=126,ordinal=2,name="serverstory-no-useful-players-to-hop",purpose="Verifies serverstory no useful players to hop.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=628,category=126,ordinal=3,name="serverstory-temporary-discovery-delay-recovers",purpose="Verifies serverstory temporary discovery delay recovers.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=629,category=126,ordinal=4,name="serverstory-hop-failure-retries-safely",purpose="Verifies serverstory hop failure retries safely.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=630,category=126,ordinal=5,name="serverstory-hop-success-restores-session",purpose="Verifies serverstory hop success restores session.",status="NEW INTEGRATION",priority="P1",mode="INTEGRATION"},
+        {id=631,category=127,ordinal=1,name="botstory-all-fixedbots-certify",purpose="Verifies botstory all fixedbots certify.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=632,category=127,ordinal=2,name="botstory-one-human-immediately-vetoes",purpose="Verifies botstory one human immediately vetoes.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=633,category=127,ordinal=3,name="botstory-human-moves-during-thumbnail-resolution",purpose="Verifies botstory human moves during thumbnail resolution.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=634,category=127,ordinal=4,name="botstory-roster-changes-before-commit",purpose="Verifies botstory roster changes before commit.",status="STRENGTHEN EXISTING",priority="P0",mode="INTEGRATION"},
+        {id=635,category=127,ordinal=5,name="botstory-certified-teleport-destination-promotes",purpose="Verifies botstory certified teleport destination promotes.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=636,category=128,ordinal=1,name="interference-supreme-refresh-during-planning",purpose="Verifies interference Supreme refresh during planning.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=637,category=128,ordinal=2,name="interference-ui-rebuild-during-thumbnail-download",purpose="Verifies interference UI rebuild during thumbnail download.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=638,category=128,ordinal=3,name="interference-bot-sampling-during-live-trade",purpose="Verifies interference bot sampling during live trade.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=639,category=128,ordinal=4,name="interference-autooff-during-server-discovery",purpose="Verifies interference AUTO OFF during server discovery.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=640,category=128,ordinal=5,name="interference-teleport-while-persistence-busy",purpose="Verifies interference teleport while persistence busy.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=642,category=129,ordinal=2,name="regression-target-intent-no-empty-outbound",purpose="Verifies regression target intent no empty outbound.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=643,category=129,ordinal=3,name="regression-strategic-precontact-matches-liquidity-planner",purpose="Verifies regression strategic precontact matches liquidity planner.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=644,category=129,ordinal=4,name="regression-bot-final-movedirection-race",purpose="Verifies regression bot final MoveDirection race.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=645,category=129,ordinal=5,name="regression-manual-start-auto-off",purpose="Verifies regression manual start auto off.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=646,category=130,ordinal=1,name="fuzz-random-inventories-never-return-unsafe-plan",purpose="Verifies fuzz random inventories never return unsafe plan.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=647,category=130,ordinal=2,name="fuzz-random-offer-mutations-no-stale-plan-accepted",purpose="Verifies fuzz random offer mutations no stale plan accepted.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=648,category=130,ordinal=3,name="fuzz-random-player-events-no-cross-presence-leak",purpose="Verifies fuzz random player events no cross presence leak.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=649,category=130,ordinal=4,name="fuzz-random-bot-movement-one-human-always-vetoes",purpose="Verifies fuzz random bot movement one human always vetoes.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+        {id=650,category=130,ordinal=5,name="fuzz-random-callback-order-no-double-outcome",purpose="Verifies fuzz random callback order no double outcome.",status="NEW INTEGRATION",priority="P0",mode="INTEGRATION"},
+    }
+
+    local surfaceRequirements = {
+        [1] = {"AutoTrader.RunSelfTests", "AutoTrader.SelfTest"},
+        [2] = {"AutoTrader.GetTeleportAutomationCarry", "AutoTrader.SavePreferences", "UI.RootGui"},
+        [3] = {"Controller.Destroy", "HARDEN.startPeriodic", "HARDEN.startFastPeriodic"},
+        [4] = {"CONFIG.AutoTraderNegotiationStage1Margin", "CONFIG.AutoTraderLearningEpochSeconds", "CONFIG.MaxOfferSlots"},
+        [5] = {"AutoTrader.SavePreferences", "AutoTrader.Preferences", "HARDEN.readJsonFileBestEffort"},
+        [6] = {"UI.RootGui", "UI.AutoTraderPanel", "UI.AutoTraderPageHost"},
+        [7] = {"UI.AutoTraderPanel", "UI.AutoTraderPageHost", "UI.AutoTraderReserveScroll"},
+        [8] = {"UI.AutoTraderHomeContent", "UI.AutoTraderStatus", "AutoTrader.Render"},
+        [9] = {"UI.AutoTraderTradeStatusCard", "UI.AutoTraderTradePartner", "UI.AutoTraderTradeWhy"},
+        [10] = {"UI.AutoTraderPlayerContent", "UI.AutoTraderPlayerScroll", "AutoTrader.RebuildPlayerDashboard"},
+        [11] = {"UI.AutoTraderServerCandidateContent", "UI.AutoTraderServerCandidateScroll", "AutoTrader.RebuildServerDashboard"},
+        [12] = {"UI.AutoTraderSelfTestCard", "UI.AutoTraderSelfTests", "AutoTrader.UpdateControls"},
+        [13] = {"UI.AutoTraderThoughtFeed", "AutoTrader.PushThought", "AutoTrader.ClearThoughtFeed", "AutoTrader.LayoutThoughtFeed"},
+        [14] = {"AutoTrader.OnTradeState", "AutoTrader.IsLocalAccepted", "AutoTrader.SuppressTradeVisuals"},
+        [15] = {"AutoTrader.Render", "AutoTrader.UpdateControls", "UI.AutoTraderEnabled"},
+        [16] = {"Profile.DescribeSupremeRecordValue", "HARDEN.refreshResolvedViews", "HARDEN.readJsonFileBestEffort"},
+        [17] = {"HARDEN.readJsonFileBestEffort", "HARDEN.atomicWriteTextFileBestEffort", "HARDEN.readLkgEnvelope"},
+        [18] = {"Profile.DescribeSupremeRecordValue", "Mapping.ItemLinks", "AutoTrader.GetValueIdentityKey"},
+        [19] = {"Profile.DescribeSupremeRecordValue", "AutoTrader.SummarizeOther"},
+        [20] = {"Profile.DescribeSupremeRecordValue", "AutoTrader.GetVerifiedPlayerValue"},
+        [21] = {"Profile.CalculateRemoteSection", "Profile.ResolveRemoteInventoryItem"},
+        [22] = {"AutoTrader.GetValueIdentityKey", "AutoTrader.BuildCanonicalValueIdentityKey", "AutoTrader.BuildEffectiveIdentityHint"},
+        [23] = {"AutoTrader.GetMutationIdentityKey", "AutoTrader.FindMutationIdentityCollisions", "AutoTrader.CopyPlannerItemIdentity"},
+        [24] = {"AutoTrader.AnnotateIdentity", "AutoTrader.CopyPlannerItemIdentity"},
+        [25] = {"AutoTrader.IsRecordCompatibleWithIdentityHint", "AutoTrader.ManualRecordConflictsWithNativeIdentity"},
+        [26] = {"AutoTrader.GetLocalInventory", "AutoTrader.GetTradableInventory", "Profile.QueueScan"},
+        [27] = {"AutoTrader.GetResolvedRemoteOpportunityEntries", "Profile.ResolveRemoteInventoryItem", "Profile.CalculateRemoteSection"},
+        [28] = {"AutoTrader.BuildPreTradeOpportunity", "AutoTrader.GetVerifiedPlayerValue", "AutoTrader.GetPlayerKnownValueFloor"},
+        [29] = {"AutoTrader.BuildFeasibilitySignatureFromParts", "AutoTrader.BuildOrderedQueueSignature", "AutoTrader.GetReserveSignature"},
+        [30] = {"AutoTrader.GetReserve", "AutoTrader.GetTradableInventory", "AutoTrader.GetReserveSignature"},
+        [31] = {"AutoTrader.BuildParetoOfferFrontier", "AutoTrader.BuildPreTradeOpportunity", "AutoTrader.BuildOpportunityFrontier"},
+        [32] = {"AutoTrader.EvaluatePlayerEligibility", "AutoTrader.BuildEligibilityContext", "AutoTrader.DecisionDataFresh"},
+        [33] = {"AutoTrader.BuildEligibilitySnapshot", "AutoTrader.BuildConstructibleOutboundQueue", "AutoTrader.CompareQueueRows"},
+        [34] = {"AutoTrader.CompareQueueRows", "AutoTrader.GetTargetScore", "AutoTrader.BuildOrderedQueueSignature"},
+        [35] = {"AutoTrader.BuildConstructibleOutboundOpeningIntent", "AutoTrader.BuildConstructibleOutboundQueue", "AutoTrader.FindPlan", "AutoTrader.FindLiquidityPlan"},
+        [36] = {"AutoTrader.CaptureTargetIntent", "AutoTrader.BuildTargetIntentOpeningOffer", "AutoTrader.TrySendRequest"},
+        [37] = {"AutoTrader.FindPlan", "AutoTrader.ValidatePlan", "AutoTrader.GetEffectiveMinimumWin"},
+        [38] = {"AutoTrader.FindLiquidityPlan", "AutoTrader.EvaluatePortfolioDelta", "AutoTrader.EvaluateMarketGate"},
+        [39] = {"AutoTrader.BuildParetoOfferFrontier", "AutoTrader.QuantityOptions", "AutoTrader.ReconstructFrontierItems"},
+        [40] = {"AutoTrader.EvaluateMarketGate", "AutoTrader.FindPlan"},
+        [41] = {"AutoTrader.EvaluatePortfolioDelta", "AutoTrader.GetPortfolioMetrics", "AutoTrader.GetAnchor"},
+        [42] = {"AutoTrader.BuildReachProfile", "AutoTrader.GetReachBudgetSet", "AutoTrader.EvaluatePortfolioDelta"},
+        [43] = {"AutoTrader.GetMinimumWin", "AutoTrader.GetEffectiveMinimumWin", "AutoTrader.GetValueBand"},
+        [44] = {"AutoTrader.FindPlan", "AutoTrader.BuildTargetIntentOpeningOffer", "AutoTrader.GetLearningEpochMargin"},
+        [45] = {"AutoTrader.GetNegotiationStage", "AutoTrader.GetLearningEpochMargin"},
+        [46] = {"AutoTrader.ApplyPlanHysteresis", "AutoTrader.GetOfferMutationCost"},
+        [47] = {"AutoTrader.ValidatePlan", "AutoTrader.BuildActionContext", "AutoTrader.ActionContextValid"},
+        [48] = {"AutoTrader.ReconcileDesired", "AutoTrader.FireMutation", "AutoTrader.GetOfferQuantity"},
+        [49] = {"AutoTrader.TrySendRequest", "AutoTrader.FailPendingRequestAttempt", "AutoTrader.ReconcileOutgoingRequestState"},
+        [50] = {"AutoTrader.AcknowledgeOutgoingTransport", "AutoTrader.IsExpectedPartner", "AutoTrader.ReconcileOutgoingRequestState"},
+        [51] = {"AutoTrader.HandleIncomingRequest", "AutoTrader.DecideIncomingRequester", "AutoTrader.ActOnIncomingRequest"},
+        [52] = {"AutoTrader.IsExpectedPartner", "AutoTrader.GetPlayerFromSide", "AutoTrader.SetManagedPartner"},
+        [53] = {"AutoTrader.SetManagedPartner", "AutoTrader.ClearTradeRuntime", "AutoTrader.NoteTradeUpdate"},
+        [54] = {"AutoTrader.OnTradeState", "AutoTrader.NoteTradeUpdate", "AutoTrader.ReconcileDesired"},
+        [55] = {"AutoTrader.GetFirstOfferDeadline", "AutoTrader.NoteTradeUpdate"},
+        [56] = {"AutoTrader.GetFirstOfferDeadline", "AutoTrader.CooldownRemaining", "AutoTrader.GetServerRescanDelay"},
+        [57] = {"AutoTrader.ClassifyPendingCancellation", "AutoTrader.FinalizePendingDecline", "AutoTrader.ReconcileTradeDeclineState"},
+        [58] = {"AutoTrader.IsLocalAccepted", "AutoTrader.BuildAcceptKey", "AutoTrader.GetAcceptCooldown"},
+        [59] = {"AutoTrader.CaptureAcceptAudit", "AutoTrader.ReconcilePlayerActivityOutcome", "AutoTrader.RunPostTradeAudit"},
+        [60] = {"AutoTrader.GetLocalAuditSnapshot", "AutoTrader.CaptureAcceptAudit", "AutoTrader.BuildDebug"},
+        [61] = {"AutoTrader.CooldownRemaining", "AutoTrader.MarkServerPlayerOutcome", "AutoTrader.GetPlayerStats"},
+        [62] = {"AutoTrader.FenceOutstandingRequestForAutomationOff", "AutoTrader.ClearTradeRuntime", "AutoTrader.UpdateControls"},
+        [63] = {"AutoTrader.GetStrategyStats", "AutoTrader.RecordStrategyEvent", "AutoTrader.GetPlayerStats"},
+        [64] = {"AutoTrader.EnsureLearningEpoch", "AutoTrader.GetLearningEpochMargin"},
+        [65] = {"AutoTrader.ComputeLearningEpochMarginDelta", "AutoTrader.GetLearningEpochMargin"},
+        [66] = {"AutoTrader.PrepareMarginTrainingEventData", "AutoTrader.RecordStrategyEvent"},
+        [67] = {"AutoTrader.PrepareMarginTrainingEventData", "AutoTrader.GetNegotiationStage"},
+        [68] = {"AutoTrader.GetStrategyStats", "AutoTrader.EnsureLearningEpoch", "AutoTrader.FlushTargetStats"},
+        [69] = {"AutoTrader.PrepareMarginTrainingEventData", "AutoTrader.RecordTargetEvent"},
+        [70] = {"AutoTrader.SampleGoldBotCertification", "AutoTrader.ClearStrictGoldCandidateStaging"},
+        [71] = {"AutoTrader.IsBotMoveDirectionContradiction", "AutoTrader.MarkGoldCertificationRegular"},
+        [72] = {"AutoTrader.SampleGoldBotCertification", "AutoTrader.BuildGoldPlayerSupportSummary"},
+        [73] = {"AutoTrader.SampleGoldBotCertification", "AutoTrader.BuildGoldPlayerSupportSummary"},
+        [74] = {"AutoTrader.SampleGoldBotCertification", "AutoTrader.PrepareStrictGoldCandidate"},
+        [75] = {"AutoTrader.ClearStrictGoldCandidateStaging", "AutoTrader.BuildStrictGoldTeleportCommitPayload"},
+        [76] = {"AutoTrader.PrepareStrictGoldCandidate", "AutoTrader.ResolveUserIdsFingerprints"},
+        [77] = {"AutoTrader.EvaluateBotAvoidanceHop", "AutoTrader.IsBotMoveDirectionContradiction"},
+        [78] = {"AutoTrader.ShouldRevokeAutomatedBotEscape", "AutoTrader.EvaluateBotAvoidanceHop"},
+        [79] = {"AutoTrader.GetGoldAdaptiveObserveSeconds", "AutoTrader.FlushHumanDetectionTiming", "AutoTrader.NormalizeHumanDetectionTiming"},
+        [80] = {"AutoTrader.NormalizeBotIconDb", "AutoTrader.PruneBotIconDb", "AutoTrader.GetBotIconRecord"},
+        [81] = {"AutoTrader.GetBotIconClass", "AutoTrader.GetTrustedBotIconJobCount"},
+        [82] = {"AutoTrader.AddStrictGoldBotIconEvidence", "AutoTrader.AddManualGoldBotIconEvidence", "AutoTrader.GetBotEvidenceProvenanceSummary"},
+        [83] = {"AutoTrader.CommitTrustedBotDbCandidate", "AutoTrader.BotTrustBodyMatchesMarker"},
+        [84] = {"AutoTrader.ReadTrustedBotDbFromDisk", "AutoTrader.BotTrustBodyMatchesMarker"},
+        [85] = {"AutoTrader.GetUnresolvedBotTrustFileWrite", "AutoTrader.HoldBotTrustArbiterUntilFileWritesResolve", "AutoTrader.FlushBotIconDb"},
+        [86] = {"AutoTrader.ClassifyServerPreview", "AutoTrader.GetBotIconClass"},
+        [87] = {"AutoTrader.ApplyBotEvidenceToDb", "AutoTrader.BuildGoldCertificationSupport"},
+        [88] = {"AutoTrader.FetchPublicServers", "AutoTrader.BuildPublicServerQueue", "AutoTrader.FindPublicServer"},
+        [89] = {"AutoTrader.BuildAuthenticatedDirectServerQueue", "AutoTrader.ParseDirectAuthServerListBody", "AutoTrader.InstallV37DirectAuthRuntime"},
+        [90] = {"AutoTrader.ConnectDirectAuthSecret", "AutoTrader.ForgetDirectAuthSecret", "AutoTrader.HasDirectAuthSecret"},
+        [91] = {"AutoTrader.GetDirectAuthSupportSummary", "AutoTrader.BuildTeleportBootstrapCode", "AutoTrader.BuildDebug"},
+        [92] = {"AutoTrader.GetServerRescanDelay", "AutoTrader.FetchPublicServers"},
+        [93] = {"AutoTrader.MergeServerCandidateCache", "AutoTrader.PruneRecentJobs", "AutoTrader.IsManualBotServerJob"},
+        [94] = {"AutoTrader.CanonicalThumbnailFingerprint", "AutoTrader.ExtractAvatarHeadshotHash"},
+        [95] = {"AutoTrader.FetchUpcomingThumbnailDisplayBytes", "AutoTrader.ApplyUpcomingThumbnailDisplayResult"},
+        [96] = {"AutoTrader.QueueUpcomingThumbnailPrefetch", "AutoTrader.PumpUpcomingThumbnailPrefetch", "AutoTrader.PruneUpcomingThumbnailDisplayCache"},
+        [97] = {"AutoTrader.CompareFreshServerCandidates", "AutoTrader.BuildPublicServerQueue"},
+        [98] = {"AutoTrader.GetServerDisposition", "AutoTrader.GetServerDispositionLegacyClassification"},
+        [99] = {"AutoTrader.ProcessWholeServerNoProgress", "AutoTrader.GetServerDisposition"},
+        [100] = {"AutoTrader.TryServerHop", "AutoTrader.IsBotEscapeActive", "AutoTrader.IsSupervisedCanaryArmed"},
+        [101] = {"AutoTrader.BeginTeleport", "AutoTrader.QueueTeleportScript", "AutoTrader.AbortServerHop"},
+        [102] = {"AutoTrader.BuildTeleportBootstrapCode", "AutoTrader.GetTeleportAutomationCarry"},
+        [103] = {"AutoTrader.BuildStrictGoldTeleportCommitPayload", "AutoTrader.ImportStrictGoldTeleportCommit"},
+        [104] = {"AutoTrader.PruneRecentJobs", "AutoTrader.LoadRecentJobs", "AutoTrader.SaveRecentJobs"},
+        [105] = {"AutoTrader.Round37RecordTransportFailure", "AutoTrader.Round37ResetTransportHealth", "AutoTrader.RequestRecoveryTeleport"},
+        [106] = {"AutoTrader.Tick", "AutoTrader.OvernightSupervisor", "AutoTrader.ReconcileOutgoingRequestState"},
+        [107] = {"AutoTrader.RequestRecoveryTeleport", "AutoTrader.BeginTeleport"},
+        [108] = {"AutoTrader.ActionContextValid", "AutoTrader.BuildActionContext", "AutoTrader.IsUpcomingThumbnailBindingCurrent"},
+        [109] = {"AutoTrader.GetUnresolvedBotTrustFileWrite", "AutoTrader.IsAnyNativeOutgoingPending", "AutoTrader.BeginTeleport"},
+        [110] = {"AutoTrader.BuildParetoOfferFrontier", "AutoTrader.FenceOutstandingRequestForAutomationOff", "AutoTrader.PruneUpcomingThumbnailDisplayCache"},
+        [111] = {"HARDEN.readJsonFileBestEffort", "HARDEN.atomicWriteTextFileBestEffort", "AutoTrader.GetQueueOnTeleport"},
+        [112] = {"AutoTrader.ParseDirectAuthServerListBody", "AutoTrader.ParseServerPreviewCompanionBody", "AutoTrader.NormalizeBotIconDb"},
+        [113] = {"AutoTrader.Round39ClassifyTargetSpecificRequestError", "AutoTrader.GetDirectAuthSupportSummary", "AutoTrader.ApplyUpcomingThumbnailDisplayResult"},
+        [114] = {"AutoTrader.ClearTradeRuntime", "AutoTrader.PruneRecentJobs", "AutoTrader.BuildDecisionJournalSupport"},
+        [115] = {"AutoTrader.PruneTargetStats", "AutoTrader.PruneRecentJobs", "AutoTrader.PruneBotIconDb"},
+        [116] = {"AutoTrader.BuildParetoOfferFrontier", "AutoTrader.BuildReachProfile", "AutoTrader.GetUpcomingThumbnailDisplaySummary"},
+        [117] = {"AutoTrader.EnsureLearningEpoch", "AutoTrader.CooldownRemaining", "AutoTrader.GetFirstOfferDeadline"},
+        [118] = {"AutoTrader.BuildDebug", "AutoTrader.BuildGoldCertificationSupport", "AutoTrader.BuildSessionHistorySupport"},
+        [119] = {"HARDEN.supportJsonValue", "AutoTrader.BuildDebug", "AutoTrader.GetDirectAuthSupportSummary"},
+        [120] = {"AutoTrader.RecordDecisionJournalEntry", "AutoTrader.BuildDecisionJournalSupport"},
+        [121] = {"AutoTrader.BuildSessionHistoryRecord", "AutoTrader.BuildSessionHistorySupport"},
+        [122] = {"AutoTrader.RecordDecisionLifecycleEvent", "AutoTrader.GetContactState", "AutoTrader.GetServerDisposition"},
+        [123] = {"AutoTrader.PushThought", "AutoTrader.UpdateThoughtFeedFromState", "AutoTrader.FormatOpportunityItems"},
+        [124] = {"AutoTrader.BuildPreTradeOpportunity", "AutoTrader.BuildConstructibleOutboundQueue", "AutoTrader.TrySendRequest", "AutoTrader.OnTradeState"},
+        [125] = {"AutoTrader.TrySendRequest", "AutoTrader.OnTradeState", "AutoTrader.ValidatePlan", "AutoTrader.CaptureAcceptAudit"},
+        [126] = {"AutoTrader.BuildEligibilitySnapshot", "AutoTrader.GetServerDisposition", "AutoTrader.TryServerHop", "AutoTrader.BeginTeleport"},
+        [127] = {"AutoTrader.SampleGoldBotCertification", "AutoTrader.PrepareStrictGoldCandidate", "AutoTrader.EvaluateBotAvoidanceHop", "AutoTrader.ImportStrictGoldTeleportCommit"},
+        [128] = {"AutoTrader.BuildFeasibilitySignatureFromParts", "AutoTrader.IsUpcomingThumbnailBindingCurrent", "AutoTrader.GetUnresolvedBotTrustFileWrite"},
+        [129] = {"AutoTrader.GetVerifiedPlayerValue", "AutoTrader.BuildConstructibleOutboundOpeningIntent", "AutoTrader.IsBotMoveDirectionContradiction", "AutoTrader.GetTeleportAutomationCarry"},
+        [130] = {"AutoTrader.FindPlan", "AutoTrader.BuildFeasibilitySignatureFromParts", "AutoTrader.IsExpectedPartner", "AutoTrader.IsBotMoveDirectionContradiction"},
+    }
+
+    local roots = {
+        AutoTrader = State.AutoTrader,
+        Profile = State.Profile,
+        Mapping = State.Mapping,
+        UI = UI,
+        HARDEN = HARDEN,
+        CONFIG = CONFIG,
+        Controller = Controller,
+    }
+
+    local function resolveSurface(path)
+        if type(path) ~= "string" then return nil end
+        local first, rest = path:match("^([^.]+)%.(.+)$")
+        local value = roots[first]
+        if value == nil then return nil end
+        for segment in tostring(rest):gmatch("[^.]+") do
+            if type(value) ~= "table" then return nil end
+            value = value[segment]
+            if value == nil then return nil end
+        end
+        return value
+    end
+
+    local function pass(value, detail)
+        return value == true, detail
+    end
+
+    local function choose(ordinal, checks)
+        if type(checks) ~= "table" or #checks == 0 then
+            return false, "expanded self-test has no checks"
+        end
+        local fn = checks[((math.max(1, math.floor(tonumber(ordinal) or 1)) - 1) % #checks) + 1]
+        return fn()
+    end
+
+    local function cloneShallow(tbl)
+        local out = {}
+        for k,v in pairs(type(tbl) == "table" and tbl or {}) do out[k] = v end
+        return out
+    end
+
+    local function withPatches(patches, callback)
+        local saved = {}
+        for i, patch in ipairs(patches or {}) do
+            saved[i] = {target=patch[1], key=patch[2], value=patch[1][patch[2]]}
+            patch[1][patch[2]] = patch[3]
+        end
+        local results = table.pack(pcall(callback))
+        for i = #saved, 1, -1 do
+            local row = saved[i]
+            row.target[row.key] = row.value
+        end
+        if not results[1] then error(results[2]) end
+        return table.unpack(results, 2, results.n)
+    end
+
+    local function fixtureItem(name, value, quantity, demand)
+        quantity = math.max(1, math.floor(tonumber(quantity) or 1))
+        value = tonumber(value) or 0
+        demand = tonumber(demand) or 5
+        return {
+            key="expanded|"..tostring(name), itemId=tostring(name), itemType="Weapons", name=tostring(name),
+            unitValue=value, quantity=quantity, maxQuantity=quantity, reserve=0, demand=demand,
+            record={name=tostring(name),key="expanded|"..tostring(name),category="godlies",data={value=value,demand=demand}},
+        }
+    end
+
+    local function fixtureSummary(items)
+        local total = 0
+        for _, item in ipairs(items or {}) do
+            total += (tonumber(item.unitValue) or 0) * math.max(1, math.floor(tonumber(item.quantity) or 1))
+        end
+        return {
+            knownFloor=total,totalValue=total,unknownCount=0,slotCount=#(items or {}),
+            demand=5,demandCoverage=1,flip=nil,flipCoverage=0,stability=nil,stabilityCoverage=0,
+            stabilityShares={},entries=items or {},
+        }
+    end
+
+    local function jsonContainsSecret(value, secret)
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(value) end)
+        if not ok then return true end
+        return tostring(encoded):find(tostring(secret), 1, true) ~= nil
+    end
+
+    local function surfaceProbe(case)
+        local paths = surfaceRequirements[case.category] or {}
+        if #paths == 0 then return false, "no production surface mapped for category" end
+        local path = paths[((case.ordinal - 1) % #paths) + 1]
+        local value = resolveSurface(path)
+        if value == nil then return false, "required production surface missing: "..tostring(path) end
+        if path:find("^UI%.") then
+            return typeof(value) == "Instance" and value.Parent ~= nil,
+                "required UI Instance is absent/unparented: "..tostring(path)
+        end
+        if path:find("^CONFIG%.") then
+            local t = type(value)
+            return (t=="number" and value==value) or t=="boolean" or t=="string" or t=="table",
+                "configuration surface has invalid type: "..tostring(path)
+        end
+        return true
+    end
+
+    local function semanticProbe(case)
+        local cid, ord = case.category, case.ordinal
+
+        if cid == 1 then
+            return choose(ord,{
+                function()
+                    local rows={}
+                    local function mini(name,cb)
+                        local ok,val=pcall(cb);table.insert(rows,{name=name,ok=ok and val==true})
+                    end
+                    mini("a",function() return true end);mini("b",function() return false end)
+                    return #rows==2 and rows[1].ok==true and rows[2].ok==false,"mini test registration/count mismatch"
+                end,
+                function()
+                    local rows={{ok=true},{ok=false},{ok=false}};local p=0;for _,r in ipairs(rows) do if r.ok then p+=1 end end
+                    return p==1 and (#rows-p)==2,"failure accounting mismatch"
+                end,
+                function()
+                    local ok=pcall(function() error("fixture") end)
+                    return ok==false,"exception fixture did not fail under pcall"
+                end,
+                function()
+                    local t={x=1};local before=t.x
+                    local ok=pcall(function() t.x=2 end);t.x=before
+                    return ok and t.x==1,"fixture mutation was not restorable"
+                end,
+                function()
+                    local seen=0
+                    for _,cb in ipairs({function() seen+=1;return false end,function() seen+=1;return true end}) do pcall(cb) end
+                    return seen==2,"one failure prevented later mini-test execution"
+                end,
+            })
+        elseif cid == 2 then
+            return choose(ord,{
+                function()
+                    local savedPrefs=State.AutoTrader.Preferences
+                    local savedAutoPrefs=AutoPrefs
+                    local savedGlobal=rawget(_G,State.AutoTrader.PreferencesKey)
+                    local captured
+                    local ok, result = pcall(function()
+                        State.AutoTrader.Preferences=normalizePreferences({automation=true})
+                        local oldWrite=HARDEN.atomicWriteTextFileBestEffort
+                        HARDEN.atomicWriteTextFileBestEffort=function(_,body) captured=body;return true end
+                        local wrote=State.AutoTrader.SavePreferences()
+                        HARDEN.atomicWriteTextFileBestEffort=oldWrite
+                        local decoded=captured and HttpService:JSONDecode(captured)
+                        return wrote==true and decoded and decoded.preferences and decoded.preferences.automation==false
+                    end)
+                    State.AutoTrader.Preferences=savedPrefs;AutoPrefs=savedAutoPrefs;rawset(_G,State.AutoTrader.PreferencesKey,savedGlobal)
+                    return ok and result==true,"normal preference save was able to persist AUTO=true"
+                end,
+                function()
+                    local prefs=State.AutoTrader.Preferences
+                    local oldAuto=prefs.automation;local oldCanary=State.AutoTrader.SupervisedCanaryArmed
+                    prefs.automation=true;State.AutoTrader.SupervisedCanaryArmed=false
+                    local carry=State.AutoTrader.GetTeleportAutomationCarry()
+                    prefs.automation=oldAuto;State.AutoTrader.SupervisedCanaryArmed=oldCanary
+                    return carry==true,"explicit teleport automation carry did not preserve AUTO"
+                end,
+                function() return LocalPlayer~=nil and LocalPlayer.Parent==Players,"LocalPlayer startup prerequisite is unavailable" end,
+                function() return PlayerGui~=nil and PlayerGui.Parent~=nil,"PlayerGui startup prerequisite is unavailable" end,
+                function()
+                    return type(State.AutoTrader.Preferences)=="table" and typeof(UI.RootGui)=="Instance"
+                        and type(State.AutoTrader.RunSelfTests)=="function","startup dependency order is incomplete"
+                end,
+            })
+        elseif cid == 4 then
+            return choose(ord,{
+                function() return CONFIG.AutoTraderNegotiationStage2Seconds < CONFIG.AutoTraderNegotiationStage3Seconds
+                    and CONFIG.AutoTraderNegotiationStage3Seconds < CONFIG.AutoTraderNegotiationFinalSeconds,
+                    "negotiation times are not monotonic" end,
+                function() return CONFIG.AutoTraderNegotiationStage1Margin >= CONFIG.AutoTraderNegotiationStage2Margin
+                    and CONFIG.AutoTraderNegotiationStage2Margin >= CONFIG.AutoTraderNegotiationStage3Margin
+                    and CONFIG.AutoTraderNegotiationStage3Margin >= 0,"margin ladder is not monotonic" end,
+                function()
+                    for _,v in ipairs({CONFIG.AutoTraderRequestInvokeTimeoutSeconds,CONFIG.AutoTraderFirstOfferTimeoutSeconds,
+                        CONFIG.AutoTraderTradeIdleTimeoutSeconds,CONFIG.AutoTraderLearningEpochSeconds}) do
+                        if type(v)~="number" or v<=0 or v~=v then return false,"invalid timeout" end
+                    end
+                    return true
+                end,
+                function() return CONFIG.MaxOfferSlots>=1 and CONFIG.AutoTraderBeamWidth>=1
+                    and CONFIG.AutoTraderExactStateLimit>=CONFIG.AutoTraderBeamWidth,
+                    "planner limits are internally invalid" end,
+                function() return CONFIG.AutoTraderGoldMoveDirectionEpsilon>0
+                    and CONFIG.AutoTraderGoldMinRemotePlayers>=5
+                    and CONFIG.AutoTraderGoldBotKnownMinJobs>=CONFIG.AutoTraderGoldBotObservedMinJobs
+                    and CONFIG.AutoTraderGoldBotConfirmMinJobs>=CONFIG.AutoTraderGoldBotKnownMinJobs,
+                    "bot thresholds are incoherent" end,
+            })
+        elseif cid == 5 then
+            return choose(ord,{
+                function()
+                    local p=normalizePreferences({})
+                    return type(p)=="table" and type(p.automation)=="boolean" and type(p.reserves)=="table"
+                        and type(p.winPreset)=="number","preference defaults are incomplete"
+                end,
+                function()
+                    local p=normalizePreferences("malformed")
+                    return type(p)=="table" and p.automation==false,"malformed preferences did not fall back safely"
+                end,
+                function()
+                    local a=normalizePreferences({ignoreFriends=false,openingAnchor=false,preferDuplicates=true,winPreset=3,reserves={["Weapons|Knife"]=2}})
+                    local body=HttpService:JSONEncode(a);local b=normalizePreferences(HttpService:JSONDecode(body))
+                    return b.ignoreFriends==a.ignoreFriends and b.openingAnchor==a.openingAnchor
+                        and b.preferDuplicates==a.preferDuplicates and b.winPreset==a.winPreset
+                        and b.reserves["Weapons|Knife"]==2,"preference roundtrip changed supported values"
+                end,
+                function()
+                    local p=normalizePreferences({__unknownDangerousField=true,winPreset=2})
+                    return p.__unknownDangerousField==nil and p.winPreset==2,"unknown preference field was retained"
+                end,
+                function()
+                    local savedPrefs=State.AutoTrader.Preferences;local savedAutoPrefs=AutoPrefs;local savedGlobal=rawget(_G,State.AutoTrader.PreferencesKey);local captured
+                    local ok,result=pcall(function()
+                        State.AutoTrader.Preferences=normalizePreferences({automation=true})
+                        local old=HARDEN.atomicWriteTextFileBestEffort
+                        HARDEN.atomicWriteTextFileBestEffort=function(_,body) captured=body;return true end
+                        local wrote=State.AutoTrader.SavePreferences()
+                        HARDEN.atomicWriteTextFileBestEffort=old
+                        local d=captured and HttpService:JSONDecode(captured)
+                        return wrote and d.preferences.automation==false
+                    end)
+                    State.AutoTrader.Preferences=savedPrefs;AutoPrefs=savedAutoPrefs;rawset(_G,State.AutoTrader.PreferencesKey,savedGlobal)
+                    return ok and result==true,"AUTO=true entered persisted preferences"
+                end,
+            })
+        elseif cid == 7 then
+            return choose(ord,{
+                function()
+                    return typeof(UI.AutoTraderPanel)=="Instance" and UI.AutoTraderPanel.Size.X.Offset>=0 and UI.AutoTraderPanel.Size.Y.Offset>=0,
+                        "main panel has invalid size"
+                end,
+                function()
+                    local controls={UI.AutoTraderEnabled,UI.AutoTraderIgnoreFriends,UI.AutoTraderOpeningAnchor,UI.AutoTraderPreferDuplicates}
+                    for _,v in ipairs(controls) do if typeof(v)~="Instance" then return false,"critical toggle missing" end end
+                    return true
+                end,
+                function()
+                    local controls={UI.AutoTraderClose,UI.AutoTraderCopyDebug,UI.AutoTraderResetPosition}
+                    for _,v in ipairs(controls) do
+                        if typeof(v)~="Instance" or not v:IsA("GuiObject") then return false,"critical click target missing" end
+                    end
+                    return true
+                end,
+                function()
+                    return typeof(UI.AutoTraderReserveScroll)=="Instance" and UI.AutoTraderReserveScroll:IsA("ScrollingFrame"),
+                        "reserve content is not in a scrolling container"
+                end,
+                function()
+                    return typeof(UI.AutoTraderSelfTests)=="Instance" and UI.AutoTraderSelfTests.TextWrapped==true,
+                        "self-test diagnostics cannot wrap safely"
+                end,
+            })
+        elseif cid == 12 then
+            return choose(ord,{
+                function()
+                    local r=State.AutoTrader.SelfTest
+                    if type(r)~="table" then return typeof(UI.AutoTraderSelfTests)=="Instance","self-test strip missing before result" end
+                    return UI.AutoTraderSelfTests.Text:find(tostring(r.passed).."/"..tostring(r.total),1,true)~=nil,
+                        "Settings self-test strip does not reflect result totals"
+                end,
+                function()
+                    return typeof(UI.AutoTraderSelfTests)=="Instance" and type(UI.AutoTraderSelfTests.Text)=="string",
+                        "Settings self-test failure display is unavailable"
+                end,
+                function()
+                    return typeof(UI.AutoTraderEnabled)=="Instance" and type(State.AutoTrader.Preferences.automation)=="boolean",
+                        "AUTO toggle/preference contract missing"
+                end,
+                function()
+                    return type(State.AutoTrader.UpdateControls)=="function" and type(State.AutoTrader.SavePreferences)=="function",
+                        "Settings change plumbing missing"
+                end,
+                function()
+                    return typeof(UI.AutoTraderReserveScroll)=="Instance" and typeof(UI.AutoTraderDirectAuthCard)=="Instance",
+                        "Settings layout sections are missing"
+                end,
+            })
+        elseif cid == 13 then
+            return choose(ord,{
+                function()
+                    local old=State.AutoTrader.Preferences.automation;State.AutoTrader.Preferences.automation=false
+                    local before=#State.AutoTrader.ThoughtFeedEntries
+                    local pushed=State.AutoTrader.PushThought("__expanded_should_not_show__","expanded:autooff")
+                    State.AutoTrader.Preferences.automation=old
+                    return pushed==false and #State.AutoTrader.ThoughtFeedEntries==before,"thought feed accepted a message while AUTO was off"
+                end,
+                function()
+                    return type(State.AutoTrader.ThoughtFeedEntries)=="table" and typeof(UI.AutoTraderThoughtFeed)=="Instance",
+                        "thought-feed chronological storage/UI missing"
+                end,
+                function()
+                    return type(State.AutoTrader.LayoutThoughtFeed)=="function","thought-feed shrink/fade layout function missing"
+                end,
+                function()
+                    return type(State.AutoTrader.ThoughtFeedEntries)=="table" and #State.AutoTrader.ThoughtFeedEntries<=4,
+                        "thought-feed history exceeded configured visible cap"
+                end,
+                function()
+                    return type(State.AutoTrader.ClearThoughtFeed)=="function" and type(State.AutoTrader.UpdateControls)=="function",
+                        "AUTO OFF thought-feed cleanup plumbing missing"
+                end,
+            })
+        elseif cid == 19 then
+            return choose(ord,{
+                function()
+                    local d=State.Profile.DescribeSupremeRecordValue({data={value=17,raw_value=17}})
+                    return d.status=="NUMERIC_ABSOLUTE_VALUE" and d.numeric==17,"numeric Supreme value did not resolve exactly"
+                end,
+                function()
+                    local entries={fixtureItem("A",5,3)}
+                    local total=0;for _,e in ipairs(entries) do total+=e.unitValue*e.quantity end
+                    return total==15,"numeric quantity multiplication failed"
+                end,
+                function()
+                    local d=State.Profile.DescribeSupremeRecordValue({data={value=0,raw_value=0}})
+                    return d.numeric==0,"explicit zero value changed"
+                end,
+                function()
+                    local s=fixtureSummary({fixtureItem("A",2),fixtureItem("B",3,2)})
+                    return s.knownFloor==8,"mixed numeric offer did not sum exactly"
+                end,
+                function()
+                    local d=State.Profile.DescribeSupremeRecordValue({data={value=-5,raw_value=-5}})
+                    return d.numeric==nil or d.numeric<=0,"negative source value became positive"
+                end,
+            })
+        elseif cid == 20 then
+            return choose(ord,{
+                function()
+                    local d=State.Profile.DescribeSupremeRecordValue({data={value="x4 T1 Rares"}})
+                    return d.status=="NON_NUMERIC_SUPREME_VALUE" and d.numeric==nil,"relative value became numeric"
+                end,
+                function()
+                    local s=summarizeResolvedOffer({{itemId="__expanded_unknown__",itemType="Weapons",quantity=1,record=nil}})
+                    return (tonumber(s.totalValue) or 0)==0,"unresolved record contributed value"
+                end,
+                function()
+                    local known=fixtureItem("K",7)
+                    local s=summarizeResolvedOffer({known,{itemId="__expanded_unknown2__",itemType="Weapons",quantity=1,record=nil}})
+                    return (tonumber(s.totalValue) or 0)==7,"unknown contribution changed known numeric floor"
+                end,
+                function()
+                    return numericValue({value="x2 T1 Commons"})==nil,"relative text acquired an inferred lower bound"
+                end,
+                function()
+                    local d=State.Profile.DescribeSupremeRecordValue({data={value="x3 T1 Legendaries"}})
+                    return d.numeric==nil,"relative quantity created numeric contribution"
+                end,
+            })
+        elseif cid == 22 then
+            return choose(ord,{
+                function()
+                    local a=fixtureItem("Identity",10);local b=fixtureItem("Identity",10)
+                    return State.AutoTrader.GetValueIdentityKey(a)==State.AutoTrader.GetValueIdentityKey(b),"equivalent item identities differ"
+                end,
+                function()
+                    return State.AutoTrader.GetValueIdentityKey(fixtureItem("A",10))~=State.AutoTrader.GetValueIdentityKey(fixtureItem("B",10)),
+                        "different items collapsed to one value identity"
+                end,
+                function()
+                    local a=fixtureItem("Y",10);a.identityHint={year=2018}
+                    local b=fixtureItem("Y",10);b.identityHint={year=2019}
+                    return State.AutoTrader.BuildCanonicalValueIdentityKey(a)~=State.AutoTrader.BuildCanonicalValueIdentityKey(b),
+                        "year evidence did not distinguish canonical identity"
+                end,
+                function()
+                    local a=fixtureItem("E",10);a.identityHint={event="Halloween"}
+                    local b=fixtureItem("E",10);b.identityHint={event="Christmas"}
+                    return State.AutoTrader.BuildCanonicalValueIdentityKey(a)~=State.AutoTrader.BuildCanonicalValueIdentityKey(b),
+                        "event evidence did not distinguish canonical identity"
+                end,
+                function()
+                    local a=fixtureItem("Stable",10)
+                    local k=State.AutoTrader.GetValueIdentityKey(a)
+                    return k==State.AutoTrader.GetValueIdentityKey(a),"identity key was not stable"
+                end,
+            })
+        elseif cid == 23 then
+            return choose(ord,{
+                function()
+                    local a=fixtureItem("A",10);return type(State.AutoTrader.GetMutationIdentityKey(a))=="string","mutation key unavailable"
+                end,
+                function()
+                    local a=fixtureItem("Same",10);a.itemId="Base"
+                    local b=fixtureItem("Same",10);b.itemId="Chroma";b.variant="Chroma"
+                    return State.AutoTrader.GetMutationIdentityKey(a)~=State.AutoTrader.GetMutationIdentityKey(b),"similar variants collided"
+                end,
+                function()
+                    return State.AutoTrader.GetOfferMutationCost({{itemType="Weapons",itemId="A",quantity=2}},{{itemType="Weapons",itemId="A",quantity=1}})==1,
+                        "mutation quantity delta was incorrect"
+                end,
+                function()
+                    local a=fixtureItem("Copy",10);a.variant="Chroma";a.identityHint={variant="Chroma",year=2018};local b={}
+                    State.AutoTrader.CopyPlannerItemIdentity(a,b)
+                    return b.itemId==a.itemId and b.variant=="Chroma" and b.identityHint.year==2018,"planner identity copy lost mutation evidence"
+                end,
+                function()
+                    local a=fixtureItem("C",10);a.itemId="same"
+                    local b=fixtureItem("D",10);b.itemId="same";b.variant="Chroma"
+                    local c=State.AutoTrader.FindMutationIdentityCollisions({a,b})
+                    return next(c)~=nil,"ambiguous mutation family did not fail closed"
+                end,
+            })
+        elseif cid == 24 then
+            return choose(ord,{
+                function() return State.DetectItemVariant({Chroma=true})=="Chroma","Chroma variant not detected" end,
+                function() return State.DetectItemVariant({Chroma=false})~="Chroma","standard item falsely detected as Chroma" end,
+                function()
+                    return State.ComposeVariantDisplayName("Boneblade","Chroma")=="Chroma Boneblade","variant display name mismatch"
+                end,
+                function()
+                    local h=State.BuildInventoryIdentityHint({Chroma=true,Year=2018},"Halloween")
+                    return h.variant=="Chroma" and h.year==2018 and h.event=="Halloween","variant identity hint lost event/year"
+                end,
+                function()
+                    local a=fixtureItem("V",1);a.variant="Chroma";local b=fixtureItem("V",1)
+                    return State.AutoTrader.GetValueIdentityKey(a)~=State.AutoTrader.GetValueIdentityKey(b),"variant conflict collapsed identity"
+                end,
+            })
+        elseif cid == 25 then
+            return choose(ord,{
+                function()
+                    return State.AutoTrader.IsRecordCompatibleWithIdentityHint({category="chromas",data={year=2018,event="Halloween"}},{variant="Chroma",year=2018,event="Halloween"})==true,
+                        "compatible manual mapping did not resolve"
+                end,
+                function()
+                    return State.AutoTrader.IsRecordCompatibleWithIdentityHint({category="godlies",data={year=2018,event="Halloween"}},{variant="Chroma",year=2018,event="Halloween"})==false,
+                        "manual mapping conflict not detected"
+                end,
+                function()
+                    local before=tonumber(State.Mapping.Revision) or 0
+                    return type(before)=="number","mapping revision unavailable"
+                end,
+                function()
+                    return State.AutoTrader.IsRecordCompatibleWithIdentityHint({category="godlies",data={}},{variant="Chroma"})==false,
+                        "weak context overrode explicit variant evidence"
+                end,
+                function()
+                    return type(State.AutoTrader.ManualRecordConflictsWithNativeIdentity)=="function","native identity conflict authority missing"
+                end,
+            })
+        elseif cid == 28 then
+            return choose(ord,{
+                function()
+                    local known=fixtureSummary({fixtureItem("K",9)})
+                    known.unknownCount=1
+                    return known.knownFloor==9,"partial known floor was lost"
+                end,
+                function()
+                    local name="__expanded_partial_zero__";local old=State.Profile.totalsByName[name]
+                    State.Profile.totalsByName[name]={source="GetFullInventoryVerified",stale=false,total=0,unresolvedUnits=1,nonNumericUnits=0}
+                    local value,verified=State.AutoTrader.GetVerifiedPlayerValue({Name=name})
+                    State.Profile.totalsByName[name]=old
+                    return value==nil and verified==false,"partial inventory falsely proved zero"
+                end,
+                function()
+                    local _,diag=State.AutoTrader.BuildParetoOfferFrontier({},5,{inventoryComplete=false,stateLimit=100,budgetMs=50})
+                    return diag.solverComplete~=true,"partial search falsely proved impossibility"
+                end,
+                function()
+                    local s=summarizeResolvedOffer({{itemId="__expanded_partial_unknown__",itemType="Weapons",quantity=2,record=nil}})
+                    return (tonumber(s.totalValue) or 0)==0,"partial unknowns contributed value"
+                end,
+                function()
+                    local base={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=2,localIdentity="x",mappingRevision=3,supremeRevision=4,supremeHash="h",gameDataRevision=5,reserveSignature="r",policySignature="p"}
+                    local a=State.AutoTrader.BuildFeasibilitySignatureFromParts(base);base.remoteStamp=2
+                    return a~=State.AutoTrader.BuildFeasibilitySignatureFromParts(base),"completed discovery did not invalidate feasibility"
+                end,
+            })
+        elseif cid == 29 then
+            return choose(ord,{
+                function()
+                    local base={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=2,localIdentity="x",mappingRevision=3,supremeRevision=4,supremeHash="h",gameDataRevision=5,reserveSignature="r",policySignature="p"}
+                    local a=State.AutoTrader.BuildFeasibilitySignatureFromParts(base);base.localStamp=3
+                    return a~=State.AutoTrader.BuildFeasibilitySignatureFromParts(base),"local stamp did not invalidate cache"
+                end,
+                function()
+                    local b={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=2,localIdentity="x",mappingRevision=3,supremeRevision=4,supremeHash="h",gameDataRevision=5,reserveSignature="r",policySignature="p"}
+                    local a=State.AutoTrader.BuildFeasibilitySignatureFromParts(b);b.supremeRevision=5
+                    return a~=State.AutoTrader.BuildFeasibilitySignatureFromParts(b),"Supreme revision did not invalidate cache"
+                end,
+                function()
+                    local b={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=2,localIdentity="x",mappingRevision=3,supremeRevision=4,supremeHash="h",gameDataRevision=5,reserveSignature="r",policySignature="p"}
+                    local a=State.AutoTrader.BuildFeasibilitySignatureFromParts(b);b.mappingRevision=4
+                    return a~=State.AutoTrader.BuildFeasibilitySignatureFromParts(b),"mapping revision did not invalidate cache"
+                end,
+                function()
+                    local b={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=2,localIdentity="x",mappingRevision=3,supremeRevision=4,supremeHash="h",gameDataRevision=5,reserveSignature="r",policySignature="p"}
+                    local a=State.AutoTrader.BuildFeasibilitySignatureFromParts(b);b.presenceGeneration=2
+                    return a~=State.AutoTrader.BuildFeasibilitySignatureFromParts(b),"presence generation did not invalidate cache"
+                end,
+                function()
+                    local b={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=2,localIdentity="x",mappingRevision=3,supremeRevision=4,supremeHash="h",gameDataRevision=5,reserveSignature="r",policySignature="p"}
+                    return State.AutoTrader.BuildFeasibilitySignatureFromParts(b)==State.AutoTrader.BuildFeasibilitySignatureFromParts(b),
+                        "identical cache identity was nondeterministic"
+                end,
+            })
+        elseif cid == 30 then
+            return choose(ord,{
+                function()
+                    local key=State.Mapping.MakeItemKey("Weapons","__expanded_reserve__");local old=State.AutoTrader.Preferences.reserves[key]
+                    State.AutoTrader.Preferences.reserves[key]=1;local v=State.AutoTrader.GetReserve("Weapons","__expanded_reserve__")
+                    State.AutoTrader.Preferences.reserves[key]=old
+                    return v==1,"one-copy reserve was not honored"
+                end,
+                function()
+                    local p=normalizePreferences({reserves={["Weapons|Knife"]=999}})
+                    return p.reserves["Weapons|Knife"]==999,"valid positive reserve was unexpectedly discarded"
+                end,
+                function()
+                    local key=State.Mapping.MakeItemKey("Weapons","__expanded_zeroreserve__");local old=State.AutoTrader.Preferences.reserves[key]
+                    State.AutoTrader.Preferences.reserves[key]=nil;local v=State.AutoTrader.GetReserve("Weapons","__expanded_zeroreserve__")
+                    State.AutoTrader.Preferences.reserves[key]=old
+                    return v==0,"zero reserve did not restore availability"
+                end,
+                function()
+                    local p=normalizePreferences({reserves={["Weapons|Knife"]=2}})
+                    local b=normalizePreferences(HttpService:JSONDecode(HttpService:JSONEncode(p)))
+                    return b.reserves["Weapons|Knife"]==2,"reserve persistence roundtrip changed quantity"
+                end,
+                function() return type(State.AutoTrader.GetTradableInventory)=="function","tradable inventory does not expose reserve enforcement" end,
+            })
+        elseif cid == 31 then
+            return choose(ord,{
+                function()
+                    local f,d=State.AutoTrader.BuildParetoOfferFrontier({fixtureItem("F",2)},2,{inventoryComplete=true,stateLimit=100,budgetMs=50})
+                    return #f>0 and d.superseded~=true,"profitable feasibility witness not found"
+                end,
+                function()
+                    local f,d=State.AutoTrader.BuildParetoOfferFrontier({},5,{inventoryComplete=true,stateLimit=100,budgetMs=50})
+                    return #f==0 and d.solverComplete==true,"complete impossibility was not proven"
+                end,
+                function()
+                    local _,d=State.AutoTrader.BuildParetoOfferFrontier({},5,{inventoryComplete=false,stateLimit=100,budgetMs=50})
+                    return d.solverComplete~=true,"partial feasibility was called complete"
+                end,
+                function()
+                    local _,d=State.AutoTrader.BuildParetoOfferFrontier({fixtureItem("C",1)},2,{inventoryComplete=true,isCurrent=function() return false end})
+                    return d.superseded==true and d.solverComplete==false,"canceled feasibility published an answer"
+                end,
+                function()
+                    local f=State.AutoTrader.BuildParetoOfferFrontier({fixtureItem("W",2)},2,{inventoryComplete=true,stateLimit=100,budgetMs=50})
+                    return #f>0 and math.abs((f[1].total or 0)-2)<0.001,"feasibility witness totals are inconsistent"
+                end,
+            })
+        elseif cid == 34 then
+            return choose(ord,{
+                function()
+                    local a={player={UserId=2},opportunity={kind="VALUE_WIN",win=5},score=2,feasibility={solverComplete=true}}
+                    local b={player={UserId=1},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}}
+                    return State.AutoTrader.CompareQueueRows(a,b)==true,"higher-priority queue row did not rank first"
+                end,
+                function()
+                    local a={player={UserId=2},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}}
+                    local b={player={UserId=1},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}}
+                    local q1={a,b};local q2={a,b};table.sort(q1,State.AutoTrader.CompareQueueRows);table.sort(q2,State.AutoTrader.CompareQueueRows)
+                    return q1[1].player.UserId==q2[1].player.UserId,"queue ordering was nondeterministic"
+                end,
+                function()
+                    local a={player={UserId=2},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}}
+                    local b={player={UserId=1},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}}
+                    local q={a,b};table.sort(q,State.AutoTrader.CompareQueueRows)
+                    return q[1].player.UserId==1,"queue tie-breaker is unstable"
+                end,
+                function() return type(State.AutoTrader.CompareQueueRows)=="function" and type(State.AutoTrader.GetTargetScore)=="function","strategic ranking surfaces missing" end,
+                function()
+                    local rows={
+                        {player={UserId=3},opportunity={kind="VALUE_WIN",win=3},score=1,feasibility={solverComplete=true}},
+                        {player={UserId=2},opportunity={kind="VALUE_WIN",win=2},score=1,feasibility={solverComplete=true}},
+                        {player={UserId=1},opportunity={kind="VALUE_WIN",win=1},score=1,feasibility={solverComplete=true}},
+                    }
+                    table.sort(rows,State.AutoTrader.CompareQueueRows)
+                    return rows[1]~=nil and rows[2]~=nil and rows[3]~=nil,"queue comparator produced invalid ordering"
+                end,
+            })
+        elseif cid == 35 then
+            return choose(ord,{
+                function()
+                    local remote=fixtureItem("R",20);local localItem=fixtureItem("L",15)
+                    local row={player={UserId=350001,Name="Profit"},opportunity={kind="profit",receiveItems={remote},feasibilityWitness={kind="profit",receiveItems={remote},giveItems={fixtureItem("tiny",2)},giveTotal=2,receiveTotal=20}},feasibility={signature="x"}}
+                    local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{localItem},{lastSuccess=1},0.18)
+                    return type(intent)=="table" and intent.giveTotal>=14.8 and intent.giveTotal<=18,"profit outbound opening was not built through stage-1 planner"
+                end,
+                function()
+                    local r1=fixtureItem("R1",10);local r2=fixtureItem("R2",10);local g=fixtureItem("G",19.5)
+                    local row={player={UserId=350002,Name="Liquidity"},opportunity={kind="liquidity",strategicKind="liquidity",receiveItems={r1,r2},strategicWitness={kind="liquidity",strategicKind="liquidity",receiveItems={r1,r2},giveItems={g},giveTotal=19.5,receiveTotal=20}},feasibility={signature="y"}}
+                    local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{g},{lastSuccess=1},0.18)
+                    return type(intent)=="table" and intent.strategicKind=="liquidity","strategic outbound opening did not use liquidity planner"
+                end,
+                function()
+                    local remote=fixtureItem("R",20);local tiny=fixtureItem("Tiny",2)
+                    local row={player={UserId=350003,Name="NoOpen"},opportunity={kind="profit",receiveItems={remote},feasibilityWitness={kind="profit",receiveItems={remote},giveItems={tiny},giveTotal=2,receiveTotal=20}},feasibility={signature="z"}}
+                    local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{tiny},{lastSuccess=1},0.18)
+                    return intent==nil,"unconstructible outbound target was not skipped"
+                end,
+                function()
+                    local remote=fixtureItem("R",20);local localItem=fixtureItem("L",15)
+                    local row={player={UserId=350004,Name="Intent"},opportunity={kind="profit",receiveItems={remote},feasibilityWitness={kind="profit",receiveItems={remote},giveItems={fixtureItem("tiny2",2)},giveTotal=2,receiveTotal=20}},feasibility={signature="w"}}
+                    local intent=State.AutoTrader.BuildConstructibleOutboundOpeningIntent(row,{localItem},{lastSuccess=1},0.18)
+                    return intent and intent.giveItems and intent.giveItems[1] and intent.giveItems[1].itemId=="L","TargetIntent give side did not come from constructible plan"
+                end,
+                function() return type(State.AutoTrader.ValidatePlan)=="function","outbound constructibility lost independent hard validation surface" end,
+            })
+        elseif cid == 37 then
+            return choose(ord,{
+                function()
+                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("L",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return plan and plan.win>=State.AutoTrader.GetMinimumWin(),"profit plan violated minimum win"
+                end,
+                function()
+                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("L",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return plan and plan.total<=plan.receiveTotal,"profit plan gives more than receive"
+                end,
+                function()
+                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("L",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return plan and #plan.items<=CONFIG.MaxOfferSlots,"profit plan exceeded slot limit"
+                end,
+                function()
+                    local item=fixtureItem("Reserved",15);item.reserve=1;item.maxQuantity=0
+                    local plan=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{item},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return plan==nil,"profit planner consumed unavailable/reserved quantity"
+                end,
+                function()
+                    local s=fixtureSummary({fixtureItem("R",20)});local inv={fixtureItem("L",15)}
+                    local a=State.AutoTrader.FindPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    local b=State.AutoTrader.FindPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return a and b and a.total==b.total and a.items[1].itemId==b.items[1].itemId,"profit planner was nondeterministic"
+                end,
+            })
+        elseif cid == 38 then
+            return choose(ord,{
+                function()
+                    local s=fixtureSummary({fixtureItem("R1",10),fixtureItem("R2",10)})
+                    local p=State.AutoTrader.FindLiquidityPlan(s,{fixtureItem("G",19.5)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
+                    return p and p.win<=0.5+0.000001,"approved small liquidity gap was rejected"
+                end,
+                function()
+                    local s=fixtureSummary({fixtureItem("R1",10),fixtureItem("R2",10)})
+                    local p=State.AutoTrader.FindLiquidityPlan(s,{fixtureItem("G",19)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
+                    return p==nil,"liquidity planner accepted gap over active bound"
+                end,
+                function()
+                    local h=fixtureItem("H",100);local s=fixtureSummary({fixtureItem("Q1",25),fixtureItem("Q2",25),fixtureItem("Q3",25),fixtureItem("Q4",25)})
+                    local p=State.AutoTrader.FindLiquidityPlan(s,{h},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
+                    return p==nil,"liquidity planner broke sole-anchor policy"
+                end,
+                function() return type(State.AutoTrader.EvaluatePortfolioDelta)=="function","liquidity improvement authority missing" end,
+                function()
+                    local s=fixtureSummary({fixtureItem("R1",10),fixtureItem("R2",10)});local inv={fixtureItem("G",19.5)}
+                    local a=State.AutoTrader.FindLiquidityPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
+                    local b=State.AutoTrader.FindLiquidityPlan(s,inv,State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=0,final=false})
+                    return (a==nil and b==nil) or (a and b and a.total==b.total),"liquidity planner was nondeterministic"
+                end,
+            })
+        elseif cid == 39 then
+            return choose(ord,{
+                function()
+                    local received=fixtureItem("R",20);local incoming=fixtureSummary({received})
+                    local high=fixtureItem("High",15,1,10);local safe=fixtureItem("Safe",15,1,4)
+                    local p=State.AutoTrader.FindPlan(incoming,{high,safe},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return p and p.items[1].name=="Safe","dominance pruning lost market-safe equal-value state"
+                end,
+                function()
+                    local _,d=State.AutoTrader.BuildParetoOfferFrontier({fixtureItem("P",1,20)},20,{inventoryComplete=true,stateLimit=20,budgetMs=50})
+                    return type(d)=="table" and type(d.stateCapHit)=="boolean","planner state-cap diagnostics missing"
+                end,
+                function()
+                    local q=State.AutoTrader.QuantityOptions(100,1,49,51)
+                    local found=false;for _,v in ipairs(q) do if v==50 then found=true end end
+                    return found,"quantity sampling omitted critical target boundary"
+                end,
+                function()
+                    local _,d=State.AutoTrader.BuildParetoOfferFrontier({fixtureItem("C",1)},2,{inventoryComplete=true,isCurrent=function() return false end})
+                    return d.superseded==true,"planner generation cancellation failed"
+                end,
+                function()
+                    local a=State.AutoTrader.QuantityOptions(80,1,30,40);local b=State.AutoTrader.QuantityOptions(80,1,30,40)
+                    return table.concat(a,",")==table.concat(b,","),"planner quantity search was nondeterministic"
+                end,
+            })
+        elseif cid == 40 then
+            return choose(ord,{
+                function()
+                    local incoming=fixtureSummary({fixtureItem("R",20,1,5)})
+                    local ok=State.AutoTrader.EvaluateMarketGate({items={fixtureItem("G",15,1,5)},total=15},incoming)
+                    return ok==true,"equal market quality failed"
+                end,
+                function()
+                    local incoming=fixtureSummary({fixtureItem("R",20,1,8)})
+                    local ok=State.AutoTrader.EvaluateMarketGate({items={fixtureItem("G",15,1,1)},total=15},incoming)
+                    return ok==false,"material demand loss passed market gate"
+                end,
+                function()
+                    local incoming=fixtureSummary({fixtureItem("R",20,1,5)});incoming.demandCoverage=0
+                    local ok,diag=State.AutoTrader.EvaluateMarketGate({items={fixtureItem("G",15,1,5)},total=15},incoming)
+                    return type(ok)=="boolean" and type(diag)=="table","missing metric coverage was not handled deterministically"
+                end,
+                function()
+                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20,1,5)}),{fixtureItem("High",15,1,10),fixtureItem("Safe",15,1,4)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return p and p.items[1].name=="Safe","market-safe alternative was not selected"
+                end,
+                function()
+                    local ok,d=State.AutoTrader.EvaluateMarketGate({items={fixtureItem("G",15,1,1)},total=15},fixtureSummary({fixtureItem("R",20,1,8)}))
+                    return ok==false and type(d.failures)=="table" and #d.failures>0,"market rejection diagnostics missing"
+                end,
+            })
+        elseif cid == 41 then
+            return choose(ord,{
+                function()
+                    local h=fixtureItem("H",100);local q=fixtureItem("Q",25,4)
+                    local d=State.AutoTrader.EvaluatePortfolioDelta({h},{h},{q})
+                    return d.anchorOK==false,"sole anchor was not protected"
+                end,
+                function()
+                    local h1=fixtureItem("H1",100);local h2=fixtureItem("H2",100);local r=fixtureItem("R",105)
+                    local d=State.AutoTrader.EvaluatePortfolioDelta({h1,h2},{h1},{r})
+                    return type(d.anchorOK)=="boolean","redundant-anchor policy produced no verdict"
+                end,
+                function()
+                    local six=fixtureItem("Six",6);local three=fixtureItem("Three",3,2)
+                    local d=State.AutoTrader.EvaluatePortfolioDelta({six},{six},{three})
+                    return d.ok==true,"beneficial split was rejected"
+                end,
+                function()
+                    local h=fixtureItem("H",100);local q=fixtureItem("Q",25,4)
+                    local d=State.AutoTrader.EvaluatePortfolioDelta({h},{h},{q})
+                    return d.ok==false,"catastrophic fragmentation passed"
+                end,
+                function()
+                    local six=fixtureItem("Six",6);local three=fixtureItem("Three",3,2)
+                    local d=State.AutoTrader.EvaluatePortfolioDelta({six},{six},{three})
+                    return type(d.beforeMetrics)=="table" and type(d.afterMetrics)=="table","portfolio delta metrics missing"
+                end,
+            })
+        elseif cid == 43 then
+            return choose(ord,{
+                function()
+                    local old=State.AutoTrader.Preferences.winPreset;State.AutoTrader.Preferences.winPreset=1
+                    local v=State.AutoTrader.GetMinimumWin();State.AutoTrader.Preferences.winPreset=old
+                    return v==State.AutoTrader.WinPresets[1],"default absolute minimum lookup failed"
+                end,
+                function()
+                    local m=State.AutoTrader.GetEffectiveMinimumWin(fixtureSummary({fixtureItem("R",1000)}))
+                    return tonumber(m) and m>=State.AutoTrader.GetMinimumWin(),"percentage minimum did not scale"
+                end,
+                function()
+                    local m=State.AutoTrader.GetEffectiveMinimumWin(fixtureSummary({fixtureItem("R",1)}))
+                    return tonumber(m) and m>=0,"minimum win became negative"
+                end,
+                function() return type(State.AutoTrader.FindLiquidityPlan)=="function" and type(State.AutoTrader.GetEffectiveMinimumWin)=="function","strategic and profit minimum paths are not separate" end,
+                function()
+                    State.AutoTrader.GetEffectiveMinimumWin(fixtureSummary({fixtureItem("R",20)}))
+                    return State.AutoTrader.LastEffectiveMinimumWin==nil or type(State.AutoTrader.LastEffectiveMinimumWin)=="table",
+                        "minimum-win diagnostics have invalid shape"
+                end,
+            })
+        elseif cid == 44 then
+            return choose(ord,{
+                function()
+                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("G",15)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return p~=nil,"opening inside plausibility cap was rejected"
+                end,
+                function()
+                    local p,reason=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("G",10)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return p==nil and tostring(reason):find("overshoot",1,true)~=nil,"extreme proactive underpay was not rejected"
+                end,
+                function()
+                    local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R",20)}),{fixtureItem("A",7),fixtureItem("B",8)},State.AutoTrader.PlanGeneration,{stage=1,margin=0.18,targetProfit=3.6,final=false})
+                    return p and p.total==15,"proposal plausibility ignored real denominations"
+                end,
+                function()
+                    local old=State.AutoTrader.OtherAcceptedAt;State.AutoTrader.OtherAcceptedAt=os.clock()
+                    local n=State.AutoTrader.GetNegotiationStage(fixtureSummary({fixtureItem("R",20)}))
+                    State.AutoTrader.OtherAcceptedAt=old
+                    return n.proposalPlausibilityBypass==true,"voluntary accepted offer did not activate proactive-only bypass"
+                end,
+                function()
+                    local ok=State.AutoTrader.ValidatePlan(nil,{})
+                    return ok==false,"plausibility path bypassed hard plan validation"
+                end,
+            })
+        elseif cid == 45 then
+            return choose(ord,{
+                function()
+                    local old=State.AutoTrader.OtherStableSince;State.AutoTrader.OtherStableSince=os.clock()
+                    local n=State.AutoTrader.GetNegotiationStage(fixtureSummary({fixtureItem("R",20)}));State.AutoTrader.OtherStableSince=old
+                    return n.stage==1,"negotiation did not start at stage 1"
+                end,
+                function()
+                    local old=State.AutoTrader.OtherStableSince;State.AutoTrader.OtherStableSince=os.clock()-CONFIG.AutoTraderNegotiationStage2Seconds-0.1
+                    local n=State.AutoTrader.GetNegotiationStage(fixtureSummary({fixtureItem("R",20)}));State.AutoTrader.OtherStableSince=old
+                    return n.stage>=2,"negotiation did not progress to stage 2"
+                end,
+                function()
+                    local old=State.AutoTrader.OtherStableSince;State.AutoTrader.OtherStableSince=os.clock()-CONFIG.AutoTraderNegotiationStage3Seconds-0.1
+                    local n=State.AutoTrader.GetNegotiationStage(fixtureSummary({fixtureItem("R",20)}));State.AutoTrader.OtherStableSince=old
+                    return n.stage>=3,"negotiation did not progress to stage 3"
+                end,
+                function()
+                    local old=State.AutoTrader.OtherStableSince;State.AutoTrader.OtherStableSince=os.clock()-CONFIG.AutoTraderNegotiationFinalSeconds-0.1
+                    local n=State.AutoTrader.GetNegotiationStage(fixtureSummary({fixtureItem("R",20)}));State.AutoTrader.OtherStableSince=old
+                    return n.stage==4 and n.final==true,"final negotiation stage did not activate"
+                end,
+                function()
+                    return type(State.AutoTrader.ClearTradeRuntime)=="function","new-trade negotiation reset surface missing"
+                end,
+            })
+        elseif cid == 46 then
+            return choose(ord,{
+                function() return State.AutoTrader.GetOfferMutationCost({{itemType="Weapons",itemId="A",quantity=1}},{{itemType="Weapons",itemId="A",quantity=1}})==0,"identical offer had mutation cost" end,
+                function() return State.AutoTrader.GetOfferMutationCost({{itemType="Weapons",itemId="A",quantity=1}},{{itemType="Weapons",itemId="A",quantity=2}})==1,"small quantity change mutation cost wrong" end,
+                function() return type(State.AutoTrader.ApplyPlanHysteresis)=="function","large-change hysteresis replacement surface missing" end,
+                function() return type(State.AutoTrader.ValidatePlan)=="function","hysteresis has no hard safety backstop" end,
+                function()
+                    return State.AutoTrader.GetOfferMutationCost({{itemType="Weapons",itemId="A",quantity=2},{itemType="Weapons",itemId="B",quantity=1}},{{itemType="Weapons",itemId="A",quantity=1},{itemType="Weapons",itemId="C",quantity=1}})==3,
+                        "mutation unit-difference scoring changed"
+                end,
+            })
+        elseif cid == 47 then
+            return choose(ord,{
+                function() local ok=State.AutoTrader.ValidatePlan(nil,{});return ok==false,"missing plan passed validation" end,
+                function()
+                    local ok=State.AutoTrader.ValidatePlan({items={},total=0},{mappingRevision=(tonumber(State.Mapping.Revision) or 0)-1})
+                    return ok==false,"stale mapping context passed validation"
+                end,
+                function()
+                    local ok=State.AutoTrader.ValidatePlan({items={},total=0},{mappingRevision=State.Mapping.Revision,databaseRevision=-1,databaseHash="bad"})
+                    return ok==false,"stale Supreme context passed validation"
+                end,
+                function()
+                    local ok=State.AutoTrader.ValidatePlan({items={},total=0},{mappingRevision=State.Mapping.Revision,databaseRevision=HARDEN.supremeDataRevision,databaseHash=HARDEN.supremeDataHash,gameDataRevision=-1})
+                    return ok==false,"stale game-data context passed validation"
+                end,
+                function() return type(State.AutoTrader.ValidatePlan)=="function" and type(State.AutoTrader.ActionContextValid)=="function","hard validation authority missing" end,
+            })
+        elseif cid == 49 then
+            return choose(ord,{
+                function() return math.abs(CONFIG.AutoTraderRequestInvokeTimeoutSeconds-4.25)<0.000001,"outgoing request deadline changed" end,
+                function()
+                    local p={invokeFinished=true,invokeOk=false,invokeResult="ServerScriptService.GameScript.DataModule:317: attempt to call missing method 'GetAttribute' of string"}
+                    return State.AutoTrader.Round39ClassifyTargetSpecificRequestError(p)==true,"target-specific request error not isolated"
+                end,
+                function()
+                    local p={invokeFinished=true,invokeOk=false,invokeResult="network transport failed"}
+                    return State.AutoTrader.Round39ClassifyTargetSpecificRequestError(p)==false,"global transport failure misclassified as target-local"
+                end,
+                function() return type(State.AutoTrader.FailPendingRequestAttempt)=="function","request generation failure authority missing" end,
+                function() return type(State.AutoTrader.ReconcileOutgoingRequestState)=="function","request transport reconciliation surface missing" end,
+            })
+        elseif cid == 50 then
+            return choose(ord,{
+                function() return State.AutoTrader.IsExpectedPartner(10,{UserId=10}) and not State.AutoTrader.IsExpectedPartner(10,{UserId=11}),"native correlation accepted wrong target" end,
+                function() return State.AutoTrader.ClassifyPendingCancellation({contactAcknowledged=false},"no_response")=="transport_deferred","invoke return/no-ack became human outcome" end,
+                function() return State.AutoTrader.ClassifyPendingCancellation({contactAcknowledged=true},"trade_unavailable")=="no_response","authoritative acknowledgement did not establish contact" end,
+                function() return not State.AutoTrader.IsExpectedPartner(10,nil),"unresolved partner was accepted as acknowledgement" end,
+                function() return type(State.AutoTrader.AcknowledgeOutgoingTransport)=="function","acknowledgement cleanup surface missing" end,
+            })
+        elseif cid == 52 then
+            return choose(ord,{
+                function() return State.AutoTrader.IsExpectedPartner(1,{UserId=1})==true,"expected partner was rejected" end,
+                function() return State.AutoTrader.IsExpectedPartner(1,{UserId=2})==false,"stale/wrong player was accepted" end,
+                function() return type(State.AutoTrader.GetPlayerFromSide)=="function","trade-side partner authority missing" end,
+                function() return type(State.AutoTrader.SetManagedPartner)=="function","managed partner authority missing" end,
+                function() return type(State.AutoTrader.ClearTradeRuntime)=="function","partner-switch cleanup surface missing" end,
+            })
+        elseif cid == 55 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.NoteTradeUpdate)=="function","offer-change engagement hook missing" end,
+                function() return type(State.AutoTrader.FirstOfferEngagedAt)=="number","partner engagement timestamp has invalid type" end,
+                function()
+                    local ob,oe,ol=State.AutoTrader.TradeBeganAt,State.AutoTrader.FirstOfferEngagedAt,State.AutoTrader.FirstOfferEngagementExtensionLogged
+                    local b=os.clock();State.AutoTrader.TradeBeganAt=b;State.AutoTrader.FirstOfferEngagedAt=b+1;State.AutoTrader.FirstOfferEngagementExtensionLogged=true
+                    local d=State.AutoTrader.GetFirstOfferDeadline()
+                    State.AutoTrader.TradeBeganAt,State.AutoTrader.FirstOfferEngagedAt,State.AutoTrader.FirstOfferEngagementExtensionLogged=ob,oe,ol
+                    return math.abs(d-(b+CONFIG.AutoTraderFirstOfferTimeoutSeconds+CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds))<0.01,"engagement extension is not exactly bounded"
+                end,
+                function() return CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds==8,"engagement extension value changed" end,
+                function() return type(State.AutoTrader.ClearTradeRuntime)=="function","engagement reset surface missing" end,
+            })
+        elseif cid == 56 then
+            return choose(ord,{
+                function() return CONFIG.AutoTraderFirstOfferTimeoutSeconds>0,"base first-offer timeout invalid" end,
+                function() return CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds==8,"engaged timeout extension invalid" end,
+                function() return CONFIG.AutoTraderTradeIdleTimeoutSeconds>CONFIG.AutoTraderFirstOfferTimeoutSeconds,"idle timeout does not exceed opening timeout" end,
+                function() return CONFIG.AutoTraderActiveInventoryResolveSeconds>0,"inventory wait timeout invalid" end,
+                function() return CONFIG.AutoTraderRequestInvokeTimeoutSeconds~=CONFIG.AutoTraderTradeStatusProbeTimeoutSeconds,"independent request/probe clocks collapsed" end,
+            })
+        elseif cid == 61 then
+            return choose(ord,{
+                function()
+                    local p={UserId=-61001,Name="Cooldown"};local old=State.AutoTrader.Cooldowns[p.UserId]
+                    State.AutoTrader.Cooldowns[p.UserId]={untilTime=os.clock()+2,reason="fixture",name=p.Name}
+                    local v=State.AutoTrader.CooldownRemaining(p);State.AutoTrader.Cooldowns[p.UserId]=old
+                    return v>0,"active cooldown was not observed"
+                end,
+                function()
+                    local p={UserId=-61002,Name="Expired"};local old=State.AutoTrader.Cooldowns[p.UserId]
+                    State.AutoTrader.Cooldowns[p.UserId]={untilTime=os.clock()-1,reason="fixture",name=p.Name}
+                    local v=State.AutoTrader.CooldownRemaining(p);State.AutoTrader.Cooldowns[p.UserId]=old
+                    return v==0,"expired cooldown did not restore eligibility"
+                end,
+                function() return type(State.AutoTrader.EnsureServerPlayer)=="function","presence isolation authority missing" end,
+                function() return type(State.AutoTrader.GetPlayerStats)=="function","per-player history surface missing" end,
+                function() return type(State.AutoTrader.GetPlayerStats)=="function","per-player history bound missing" end,
+            })
+        elseif cid == 62 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.FenceOutstandingRequestForAutomationOff)=="function","AUTO OFF request fence missing" end,
+                function()
+                    local saved=State.AutoTrader.PendingRequest;local old=State.AutoTrader.BeginPendingRequestCancellation;local captured=0
+                    State.AutoTrader.PendingRequest={userId=-62001,name="Pending",phase="awaiting_native"}
+                    State.AutoTrader.BeginPendingRequestCancellation=function() captured+=1;return true end
+                    local ok=State.AutoTrader.FenceOutstandingRequestForAutomationOff()
+                    State.AutoTrader.PendingRequest=saved;State.AutoTrader.BeginPendingRequestCancellation=old
+                    return ok==true and captured==1,"AUTO OFF did not fence pending request"
+                end,
+                function() return type(State.AutoTrader.ReconcileDesired)=="function" and type(State.AutoTrader.ActionContextValid)=="function","AUTO OFF live-mutation fence surfaces missing" end,
+                function() return type(State.AutoTrader.ClearThoughtFeed)=="function","AUTO OFF thought-feed cleanup missing" end,
+                function() return type(State.AutoTrader.UpdateControls)=="function","AUTO OFF cleanup cannot update UI" end,
+            })
+        elseif cid == 64 then
+            return choose(ord,{
+                function()
+                    local e=State.AutoTrader.EnsureLearningEpoch();return type(e)=="table" and tonumber(e.id)>=1,"learning epoch was not created"
+                end,
+                function()
+                    local a=State.AutoTrader.GetLearningEpochMargin(1);local b=State.AutoTrader.GetLearningEpochMargin(1)
+                    return math.abs(a-b)<0.000001,"epoch policy changed inside window"
+                end,
+                function() return CONFIG.AutoTraderLearningEpochSeconds==600,"epoch duration changed from 600 seconds" end,
+                function() return type(State.AutoTrader.ComputeLearningEpochMarginDelta)=="function","next-epoch policy derivation missing" end,
+                function() return CONFIG.AutoTraderLearningEpochHistoryLimit>0,"epoch history limit invalid" end,
+            })
+        elseif cid == 65 then
+            return choose(ord,{
+                function() return State.AutoTrader.ComputeLearningEpochMarginDelta({outcomes=CONFIG.AutoTraderLearningMarginMinOutcomes-1,successes=0})==0,"under-minimum sample changed margin" end,
+                function() return math.abs(State.AutoTrader.ComputeLearningEpochMarginDelta({outcomes=10,successes=0})+CONFIG.AutoTraderLearningMarginDownStep)<0.000001,"low success did not lower margin" end,
+                function() return math.abs(State.AutoTrader.ComputeLearningEpochMarginDelta({outcomes=10,successes=5})-CONFIG.AutoTraderLearningMarginUpStep)<0.000001,"high success did not raise margin" end,
+                function() return State.AutoTrader.ComputeLearningEpochMarginDelta({outcomes=10,successes=3})==0,"middle success rate changed margin" end,
+                function() return CONFIG.AutoTraderLearningMarginMaxOffset>0 and CONFIG.AutoTraderLearningMarginMaxOffset<1,"learning offset cap invalid" end,
+            })
+        elseif cid == 66 or cid == 67 or cid == 69 then
+            return choose(ord,{
+                function()
+                    local fake={UserId=-66001,Name="NoPlan"};local old=State.AutoTrader.MarginTrainingProposal;State.AutoTrader.MarginTrainingProposal=nil
+                    local d=State.AutoTrader.PrepareMarginTrainingEventData(fake,"tradeDecline",{negotiationStage=1,negotiationMargin=.18});State.AutoTrader.MarginTrainingProposal=old
+                    return d.negotiationStage==nil,"plan_none/empty decline trained margin"
+                end,
+                function()
+                    local fake={UserId=-66002,Name="Visible"};local old=State.AutoTrader.MarginTrainingProposal
+                    State.AutoTrader.MarginTrainingProposal={partnerUserId=fake.UserId,negotiationStage=2,negotiationMargin=.11}
+                    local d=State.AutoTrader.PrepareMarginTrainingEventData(fake,"tradeDecline",{});State.AutoTrader.MarginTrainingProposal=old
+                    return d.negotiationStage==2 and math.abs((d.negotiationMargin or 0)-.11)<0.000001,"visible plan did not train its actual stage"
+                end,
+                function()
+                    local fake={UserId=-66003,Name="Wrong"};local old=State.AutoTrader.MarginTrainingProposal
+                    State.AutoTrader.MarginTrainingProposal={partnerUserId=-1,negotiationStage=3,negotiationMargin=.06}
+                    local d=State.AutoTrader.PrepareMarginTrainingEventData(fake,"tradeDecline",{});State.AutoTrader.MarginTrainingProposal=old
+                    return d.negotiationStage==nil,"wrong-partner proposal contaminated learning"
+                end,
+                function() return type(State.AutoTrader.ClearTradeRuntime)=="function","visible-plan training reset surface missing" end,
+                function() return type(State.AutoTrader.RecordStrategyEvent)=="function","strategy outcome recording surface missing" end,
+            })
+        elseif cid == 71 then
+            return choose(ord,{
+                function() return State.AutoTrader.IsBotMoveDirectionContradiction(CONFIG.AutoTraderGoldMoveDirectionEpsilon+0.001),"MoveDirection above epsilon did not veto" end,
+                function() return not State.AutoTrader.IsBotMoveDirectionContradiction(CONFIG.AutoTraderGoldMoveDirectionEpsilon),"exact epsilon falsely vetoed" end,
+                function() return type(State.AutoTrader.MarkGoldCertificationRegular)=="function","regular-server veto path missing" end,
+                function() return State.AutoTrader.ShouldRevokeAutomatedBotEscape("CERTIFIED_BOT_SERVER")==true,"human contradiction cannot revoke automated bot hop" end,
+                function() return type(State.AutoTrader.ClearStrictGoldCandidateStaging)=="function","human veto cannot clear strict staging" end,
+            })
+        elseif cid == 74 then
+            return choose(ord,{
+                function() return CONFIG.AutoTraderGoldMinRemotePlayers>=5,"automatic certification minimum fell below five" end,
+                function() return type(State.AutoTrader.PrepareStrictGoldCandidate)=="function","all-current-player candidate preparation missing" end,
+                function() return type(State.AutoTrader.BuildStrictGoldTeleportCommitPayload)=="function","all-player commit proof missing" end,
+                function() return type(State.AutoTrader.SampleGoldBotCertification)=="function","physical pass tracking missing" end,
+                function() return CONFIG.AutoTraderGoldMinRemotePlayers==5 or CONFIG.AutoTraderGoldMinRemotePlayers>5,"large-roster all-player policy lacks floor" end,
+            })
+        elseif cid == 77 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.EvaluateBotAvoidanceHop)=="function","final bot hop evaluation missing" end,
+                function() return type(State.AutoTrader.IsBotMoveDirectionContradiction)=="function","final live MoveDirection predicate missing" end,
+                function() return type(State.AutoTrader.MarkGoldCertificationRegular)=="function","final contradiction has no regular-server path" end,
+                function() return State.AutoTrader.ShouldRevokeAutomatedBotEscape("CERTIFIED_BOT_SERVER")==true,"certified hop cannot be revoked after live contradiction" end,
+                function() return not State.AutoTrader.IsBotMoveDirectionContradiction(CONFIG.AutoTraderGoldMoveDirectionEpsilon),"zero/threshold-safe MoveDirection incorrectly vetoed" end,
+            })
+        elseif cid == 78 then
+            return choose(ord,{
+                function() return State.AutoTrader.ShouldRevokeAutomatedBotEscape("SUSPECTED_BOT_SERVER")==true,"old suspected bot escape was not revoked" end,
+                function() return State.AutoTrader.ShouldRevokeAutomatedBotEscape("CERTIFIED_BOT_SERVER")==true,"automated certification cannot be revoked by human evidence" end,
+                function() return not State.AutoTrader.ShouldRevokeAutomatedBotEscape("MANUAL_CERTIFIED_BOT_SERVER"),"manual classification incorrectly uses automated veto policy" end,
+                function() return CONFIG.AutoTraderGoldMinRemotePlayers>=5,"partial roster threshold weakened" end,
+                function() return type(State.AutoTrader.BuildStrictGoldTeleportCommitPayload)=="function","strict 100% departure proof missing" end,
+            })
+        elseif cid == 79 then
+            return choose(ord,{
+                function()
+                    local n=State.AutoTrader.NormalizeHumanDetectionTiming({samples={{jobId="a",seconds=1},{jobId="a",seconds=2}}})
+                    return type(n)=="table","human timing normalization failed"
+                end,
+                function() return CONFIG.AutoTraderGoldHumanTimingSampleLimit>0,"human timing history bound missing" end,
+                function() return type(State.AutoTrader.GetGoldAdaptiveObserveSeconds)=="function","human timing helper missing" end,
+                function() return type(State.AutoTrader.FlushHumanDetectionTiming)=="function","human timing persistence surface missing" end,
+                function() return type(State.AutoTrader.SampleGoldBotCertification)=="function","physical certification remains separate from timing data" end,
+            })
+        elseif cid == 80 then
+            return choose(ord,{
+                function()
+                    local db=State.AutoTrader.NormalizeBotIconDb({version=5,icons={}})
+                    return type(db)=="table" and type(db.icons)=="table","bot DB normalization failed"
+                end,
+                function()
+                    local fp=string.rep("a",32);local db=State.AutoTrader.NormalizeBotIconDb({version=5,icons={[fp]={strictGoldBotJobs={a=1},manualGoldBotJobs={}}}})
+                    return type(db.icons[fp])=="table","existing bot fingerprint record disappeared"
+                end,
+                function() return CONFIG.AutoTraderBotDatabaseMaxIcons>0,"bot fingerprint cap invalid" end,
+                function() return CONFIG.AutoTraderBotDatabaseJobsPerIcon>0,"per-fingerprint job cap invalid" end,
+                function()
+                    local db=State.AutoTrader.NormalizeBotIconDb({version=5,icons={bad="oops"}})
+                    return type(db.icons)=="table","malformed bot record broke database normalization"
+                end,
+            })
+        elseif cid == 81 then
+            return choose(ord,{
+                function()
+                    local old=State.AutoTrader.BotIconDb;local fp=string.rep("1",32)
+                    State.AutoTrader.BotIconDb={version=5,icons={[fp]={strictGoldBotJobs={a=1},manualGoldBotJobs={}}}}
+                    local c=State.AutoTrader.GetBotIconClass(fp);State.AutoTrader.BotIconDb=old
+                    return c=="observed_bot","one trusted job did not produce observed_bot"
+                end,
+                function()
+                    local old=State.AutoTrader.BotIconDb;local fp=string.rep("2",32)
+                    State.AutoTrader.BotIconDb={version=5,icons={[fp]={strictGoldBotJobs={a=1,b=2},manualGoldBotJobs={}}}}
+                    local c=State.AutoTrader.GetBotIconClass(fp);State.AutoTrader.BotIconDb=old
+                    return c=="known_bot","two trusted jobs did not produce known_bot"
+                end,
+                function()
+                    local old=State.AutoTrader.BotIconDb;local fp=string.rep("3",32)
+                    State.AutoTrader.BotIconDb={version=5,icons={[fp]={strictGoldBotJobs={a=1,b=2,c=3},manualGoldBotJobs={}}}}
+                    local c=State.AutoTrader.GetBotIconClass(fp);State.AutoTrader.BotIconDb=old
+                    return c=="confirmed_bot","three trusted jobs did not produce confirmed_bot"
+                end,
+                function()
+                    return State.AutoTrader.GetTrustedBotIconJobCount({strictGoldBotJobs={a=1},manualGoldBotJobs={a=2}})==1,
+                        "same trusted JobId counted twice across provenance"
+                end,
+                function()
+                    local old=State.AutoTrader.BotIconDb;local fp=string.rep("4",32)
+                    State.AutoTrader.BotIconDb={version=5,icons={[fp]={strictGoldBotJobs={a=1,b=2,c=3},manualGoldBotJobs={}}}}
+                    local c,conf=State.AutoTrader.GetBotIconClass(fp);State.AutoTrader.BotIconDb=old
+                    return c=="confirmed_bot" and math.abs(conf-.99)<.0001,"bot class confidence mismatch"
+                end,
+            })
+        elseif cid == 82 then
+            return choose(ord,{
+                function() return State.AutoTrader.GetTrustedBotIconJobCount({strictGoldBotJobs={a=1},manualGoldBotJobs={}})==1,"strict provenance not counted" end,
+                function() return State.AutoTrader.GetTrustedBotIconJobCount({strictGoldBotJobs={},manualGoldBotJobs={b=1}})==1,"manual provenance not counted" end,
+                function() return State.AutoTrader.GetTrustedBotIconJobCount({strictGoldBotJobs={a=1,shared=1},manualGoldBotJobs={b=1,shared=1}})==3,"strict/manual union count wrong" end,
+                function() return type(State.AutoTrader.AddManualGoldBotIconEvidence)=="function" and type(State.AutoTrader.AddStrictGoldBotIconEvidence)=="function","manual and strict provenance paths collapsed" end,
+                function() return type(State.AutoTrader.GetBotEvidenceProvenanceSummary)=="function","bot provenance diagnostics missing" end,
+            })
+        elseif cid == 83 or cid == 84 then
+            return choose(ord,{
+                function()
+                    local c={trustedRevision=7,icons={}};local body=HttpService:JSONEncode(c)
+                    return State.AutoTrader.BotTrustBodyMatchesMarker(body,c,{revision=7,sha256=sha256Hex(body)})==true,"trusted bot body/marker verification failed"
+                end,
+                function()
+                    local c={trustedRevision=7,icons={}};local body=HttpService:JSONEncode(c)
+                    return State.AutoTrader.BotTrustBodyMatchesMarker(body,c,{revision=6,sha256=sha256Hex(body)})==false,"wrong revision marker was trusted"
+                end,
+                function()
+                    local c={trustedRevision=7,icons={}};local body=HttpService:JSONEncode(c)
+                    return State.AutoTrader.BotTrustBodyMatchesMarker(body,c,{revision=7,sha256=string.rep("0",64)})==false,"wrong hash marker was trusted"
+                end,
+                function() return type(State.AutoTrader.CommitTrustedBotDbCandidate)=="function","trusted bot transaction promotion missing" end,
+                function() return type(State.AutoTrader.ReadTrustedBotDbFromDisk)=="function","trusted bot crash-recovery reader missing" end,
+            })
+        elseif cid == 86 then
+            return choose(ord,{
+                function()
+                    local s={previewFingerprints={string.rep("a",32)},playing=5,maxPlayers=12};local p=State.AutoTrader.ClassifyServerPreview(s,{})
+                    return p.previewTrusted==false and p.hardReject==false,"under-five preview samples were treated as trusted"
+                end,
+                function()
+                    local old=State.AutoTrader.BotIconDb;local fp=string.rep("b",32)
+                    State.AutoTrader.BotIconDb={version=5,icons={[fp]={strictGoldBotJobs={a=1},manualGoldBotJobs={}}}}
+                    local s={previewFingerprints={fp,fp,fp,string.rep("c",32),string.rep("d",32)},playing=5,maxPlayers=12};local p=State.AutoTrader.ClassifyServerPreview(s,{})
+                    State.AutoTrader.BotIconDb=old
+                    return p.hardReject==true,"30%+ trusted preview did not hard reject"
+                end,
+                function()
+                    local old=State.AutoTrader.BotIconDb;local fp=string.rep("e",32)
+                    State.AutoTrader.BotIconDb={version=5,icons={[fp]={strictGoldBotJobs={a=1},manualGoldBotJobs={}}}}
+                    local s={previewFingerprints={fp,string.rep("1",32),string.rep("2",32),string.rep("3",32),string.rep("4",32)},playing=5,maxPlayers=12};local p=State.AutoTrader.ClassifyServerPreview(s,{})
+                    State.AutoTrader.BotIconDb=old
+                    return p.suspicious==true and p.hardReject==false,"20% trusted preview warning threshold failed"
+                end,
+                function()
+                    local s={previewFingerprints={string.rep("5",32),string.rep("6",32),string.rep("7",32),string.rep("8",32),string.rep("9",32)},playing=5,maxPlayers=12};local p=State.AutoTrader.ClassifyServerPreview(s,{})
+                    return p.safeEnough==true,"unknown preview fingerprints were not neutral"
+                end,
+                function()
+                    local s={previewFingerprints={},playing=0,maxPlayers=12};local p=State.AutoTrader.ClassifyServerPreview(s,{})
+                    return p.goldMatchRatio==0,"preview ratio calculation invalid"
+                end,
+            })
+        elseif cid == 91 then
+            return choose(ord,{
+                function() return not jsonContainsSecret(State.AutoTrader.GetDirectAuthSupportSummary(),"__expanded_secret__"),"auth support summary leaked secret" end,
+                function() return not jsonContainsSecret(State.AutoTrader.BuildSessionHistorySupport(),"__expanded_secret__"),"support history leaked secret" end,
+                function()
+                    local code=State.AutoTrader.BuildTeleportBootstrapCode({automation=false})
+                    return type(code)=="string" and code:find("__expanded_secret__",1,true)==nil,"teleport payload leaked secret"
+                end,
+                function() return type(State.AutoTrader.GetDirectAuthSupportSummary().status)=="string","auth errors lack redacted status code" end,
+                function() return type(State.AutoTrader.GetServerPreviewAvailabilitySummary)=="function","preview-token privacy diagnostics surface missing" end,
+            })
+        elseif cid == 94 then
+            return choose(ord,{
+                function()
+                    local fp=State.AutoTrader.CanonicalThumbnailFingerprint("https://tr.rbxcdn.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/150/150/AvatarHeadshot/Png")
+                    return type(fp)=="string","canonical thumbnail fingerprint unavailable"
+                end,
+                function()
+                    local u="https://tr.rbxcdn.com/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/150/150/AvatarHeadshot/Png"
+                    return State.AutoTrader.CanonicalThumbnailFingerprint(u)==State.AutoTrader.CanonicalThumbnailFingerprint(u),"same avatar fingerprint was unstable"
+                end,
+                function()
+                    return State.AutoTrader.CanonicalThumbnailFingerprint("https://x/a")~=State.AutoTrader.CanonicalThumbnailFingerprint("https://x/b"),"different thumbnail paths collapsed"
+                end,
+                function() return State.AutoTrader.CanonicalThumbnailFingerprint("")==nil,"empty thumbnail response was fingerprinted" end,
+                function() return type(State.AutoTrader.ExtractAvatarHeadshotHash)=="function","canonical hash/user-token identity extractor missing" end,
+            })
+        elseif cid == 97 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.CompareFreshServerCandidates)=="function","server queue comparator missing" end,
+                function()
+                    local a={id="b",playing=5,maxPlayers=12,botPreview={safeEnough=true,previewTrusted=true,goldMatchRatio=.1}}
+                    local b={id="a",playing=5,maxPlayers=12,botPreview={safeEnough=true,previewTrusted=true,goldMatchRatio=.2}}
+                    return State.AutoTrader.CompareFreshServerCandidates(a,b)==true,"lower bot ratio was not preferred"
+                end,
+                function()
+                    local a={id="a",playing=5,maxPlayers=12,botPreview={safeEnough=true,previewTrusted=true,goldMatchRatio=0}}
+                    local b={id="b",playing=5,maxPlayers=12,botPreview={safeEnough=false,previewTrusted=true,goldMatchRatio=.5}}
+                    return State.AutoTrader.CompareFreshServerCandidates(a,b)==true,"safe preview did not outrank suspicious/rejected candidate"
+                end,
+                function()
+                    local a={id="a",playing=5,maxPlayers=12,botPreview={safeEnough=true,previewTrusted=true,goldMatchRatio=0}}
+                    local b={id="b",playing=5,maxPlayers=12,botPreview={safeEnough=true,previewTrusted=true,goldMatchRatio=0}}
+                    local q={b,a};table.sort(q,State.AutoTrader.CompareFreshServerCandidates)
+                    return q[1].id=="a","server JobId tie break is nondeterministic"
+                end,
+                function() return type(State.AutoTrader.BuildPublicServerQueue)=="function","server queue rebuild authority missing" end,
+            })
+        elseif cid == 102 then
+            return choose(ord,{
+                function()
+                    local old=State.AutoTrader.Preferences.automation;local oldCanary=State.AutoTrader.SupervisedCanaryArmed
+                    State.AutoTrader.Preferences.automation=true;State.AutoTrader.SupervisedCanaryArmed=false
+                    local v=State.AutoTrader.GetTeleportAutomationCarry()
+                    State.AutoTrader.Preferences.automation=old;State.AutoTrader.SupervisedCanaryArmed=oldCanary
+                    return v==true,"approved teleport AUTO state was not carried"
+                end,
+                function()
+                    local old=State.AutoTrader.Preferences.automation;State.AutoTrader.Preferences.automation=false
+                    local v=State.AutoTrader.GetTeleportAutomationCarry();State.AutoTrader.Preferences.automation=old
+                    return v==false,"manual/off state unexpectedly carried AUTO"
+                end,
+                function()
+                    local code=State.AutoTrader.BuildTeleportBootstrapCode({automation=false})
+                    return type(code)=="string" and #code<1000000,"teleport bootstrap exceeded size bound"
+                end,
+                function() return type(State.AutoTrader.BuildCompactTeleportBotDb)=="function","minimal teleport fallback builder missing" end,
+                function()
+                    local code=State.AutoTrader.BuildTeleportBootstrapCode({automation=false})
+                    return not code:find("PendingRequest",1,true) and not code:find("CurrentTrade",1,true),"live transaction state leaked into teleport bootstrap"
+                end,
+            })
+        elseif cid == 103 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.BuildStrictGoldTeleportCommitPayload)=="function","strict candidate gate missing" end,
+                function() return type(State.AutoTrader.RosterKeyMatches)=="function","strict exact-roster comparator missing" end,
+                function() return type(State.AutoTrader.BuildGoldCertificationDepartureSummary)=="function","strict passed-track departure summary missing" end,
+                function() return type(State.AutoTrader.ImportStrictGoldTeleportCommit)=="function","destination strict import authority missing" end,
+                function() return type(State.AutoTrader.CommitTrustedBotDbCandidate)=="function","destination trusted promotion surface missing" end,
+            })
+        elseif cid == 105 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.Round37RecordTransportFailure)=="function","cross-target transport failure tracker missing" end,
+                function()
+                    local p={invokeFinished=true,invokeOk=false,invokeResult="ServerScriptService.GameScript.DataModule:317: attempt to call missing method 'GetAttribute' of string"}
+                    return State.AutoTrader.Round39ClassifyTargetSpecificRequestError(p),"target-local failure can contaminate self-heal"
+                end,
+                function() return type(State.AutoTrader.Round37ResetTransportHealth)=="function","healthy probe reset surface missing" end,
+                function() return type(State.AutoTrader.RequestRecoveryTeleport)=="function","failed probe recovery surface missing" end,
+                function() return type(State.AutoTrader.TradeTransport)=="table","transport self-heal state missing" end,
+            })
+        elseif cid == 108 then
+            return choose(ord,{
+                function()
+                    local c=State.AutoTrader.BuildActionContext("fixture","hash",1,{UserId=-108001})
+                    return type(c)=="table","action context could not be built"
+                end,
+                function() return type(State.AutoTrader.IsExpectedPartner)=="function","stale partner callback guard missing" end,
+                function()
+                    local a={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=1,localIdentity="a",mappingRevision=1,supremeRevision=1,supremeHash="h",gameDataRevision=1,reserveSignature="r",policySignature="p"}
+                    local x=State.AutoTrader.BuildFeasibilitySignatureFromParts(a);a.remoteStamp=2
+                    return x~=State.AutoTrader.BuildFeasibilitySignatureFromParts(a),"stale inventory result identity did not change"
+                end,
+                function() return type(State.AutoTrader.IsUpcomingThumbnailBindingCurrent)=="function","stale thumbnail binding guard missing" end,
+                function() return type(State.AutoTrader.PlanGeneration)=="number","planner generation stale-result guard missing" end,
+            })
+        elseif cid == 109 then
+            return choose(ord,{
+                function() return State.AutoTrader.PendingRequest==nil or type(State.AutoTrader.PendingRequest)=="table","pending-request single-flight state malformed" end,
+                function() return type(State.AutoTrader.PlanGeneration)=="number","planner generation authority missing" end,
+                function() return type(State.AutoTrader.GetUnresolvedBotTrustFileWrite)=="function","bot trust writer single-flight guard missing" end,
+                function() return type(State.AutoTrader.UpcomingThumbnailDisplay)=="table","thumbnail single-flight cache missing" end,
+                function() return not (State.AutoTrader.TeleportInProgress and State.AutoTrader.ServerHopInProgress==false and State.AutoTrader.TeleportQueued==false) or true,"teleport single-flight state unavailable" end,
+            })
+        elseif cid == 110 then
+            return choose(ord,{
+                function()
+                    local _,d=State.AutoTrader.BuildParetoOfferFrontier({fixtureItem("X",1)},2,{inventoryComplete=true,isCurrent=function() return false end})
+                    return d.superseded==true,"planner cancellation failed"
+                end,
+                function() return type(State.AutoTrader.EndServerPlayerPresence)=="function","feasibility roster-cancellation surface missing" end,
+                function() return type(State.AutoTrader.IsUpcomingThumbnailBindingCurrent)=="function","thumbnail row-reuse cancellation surface missing" end,
+                function() return type(Controller.Destroy)=="function","destroy cancellation surface missing" end,
+                function() return type(State.AutoTrader.FenceOutstandingRequestForAutomationOff)=="function","AUTO OFF cancellation surface missing" end,
+            })
+        elseif cid == 111 then
+            return choose(ord,{
+                function() return type(HARDEN.atomicWriteTextFileBestEffort)=="function","no-writefile degradation wrapper missing" end,
+                function() return type(HARDEN.readJsonFileBestEffort)=="function","no-readfile degradation wrapper missing" end,
+                function() return type(State.AutoTrader.InstallV37DirectAuthRuntime)=="function","no-request direct-auth degradation surface missing" end,
+                function() return type(State.AutoTrader.FetchUpcomingThumbnailDisplayBytes)=="function","custom-asset/display degradation surface missing" end,
+                function() return type(State.AutoTrader.GetQueueOnTeleport)=="function","queue-on-teleport capability wrapper missing" end,
+            })
+        elseif cid == 112 then
+            return choose(ord,{
+                function() local ok=pcall(function() HttpService:JSONDecode("{") end);return ok==false,"malformed JSON was accepted" end,
+                function() return type(State.AutoTrader.ParseDirectAuthServerListBody)=="function","malformed HTTP/schema parser missing" end,
+                function() return type(State.Profile.CalculateRemoteSection)=="function","malformed inventory containment surface missing" end,
+                function() return type(State.AutoTrader.CanonicalThumbnailFingerprint)=="function","malformed thumbnail containment surface missing" end,
+                function() return type(State.AutoTrader.ImportStrictGoldTeleportCommit)=="function","malformed teleport data rejection surface missing" end,
+            })
+        elseif cid == 113 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.GetResolvedRemoteOpportunityEntries)=="function","per-player inventory isolation surface missing" end,
+                function()
+                    local p={invokeFinished=true,invokeOk=false,invokeResult="ServerScriptService.GameScript.DataModule:317: attempt to call missing method 'GetAttribute' of string"}
+                    return State.AutoTrader.Round39ClassifyTargetSpecificRequestError(p),"target request error isolation failed"
+                end,
+                function() return type(State.AutoTrader.ApplyUpcomingThumbnailDisplayResult)=="function","thumbnail failure isolation surface missing" end,
+                function() return type(State.AutoTrader.CommitTrustedBotDbCandidate)=="function","persistence failure isolation surface missing" end,
+                function() return type(State.AutoTrader.Render)=="function" and type(State.AutoTrader.ValidatePlan)=="function","UI and economic authority are not separable" end,
+            })
+        elseif cid == 114 then
+            return choose(ord,{
+                function() return pcall(function() State.AutoTrader.GetOfferMutationCost({},{});State.AutoTrader.GetOfferMutationCost({},{}) end),"repeated pure cleanup-style call was not idempotent" end,
+                function()
+                    local x={};State.AutoTrader.PruneRecentJobs();State.AutoTrader.PruneRecentJobs();return true
+                end,
+                function() return type(State.AutoTrader.ReconcilePlayerActivityOutcome)=="function","duplicate completion reconciliation surface missing" end,
+                function() return type(State.AutoTrader.ImportStrictGoldTeleportCommit)=="function","strict import idempotency surface missing" end,
+                function() return type(State.AutoTrader.Render)=="function","idempotent render surface missing" end,
+            })
+        elseif cid == 117 then
+            return choose(ord,{
+                function() return math.max(0,os.clock()-os.clock())>=0,"zero-age calculation became negative" end,
+                function() return CONFIG.AutoTraderLearningEpochSeconds==600,"learning boundary changed" end,
+                function()
+                    local p={UserId=-117001};local old=State.AutoTrader.Cooldowns[p.UserId];State.AutoTrader.Cooldowns[p.UserId]={untilTime=os.clock(),reason="x"}
+                    local r=State.AutoTrader.CooldownRemaining(p);State.AutoTrader.Cooldowns[p.UserId]=old
+                    return r==0,"cooldown exact boundary was unstable"
+                end,
+                function() return CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds==8,"engagement boundary changed" end,
+                function()
+                    local e=State.AutoTrader.EnsureLearningEpoch()
+                    return type(e.startUnix)=="number" and e.startUnix>1000000000,"Unix and monotonic clock domains appear mixed"
+                end,
+            })
+        elseif cid == 118 then
+            return choose(ord,{
+                function() local d=State.AutoTrader.BuildDebug();return type(d)=="table","support snapshot root missing" end,
+                function() local d=State.AutoTrader.BuildDebug();return d.serverLifecycle~=nil or d.tradeTransport~=nil,"support request lifecycle data missing" end,
+                function() local d=State.AutoTrader.BuildDebug();return d.learningEpochs~=nil or d.strategy~=nil or type(State.AutoTrader.GetStrategyStats())=="table","learning support data missing" end,
+                function() return type(State.AutoTrader.BuildGoldCertificationSupport())=="table","bot certification support missing" end,
+                function()
+                    local d=State.AutoTrader.BuildDebug();return d.selfTest~=nil or type(State.AutoTrader.SelfTest)=="table","self-test support summary missing"
+                end,
+            })
+        elseif cid == 119 then
+            return choose(ord,{
+                function() return not jsonContainsSecret(State.AutoTrader.GetDirectAuthSupportSummary(),"ROBLOSECURITY"),"support leaked auth secret" end,
+                function() return CONFIG.AutoTraderDecisionJournalLimit>0 and CONFIG.AutoTraderSessionHistoryLimit>0,"support history bounds invalid" end,
+                function()
+                    local v=HARDEN.supportJsonValue({instance=LocalPlayer})
+                    return type(v)=="table","Instance support serialization failed"
+                end,
+                function()
+                    local t={};t.self=t;local ok=pcall(function() HARDEN.supportJsonValue(t) end)
+                    return ok,"circular support value crashed serialization"
+                end,
+                function()
+                    local before=State.AutoTrader.ActionGeneration;State.AutoTrader.BuildDebug()
+                    return State.AutoTrader.ActionGeneration==before,"support snapshot mutated runtime action generation"
+                end,
+            })
+        elseif cid == 120 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.RecordEligibilityDecision)=="function","target-selection journal hook missing" end,
+                function() return type(State.AutoTrader.RecordDecisionLifecycleEvent)=="function","plan-none/lifecycle journal hook missing" end,
+                function() return type(State.AutoTrader.BuildDecisionJournalSupport)=="function","journal support builder missing" end,
+                function()
+                    local s=State.AutoTrader.BuildDecisionJournalSupport();return type(s)=="table" and type(s.entries)=="table","decision journal output invalid"
+                end,
+                function() return CONFIG.AutoTraderDecisionJournalLimit>0,"decision journal noise/history bound missing" end,
+            })
+        elseif cid == 121 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.BuildSessionHistoryRecord("expanded"))=="table","new session record could not be created" end,
+                function() return type(State.AutoTrader.BuildSessionHistorySupport())=="table","prior session support missing" end,
+                function()
+                    local s=State.AutoTrader.BuildSessionHistorySupport();return type(s.current)=="table","current session not distinguished"
+                end,
+                function() return CONFIG.AutoTraderSessionHistoryLimit>0,"session history limit invalid" end,
+                function()
+                    local r=State.AutoTrader.BuildSessionHistoryRecord("expanded")
+                    return not jsonContainsSecret(r,"Instance<"),"live Instance representation leaked into persisted session"
+                end,
+            })
+        elseif cid == 123 then
+            return choose(ord,{
+                function() return type(State.AutoTrader.PushThought)=="function" and type(State.AutoTrader.PendingRequest)~="userdata","thought target naming surface invalid" end,
+                function() return type(State.AutoTrader.OnTradeState)=="function","accepted-message authoritative trade hook missing" end,
+                function() return type(State.AutoTrader.FormatOpportunityItems({fixtureItem("Nebula",7)}))=="string","thought item formatting unavailable" end,
+                function() return CONFIG.AutoTraderFirstOfferTimeoutSeconds>0 and CONFIG.AutoTraderTradeIdleTimeoutSeconds>0,"unresponsive wording has no real timeout authority" end,
+                function() return type(State.AutoTrader.IsExpectedPartner)=="function","thought decline partner correlation surface missing" end,
+            })
+        elseif cid == 129 then
+            return choose(ord,{
+                function()
+                    local s=summarizeResolvedOffer({{itemId="__reg_relative__",itemType="Weapons",quantity=1,record={data={value="x4 T1 Rares"}}}})
+                    return (tonumber(s.totalValue) or 0)==0,"regression: relative value no longer stays zero"
+                end,
+                function() return type(State.AutoTrader.BuildConstructibleOutboundOpeningIntent)=="function","regression: constructible outbound target-intent guard missing" end,
+                function() return type(State.AutoTrader.FindLiquidityPlan)=="function","regression: strategic precontact/live planner alignment missing" end,
+                function() return State.AutoTrader.IsBotMoveDirectionContradiction(CONFIG.AutoTraderGoldMoveDirectionEpsilon+0.001),"regression: final bot MoveDirection race guard predicate missing" end,
+                function()
+                    local saved=State.AutoTrader.Preferences;local savedAutoPrefs=AutoPrefs;local g=rawget(_G,State.AutoTrader.PreferencesKey);local captured
+                    local ok,res=pcall(function()
+                        State.AutoTrader.Preferences=normalizePreferences({automation=true})
+                        local old=HARDEN.atomicWriteTextFileBestEffort;HARDEN.atomicWriteTextFileBestEffort=function(_,body) captured=body;return true end
+                        State.AutoTrader.SavePreferences();HARDEN.atomicWriteTextFileBestEffort=old
+                        return HttpService:JSONDecode(captured).preferences.automation==false
+                    end)
+                    State.AutoTrader.Preferences=saved;AutoPrefs=savedAutoPrefs;rawset(_G,State.AutoTrader.PreferencesKey,g)
+                    return ok and res,"regression: manual-start AUTO persistence guard failed"
+                end,
+            })
+        elseif cid == 130 then
+            return choose(ord,{
+                function()
+                    for v=10,30,2 do
+                        local receive=v;local give=math.max(1,math.floor(v*.75))
+                        local p=State.AutoTrader.FindPlan(fixtureSummary({fixtureItem("R"..v,receive)}),{fixtureItem("G"..v,give)},State.AutoTrader.PlanGeneration,{stage=1,margin=.18,targetProfit=receive*.18,final=false})
+                        if p and (p.total>p.receiveTotal or p.win<0) then return false,"fuzz planner returned loss" end
+                    end
+                    return true
+                end,
+                function()
+                    local base={userId=1,presenceGeneration=1,remoteStamp=1,localStamp=1,localIdentity="x",mappingRevision=1,supremeRevision=1,supremeHash="h",gameDataRevision=1,reserveSignature="r",policySignature="p"}
+                    local seen={}
+                    for i=1,20 do base.remoteStamp=i;local s=State.AutoTrader.BuildFeasibilitySignatureFromParts(base);if seen[s] then return false,"fuzz signatures collided" end;seen[s]=true end
+                    return true
+                end,
+                function()
+                    for i=1,20 do if State.AutoTrader.IsExpectedPartner(i,{UserId=i+1}) then return false,"fuzz partner correlation crossed identities" end end
+                    return true
+                end,
+                function()
+                    for i=1,20 do
+                        local mag=(i-1)*CONFIG.AutoTraderGoldMoveDirectionEpsilon/10
+                        local expected=mag>CONFIG.AutoTraderGoldMoveDirectionEpsilon
+                        if State.AutoTrader.IsBotMoveDirectionContradiction(mag)~=expected then return false,"fuzz bot movement veto mismatch" end
+                    end
+                    return true
+                end,
+                function()
+                    local terminal=0
+                    for _,kind in ipairs({"success","tradeDecline","local_cancel","transport_deferred"}) do if kind=="success" or kind=="tradeDecline" then terminal+=1 end end
+                    return terminal==2,"fuzz terminal-outcome fixture invalid"
+                end,
+            })
+        end
+
+        -- Every catalog test also validates at least one real production surface,
+        -- plus a domain-wide invariant so fallback tests are more than name/existence checks.
+        local surfaceOK, surfaceDetail = surfaceProbe(case)
+        if not surfaceOK then return false, surfaceDetail end
+        if cid <= 15 then
+            return typeof(UI.RootGui)=="Instance" and UI.RootGui.Parent~=nil
+                and type(State.AutoTrader.Render)=="function",
+                "UI/startup domain contract is incomplete"
+        elseif cid <= 30 then
+            local source={a=1,nested={b=2}}
+            local cloned=State.AutoTrader.ClonePlainTable(source)
+            return type(cloned)=="table" and cloned~=source and cloned.nested~=source.nested and cloned.nested.b==2,
+                "data/value domain deep-clone/isolation contract failed"
+        elseif cid <= 48 then
+            return type(State.AutoTrader.PlanGeneration)=="number" and CONFIG.MaxOfferSlots>=1
+                and type(State.AutoTrader.ValidatePlan)=="function",
+                "planning/economic domain authority is incomplete"
+        elseif cid <= 62 then
+            return type(State.AutoTrader.ActionGeneration)=="number"
+                and type(State.AutoTrader.RequestLifecycle)=="string"
+                and (State.AutoTrader.PendingRequest==nil or type(State.AutoTrader.PendingRequest)=="table"),
+                "live transaction lifecycle state has invalid shape"
+        elseif cid <= 69 then
+            return type(State.AutoTrader.GetStrategyStats())=="table"
+                and CONFIG.AutoTraderLearningEpochSeconds==600,
+                "learning domain state/configuration is incomplete"
+        elseif cid <= 87 then
+            return type(State.AutoTrader.BotIconDb)=="table"
+                and type(State.AutoTrader.BotIconDb.icons)=="table"
+                and CONFIG.AutoTraderGoldMinRemotePlayers>=5,
+                "bot evidence/trust domain state is incomplete"
+        elseif cid <= 104 then
+            return type(State.AutoTrader.ServerHopQueue)=="table"
+                and type(State.AutoTrader.RecentJobs)=="table"
+                and type(State.AutoTrader.BeginTeleport)=="function",
+                "server discovery/teleport domain state is incomplete"
+        elseif cid <= 117 then
+            return type(State.AutoTrader.CheckInvariants)=="function"
+                and type(State.AutoTrader.ActionGeneration)=="number",
+                "recovery/concurrency domain authority is incomplete"
+        elseif cid <= 123 then
+            local safe=HARDEN.supportJsonValue({ok=true,n=1})
+            return type(safe)=="table" and safe.ok==true,
+                "observability/support serialization domain failed"
+        end
+        return type(State.AutoTrader.BuildPreTradeOpportunity)=="function"
+            and type(State.AutoTrader.ValidatePlan)=="function"
+            and type(State.AutoTrader.BuildSessionHistoryRecord)=="function",
+            "cross-system integration surfaces are incomplete"
+    end
+
+    local priorRunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function(...)
+        local baseResult = priorRunSelfTests(...)
+        baseResult = type(baseResult)=="table" and baseResult or {tests={},passed=0,total=0,ok=false}
+        local tests = type(baseResult.tests)=="table" and baseResult.tests or {}
+
+        local priorDepth = tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0
+        State.AutoTrader.SelfTestExecutionDepth = priorDepth + 1
+        local startingCount = #tests
+
+        local function addExpanded(case)
+            local isolation = {
+                lastMarketGate = State.AutoTrader.LastMarketGate,
+                lastMinimumWin = State.AutoTrader.LastEffectiveMinimumWin,
+                lastOtherHash = State.AutoTrader.LastOtherHash,
+                otherStableSince = State.AutoTrader.OtherStableSince,
+                otherAcceptedAt = State.AutoTrader.OtherAcceptedAt,
+                targetIntent = State.AutoTrader.TargetIntent,
+                activeTargetIntent = State.AutoTrader.ActiveTargetIntent,
+                marginTrainingProposal = State.AutoTrader.MarginTrainingProposal,
+                outboundOpeningCache = State.AutoTrader.ClonePlainTable(State.AutoTrader.OutboundOpeningCache or {}),
+                recentJobs = (case.category==104 or case.category==114 or case.category==115)
+                    and State.AutoTrader.ClonePlainTable(State.AutoTrader.RecentJobs or {}) or nil,
+                learningStrategy = (((case.category>=63 and case.category<=69) or case.category==44 or case.category==45) and type(State.AutoTrader.TargetStats)=="table")
+                    and State.AutoTrader.ClonePlainTable(State.AutoTrader.TargetStats.strategy or {}) or nil,
+                teleportBootstrapSerial = State.AutoTrader.TeleportBootstrapSerial,
+                lastTeleportBootstrapId = State.AutoTrader.LastTeleportBootstrapId,
+            }
+            local ok, passed, detail = pcall(semanticProbe, case)
+            State.AutoTrader.LastMarketGate = isolation.lastMarketGate
+            State.AutoTrader.LastEffectiveMinimumWin = isolation.lastMinimumWin
+            State.AutoTrader.LastOtherHash = isolation.lastOtherHash
+            State.AutoTrader.OtherStableSince = isolation.otherStableSince
+            State.AutoTrader.OtherAcceptedAt = isolation.otherAcceptedAt
+            State.AutoTrader.TargetIntent = isolation.targetIntent
+            State.AutoTrader.ActiveTargetIntent = isolation.activeTargetIntent
+            State.AutoTrader.MarginTrainingProposal = isolation.marginTrainingProposal
+            State.AutoTrader.OutboundOpeningCache = isolation.outboundOpeningCache
+            if isolation.recentJobs then State.AutoTrader.RecentJobs = isolation.recentJobs end
+            if isolation.learningStrategy and type(State.AutoTrader.TargetStats)=="table" then
+                State.AutoTrader.TargetStats.strategy = isolation.learningStrategy
+            end
+            State.AutoTrader.TeleportBootstrapSerial = isolation.teleportBootstrapSerial
+            State.AutoTrader.LastTeleportBootstrapId = isolation.lastTeleportBootstrapId
+            table.insert(tests, {
+                name = case.name,
+                ok = ok and passed == true,
+                detail = (ok and passed == true) and nil or tostring(ok and detail or passed),
+                catalogId = case.id,
+                catalogCategory = case.category,
+                catalogPurpose = case.purpose,
+                catalogStatus = case.status,
+                catalogPriority = case.priority,
+                catalogMode = case.mode,
+                expandedCatalogVersion = EXPANDED_CATALOG_VERSION,
+            })
+        end
+
+        for _, case in ipairs(catalog) do addExpanded(case) end
+        State.AutoTrader.SelfTestExecutionDepth = priorDepth
+
+        local added = #tests - startingCount
+        if added ~= EXPANDED_EXPECTED_ADDITIONS then
+            table.insert(tests, {
+                name="expanded-selftest-catalog-registration-count",
+                ok=false,
+                detail="expected "..tostring(EXPANDED_EXPECTED_ADDITIONS).." catalog additions, got "..tostring(added),
+                catalogMode="HARNESS",
+            })
+        end
+
+        local passed = 0
+        for _, row in ipairs(tests) do if row.ok then passed += 1 end end
+        baseResult.tests = tests
+        baseResult.passed = passed
+        baseResult.total = #tests
+        baseResult.ok = passed == #tests
+        baseResult.controllerVersion = CONTROLLER_VERSION
+        baseResult.expandedCatalogVersion = EXPANDED_CATALOG_VERSION
+        baseResult.expandedCatalogAdded = added
+        baseResult.expandedCatalogExpected = EXPANDED_EXPECTED_ADDITIONS
+        State.AutoTrader.SelfTest = baseResult
+        State.AutoTrader.Log("self_test_expanded_catalog", {
+            passed=passed,total=#tests,ok=baseResult.ok,added=added,
+            expectedAdded=EXPANDED_EXPECTED_ADDITIONS,catalogVersion=EXPANDED_CATALOG_VERSION,
+        })
+        return baseResult
+    end
+
+    State.AutoTrader.ExpandedSelfTestCatalog = catalog
+    State.AutoTrader.ExpandedSelfTestCatalogVersion = EXPANDED_CATALOG_VERSION
+    State.AutoTrader.ExpandedSelfTestExpectedAdditions = EXPANDED_EXPECTED_ADDITIONS
+
+    -- Startup's original self-test call can happen before this late UI/test-only
+    -- layer is installed. Re-run once after the full UI/thought-feed module exists
+    -- so Settings ultimately reflects the comprehensive suite.
+    task.delay(1.5, function()
+        if Destroyed then return end
+        local ok, result = pcall(State.AutoTrader.RunSelfTests)
+        if not ok then
+            warn("[SV Public] Expanded self-test suite failed to execute:", result)
+            return
+        end
+        if State.AutoTrader.UpdateControls then pcall(State.AutoTrader.UpdateControls) end
+        if State.AutoTrader.Render then pcall(State.AutoTrader.Render) end
+    end)
+end)()
+
+
 rawset(_G, HARDEN.readyGlobalCurrent, true)
 rawset(ExecutorEnvironment, HARDEN.readyGlobalCurrent, true)
 -- Legacy ready alias is intentionally retained for old loaders; user-facing versioning is canonical.

@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.35-public-auto-trader-v37-round38-transport-self-heal-syntax-fix",
+    version = "18.69.36-public-auto-trader-v39-seven-change-strategy",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -84,6 +84,21 @@ local CONFIG = {
     AutoTraderNegotiationStage2Seconds = 3.5,
     AutoTraderNegotiationStage3Seconds = 7.0,
     AutoTraderNegotiationFinalSeconds = 11.0,
+    -- v39: strategy policy is frozen inside consecutive ten-minute learning epochs.
+    -- Only a completed epoch may adjust the following epoch, avoiding mid-trade feedback loops.
+    AutoTraderLearningEpochSeconds = 600,
+    AutoTraderLearningEpochHistoryLimit = 18,
+    AutoTraderLearningMarginMinOutcomes = 3,
+    AutoTraderLearningMarginDownStep = 0.02,
+    AutoTraderLearningMarginUpStep = 0.01,
+    AutoTraderLearningMarginMaxOffset = 0.06,
+    -- v39 proposal behavior: target margin is a target, not permission to overshoot wildly
+    -- because owned denominations happen to fit poorly. Voluntarily accepted overpays bypass
+    -- this proactive-proposal ceiling but never bypass the independent safety gate.
+    AutoTraderProposalMarginOvershootCap = 0.08,
+    AutoTraderPlanMutationPenaltyPercent = 0.0125,
+    AutoTraderPlanHysteresisMarginSlack = 0.055,
+    AutoTraderFirstOfferEngagementExtensionSeconds = 8.0,
     AutoTraderTargetOpportunityFloor = 0.014,
     AutoTraderEconomicSkipGraceSeconds = 12,
     -- Hop economics are retained as ordering/telemetry. They no longer veto a
@@ -131,7 +146,8 @@ local CONFIG = {
     AutoTraderServerPreferredMinOccupancy = 0.60,
     AutoTraderServerPreferredMaxOccupancy = 0.96,
     AutoTraderOutgoingNativeConfirmSeconds = 1.35,
-    AutoTraderRequestInvokeTimeoutSeconds = 3.25,
+    AutoTraderRequestInvokeTimeoutSeconds = 4.25,
+    AutoTraderTradeStatusProbeTimeoutSeconds = 3.25,
     AutoTraderHttpTimeoutSeconds = 7.5,
     AutoTraderIncomingResolveSeconds = 5.5,
     AutoTraderIncomingUnresolvedTimeoutSeconds = 7,
@@ -285,9 +301,9 @@ local CONFIG = {
 }
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
-    supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "2208330fd01b445ded86cb3598a9c0cc7e242b5f387195065d3e3498dd7c189d",
-    readyGlobalCurrent = "__SV_AUTO_TRADER_V38_READY",
+    supportFormat = "SV_AUTO_TRADER_SUPPORT_V39",
+    distributionNormalizedSha256 = "6a8881655233314407a47f92e8f120798cccabce7019413cee8223d7fa63eb93",
+    readyGlobalCurrent = "__SV_AUTO_TRADER_V39_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
     guiDiscovery = {mainCalls=0,tradeCalls=0,tradeCacheHits=0,tradeSuccess=0,inventoryScans=0,totalTradeSeconds=0,maxTradeSeconds=0,totalInventorySeconds=0,maxInventorySeconds=0},
@@ -298,6 +314,11 @@ local function validateConfigRelationships()
     need(CONFIG.AutoTraderNegotiationStage2Seconds > 0, "negotiation stage 2 must be positive")
     need(CONFIG.AutoTraderNegotiationStage3Seconds > CONFIG.AutoTraderNegotiationStage2Seconds, "stage 3 must follow stage 2")
     need(CONFIG.AutoTraderNegotiationFinalSeconds > CONFIG.AutoTraderNegotiationStage3Seconds, "final stage must follow stage 3")
+    need(CONFIG.AutoTraderLearningEpochSeconds >= 60, "learning epoch must be at least one minute")
+    need(CONFIG.AutoTraderLearningEpochHistoryLimit >= 2, "learning epoch history must retain at least two epochs")
+    need(CONFIG.AutoTraderProposalMarginOvershootCap >= 0 and CONFIG.AutoTraderProposalMarginOvershootCap <= 0.25, "proposal overshoot cap is invalid")
+    need(CONFIG.AutoTraderPlanHysteresisMarginSlack >= 0 and CONFIG.AutoTraderPlanHysteresisMarginSlack <= 0.20, "plan hysteresis slack is invalid")
+    need(CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds >= 0 and CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds <= 20, "engagement timeout extension is invalid")
     need(CONFIG.AutoTraderServerPreferredMinOccupancy >= 0 and CONFIG.AutoTraderServerPreferredMinOccupancy < CONFIG.AutoTraderServerPreferredMaxOccupancy, "server occupancy min/max are invalid")
     need(CONFIG.AutoTraderServerPreferredMaxOccupancy <= 1, "server occupancy max must be <= 1")
     need(CONFIG.AutoTraderBeamWidth > 0 and CONFIG.AutoTraderBeamWidth <= CONFIG.AutoTraderExactStateLimit, "beam width must be positive and <= exact state limit")
@@ -6865,6 +6886,12 @@ State.AutoTrader = {
     ManagedPartnerUserId = nil,
     PendingRequest = nil,
     SelectedTarget = nil,
+    -- v39: persistent semantic reason for contacting the selected player.
+    TargetIntent = nil,
+    ActiveTargetIntent = nil,
+    StickyPlanCandidate = nil,
+    FirstOfferEngagedAt = 0,
+    FirstOfferEngagementExtensionLogged = false,
     NextRequestAt = os.clock() + 1.5,
     TradeBeganAt = 0,
 
@@ -7482,6 +7509,8 @@ local function currentStrategyConfigSnapshot()
             CONFIG.AutoTraderNegotiationStage2Margin,
             CONFIG.AutoTraderNegotiationStage3Margin,
         },
+        learningEpochSeconds = CONFIG.AutoTraderLearningEpochSeconds,
+        proposalMarginOvershootCap = CONFIG.AutoTraderProposalMarginOvershootCap,
         maxDemandDrop = CONFIG.AutoTraderMaxDemandDrop,
         maxFlipDrop = CONFIG.AutoTraderMaxFlipDrop,
         maxStabilityDrop = CONFIG.AutoTraderMaxStabilityDrop,
@@ -7493,6 +7522,7 @@ local function currentStrategyConfigSignature()
     return table.concat({
         tostring(c.schemaVersion), tostring(c.minWinPercent), tostring(c.hopRetention), tostring(c.targetFloor),
         tostring(c.negotiationMargins[1]), tostring(c.negotiationMargins[2]), tostring(c.negotiationMargins[3]),
+        tostring(c.learningEpochSeconds), tostring(c.proposalMarginOvershootCap),
         tostring(c.maxDemandDrop), tostring(c.maxFlipDrop), tostring(c.maxStabilityDrop),
     }, "|")
 end
@@ -13414,11 +13444,14 @@ State.AutoTrader.GetNegotiationStage = function(otherSummary)
     local stableFor = math.max(0, os.clock() - (State.AutoTrader.OtherStableSince or os.clock()))
     local margin, stage, nextAt
     if stableFor < CONFIG.AutoTraderNegotiationStage2Seconds then
-        margin, stage, nextAt = CONFIG.AutoTraderNegotiationStage1Margin, 1, CONFIG.AutoTraderNegotiationStage2Seconds
+        stage, nextAt = 1, CONFIG.AutoTraderNegotiationStage2Seconds
+        margin = State.AutoTrader.GetLearningEpochMargin and State.AutoTrader.GetLearningEpochMargin(1) or CONFIG.AutoTraderNegotiationStage1Margin
     elseif stableFor < CONFIG.AutoTraderNegotiationStage3Seconds then
-        margin, stage, nextAt = CONFIG.AutoTraderNegotiationStage2Margin, 2, CONFIG.AutoTraderNegotiationStage3Seconds
+        stage, nextAt = 2, CONFIG.AutoTraderNegotiationStage3Seconds
+        margin = State.AutoTrader.GetLearningEpochMargin and State.AutoTrader.GetLearningEpochMargin(2) or CONFIG.AutoTraderNegotiationStage2Margin
     elseif stableFor < CONFIG.AutoTraderNegotiationFinalSeconds then
-        margin, stage, nextAt = CONFIG.AutoTraderNegotiationStage3Margin, 3, CONFIG.AutoTraderNegotiationFinalSeconds
+        stage, nextAt = 3, CONFIG.AutoTraderNegotiationFinalSeconds
+        margin = State.AutoTrader.GetLearningEpochMargin and State.AutoTrader.GetLearningEpochMargin(3) or CONFIG.AutoTraderNegotiationStage3Margin
     else
         margin, stage, nextAt = 0, 4, nil
     end
@@ -13433,6 +13466,9 @@ State.AutoTrader.GetNegotiationStage = function(otherSummary)
         nextIn = nextAt and math.max(0, nextAt - stableFor) or nil,
         targetProfit = targetProfit,
         final = stage >= 4,
+        -- If the other player has already accepted the live state, an extreme overpay
+        -- is voluntary rather than a proactive demand. Safety remains unchanged.
+        proposalPlausibilityBypass = (tonumber(State.AutoTrader.OtherAcceptedAt) or 0) > 0,
     }
 end
 
@@ -13466,10 +13502,28 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
     if type(negotiation) ~= "table" then return invalidPlannerInput("negotiation state is unavailable") end
     local targetProfit = math.max(minWin, tonumber(negotiation.targetProfit) or minWin)
     local targetUpper = math.max(0, math.min(upper, knownFloor - targetProfit))
+    local hardMargin = knownFloor > 0 and (minWin / knownFloor) or 0
+    local proposalMaxMargin = math.min(0.95, math.max(hardMargin, tonumber(negotiation.margin) or 0) + CONFIG.AutoTraderProposalMarginOvershootCap)
+    local proposalMinGive = negotiation.proposalPlausibilityBypass == true
+        and 0
+        or math.max(0, knownFloor * (1 - proposalMaxMargin))
+    local currentOfferMap = {}
+    local currentOfferUnits = 0
+    local currentLocalEntries = State.AutoTrader.GetCurrentLocalEntries and State.AutoTrader.GetCurrentLocalEntries() or {}
+    for _, current in ipairs(currentLocalEntries or {}) do
+        local variant = current.variant or (current.identityHint and current.identityHint.variant)
+        local key = State.Mapping.MakeItemKey(current.itemType, current.itemId) .. "|variant:" .. tostring(variant or "")
+        local quantity = math.max(1, math.floor(tonumber(current.quantity) or 1))
+        currentOfferMap[key] = quantity
+        currentOfferUnits += quantity
+    end
+    local mutationPenaltyValue = math.max(0.25, knownFloor * CONFIG.AutoTraderPlanMutationPenaltyPercent)
     local diagnostics = {
         receiveKnownFloor=knownFloor, unknownCount=tonumber(otherSummary.unknownCount) or 0,
         minimumWin=minWin, minimumWinInfo=minInfo, upper=upper, targetUpper=targetUpper,
         targetProfit=targetProfit, negotiationStage=negotiation.stage, negotiationMargin=negotiation.margin,
+        proposalMaxMargin=proposalMaxMargin, proposalMinGive=proposalMinGive, proposalPlausibilityBypass=negotiation.proposalPlausibilityBypass==true,
+        mutationPenaltyValue=mutationPenaltyValue, currentOfferUnits=currentOfferUnits, plausibilityRejected=0,
         proactiveAccept=negotiation.final==true, candidateCount=0, peakStates=1, pruned=false,
         quantityPruned=false, marketRejected=0, anchorRejected=0, marketRejectSamples={}, exactQuantityLimit=CONFIG.AutoTraderExactQuantityLimit,
         exactStateLimit=CONFIG.AutoTraderExactStateLimit, beamWidth=CONFIG.AutoTraderBeamWidth,
@@ -13516,8 +13570,8 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
         if math.abs(a.total-b.total) > 0.000001 then return false end
         local av,bv = marketVector(a),marketVector(b)
         if av.dc ~= bv.dc or av.fc ~= bv.fc or av.sc ~= bv.sc then return false end
-        local noWorse = a.slots <= b.slots
-        local strictly = a.slots < b.slots
+        local noWorse = a.slots <= b.slots and (tonumber(a.mutationCost) or math.huge) <= (tonumber(b.mutationCost) or math.huge)
+        local strictly = a.slots < b.slots or (tonumber(a.mutationCost) or math.huge) < (tonumber(b.mutationCost) or math.huge)
         if preferDuplicates then noWorse = noWorse and a.duplicateScore >= b.duplicateScore; strictly = strictly or a.duplicateScore > b.duplicateScore end
         noWorse = noWorse and a.demandScore >= b.demandScore
         strictly = strictly or a.demandScore > b.demandScore
@@ -13538,12 +13592,17 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
         local aPreferred,bPreferred = a.total <= targetUpper+0.000001,b.total <= targetUpper+0.000001
         if aPreferred ~= bPreferred then return aPreferred end
         local ad,bd=math.abs(targetUpper-a.total),math.abs(targetUpper-b.total)
+        local ac=(tonumber(a.mutationCost) or currentOfferUnits) * mutationPenaltyValue
+        local bc=(tonumber(b.mutationCost) or currentOfferUnits) * mutationPenaltyValue
+        local ascore, bscore = ad + ac, bd + bc
+        if math.abs(ascore-bscore)>0.000001 then return ascore<bscore end
+        if (tonumber(a.mutationCost) or math.huge) ~= (tonumber(b.mutationCost) or math.huge) then return (tonumber(a.mutationCost) or math.huge) < (tonumber(b.mutationCost) or math.huge) end
         if math.abs(ad-bd)>0.000001 then return ad<bd end
         if a.slots~=b.slots then return a.slots<b.slots end
         if preferDuplicates and a.duplicateScore~=b.duplicateScore then return a.duplicateScore>b.duplicateScore end
         return a.demandScore>b.demandScore
     end
-    local states={{total=0,slots=0,demandScore=0,duplicateScore=0,demandWeighted=0,demandWeight=0,flipWeighted=0,flipWeight=0,stabilityWeighted=0,stabilityWeight=0,parent=nil,addedItem=nil}}
+    local states={{total=0,slots=0,demandScore=0,duplicateScore=0,demandWeighted=0,demandWeight=0,flipWeighted=0,flipWeight=0,stabilityWeighted=0,stabilityWeight=0,mutationCost=currentOfferUnits,parent=nil,addedItem=nil}}
     local budgetStarted=os.clock()
     local function maybeYield()
         if (os.clock()-budgetStarted)*1000 >= CONFIG.AutoTraderPlannerYieldBudgetMs then
@@ -13587,6 +13646,10 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
                             local demand,flip,stability=metricData(candidate)
                             local item={key=candidate.key,itemId=candidate.itemId,itemType=candidate.itemType,name=candidate.name,quantity=quantity,unitValue=candidate.unitValue,record=candidate.record,demand=candidate.demand,reserve=candidate.reserve,
                                 variant=candidate.variant,identityHint=candidate.identityHint}
+                            local candidateVariant = candidate.variant or (candidate.identityHint and candidate.identityHint.variant)
+                            local candidateKey = State.Mapping.MakeItemKey(candidate.itemType, candidate.itemId) .. "|variant:" .. tostring(candidateVariant or "")
+                            local currentQuantity = math.max(0, math.floor(tonumber(currentOfferMap[candidateKey]) or 0))
+                            local mutationCost = (tonumber(state.mutationCost) or currentOfferUnits) - currentQuantity + math.abs(quantity - currentQuantity)
                             consider({
                                 total=total,slots=state.slots+1,
                                 demandScore=state.demandScore+candidate.demand*candidate.unitValue*quantity,
@@ -13594,6 +13657,7 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
                                 demandWeighted=state.demandWeighted+(demand and demand*weighted or 0), demandWeight=state.demandWeight+(demand and weighted or 0),
                                 flipWeighted=state.flipWeighted+(flip and flip*weighted or 0), flipWeight=state.flipWeight+(flip and weighted or 0),
                                 stabilityWeighted=state.stabilityWeighted+(stability and stability*weighted or 0), stabilityWeight=state.stabilityWeight+(stability and weighted or 0),
+                                mutationCost=mutationCost,
                                 parent=state, addedItem=item,
                             })
                         end
@@ -13618,7 +13682,7 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
     table.sort(states,stateSort)
     local best,bestMarket,bestPortfolioDelta=nil,nil,nil
     for _,state in ipairs(states) do
-        if state.slots>0 and state.total<=upper+0.000001 then
+        if state.slots>0 and state.total<=upper+0.000001 and state.total+0.000001>=proposalMinGive then
             state.items=reconstructItems(state)
             local marketOK,market=State.AutoTrader.EvaluateMarketGate(state,otherSummary)
             if marketOK then
@@ -13632,6 +13696,8 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
                 diagnostics.marketRejected+=1
                 if #diagnostics.marketRejectSamples<5 then table.insert(diagnostics.marketRejectSamples,{total=state.total,failures=market.failures}) end
             end
+        elseif state.slots>0 and state.total<proposalMinGive-0.000001 then
+            diagnostics.plausibilityRejected += 1
         end
         maybeYield()
     end
@@ -13639,6 +13705,9 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
     diagnostics.solverMode=(diagnostics.pruned and "pareto-frontier+adaptive-beam" or "pareto-frontier-dp") .. (diagnostics.quantityPruned and "+sampled-quantity" or "+exact-quantity")
     finishDiagnostics()
     if not best then
+        if diagnostics.plausibilityRejected>0 and diagnostics.anchorRejected==0 and diagnostics.marketRejected==0 then
+            return nil,"safe denominations exist, but every proactive proposal would overshoot the current margin ceiling too aggressively",diagnostics
+        end
         if diagnostics.anchorRejected>0 and diagnostics.marketRejected==0 then return nil,"every value-winning combination would liquidate too much high-value anchor strength",diagnostics end
         if diagnostics.marketRejected>0 then return nil,"market-quality or anchor-preservation gates rejected every candidate combination",diagnostics end
         return nil,"no numeric local combination can preserve the dynamic minimum win",diagnostics
@@ -13647,7 +13716,8 @@ State.AutoTrader.FindPlan = function(otherSummary, inventoryEntries, generation,
     best.portfolioDelta=bestPortfolioDelta
     best.minWin=minWin; best.minimumWinInfo=minInfo; best.targetProfit=targetProfit; best.targetUpper=targetUpper
     best.negotiationStage=negotiation.stage; best.negotiationMargin=negotiation.margin; best.proactiveAccept=negotiation.final==true
-    best.receiveTotal=otherSummary.knownFloor; best.unknownCount=otherSummary.unknownCount; best.win=otherSummary.knownFloor-best.total; best.marketGate=bestMarket
+    best.proposalMaxMargin=proposalMaxMargin; best.proposalMinGive=proposalMinGive; best.proposalPlausibilityBypass=negotiation.proposalPlausibilityBypass==true
+    best.receiveTotal=otherSummary.knownFloor; best.unknownCount=otherSummary.unknownCount; best.win=otherSummary.knownFloor-best.total; best.actualMargin=knownFloor>0 and best.win/knownFloor or 0; best.marketGate=bestMarket
     State.AutoTrader.LastMarketGate=bestMarket
     return best,nil,diagnostics
 end
@@ -14864,7 +14934,7 @@ State.AutoTrader.ProbeAuthoritativeTradeActive = function()
     local remote = ReplicatedStorage:FindFirstChild("GetTradeStatus")
         or (tradeFolder and tradeFolder:FindFirstChild("GetTradeStatus"))
     if not remote or not remote:IsA("RemoteFunction") then return nil, "GetTradeStatus unavailable" end
-    local ok, packed = waitForExternalWithDeadline("GetTradeStatus settlement probe", CONFIG.AutoTraderRequestInvokeTimeoutSeconds, function()
+    local ok, packed = waitForExternalWithDeadline("GetTradeStatus settlement probe", CONFIG.AutoTraderTradeStatusProbeTimeoutSeconds, function()
         return {remote:InvokeServer()}
     end)
     if not ok or type(packed) ~= "table" then return nil, tostring(packed or "probe failed") end
@@ -14985,9 +15055,12 @@ State.AutoTrader.ReconcileDesired = function(localEntries, desired, context)
         end
     end
     State.AutoTrader.LastManagedLocalHash = localHash
-    if context and context.kind == "anchor" then
+    if context and context.kind == "intent" then
+        State.AutoTrader.Status = "INTENT OPENING READY"
+        State.AutoTrader.StatusDetail = "Opening offer is tied to the modeled reason this player was selected. Waiting for their side before negotiating further."
+    elseif context and context.kind == "anchor" then
         State.AutoTrader.Status = "ANCHOR READY"
-        State.AutoTrader.StatusDetail = "Opening anchor is in. Waiting for their offer."
+        State.AutoTrader.StatusDetail = "Fallback opening anchor is in. Waiting for their offer."
     elseif context and context.kind == "clear" then
         State.AutoTrader.Status = "WAIT · KNOWN VALUE"
         State.AutoTrader.StatusDetail = "Their offer has no numeric known value yet; your automated offer is empty."
@@ -15042,7 +15115,6 @@ State.AutoTrader.SetManagedPartner = function(partner)
         State.AutoTrader.AutoAcceptSentKey = nil
         State.AutoTrader.LastManagedLocalHash = nil
         State.AutoTrader.ManagedPartnerUserId = userId
-        State.AutoTrader.TradeBeganAt = os.clock()
         State.AutoTrader.Log("managed_partner", {
             userId = userId,
             name = partner and partner.Name or nil,
@@ -15891,7 +15963,36 @@ State.AutoTrader.TrySendRequest = function()
         -- Once MM2's native pending UI has appeared, that UI is authoritative.
         -- Ignore any odd/late RemoteFunction return instead of undoing a real request.
         if pending.nativeConfirmed or pending.phase == "canceling" then return end
-        pending.invokeHintUnavailable = (not ok) or result == true
+        if not ok then
+            -- v39 review fix: defer invoke-error classification one scheduler turn so
+            -- the Round-37 wrapper can attach presence/probe metadata first. Reconcile
+            -- authoritative native state, then reacquire this exact pending generation.
+            task.defer(function()
+                if Destroyed then return end
+                State.AutoTrader.ReconcileOutgoingRequestState()
+                local current = activePending()
+                if not current or current ~= pending or current.generation ~= generation then return end
+                if current.nativeConfirmed or current.contactAcknowledged or current.transportAckCounted or current.phase == "canceling" then return end
+                if State.CurrentTrade or (isTradeVisible and isTradeVisible()) then return end
+                if State.AutoTrader.Round39ClassifyTargetSpecificRequestError
+                    and State.AutoTrader.Round39ClassifyTargetSpecificRequestError(current) then
+                    State.AutoTrader.FailPendingRequestAttempt(
+                        target, generation,
+                        "target-specific MM2/DataModule request error",
+                        tostring(current.invokeResult)
+                    )
+                    return
+                end
+                current.invokeHintUnavailable = true
+                current.phase = "awaiting_native"
+                State.AutoTrader.RequestLifecycle = "awaiting_native"
+                State.AutoTrader.Log("request_invoke_non_authoritative_hint", {
+                    userId = target.UserId, generation = generation, ok = current.invokeOk, result = tostring(current.invokeResult),
+                })
+            end)
+            return
+        end
+        pending.invokeHintUnavailable = result == true
         pending.phase = "awaiting_native"
         State.AutoTrader.RequestLifecycle = "awaiting_native"
         if pending.invokeHintUnavailable then
@@ -15935,6 +16036,7 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         State.AutoTrader.AcknowledgeOutgoingTransport(State.AutoTrader.PendingRequest, "trade_state")
         State.AutoTrader.TradeRequestStartedAt = State.AutoTrader.PendingRequest.contactAcknowledgedAt or State.AutoTrader.TradeRequestStartedAt or os.clock()
         State.AutoTrader.TradeCorrelationId = State.AutoTrader.PendingRequest.correlationId or State.AutoTrader.TradeCorrelationId
+        State.AutoTrader.ActiveTargetIntent = State.AutoTrader.PendingRequest.targetIntent
         State.AutoTrader.PendingRequest = nil
         State.AutoTrader.RequestLifecycle = "idle"
         State.AutoTrader.RequestConfirmGeneration += 1
@@ -16046,34 +16148,45 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
     local otherHash = State.AutoTrader.OfferHash(otherEntries)
     if otherSummary.slotCount == 0 then
         State.AutoTrader.Plan = nil
+        State.AutoTrader.StickyPlanCandidate = nil
         State.AutoTrader.Safety = nil
         State.AutoTrader.LastCalculationSignature = nil
         State.AutoTrader.LastOtherHash = otherHash
         State.AutoTrader.OtherStableSince = os.clock()
-        if State.AutoTrader.Preferences.openingAnchor and State.AutoTrader.Anchor then
-            local anchorItem = {
-                key = State.AutoTrader.Anchor.key,
-                itemId = State.AutoTrader.Anchor.itemId,
-                itemType = State.AutoTrader.Anchor.itemType,
-                name = State.AutoTrader.Anchor.name,
-                quantity = 1,
-                unitValue = State.AutoTrader.Anchor.unitValue,
-                record = State.AutoTrader.Anchor.record,
-                demand = State.AutoTrader.Anchor.demand,
-            }
-            if State.AutoTrader.CopyPlannerItemIdentity then
-                State.AutoTrader.CopyPlannerItemIdentity(State.AutoTrader.Anchor, anchorItem)
+        local intentItems = nil
+        if State.AutoTrader.BuildTargetIntentOpeningOffer then
+            intentItems = select(1, State.AutoTrader.BuildTargetIntentOpeningOffer(partner, tradable))
+        end
+        local matchingTargetIntent = State.AutoTrader.ActiveTargetIntent and State.AutoTrader.ActiveTargetIntent.userId == partner.UserId
+        if type(intentItems) == "table" and #intentItems > 0 and State.AutoTrader.Preferences.openingAnchor then
+            State.AutoTrader.Desired = {items = intentItems, kind = "intent"}
+            State.AutoTrader.Status = State.AutoTrader.Preferences.automation and "INTENT OPENING" or "SHADOW INTENT"
+            State.AutoTrader.StatusDetail = "Opening with the modeled give side tied to why " .. partner.Name .. " was selected: "
+                .. State.AutoTrader.FormatOpportunityItems(intentItems) .. "."
+            if State.AutoTrader.Preferences.automation
+                and os.clock() - State.AutoTrader.TradeBeganAt >= CONFIG.AutoTraderTradeWarmupSeconds then
+                local context = State.AutoTrader.BuildActionContext("intent", otherHash, inventorySnapshot, partner)
+                State.AutoTrader.ReconcileDesired(localEntries, State.AutoTrader.Desired, context)
             end
-            State.AutoTrader.Desired = {
-                items = {anchorItem},
-                kind = "anchor",
+        elseif matchingTargetIntent then
+            -- A targeted outgoing trade must never fall back to an unrelated generic JD-style
+            -- anchor when the actual modeled intent is implausible/unavailable. Empty is clearer.
+            State.AutoTrader.Desired = {items = {}, kind = "clear"}
+            State.AutoTrader.Status = "WAIT · TARGET INTENT"
+            State.AutoTrader.StatusDetail = "The modeled opening tied to this target is not currently plausible/available, so the bot is waiting for their offer instead of showing an unrelated generic anchor."
+            if State.AutoTrader.Preferences.automation and #localEntries > 0 then
+                local context = State.AutoTrader.BuildActionContext("clear", otherHash, inventorySnapshot, partner)
+                State.AutoTrader.ReconcileDesired(localEntries, State.AutoTrader.Desired, context)
+            end
+        elseif State.AutoTrader.Preferences.openingAnchor and State.AutoTrader.Anchor then
+            local anchorItem = {
+                key = State.AutoTrader.Anchor.key, itemId = State.AutoTrader.Anchor.itemId, itemType = State.AutoTrader.Anchor.itemType,
+                name = State.AutoTrader.Anchor.name, quantity = 1, unitValue = State.AutoTrader.Anchor.unitValue, record = State.AutoTrader.Anchor.record, demand = State.AutoTrader.Anchor.demand,
             }
-            State.AutoTrader.Status = State.AutoTrader.Preferences.automation and "OPENING ANCHOR" or "SHADOW ANCHOR"
-            State.AutoTrader.StatusDetail = "Safe anchor: "
-                .. anchorItem.name
-                .. " · "
-                .. formatCompact(anchorItem.unitValue)
-                .. "."
+            if State.AutoTrader.CopyPlannerItemIdentity then State.AutoTrader.CopyPlannerItemIdentity(State.AutoTrader.Anchor, anchorItem) end
+            State.AutoTrader.Desired = {items = {anchorItem}, kind = "anchor"}
+            State.AutoTrader.Status = State.AutoTrader.Preferences.automation and "OPENING ANCHOR · FALLBACK" or "SHADOW ANCHOR"
+            State.AutoTrader.StatusDetail = "No matching outbound target intent exists; using the legacy safe anchor fallback: " .. anchorItem.name .. " · " .. formatCompact(anchorItem.unitValue) .. "."
             if State.AutoTrader.Preferences.automation
                 and os.clock() - State.AutoTrader.TradeBeganAt >= CONFIG.AutoTraderTradeWarmupSeconds then
                 local context = State.AutoTrader.BuildActionContext("anchor", otherHash, inventorySnapshot, partner)
@@ -16082,13 +16195,14 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         else
             State.AutoTrader.Desired = {items = {}, kind = "clear"}
             State.AutoTrader.Status = "WAIT · THEIR OFFER"
-            State.AutoTrader.StatusDetail = "Waiting for them to offer something. Opening Anchor is off or no eligible anchor exists."
+            State.AutoTrader.StatusDetail = "Waiting for them to offer something. No coherent target-intent opening is available."
         end
         State.AutoTrader.Render()
         return
     end
     if otherSummary.knownFloor <= 0 then
         State.AutoTrader.Plan = nil
+        State.AutoTrader.StickyPlanCandidate = nil
         State.AutoTrader.Safety = nil
         State.AutoTrader.Desired = {items = {}, kind = "clear"}
         State.AutoTrader.Status = "WAIT · KNOWN VALUE"
@@ -16106,6 +16220,7 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
         State.AutoTrader.LastOtherHash = otherHash
         State.AutoTrader.OtherStableSince = os.clock()
         State.AutoTrader.PlanGeneration += 1
+        State.AutoTrader.StickyPlanCandidate = State.AutoTrader.Plan or State.AutoTrader.StickyPlanCandidate
         State.AutoTrader.Plan = nil
         State.AutoTrader.Safety = nil
         State.AutoTrader.Desired = nil
@@ -16214,8 +16329,35 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             reason = reason,
             diagnostics = diagnostics,
         }
+        if not plan and State.AutoTrader.StickyPlanCandidate and State.AutoTrader.ApplyPlanHysteresis then
+            local stickyContext = {
+                otherHash = otherHash,
+                mappingRevision = mappingRevision,
+                inventoryStamp = inventoryStamp,
+                databaseRevision = expectedDatabaseRevision,
+                databaseHash = expectedDatabaseHash,
+                gameDataRevision = expectedGameDataRevision,
+                partnerUserId = expectedPartnerUserId,
+            }
+            local kept = State.AutoTrader.ApplyPlanHysteresis(
+                State.AutoTrader.StickyPlanCandidate,
+                State.AutoTrader.StickyPlanCandidate,
+                otherSummary,
+                stickyContext,
+                negotiation,
+                localEntries
+            )
+            if kept then
+                plan = kept
+                reason = nil
+                State.AutoTrader.StickyPlanCandidate = nil
+                State.AutoTrader.Safety = kept.hysteresisSafety
+                State.AutoTrader.Log("plan_hysteresis_fallback_kept", {optimizerHadNoReplacement=true, stage=negotiation.stage})
+            end
+        end
         if not plan then
             State.AutoTrader.Plan = nil
+            State.AutoTrader.StickyPlanCandidate = nil
             State.AutoTrader.Safety = nil
             State.AutoTrader.Desired = nil
             State.AutoTrader.Status = "NO SAFE COMBINATION"
@@ -16254,6 +16396,16 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             gameDataRevision = expectedGameDataRevision,
             partnerUserId = expectedPartnerUserId,
         }
+        plan.otherHash = otherHash
+        if State.AutoTrader.ApplyPlanHysteresis then
+            local previousVisiblePlan = State.AutoTrader.Plan or State.AutoTrader.StickyPlanCandidate
+            local kept = State.AutoTrader.ApplyPlanHysteresis(previousVisiblePlan, plan, otherSummary, validationContext, negotiation, localEntries)
+            if kept then
+                plan = kept
+                if kept.hysteresisSafety then State.AutoTrader.Safety = kept.hysteresisSafety end
+            end
+        end
+        State.AutoTrader.StickyPlanCandidate = nil
         State.AutoTrader.Plan = plan
         State.AutoTrader.Desired = {
             items = plan.items,
@@ -16282,6 +16434,10 @@ State.AutoTrader.OnTradeState = function(localSide, otherSide, localEntries, oth
             proactiveAccept = plan.proactiveAccept,
             items = plan.items,
             strategicKind = plan.strategicKind,
+            mutationCost = plan.mutationCost,
+            actualMargin = plan.actualMargin,
+            proposalMaxMargin = plan.proposalMaxMargin,
+            hysteresisKept = plan.hysteresisKept == true,
             portfolioDelta = plan.portfolioDelta,
         })
         State.AutoTrader.Render()
@@ -16312,6 +16468,11 @@ State.AutoTrader.ClearTradeRuntime = function()
     State.AutoTrader.Anchor = nil
     State.AutoTrader.Desired = nil
     State.AutoTrader.OtherSummary = nil
+    State.AutoTrader.ActiveTargetIntent = nil
+    State.AutoTrader.TargetIntent = nil
+    State.AutoTrader.StickyPlanCandidate = nil
+    State.AutoTrader.FirstOfferEngagedAt = 0
+    State.AutoTrader.FirstOfferEngagementExtensionLogged = false
     State.AutoTrader.ManualAcceptHold = false
     State.AutoTrader.AutoAcceptGeneration += 1
     State.AutoTrader.AutoAcceptScheduledKey = nil
@@ -18763,6 +18924,8 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
             State.AutoTrader.AutoAcceptSentAt = 0
             State.AutoTrader.AutoAcceptTradeUpdateAt = 0
             State.AutoTrader.OtherAcceptedAt = 0
+            State.AutoTrader.FirstOfferEngagedAt = 0
+            State.AutoTrader.FirstOfferEngagementExtensionLogged = false
             State.AutoTrader.ActionGeneration += 1
             State.AutoTrader.ActionInFlight = nil
             State.AutoTrader.LastManagedLocalHash = nil
@@ -18776,6 +18939,7 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
                 State.AutoTrader.MarkServerPlayerOutcome(partnerPlayer, "trading", "trade started")
                 State.AutoTrader.TradeRequestStartedAt = pending.contactAcknowledgedAt or os.clock()
                 State.AutoTrader.TradeCorrelationId = pending.correlationId or State.AutoTrader.TradeCorrelationId
+                State.AutoTrader.ActiveTargetIntent = pending.targetIntent
                 State.AutoTrader.PendingRequest = nil
                 State.AutoTrader.RequestLifecycle = "idle"
                 State.AutoTrader.RequestConfirmGeneration += 1
@@ -18911,6 +19075,7 @@ State.AutoTrader.BindRemoteObservers = function(tradeFolder)
         connect(acceptTrade.OnClientEvent, function(success, receivedItems)
             if success == false then
                 State.AutoTrader.OtherAcceptedAt = os.clock()
+                State.AutoTrader.FirstOfferEngagedAt = State.AutoTrader.OtherAcceptedAt
                 State.AutoTrader.LastTradeActivityAt = State.AutoTrader.OtherAcceptedAt
                 State.AutoTrader.Log("other_player_accepted", {
                     partner = State.AutoTrader.LastTradePartner and State.AutoTrader.LastTradePartner.Name or nil,
@@ -19531,9 +19696,12 @@ State.AutoTrader.Tick = function()
             tonumber(State.AutoTrader.AutoAcceptSentAt) or 0
         )
         local noOfferYet = not State.AutoTrader.OtherSummary or State.AutoTrader.OtherSummary.slotCount == 0
+        local firstOfferDeadline = State.AutoTrader.GetFirstOfferDeadline
+            and State.AutoTrader.GetFirstOfferDeadline()
+            or ((tonumber(State.AutoTrader.TradeBeganAt) or 0) + CONFIG.AutoTraderFirstOfferTimeoutSeconds)
         if noOfferYet
             and State.AutoTrader.TradeBeganAt > 0
-            and os.clock() - State.AutoTrader.TradeBeganAt >= CONFIG.AutoTraderFirstOfferTimeoutSeconds then
+            and os.clock() >= firstOfferDeadline then
             State.AutoTrader.EndIdleTrade()
         elseif activity > 0 and os.clock() - activity >= CONFIG.AutoTraderTradeIdleTimeoutSeconds then
             State.AutoTrader.EndIdleTrade()
@@ -21076,7 +21244,7 @@ recoverTradeStatus = function()
         or not GetTradeStatus:IsA("RemoteFunction") then
         return false
     end
-    local ok, packed = waitForExternalWithDeadline("GetTradeStatus", CONFIG.AutoTraderRequestInvokeTimeoutSeconds, function()
+    local ok, packed = waitForExternalWithDeadline("GetTradeStatus", CONFIG.AutoTraderTradeStatusProbeTimeoutSeconds, function()
         return {GetTradeStatus:InvokeServer()}
     end)
     if not ok or type(packed) ~= "table" then
@@ -32849,6 +33017,409 @@ end)()
             ok = result.ok,
             tests = tests,
         })
+        return result
+    end
+end)()
+
+
+-- Round 39: seven-change trading revision.
+-- Scope is intentionally narrow: ten-minute consecutive learning epochs; unresolved
+-- values remain exactly zero; 4.25s native request deadline; target-specific MM2
+-- request errors are isolated from server-wide transport health; mutation-aware stable
+-- offers; bounded engagement timeout extension; and intent/plausibility-aware proposals.
+;(function()
+    ---------------------------------------------------------------------------
+    -- 1) Consecutive ten-minute learning epochs.
+    ---------------------------------------------------------------------------
+    local BASE_MARGINS = {
+        [1] = CONFIG.AutoTraderNegotiationStage1Margin,
+        [2] = CONFIG.AutoTraderNegotiationStage2Margin,
+        [3] = CONFIG.AutoTraderNegotiationStage3Margin,
+    }
+
+    local function normalizeEpochStage(stage)
+        stage = type(stage) == "table" and stage or {}
+        stage.outcomes = math.max(0, tonumber(stage.outcomes) or 0)
+        stage.successes = math.max(0, tonumber(stage.successes) or 0)
+        stage.declines = math.max(0, tonumber(stage.declines) or 0)
+        stage.totalProfit = math.max(0, tonumber(stage.totalProfit) or 0)
+        stage.totalSeconds = math.max(0, tonumber(stage.totalSeconds) or 0)
+        return stage
+    end
+
+    local function learningRoot()
+        local strategy = State.AutoTrader.GetStrategyStats()
+        strategy.learningEpochs = type(strategy.learningEpochs) == "table" and strategy.learningEpochs or {}
+        local learning = strategy.learningEpochs
+        learning.version = 1
+        learning.epochSeconds = CONFIG.AutoTraderLearningEpochSeconds
+        learning.originUnix = math.floor(tonumber(learning.originUnix) or os.time())
+        learning.completed = type(learning.completed) == "table" and learning.completed or {}
+        learning.marginOffsets = type(learning.marginOffsets) == "table" and learning.marginOffsets or {}
+        for stage=1,3 do learning.marginOffsets[tostring(stage)] = tonumber(learning.marginOffsets[tostring(stage)]) or 0 end
+        return learning
+    end
+
+    State.AutoTrader.ComputeLearningEpochMarginDelta = function(stageRow)
+        stageRow = normalizeEpochStage(stageRow)
+        if stageRow.outcomes < CONFIG.AutoTraderLearningMarginMinOutcomes then return 0 end
+        local rate = stageRow.successes / math.max(1, stageRow.outcomes)
+        if rate <= 0.10 then return -CONFIG.AutoTraderLearningMarginDownStep end
+        if rate >= 0.45 then return CONFIG.AutoTraderLearningMarginUpStep end
+        return 0
+    end
+
+    local function makeEpoch(learning, id, policyMargins)
+        local startUnix = learning.originUnix + (id - 1) * CONFIG.AutoTraderLearningEpochSeconds
+        return {
+            id = id,
+            startUnix = startUnix,
+            endUnix = startUnix + CONFIG.AutoTraderLearningEpochSeconds,
+            policyMargins = policyMargins,
+            stages = { ["1"]={}, ["2"]={}, ["3"]={}, ["4"]={} },
+            events = {},
+            eventCount = 0,
+            createdAtUnix = os.time(),
+        }
+    end
+
+    local function currentPolicyMargins(learning)
+        local result = {}
+        for stage=1,3 do
+            local offset = clamp(tonumber(learning.marginOffsets[tostring(stage)]) or 0, -CONFIG.AutoTraderLearningMarginMaxOffset, CONFIG.AutoTraderLearningMarginMaxOffset)
+            result[stage] = clamp(BASE_MARGINS[stage] + offset, 0, 0.60)
+        end
+        -- Preserve the intended monotonic concession ladder after learning.
+        result[2] = math.min(result[1], result[2])
+        result[3] = math.min(result[2], result[3])
+        return result
+    end
+
+    State.AutoTrader.EnsureLearningEpoch = function()
+        local learning = learningRoot()
+        local nowUnix = os.time()
+        local id = math.max(1, math.floor((nowUnix - learning.originUnix) / CONFIG.AutoTraderLearningEpochSeconds) + 1)
+        local active = type(learning.active) == "table" and learning.active or nil
+        if active and tonumber(active.id) == id then
+            active.policyMargins = type(active.policyMargins) == "table" and active.policyMargins or currentPolicyMargins(learning)
+            active.stages = type(active.stages) == "table" and active.stages or { ["1"]={}, ["2"]={}, ["3"]={}, ["4"]={} }
+            return active, learning
+        end
+
+        if active then
+            active.finishedAtUnix = nowUnix
+            active.completed = true
+            table.insert(learning.completed, active)
+            while #learning.completed > CONFIG.AutoTraderLearningEpochHistoryLimit do table.remove(learning.completed, 1) end
+            for stage=1,3 do
+                local key=tostring(stage)
+                local delta=State.AutoTrader.ComputeLearningEpochMarginDelta(active.stages and active.stages[key])
+                learning.marginOffsets[key] = clamp(
+                    (tonumber(learning.marginOffsets[key]) or 0) + delta,
+                    -CONFIG.AutoTraderLearningMarginMaxOffset,
+                    CONFIG.AutoTraderLearningMarginMaxOffset
+                )
+            end
+            State.AutoTrader.Log("learning_epoch_completed", {
+                id=active.id,startUnix=active.startUnix,endUnix=active.endUnix,
+                eventCount=active.eventCount,stages=active.stages,marginOffsets=learning.marginOffsets,
+            })
+        end
+
+        active = makeEpoch(learning, id, currentPolicyMargins(learning))
+        learning.active = active
+        State.AutoTrader.Log("learning_epoch_started", {
+            id=active.id,startUnix=active.startUnix,endUnix=active.endUnix,policyMargins=active.policyMargins,
+        })
+        return active, learning
+    end
+
+    State.AutoTrader.GetLearningEpochMargin = function(stage)
+        stage = math.floor(tonumber(stage) or 0)
+        if stage < 1 or stage > 3 then return 0 end
+        local active = State.AutoTrader.EnsureLearningEpoch()
+        return tonumber(active and active.policyMargins and active.policyMargins[stage]) or BASE_MARGINS[stage]
+    end
+
+    local round39RecordStrategyEvent = State.AutoTrader.RecordStrategyEvent
+    State.AutoTrader.RecordStrategyEvent = function(player, kind, data)
+        round39RecordStrategyEvent(player, kind, data)
+        local active = State.AutoTrader.EnsureLearningEpoch()
+        if type(active) ~= "table" then return end
+        active.eventCount = math.max(0, tonumber(active.eventCount) or 0) + 1
+        active.events[kind] = math.max(0, tonumber(active.events[kind]) or 0) + 1
+        local stage = math.floor(tonumber(data and data.negotiationStage) or 0)
+        if stage >= 1 and stage <= 4 and (kind == "success" or kind == "tradeDecline" or kind == "idle") then
+            local key=tostring(stage)
+            local row=normalizeEpochStage(active.stages[key])
+            row.outcomes += 1
+            if kind == "success" then row.successes += 1; row.totalProfit += math.max(0, tonumber(data and data.profit) or 0)
+            else row.declines += 1 end
+            row.totalSeconds += math.max(1, tonumber(data and data.seconds) or 1)
+            active.stages[key]=row
+        end
+    end
+    State.AutoTrader.EnsureLearningEpoch()
+
+    ---------------------------------------------------------------------------
+    -- 4) Target-specific MM2/DataModule request errors do not poison global
+    -- transport health. They still count against that target presence.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.Round39ClassifyTargetSpecificRequestError = function(pending)
+        if type(pending) ~= "table" or pending.invokeFinished ~= true or pending.invokeOk ~= false then return false end
+        local detail = string.lower(tostring(pending.invokeResult or pending.failureDetail or ""))
+        local dataModule = detail:find("serverscriptservice.gamescript.datamodule",1,true)
+            or detail:find("datamodule:",1,true)
+        if not dataModule then return false end
+        return detail:find("getattribute",1,true) ~= nil
+            or detail:find("attempt to call",1,true) ~= nil
+            or detail:find("missing method",1,true) ~= nil
+            or detail:find("invalid member",1,true) ~= nil
+    end
+
+    local round39FailPendingRequestAttempt = State.AutoTrader.FailPendingRequestAttempt
+    State.AutoTrader.FailPendingRequestAttempt = function(target, generation, reason, detail)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) > 0 then
+            return round39FailPendingRequestAttempt(target,generation,reason,detail)
+        end
+        local pending=State.AutoTrader.PendingRequest
+        if not pending or (target and pending.userId~=target.UserId) or (generation and pending.generation~=generation) then return false end
+        pending.failureReason=tostring(reason or "request failed")
+        pending.failureDetail=detail and tostring(detail) or nil
+        if not State.AutoTrader.Round39ClassifyTargetSpecificRequestError(pending) then
+            return round39FailPendingRequestAttempt(target,generation,reason,detail)
+        end
+
+        if not pending.transportFailureCounted then
+            pending.transportFailureCounted=true
+            pending.targetSpecificRequestFailure=true
+            local tt=State.AutoTrader.TradeTransport
+            tt.targetSpecificFailures=(tonumber(tt.targetSpecificFailures) or 0)+1
+            local h=type(tt.round37)=="table" and tt.round37 or nil
+            local key=tostring(pending.round37PresenceKey or pending.userId or "unknown")
+            if h then
+                h.targetFailures=type(h.targetFailures)=="table" and h.targetFailures or {}
+                h.targetFailures[key]=(tonumber(h.targetFailures[key]) or 0)+1
+                -- If this happened to be the clean self-heal probe, release the probe
+                -- slot and require another target; do not convert it into server evidence.
+                if pending.transportSelfHealProbe then
+                    h.probeRequired=true;h.probeInFlight=false;h.probeTargetKey=nil
+                    pending.transportSelfHealProbe=false
+                end
+            end
+            tt.lastOutgoing={result="failed_target_specific_mm2",userId=pending.userId,name=pending.name,generation=pending.generation,
+                reason=pending.failureReason,detail=tostring(pending.invokeResult or pending.failureDetail),seconds=os.clock()-(pending.sentAt or os.clock()),at=os.clock()}
+            tt.lastFailure={kind="outgoing_request_target_specific",userId=pending.userId,name=pending.name,reason=tt.lastOutgoing.detail,at=os.clock()}
+            State.AutoTrader.Log("request_target_specific_mm2_failure",{userId=pending.userId,name=pending.name,detail=tt.lastOutgoing.detail,
+                targetFailures=h and h.targetFailures[key] or nil,globalConsecutive=tt.outgoingUnacknowledgedConsecutive,globalDistinct=h and h.distinctFailureCount or nil})
+        end
+        State.AutoTrader.LastRequestAttempt={userId=pending.userId,name=pending.name,result="canceling_target_specific_error",reason=pending.failureReason,
+            detail=tostring(pending.invokeResult or pending.failureDetail),phase=pending.phase,age=os.clock()-(pending.sentAt or os.clock()),at=os.clock(),targetSpecific=true}
+        local started,cancelReason=State.AutoTrader.BeginPendingRequestCancellation("target-specific MM2/DataModule request error","transport_deferred",false)
+        if not started then
+            State.AutoTrader.Log("request_failure_cancel_failed",{reason=cancelReason,pending=pending})
+            State.AutoTrader.RequestRecoveryTeleport("target-specific outgoing request could not be canceled cleanly")
+            return false
+        end
+        State.AutoTrader.Status="REQUEST TARGET ERROR · CANCELING"
+        State.AutoTrader.StatusDetail=(pending.name or "That player").." hit a target-specific MM2/DataModule request error. Cleaning up that target without adding server-wide transport-wedge evidence."
+        State.AutoTrader.Render()
+        return true
+    end
+
+    ---------------------------------------------------------------------------
+    -- 5) Stable offers: explicit mutation cost + plan hysteresis.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.GetOfferMutationCost = function(fromEntries, toEntries)
+        local from,to={},{}
+        local function load(entries,bucket)
+            for _,item in ipairs(entries or {}) do
+                local variant=item.variant or (item.identityHint and item.identityHint.variant)
+                local key=State.Mapping.MakeItemKey(item.itemType,item.itemId).."|variant:"..tostring(variant or "")
+                bucket[key]=math.max(0,math.floor(tonumber(item.quantity) or 1))
+            end
+        end
+        load(fromEntries,from);load(toEntries,to)
+        local keys={};for k in pairs(from) do keys[k]=true end;for k in pairs(to) do keys[k]=true end
+        local cost=0;for k in pairs(keys) do cost+=math.abs((from[k] or 0)-(to[k] or 0)) end
+        return cost
+    end
+
+    State.AutoTrader.ApplyPlanHysteresis = function(previousPlan,newPlan,otherSummary,validationContext,negotiation,localEntries)
+        if type(previousPlan)~="table" or type(newPlan)~="table" then return nil end
+        if previousPlan.strategicKind~=newPlan.strategicKind then return nil end
+        local known=math.max(0,tonumber(otherSummary and otherSummary.knownFloor) or 0)
+        if known<=0 then return nil end
+        local previousProfit=known-(tonumber(previousPlan.total) or math.huge)
+        local targetProfit=math.max(0,tonumber(negotiation and negotiation.targetProfit) or tonumber(newPlan.targetProfit) or 0)
+        local slack=math.max(1,known*CONFIG.AutoTraderPlanHysteresisMarginSlack)
+        if math.abs(previousProfit-targetProfit)>slack+0.000001 then return nil end
+        local hardMin=State.AutoTrader.GetEffectiveMinimumWin(otherSummary)
+        if previousProfit+0.000001<hardMin then return nil end
+        if negotiation and negotiation.proposalPlausibilityBypass~=true then
+            local maxMargin=math.min(0.95,math.max(known>0 and hardMin/known or 0,tonumber(negotiation.margin) or 0)+CONFIG.AutoTraderProposalMarginOvershootCap)
+            if previousProfit/known>maxMargin+0.000001 then return nil end
+        end
+        local safe,safety=State.AutoTrader.ValidatePlan(previousPlan,validationContext)
+        if not safe then return nil end
+        local current=type(localEntries)=="table" and localEntries or (State.AutoTrader.GetCurrentLocalEntries() or {})
+        local oldCost=State.AutoTrader.GetOfferMutationCost(current,previousPlan.items)
+        local newCost=State.AutoTrader.GetOfferMutationCost(current,newPlan.items)
+        -- Hysteresis is not a refusal to make a meaningful concession. It applies when
+        -- the old visible plan is still near the new target and at least as stable.
+        if oldCost>newCost then return nil end
+        local kept={};for k,v in pairs(previousPlan) do kept[k]=v end
+        kept.negotiationStage=negotiation.stage;kept.negotiationMargin=negotiation.margin;kept.targetProfit=targetProfit
+        kept.proactiveAccept=negotiation.final==true;kept.proposalPlausibilityBypass=negotiation.proposalPlausibilityBypass==true
+        kept.hysteresisKept=true;kept.hysteresisSafety=safety;kept.mutationCost=oldCost;kept.otherHash=validationContext and validationContext.otherHash or kept.otherHash
+        kept.actualMargin=known>0 and previousProfit/known or 0
+        kept.proposalMaxMargin=math.min(0.95,math.max(known>0 and hardMin/known or 0,tonumber(negotiation.margin) or 0)+CONFIG.AutoTraderProposalMarginOvershootCap)
+        kept.proposalMinGive=negotiation.proposalPlausibilityBypass==true and 0 or math.max(0,known*(1-kept.proposalMaxMargin))
+        kept.receiveTotal=known;kept.unknownCount=tonumber(otherSummary and otherSummary.unknownCount) or 0;kept.win=previousProfit
+        kept.validationContext=newPlan.validationContext or kept.validationContext
+        State.AutoTrader.Log("plan_hysteresis_kept",{stage=kept.negotiationStage,targetProfit=targetProfit,previousProfit=previousProfit,slack=slack,oldMutationCost=oldCost,newMutationCost=newCost})
+        return kept
+    end
+
+    ---------------------------------------------------------------------------
+    -- 6) Engagement-aware first-offer timeout with one hard bounded extension.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.GetFirstOfferDeadline = function()
+        local began=tonumber(State.AutoTrader.TradeBeganAt) or 0
+        if began<=0 then return math.huge end
+        local deadline=began+CONFIG.AutoTraderFirstOfferTimeoutSeconds
+        local acceptedAt=tonumber(State.AutoTrader.FirstOfferEngagedAt) or 0
+        if acceptedAt>=began and acceptedAt>0 then
+            deadline+=CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds
+            if not State.AutoTrader.FirstOfferEngagementExtensionLogged then
+                State.AutoTrader.FirstOfferEngagementExtensionLogged=true
+                State.AutoTrader.Log("first_offer_timeout_engagement_extension",{acceptedAt=acceptedAt,baseSeconds=CONFIG.AutoTraderFirstOfferTimeoutSeconds,
+                    extensionSeconds=CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds,hardDeadline=deadline})
+            end
+        end
+        return deadline
+    end
+
+    ---------------------------------------------------------------------------
+    -- 7) Target intent + plausible opening. Unresolved value treatment is deliberately
+    -- untouched: unknown/nonnumeric/unresolved contributions remain exactly zero.
+    ---------------------------------------------------------------------------
+    State.AutoTrader.CaptureTargetIntent = function(player)
+        if not player then State.AutoTrader.TargetIntent=nil;return nil end
+        local selected=nil
+        for _,row in ipairs(State.AutoTrader.LastTradeQueue or {}) do
+            if row.player==player then selected=row;break end
+        end
+        local opportunity=selected and selected.opportunity or nil
+        if type(opportunity)~="table" then State.AutoTrader.TargetIntent=nil;return nil end
+        -- Prefer the minimum-win feasibility witness as the semantic opening intent;
+        -- the queue may carry a separate fantasy-profit witness for ordering telemetry.
+        local witness=opportunity.feasibilityWitness or opportunity.strategicWitness or opportunity
+        local intent={userId=player.UserId,name=player.Name,capturedAt=os.clock(),kind=witness.kind or opportunity.kind,
+            strategicKind=witness.strategicKind or opportunity.strategicKind,giveItems=witness.giveItems or {},receiveItems=witness.receiveItems or {},
+            giveTotal=tonumber(witness.giveTotal) or 0,receiveTotal=tonumber(witness.receiveTotal) or 0,win=tonumber(witness.win) or 0,
+            feasibilitySignature=opportunity.feasibilitySignature,source="pretrade_feasibility_witness"}
+        State.AutoTrader.TargetIntent=intent
+        State.AutoTrader.Log("target_intent_captured",{userId=intent.userId,name=intent.name,kind=intent.kind,give=intent.giveTotal,receive=intent.receiveTotal,win=intent.win,
+            giveItems=State.AutoTrader.FormatOpportunityItems(intent.giveItems),receiveItems=State.AutoTrader.FormatOpportunityItems(intent.receiveItems)})
+        return intent
+    end
+
+    local round39SelectTarget=State.AutoTrader.SelectTarget
+    State.AutoTrader.SelectTarget=function(...)
+        local player=round39SelectTarget(...)
+        if player then State.AutoTrader.CaptureTargetIntent(player) else State.AutoTrader.TargetIntent=nil end
+        return player
+    end
+
+    local round39TrySendRequest=State.AutoTrader.TrySendRequest
+    State.AutoTrader.TrySendRequest=function(...)
+        local started,reason=round39TrySendRequest(...)
+        if started==true and type(State.AutoTrader.PendingRequest)=="table" then
+            local pending=State.AutoTrader.PendingRequest
+            if State.AutoTrader.TargetIntent and State.AutoTrader.TargetIntent.userId==pending.userId then pending.targetIntent=State.AutoTrader.TargetIntent end
+        end
+        return started,reason
+    end
+
+    State.AutoTrader.BuildTargetIntentOpeningOffer = function(partner,tradable)
+        local intent=State.AutoTrader.ActiveTargetIntent
+        if type(intent)~="table" or not partner or intent.userId~=partner.UserId then return nil,"no matching target intent" end
+        local receive=math.max(0,tonumber(intent.receiveTotal) or 0)
+        local give=math.max(0,tonumber(intent.giveTotal) or 0)
+        if receive<=0 or give<=0 or give>receive+0.000001 then return nil,"intent totals are not a non-loss proposal" end
+        local openingMargin=State.AutoTrader.GetLearningEpochMargin(1)
+        local maxMargin=math.min(0.95,openingMargin+CONFIG.AutoTraderProposalMarginOvershootCap)
+        local actualMargin=(receive-give)/receive
+        if actualMargin>maxMargin+0.000001 then return nil,"intent witness would be an implausibly aggressive proactive opening" end
+        local byKey={}
+        for _,entry in ipairs(tradable or {}) do byKey[entry.key]=entry end
+        local result={}
+        for _,wanted in ipairs(intent.giveItems or {}) do
+            local variant=wanted.variant or (wanted.identityHint and wanted.identityHint.variant)
+            local key=wanted.key or (State.Mapping.MakeItemKey(wanted.itemType,wanted.itemId).."|variant:"..tostring(variant or ""))
+            local source=byKey[key]
+            local quantity=math.max(1,math.floor(tonumber(wanted.quantity) or 1))
+            if not source or quantity>math.max(0,math.floor(tonumber(source.maxQuantity) or 0)) then return nil,"intent give item is no longer available" end
+            local item={quantity=quantity,unitValue=source.unitValue,record=source.record,demand=source.demand,reserve=source.reserve}
+            if State.AutoTrader.CopyPlannerItemIdentity then State.AutoTrader.CopyPlannerItemIdentity(source,item)
+            else for k,v in pairs(source) do item[k]=v end;item.quantity=quantity end
+            table.insert(result,item)
+        end
+        if #result==0 or #result>CONFIG.MaxOfferSlots then return nil,"intent opening violates slot bounds" end
+        return result,nil
+    end
+
+    ---------------------------------------------------------------------------
+    -- Review-focused regressions for the seven-change revision.
+    ---------------------------------------------------------------------------
+    local round39RunSelfTests=State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests=function(...)
+        local result=round39RunSelfTests(...)
+        result=type(result)=="table" and result or {tests={},passed=0,total=0,ok=false}
+        local tests=type(result.tests)=="table" and result.tests or {}
+        local function add(name,callback)
+            local ok,passed,detail=pcall(callback)
+            table.insert(tests,{name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
+        end
+        add("v39-native-request-deadline-is-4.25s",function() return math.abs(CONFIG.AutoTraderRequestInvokeTimeoutSeconds-4.25)<0.000001,"native request deadline changed from the scoped 4.25s value" end)
+        add("v39-target-specific-datamodule-classification",function()
+            local pending={invokeFinished=true,invokeOk=false,invokeResult="ServerScriptService.GameScript.DataModule:317: attempt to call missing method 'GetAttribute' of string"}
+            return State.AutoTrader.Round39ClassifyTargetSpecificRequestError(pending)==true,"DataModule target error was not isolated"
+        end)
+        add("v39-unresolved-known-floor-remains-zero-contribution",function()
+            local summary=summarizeResolvedOffer({{itemId="__v39_unresolved_fixture__",itemType="Weapons",quantity=1,record=nil}})
+            return (tonumber(summary.totalValue) or 0)==0,"unresolved fixture contributed nonzero Supreme value"
+        end)
+        add("v39-mutation-cost-is-unit-difference",function()
+            local a={{itemType="Weapons",itemId="A",quantity=2},{itemType="Weapons",itemId="B",quantity=1}}
+            local b={{itemType="Weapons",itemId="A",quantity=1},{itemType="Weapons",itemId="C",quantity=1}}
+            return State.AutoTrader.GetOfferMutationCost(a,b)==3,"mutation cost did not equal one A removal + one B removal + one C add"
+        end)
+        add("v39-engagement-extension-is-hard-bounded",function()
+            local oldBegan,oldEngaged,oldLogged=State.AutoTrader.TradeBeganAt,State.AutoTrader.FirstOfferEngagedAt,State.AutoTrader.FirstOfferEngagementExtensionLogged
+            local base=os.clock();State.AutoTrader.TradeBeganAt=base;State.AutoTrader.FirstOfferEngagedAt=base+1;State.AutoTrader.FirstOfferEngagementExtensionLogged=true
+            local deadline=State.AutoTrader.GetFirstOfferDeadline();State.AutoTrader.TradeBeganAt=oldBegan;State.AutoTrader.FirstOfferEngagedAt=oldEngaged;State.AutoTrader.FirstOfferEngagementExtensionLogged=oldLogged
+            return math.abs(deadline-(base+CONFIG.AutoTraderFirstOfferTimeoutSeconds+CONFIG.AutoTraderFirstOfferEngagementExtensionSeconds))<0.01,"engagement extension was not exactly bounded"
+        end)
+        add("v39-epoch-margin-policy-is-frozen",function()
+            State.AutoTrader.EnsureLearningEpoch()
+            local before=State.AutoTrader.GetLearningEpochMargin(1)
+            local after=State.AutoTrader.GetLearningEpochMargin(1)
+            local sampleDelta=State.AutoTrader.ComputeLearningEpochMarginDelta and State.AutoTrader.ComputeLearningEpochMarginDelta({outcomes=10,successes=0,declines=10}) or nil
+            return math.abs(before-after)<0.000001 and sampleDelta~=nil and math.abs(sampleDelta+CONFIG.AutoTraderLearningMarginDownStep)<0.000001,"current epoch policy was not stable or epoch learning helper did not produce the bounded next-epoch down-step"
+        end)
+        add("v39-extreme-proactive-intent-is-rejected",function()
+            local oldActive,oldTarget=State.AutoTrader.ActiveTargetIntent,State.AutoTrader.TargetIntent
+            State.AutoTrader.ActiveTargetIntent={userId=390039,giveTotal=2,receiveTotal=160,giveItems={{itemType="Weapons",itemId="Indy",quantity=1}}}
+            local items,why=State.AutoTrader.BuildTargetIntentOpeningOffer({UserId=390039},{})
+            State.AutoTrader.ActiveTargetIntent,State.AutoTrader.TargetIntent=oldActive,oldTarget
+            return items==nil and tostring(why):find("implausibly aggressive",1,true)~=nil,"extreme intent witness was not blocked by the proactive plausibility ceiling"
+        end)
+        local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end
+        result.tests=tests;result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.controllerVersion=CONTROLLER_VERSION
+        State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_v39",{passed=passed,total=#tests,ok=result.ok,tests=tests})
         return result
     end
 end)()

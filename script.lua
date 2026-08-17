@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.33-public-auto-trader-v37-round36-auto-off-request-fence",
+    version = "18.69.34-public-auto-trader-v37-round37-transport-self-heal",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -286,8 +286,8 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "931fc41a2d2667ce1c4a27f8cd829f11fe067f484c71c901970ef42a862b6cc3",
-    readyGlobalCurrent = "__SV_AUTO_TRADER_V36_READY",
+    distributionNormalizedSha256 = "9447110c604b1541c68448363c9b2236204a72ad5f864c5f713d2582fa31c5fc",
+    readyGlobalCurrent = "__SV_AUTO_TRADER_V37_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
     guiDiscovery = {mainCalls=0,tradeCalls=0,tradeCacheHits=0,tradeSuccess=0,inventoryScans=0,totalTradeSeconds=0,maxTradeSeconds=0,totalInventorySeconds=0,maxInventorySeconds=0},
@@ -32313,6 +32313,542 @@ end
         result.tests=tests;result.passed=passed;result.total=#tests;result.ok=passed==#tests;result.controllerVersion=CONTROLLER_VERSION
         State.AutoTrader.SelfTest=result
         State.AutoTrader.Log("self_test_v37_round34",{passed=passed,total=#tests,ok=result.ok,tests=tests})
+        return result
+    end
+end)()
+
+
+-- Round 37: transport self-heal / anti-wedge policy.
+-- This does not change trade economics. It separates local request-UI readiness,
+-- per-player no-ack behavior, and genuine cross-target transport health so a
+-- valuable server is not abandoned just because one or two players fail to
+-- produce MM2's authoritative SendingRequest/StartTrade state.
+(function()
+    CONFIG.AutoTraderRequestUiStableSeconds = 0.35
+    CONFIG.AutoTraderRequestUiRecoverySeconds = 8.0
+    CONFIG.AutoTraderTransportPerTargetFailureLimit = 2
+    CONFIG.AutoTraderTransportDistinctFailureThreshold = 3
+    CONFIG.AutoTraderTransportSelfHealQuietSeconds = 1.5
+
+    local function round37Health()
+        local tt = State.AutoTrader.TradeTransport
+        tt.round37 = type(tt.round37) == "table" and tt.round37 or {}
+        local h = tt.round37
+        h.targetFailures = type(h.targetFailures) == "table" and h.targetFailures or {}
+        h.distinctFailures = type(h.distinctFailures) == "table" and h.distinctFailures or {}
+        h.distinctFailureCount = tonumber(h.distinctFailureCount) or 0
+        h.uiReadySince = tonumber(h.uiReadySince) or 0
+        h.uiNotReadySince = tonumber(h.uiNotReadySince) or 0
+        h.selfHealUntil = tonumber(h.selfHealUntil) or 0
+        h.selfHealCount = tonumber(h.selfHealCount) or 0
+        h.uiContractFaults = tonumber(h.uiContractFaults) or 0
+        h.probeRequired = h.probeRequired == true
+        h.probeInFlight = h.probeInFlight == true
+        return h, tt
+    end
+
+    local function round37PresenceKeyFromPending(pending)
+        if type(pending) ~= "table" then return nil end
+        if pending.round37PresenceKey then return tostring(pending.round37PresenceKey) end
+        local player = pending.userId and Players:GetPlayerByUserId(pending.userId) or nil
+        local entry = player and State.AutoTrader.EnsureServerPlayer(player) or nil
+        return tostring(pending.userId or 0) .. ":" .. tostring(entry and entry.presenceGeneration or 0)
+    end
+
+    local function round37PresenceKeyFromRow(row)
+        if type(row) ~= "table" then return nil end
+        local player = row.player
+        local entry = row.entry
+        if not player then return nil end
+        return tostring(player.UserId) .. ":" .. tostring(entry and entry.presenceGeneration or 0)
+    end
+
+    State.AutoTrader.Round37ResetTransportHealth = function(reason)
+        local h, tt = round37Health()
+        h.distinctFailures = {}
+        h.distinctFailureCount = 0
+        h.probeRequired = false
+        h.probeInFlight = false
+        h.probeTargetKey = nil
+        h.selfHealUntil = 0
+        h.lastHealthyAt = os.clock()
+        h.lastHealthyReason = tostring(reason or "authoritative outgoing acknowledgement")
+        tt.outgoingUnacknowledgedConsecutive = 0
+        return true
+    end
+
+    State.AutoTrader.InvalidateRequestUiBindings = function(reason)
+        local h = round37Health()
+        h.uiReadySince = 0
+        h.uiNotReadySince = h.uiNotReadySince > 0 and h.uiNotReadySince or os.clock()
+        h.lastUiInvalidateAt = os.clock()
+        h.lastUiInvalidateReason = tostring(reason or "request UI invalidated")
+        State.AutoTrader.RequestCancelButton = nil
+        State.AutoTrader.IncomingRequestFrame = nil
+        State.AutoTrader.IncomingRequestUsernameObject = nil
+        task.defer(function()
+            if Destroyed then return end
+            pcall(State.AutoTrader.BindRequestCancelObserver)
+            pcall(State.AutoTrader.BindIncomingRequestObserver)
+        end)
+        return true
+    end
+
+    State.AutoTrader.GetRequestUiReadiness = function()
+        local h = round37Health()
+        local now = os.clock()
+        local frame = State.AutoTrader.GetRequestFrame()
+        local sending = frame and frame:FindFirstChild("SendingRequest") or nil
+        local receiving = frame and frame:FindFirstChild("ReceivingRequest") or nil
+        if not frame or not sending or not receiving then
+            h.uiReadySince = 0
+            h.uiNotReadySince = h.uiNotReadySince > 0 and h.uiNotReadySince or now
+            local missing = not frame and "TradeRequest"
+                or (not sending and "SendingRequest")
+                or "ReceivingRequest"
+            local reason = "MM2 request UI is not ready: missing " .. tostring(missing)
+            if h.lastUiWaitReason ~= reason then
+                h.lastUiWaitReason = reason
+                State.AutoTrader.Log("request_ui_readiness_wait", {
+                    reason = reason,
+                    missing = missing,
+                    age = now - h.uiNotReadySince,
+                })
+            end
+            if now - h.uiNotReadySince >= CONFIG.AutoTraderRequestUiRecoverySeconds
+                and h.uiRecoveryRequested ~= true
+                and State.AutoTrader.Preferences.automation then
+                h.uiRecoveryRequested = true
+                State.AutoTrader.Log("request_ui_readiness_recovery", {
+                    reason = reason,
+                    age = now - h.uiNotReadySince,
+                })
+                State.AutoTrader.RequestRecoveryTeleport(
+                    "MM2 TradeRequest UI contract stayed incomplete for "
+                    .. tostring(CONFIG.AutoTraderRequestUiRecoverySeconds) .. "s"
+                )
+            end
+            return false, reason
+        end
+        h.uiNotReadySince = 0
+        h.uiRecoveryRequested = false
+        h.lastUiWaitReason = nil
+        if h.uiReadySince <= 0 then
+            h.uiReadySince = now
+            return false, "MM2 request UI is stabilizing"
+        end
+        if now - h.uiReadySince < CONFIG.AutoTraderRequestUiStableSeconds then
+            return false, "MM2 request UI is stabilizing"
+        end
+        h.lastUiReadyAt = now
+        return true, nil
+    end
+
+    State.AutoTrader.Round37ClassifyInvokeUiFault = function(pending)
+        if type(pending) ~= "table" or pending.invokeFinished ~= true or pending.invokeOk ~= false then
+            return false
+        end
+        local detail = tostring(pending.invokeResult or "")
+        if detail:find('ReceivingRequest is not a valid member of Frame "TradeRequest"', 1, true)
+            or detail:find('SendingRequest is not a valid member of Frame "TradeRequest"', 1, true) then
+            return true
+        end
+        return false
+    end
+
+    State.AutoTrader.Round37RecordTransportFailure = function(pending, uiFault)
+        local h, tt = round37Health()
+        local key = round37PresenceKeyFromPending(pending) or tostring(pending and pending.userId or "unknown")
+        local now = os.clock()
+        local result = {
+            key = key,
+            uiFault = uiFault == true,
+            armProbe = false,
+            recoverAfterCleanup = false,
+            targetFailureCount = tonumber(h.targetFailures[key]) or 0,
+            distinctFailureCount = h.distinctFailureCount,
+        }
+        if uiFault == true then
+            h.uiContractFaults += 1
+            h.selfHealUntil = math.max(h.selfHealUntil, now + CONFIG.AutoTraderTransportSelfHealQuietSeconds)
+            h.lastUiContractFault = {
+                at = now,
+                userId = pending and pending.userId or nil,
+                name = pending and pending.name or nil,
+                detail = tostring(pending and pending.invokeResult or "request UI contract fault"),
+            }
+            if pending and pending.transportSelfHealProbe then
+                h.probeRequired = true
+                h.probeInFlight = false
+                h.probeTargetKey = nil
+                pending.transportSelfHealProbe = false
+            end
+            result.distinctFailureCount = h.distinctFailureCount
+            return result
+        end
+
+        h.targetFailures[key] = (tonumber(h.targetFailures[key]) or 0) + 1
+        result.targetFailureCount = h.targetFailures[key]
+        if h.distinctFailures[key] ~= true then
+            h.distinctFailures[key] = true
+            h.distinctFailureCount += 1
+        end
+        result.distinctFailureCount = h.distinctFailureCount
+
+        if pending and pending.transportSelfHealProbe then
+            h.probeInFlight = false
+            h.probeTargetKey = nil
+            result.recoverAfterCleanup = true
+            return result
+        end
+
+        if h.distinctFailureCount >= CONFIG.AutoTraderTransportDistinctFailureThreshold
+            and h.probeRequired ~= true
+            and h.probeInFlight ~= true then
+            h.probeRequired = true
+            h.selfHealCount += 1
+            h.selfHealUntil = math.max(h.selfHealUntil, now + CONFIG.AutoTraderTransportSelfHealQuietSeconds)
+            result.armProbe = true
+        end
+        return result
+    end
+
+    local round37EvaluatePlayerEligibility = State.AutoTrader.EvaluatePlayerEligibility
+    State.AutoTrader.EvaluatePlayerEligibility = function(player, context)
+        local row = round37EvaluatePlayerEligibility(player, context)
+        if type(row) ~= "table" or not player then return row end
+        local h = round37Health()
+        local key = round37PresenceKeyFromRow(row)
+        local failures = key and (tonumber(h.targetFailures[key]) or 0) or 0
+        if failures >= CONFIG.AutoTraderTransportPerTargetFailureLimit
+            and row.state == "actionable" then
+            row.state = "terminal"
+            row.actionable = false
+            row.contactState = "TRANSPORT_EXHAUSTED_THIS_PRESENCE"
+            row.transportFailuresThisPresence = failures
+            row.reason = "outgoing transport was unacknowledged "
+                .. tostring(failures)
+                .. " times for this player presence; preserving untouched targets instead of repeatedly hammering the same player"
+        end
+        return row
+    end
+
+    local round37CompareQueueRows = State.AutoTrader.CompareQueueRows
+    State.AutoTrader.CompareQueueRows = function(a, b)
+        local h, tt = round37Health()
+        if (tonumber(tt.outgoingUnacknowledgedConsecutive) or 0) > 0
+            or h.probeRequired
+            or h.probeInFlight then
+            local ak = round37PresenceKeyFromRow(a)
+            local bk = round37PresenceKeyFromRow(b)
+            local af = ak and (tonumber(h.targetFailures[ak]) or 0) or 0
+            local bf = bk and (tonumber(h.targetFailures[bk]) or 0) or 0
+            if af ~= bf then return af < bf end
+        end
+        return round37CompareQueueRows(a, b)
+    end
+
+    local round37AcknowledgeOutgoingTransport = State.AutoTrader.AcknowledgeOutgoingTransport
+    State.AutoTrader.AcknowledgeOutgoingTransport = function(pending, source)
+        local counted = round37AcknowledgeOutgoingTransport(pending, source)
+        if type(pending) == "table"
+            and (pending.contactAcknowledged == true or pending.transportAckCounted == true) then
+            local h = round37Health()
+            local wasProbe = pending.transportSelfHealProbe == true or h.probeInFlight == true
+            State.AutoTrader.Round37ResetTransportHealth("authoritative acknowledgement via " .. tostring(source or "unknown"))
+            if wasProbe then
+                State.AutoTrader.Log("request_transport_self_heal_probe_passed", {
+                    userId = pending.userId,
+                    name = pending.name,
+                    source = source,
+                })
+            end
+        end
+        return counted
+    end
+
+    local round37TrySendRequest = State.AutoTrader.TrySendRequest
+    State.AutoTrader.TrySendRequest = function(...)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) > 0 then
+            return round37TrySendRequest(...)
+        end
+        local h = round37Health()
+        local now = os.clock()
+        if now < h.selfHealUntil then
+            local remaining = h.selfHealUntil - now
+            State.AutoTrader.LastRequestGate = {
+                reason = "transport self-heal quiet window",
+                remaining = remaining,
+                at = now,
+            }
+            return false, "transport self-heal quiet window"
+        end
+        local uiReady, uiReason = State.AutoTrader.GetRequestUiReadiness()
+        if not uiReady then
+            State.AutoTrader.NextRequestAt = math.max(
+                tonumber(State.AutoTrader.NextRequestAt) or 0,
+                now + 0.20
+            )
+            State.AutoTrader.LastRequestGate = {reason=tostring(uiReason),at=now}
+            return false, uiReason
+        end
+        local started, reason = round37TrySendRequest(...)
+        if started == true and type(State.AutoTrader.PendingRequest) == "table" then
+            local pending = State.AutoTrader.PendingRequest
+            pending.round37PresenceKey = round37PresenceKeyFromPending(pending)
+            pending.requestUiStableAtInvoke = true
+            if h.probeRequired == true then
+                pending.transportSelfHealProbe = true
+                h.probeRequired = false
+                h.probeInFlight = true
+                h.probeTargetKey = pending.round37PresenceKey
+                h.probeStartedAt = os.clock()
+                State.AutoTrader.Log("request_transport_self_heal_probe_started", {
+                    userId = pending.userId,
+                    name = pending.name,
+                    distinctFailures = h.distinctFailureCount,
+                    targetFailures = tonumber(h.targetFailures[pending.round37PresenceKey]) or 0,
+                })
+            end
+        end
+        return started, reason
+    end
+
+    local round37FailPendingRequestAttempt = State.AutoTrader.FailPendingRequestAttempt
+    State.AutoTrader.FailPendingRequestAttempt = function(target, generation, reason, detail)
+        if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) > 0 then
+            return round37FailPendingRequestAttempt(target, generation, reason, detail)
+        end
+        local pending = State.AutoTrader.PendingRequest
+        if not pending
+            or (target and pending.userId ~= target.UserId)
+            or (generation and pending.generation ~= generation) then
+            return false
+        end
+        pending.failureReason = tostring(reason or "request failed")
+        pending.failureDetail = detail and tostring(detail) or nil
+        local uiFault = State.AutoTrader.Round37ClassifyInvokeUiFault(pending)
+        if not pending.transportFailureCounted then
+            pending.transportFailureCounted = true
+            local h, tt = round37Health()
+            tt.outgoingFailures = (tt.outgoingFailures or 0) + 1
+            if uiFault then
+                local policy = State.AutoTrader.Round37RecordTransportFailure(pending, true)
+                tt.lastOutgoing = {
+                    result = "failed_local_ui_contract",
+                    userId = pending.userId,
+                    name = pending.name,
+                    generation = pending.generation,
+                    reason = pending.failureReason,
+                    detail = tostring(pending.invokeResult or pending.failureDetail),
+                    seconds = os.clock() - (pending.sentAt or os.clock()),
+                    at = os.clock(),
+                }
+                tt.lastFailure = {
+                    kind = "outgoing_request_ui_contract",
+                    userId = pending.userId,
+                    name = pending.name,
+                    reason = tostring(pending.invokeResult or pending.failureReason),
+                    at = os.clock(),
+                }
+                State.AutoTrader.InvalidateRequestUiBindings(tt.lastFailure.reason)
+                State.AutoTrader.Log("request_transport_ui_contract_fault", {
+                    userId = pending.userId,
+                    name = pending.name,
+                    result = tostring(pending.invokeResult),
+                    uiContractFaults = h.uiContractFaults,
+                    selfHealUntil = h.selfHealUntil,
+                    distinctFailures = policy.distinctFailureCount,
+                })
+            else
+                tt.outgoingUnacknowledgedConsecutive = (tt.outgoingUnacknowledgedConsecutive or 0) + 1
+                local policy = State.AutoTrader.Round37RecordTransportFailure(pending, false)
+                tt.lastOutgoing = {
+                    result = "failed_unacknowledged",
+                    userId = pending.userId,
+                    name = pending.name,
+                    generation = pending.generation,
+                    reason = pending.failureReason,
+                    detail = pending.failureDetail,
+                    seconds = os.clock() - (pending.sentAt or os.clock()),
+                    at = os.clock(),
+                }
+                tt.lastFailure = {
+                    kind = "outgoing_request_transport",
+                    userId = pending.userId,
+                    name = pending.name,
+                    consecutive = tt.outgoingUnacknowledgedConsecutive,
+                    distinct = policy.distinctFailureCount,
+                    targetFailures = policy.targetFailureCount,
+                    reason = pending.failureReason,
+                    at = os.clock(),
+                }
+                State.AutoTrader.Log("request_transport_unacknowledged", tt.lastFailure)
+                if policy.armProbe then
+                    State.AutoTrader.Log("request_transport_self_heal_armed", {
+                        distinctFailures = policy.distinctFailureCount,
+                        quietSeconds = CONFIG.AutoTraderTransportSelfHealQuietSeconds,
+                    })
+                end
+                if policy.recoverAfterCleanup then
+                    pending.recoveryAfterCleanup = true
+                    pending.recoveryReason = "outgoing request transport self-heal probe failed after "
+                        .. tostring(policy.distinctFailureCount) .. " distinct unacknowledged player target(s)"
+                end
+            end
+        end
+        local h, tt = round37Health()
+        local key = pending.round37PresenceKey or round37PresenceKeyFromPending(pending)
+        State.AutoTrader.LastRequestAttempt = {
+            userId = pending.userId,
+            name = pending.name,
+            result = uiFault and "canceling_ui_contract_fault" or "canceling_unavailable",
+            reason = pending.failureReason,
+            detail = uiFault and tostring(pending.invokeResult or pending.failureDetail) or pending.failureDetail,
+            phase = pending.phase,
+            age = os.clock() - (pending.sentAt or os.clock()),
+            at = os.clock(),
+            transportConsecutive = tt.outgoingUnacknowledgedConsecutive,
+            transportDistinct = h.distinctFailureCount,
+            transportTargetFailures = key and (tonumber(h.targetFailures[key]) or 0) or 0,
+            transportSelfHealProbe = pending.transportSelfHealProbe == true,
+            recoveryAfterCleanup = pending.recoveryAfterCleanup == true,
+            uiContractFault = uiFault,
+        }
+        local started, cancelReason = State.AutoTrader.BeginPendingRequestCancellation(
+            uiFault and "request UI contract fault" or pending.failureReason,
+            "transport_deferred",
+            false
+        )
+        if not started then
+            State.AutoTrader.Log("request_failure_cancel_failed", {reason=cancelReason,pending=pending})
+            State.AutoTrader.RequestRecoveryTeleport("failed outgoing request could not be canceled cleanly")
+            return false
+        end
+        State.AutoTrader.Status = uiFault and "REQUEST UI · RESYNCING" or "REQUEST FAILED · CANCELING"
+        State.AutoTrader.StatusDetail = uiFault
+            and ((pending.name or "That player") .. " hit a transient MM2 TradeRequest-UI contract fault; cleaning up and rebuilding request observers locally before another attempt.")
+            or ((pending.name or "That player") .. " did not reach a trustworthy MM2 pending state; canceling/confirming cleanup before trying anybody else.")
+        State.AutoTrader.Log("request_attempt_cleanup_started", State.AutoTrader.LastRequestAttempt)
+        State.AutoTrader.Render()
+        return true
+    end
+
+    -- Round-37 regression tests are appended after the already-proven 256-test suite.
+    local round37RunSelfTests = State.AutoTrader.RunSelfTests
+    State.AutoTrader.RunSelfTests = function(...)
+        local result = round37RunSelfTests(...)
+        result = type(result) == "table" and result or {tests={},passed=0,total=0,ok=false}
+        local tests = type(result.tests) == "table" and result.tests or {}
+        local function add(name, callback)
+            local ok, passed, detail = pcall(callback)
+            table.insert(tests, {
+                name = name,
+                ok = ok and passed == true,
+                detail = (ok and passed == true) and nil or tostring(ok and detail or passed),
+            })
+        end
+
+        add("v37-round37-repeat-same-target-does-not-prove-server-transport-wedge", function()
+            local h, tt = round37Health()
+            local savedRound37 = HARDEN.supportJsonValue(tt.round37)
+            local savedConsecutive = tt.outgoingUnacknowledgedConsecutive
+            tt.round37 = {targetFailures={},distinctFailures={},distinctFailureCount=0}
+            local a1 = State.AutoTrader.Round37RecordTransportFailure({userId=370001,name="A",round37PresenceKey="370001:1"}, false)
+            local a2 = State.AutoTrader.Round37RecordTransportFailure({userId=370001,name="A",round37PresenceKey="370001:1"}, false)
+            local fresh = round37Health()
+            local passed = a1.distinctFailureCount == 1
+                and a2.distinctFailureCount == 1
+                and a2.targetFailureCount == 2
+                and a2.armProbe == false
+                and fresh.distinctFailureCount == 1
+            tt.round37 = savedRound37 or {}
+            tt.outgoingUnacknowledgedConsecutive = savedConsecutive
+            return passed, "retries to one player were misclassified as independent proof that the whole server transport was wedged"
+        end)
+
+        add("v37-round37-three-distinct-failures-arm-local-self-heal-before-rejoin", function()
+            local _, tt = round37Health()
+            local savedRound37 = HARDEN.supportJsonValue(tt.round37)
+            tt.round37 = {targetFailures={},distinctFailures={},distinctFailureCount=0}
+            State.AutoTrader.Round37RecordTransportFailure({userId=370011,name="A",round37PresenceKey="370011:1"}, false)
+            State.AutoTrader.Round37RecordTransportFailure({userId=370012,name="B",round37PresenceKey="370012:1"}, false)
+            local third = State.AutoTrader.Round37RecordTransportFailure({userId=370013,name="C",round37PresenceKey="370013:1"}, false)
+            local h = round37Health()
+            local passed = third.distinctFailureCount == 3 and third.armProbe == true
+                and third.recoverAfterCleanup == false and h.probeRequired == true and h.selfHealUntil > os.clock()
+            tt.round37 = savedRound37 or {}
+            return passed, "three distinct failures skipped the bounded local self-heal probe and went straight to rejoin"
+        end)
+
+        add("v37-round37-self-heal-probe-failure-authorizes-recovery", function()
+            local _, tt = round37Health()
+            local savedRound37 = HARDEN.supportJsonValue(tt.round37)
+            tt.round37 = {targetFailures={},distinctFailures={["370021:1"]=true,["370022:1"]=true,["370023:1"]=true},distinctFailureCount=3,probeInFlight=true}
+            local probe = State.AutoTrader.Round37RecordTransportFailure({
+                userId=370024,name="Probe",round37PresenceKey="370024:1",transportSelfHealProbe=true
+            }, false)
+            local h = round37Health()
+            local passed = probe.recoverAfterCleanup == true and h.probeInFlight == false and h.distinctFailureCount == 4
+            tt.round37 = savedRound37 or {}
+            return passed, "a failed clean self-heal probe did not authorize recovery after cross-target transport evidence"
+        end)
+
+        add("v37-round37-traderequest-ui-fault-does-not-poison-transport-health", function()
+            local _, tt = round37Health()
+            local savedRound37 = HARDEN.supportJsonValue(tt.round37)
+            tt.round37 = {targetFailures={},distinctFailures={},distinctFailureCount=0,probeRequired=true,probeInFlight=true}
+            local pending = {
+                userId=370031,name="UiFault",round37PresenceKey="370031:1",
+                transportSelfHealProbe=true,invokeFinished=true,invokeOk=false,
+                invokeResult='ReceivingRequest is not a valid member of Frame "TradeRequest"',
+            }
+            local classified = State.AutoTrader.Round37ClassifyInvokeUiFault(pending)
+            local policy = State.AutoTrader.Round37RecordTransportFailure(pending, true)
+            local h = round37Health()
+            local passed = classified == true and policy.uiFault == true and h.distinctFailureCount == 0
+                and h.probeRequired == true and h.probeInFlight == false and h.uiContractFaults == 1
+            tt.round37 = savedRound37 or {}
+            return passed, "known TradeRequest UI-shape fault was counted as proof that player/server request transport was unhealthy"
+        end)
+
+        add("v37-round37-authoritative-ack-clears-cross-target-wedge-streak", function()
+            local _, tt = round37Health()
+            local savedRound37 = HARDEN.supportJsonValue(tt.round37)
+            local savedConsecutive = tt.outgoingUnacknowledgedConsecutive
+            tt.round37 = {
+                targetFailures={["370041:1"]=1},
+                distinctFailures={["370041:1"]=true,["370042:1"]=true},
+                distinctFailureCount=2,
+                probeRequired=true,
+                probeInFlight=true,
+                selfHealUntil=os.clock()+10,
+            }
+            tt.outgoingUnacknowledgedConsecutive = 2
+            State.AutoTrader.Round37ResetTransportHealth("fixture acknowledgement")
+            local h = round37Health()
+            local passed = h.distinctFailureCount == 0 and h.probeRequired == false and h.probeInFlight == false
+                and h.selfHealUntil == 0 and tt.outgoingUnacknowledgedConsecutive == 0
+                and (tonumber(h.targetFailures["370041:1"]) or 0) == 1
+            tt.round37 = savedRound37 or {}
+            tt.outgoingUnacknowledgedConsecutive = savedConsecutive
+            return passed, "authoritative acknowledgement failed to clear server-level wedge evidence or incorrectly erased per-player retry history"
+        end)
+
+        local passed = 0
+        for _, row in ipairs(tests) do if row.ok then passed += 1 end end
+        result.tests = tests
+        result.passed = passed
+        result.total = #tests
+        result.ok = passed == #tests
+        result.controllerVersion = CONTROLLER_VERSION
+        State.AutoTrader.SelfTest = result
+        State.AutoTrader.Log("self_test_v37_round37", {
+            passed = passed,
+            total = #tests,
+            ok = result.ok,
+            tests = tests,
+        })
         return result
     end
 end)()

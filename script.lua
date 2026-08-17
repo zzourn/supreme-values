@@ -1,5 +1,5 @@
 local CONFIG = {
-    version = "18.69.25-public-auto-trader-v37-round29-release-readiness-candidate",
+    version = "18.69.26-public-auto-trader-v37-round30-native-trade-observability-candidate",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -281,7 +281,7 @@ local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V37",
-    distributionNormalizedSha256 = "7e957ca5cb6d1030f506effce03ba96ace7470c5734e548dea366f2b8fafb4fe",
+    distributionNormalizedSha256 = "73eef86c27df5fac5d115b4f7ac626a7c6a78e2558bc742227646939c6fb60b9",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V31_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -14018,20 +14018,11 @@ State.AutoTrader.SuppressTradeVisuals = function()
     if not State.AutoTrader.Preferences.automation or State.AutoTrader.SessionFrozen then
         return
     end
+    -- Round 30 observability: retain the legacy lifecycle marker so every
+    -- planner/transport/audit branch sees the same managed-trade state, but do
+    -- not mutate MM2's native TradeGUI, Container, Fade, or other game visuals.
+    -- The operator must be able to watch the real trade process while AUTO runs.
     State.AutoTrader.BackgroundSuppressed = true
-    local tradeGui = State.TradeGui
-    if not tradeGui or not tradeGui.Parent then
-        tradeGui = PlayerGui:FindFirstChild("TradeGUI")
-    end
-    local container = tradeGui and tradeGui:FindFirstChild("Container")
-    State.AutoTrader.HideBackgroundObject(container)
-    State.AutoTrader.HideBackgroundObject(TradePanel)
-    local globalFade = PlayerGui:FindFirstChild("Fade")
-    State.AutoTrader.HideBackgroundObject(globalFade)
-    local mainGui = PlayerGui:FindFirstChild("MainGUI")
-    local gameFrame = mainGui and mainGui:FindFirstChild("Game")
-    local gameFade = gameFrame and gameFrame:FindFirstChild("Fade")
-    State.AutoTrader.HideBackgroundObject(gameFade)
 end
 State.AutoTrader.RestoreTradeVisuals = function()
     for index = #State.AutoTrader.BackgroundRestore, 1, -1 do
@@ -16854,7 +16845,9 @@ State.AutoTrader.BuildDebug = function()
         autoAcceptSentAt = State.AutoTrader.AutoAcceptSentAt,
         lastTradeUpdateAt = State.AutoTrader.LastTradeUpdateAt,
         lastTradeActivityAt = State.AutoTrader.LastTradeActivityAt,
-        backgroundSuppressed = State.AutoTrader.BackgroundSuppressed,
+        backgroundSuppressed = false,
+        managedTradeLifecycleMarker = State.AutoTrader.BackgroundSuppressed,
+        nativeTradeUiPolicy = "VISIBLE_DURING_AUTOMATION",
         postTradeAuditPending = State.AutoTrader.PostTradeAuditPending,
         lastAcceptAudit = State.AutoTrader.LastAcceptAudit,
         lastAuditDetail = State.AutoTrader.LastAuditDetail,
@@ -17246,6 +17239,34 @@ UI.AutoTraderSafety.Size = UDim2.new(1, -20, 0, 20)
 UI.AutoTraderSafety.TextWrapped = true
 UI.AutoTraderSafety.TextYAlignment = Enum.TextYAlignment.Top
 UI.AutoTraderSafety.ZIndex = 1456
+
+UI.AutoTraderTradeObserveBadge = create("Frame", {
+    Name = "SV_AutoTraderTradeObserveBadge",
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, 8),
+    Size = UDim2.fromOffset(380, 48),
+    BackgroundColor3 = THEME.bg,
+    BackgroundTransparency = 0.08,
+    BorderSizePixel = 0,
+    Visible = false,
+    Active = false,
+    Selectable = false,
+    ZIndex = 1800,
+}, UI.RootGui)
+addCorner(UI.AutoTraderTradeObserveBadge, 5)
+addStroke(UI.AutoTraderTradeObserveBadge, THEME.blue, 1, 0.08)
+UI.AutoTraderTradeObservePhase = makeLabel(UI.AutoTraderTradeObserveBadge, "AUTO · TRADE", 10, THEME.blue, Enum.Font.ArialBold)
+UI.AutoTraderTradeObservePhase.Position = UDim2.fromOffset(10, 5)
+UI.AutoTraderTradeObservePhase.Size = UDim2.new(1, -20, 0, 16)
+UI.AutoTraderTradeObservePhase.TextXAlignment = Enum.TextXAlignment.Center
+UI.AutoTraderTradeObservePhase.Active = false
+UI.AutoTraderTradeObservePhase.ZIndex = 1801
+UI.AutoTraderTradeObserveStatus = makeLabel(UI.AutoTraderTradeObserveBadge, "Watching native MM2 trade UI", 10, THEME.text, Enum.Font.Arial)
+UI.AutoTraderTradeObserveStatus.Position = UDim2.fromOffset(10, 24)
+UI.AutoTraderTradeObserveStatus.Size = UDim2.new(1, -20, 0, 16)
+UI.AutoTraderTradeObserveStatus.TextXAlignment = Enum.TextXAlignment.Center
+UI.AutoTraderTradeObserveStatus.Active = false
+UI.AutoTraderTradeObserveStatus.ZIndex = 1801
 
 UI.AutoTraderServerCard = uiCard(UI.AutoTraderHomeContent, UDim2.fromOffset(0, 200), UDim2.new(0.5, -4, 0, 128))
 uiSectionTitle(UI.AutoTraderServerCard, "THIS SERVER", 6)
@@ -18157,6 +18178,17 @@ State.AutoTrader.Render = function()
     UI.AutoTraderHeaderMetric.TextColor3 = profit > 0 and THEME.green or THEME.blue
     UI.AutoTraderStatus.Text = status; UI.AutoTraderStatus.TextColor3 = color
     UI.AutoTraderStage.Text = "NOW: " .. stage; UI.AutoTraderStage.TextColor3 = color
+    if UI.AutoTraderTradeObserveBadge then
+        local observeNativeTrade = State.AutoTrader.Preferences.automation == true
+            and State.AutoTrader.BackgroundSuppressed == true
+        UI.AutoTraderTradeObserveBadge.Visible = observeNativeTrade
+        if observeNativeTrade then
+            UI.AutoTraderTradeObservePhase.Text = "AUTO · " .. tostring(stage)
+            UI.AutoTraderTradeObservePhase.TextColor3 = color
+            UI.AutoTraderTradeObserveStatus.Text = tostring(status)
+            UI.AutoTraderTradeObserveStatus.TextColor3 = color
+        end
+    end
 
     local target = State.AutoTrader.LastTradePartner or State.AutoTrader.SelectedTarget
     UI.AutoTraderTarget.Text = target and ((State.AutoTrader.LastTradePartner and "Partner: " or "Next eligible: ") .. target.Name) or "Target: —"
@@ -18870,9 +18902,9 @@ end
 State.AutoTrader.ReconcileTradeDeclineState = function()
     if not State.AutoTrader.TradeDeclinePending then return false end
     local now = os.clock()
-    -- Read the native ScreenGui enabled state directly. Background automation hides
-    -- the trade container visually, so isTradeVisible() intentionally reports true
-    -- while CurrentTrade exists and cannot be used as a decline acknowledgement.
+    -- Read the native ScreenGui enabled state directly. The Round-30 observability
+    -- patch no longer hides native trade visuals, while BackgroundSuppressed remains
+    -- a lifecycle-equivalence marker; decline acknowledgement still uses ScreenGui.
     local tradeGui = State.TradeGui
     if not tradeGui or not tradeGui.Parent then tradeGui = PlayerGui:FindFirstChild("Trade") or PlayerGui:FindFirstChild("TradeGUI") end
     local nativeActive = tradeGui and tradeGui:IsA("ScreenGui") and tradeGui.Enabled == true
@@ -20119,6 +20151,8 @@ local function discoverTradeGui(force)
     return finishTradeDiscovery(true, false)
 end
 isTradeVisible = function()
+    -- BackgroundSuppressed is retained as a managed-trade lifecycle marker for
+    -- behavioral equivalence; Round 30 no longer uses it to hide native visuals.
     if State.AutoTrader
         and State.AutoTrader.BackgroundSuppressed
         and type(State.CurrentTrade) == "table" then
@@ -31280,6 +31314,96 @@ do
                 and combined:find(marker,1,true)==nil and combined:find(replacement,1,true)==nil
                 and combined:find(internalMarker,1,true)==nil and combined:find(".ROBLOSECURITY=",1,true)==nil
             cleanup();return passed,"user auth mutation crossed self-test isolation or UI rejection consumed the pending secret"
+        end)
+
+        add("v37-round30-native-trade-gui-remains-visible-during-auto-observability",function()
+            local saved={
+                automation=State.AutoTrader.Preferences.automation,
+                frozen=State.AutoTrader.SessionFrozen,
+                marker=State.AutoTrader.BackgroundSuppressed,
+                tradeGui=State.TradeGui,
+            }
+            local fakeHost=Instance.new("Folder")
+            local fakeGui=Instance.new("ScreenGui")
+            fakeGui.Name="SV_ROUND30_NATIVE_TRADE_VISIBILITY_SELFTEST"
+            fakeGui.Enabled=true
+            fakeGui.Parent=fakeHost
+            local fakeContainer=Instance.new("Frame")
+            fakeContainer.Name="Container"
+            fakeContainer.Visible=true
+            fakeContainer.Parent=fakeGui
+            State.AutoTrader.Preferences.automation=true
+            State.AutoTrader.SessionFrozen=nil
+            State.AutoTrader.BackgroundSuppressed=false
+            State.TradeGui=fakeGui
+            local ok,err=pcall(State.AutoTrader.SuppressTradeVisuals)
+            local passed=ok and err==nil and State.AutoTrader.BackgroundSuppressed==true
+                and fakeGui.Enabled==true and fakeContainer.Visible==true
+            State.TradeGui=saved.tradeGui
+            State.AutoTrader.Preferences.automation=saved.automation
+            State.AutoTrader.SessionFrozen=saved.frozen
+            State.AutoTrader.BackgroundSuppressed=saved.marker
+            fakeHost:Destroy()
+            return passed,"AUTO observability changed native TradeGUI/Container visibility instead of keeping the real trade process visible"
+        end)
+
+        add("v37-round30-observability-only-preserves-controller-state-and-readonly-status",function()
+            local savedAutomation=State.AutoTrader.Preferences.automation
+            local savedFrozen=State.AutoTrader.SessionFrozen
+            local savedMarker=State.AutoTrader.BackgroundSuppressed
+            local snapshot={
+                plan=State.AutoTrader.Plan,
+                desired=State.AutoTrader.Desired,
+                actionGeneration=State.AutoTrader.ActionGeneration,
+                autoAcceptGeneration=State.AutoTrader.AutoAcceptGeneration,
+                actionInFlight=State.AutoTrader.ActionInFlight,
+                currentTrade=State.CurrentTrade,
+                managedPartnerUserId=State.AutoTrader.ManagedPartnerUserId,
+                pendingRequest=State.AutoTrader.PendingRequest,
+                requestLifecycle=State.AutoTrader.RequestLifecycle,
+                tradeDeclinePending=State.AutoTrader.TradeDeclinePending,
+                postTradeAuditPending=State.AutoTrader.PostTradeAuditPending,
+                serverHopInProgress=State.AutoTrader.ServerHopInProgress,
+                teleportInProgress=State.AutoTrader.TeleportInProgress,
+                selectedTarget=State.AutoTrader.SelectedTarget,
+                lastTradePartner=State.AutoTrader.LastTradePartner,
+                restoreCount=#State.AutoTrader.BackgroundRestore,
+            }
+            State.AutoTrader.Preferences.automation=true
+            State.AutoTrader.SessionFrozen=nil
+            State.AutoTrader.BackgroundSuppressed=false
+            local ok=pcall(State.AutoTrader.SuppressTradeVisuals)
+            local stateSame=ok
+                and State.AutoTrader.Plan==snapshot.plan
+                and State.AutoTrader.Desired==snapshot.desired
+                and State.AutoTrader.ActionGeneration==snapshot.actionGeneration
+                and State.AutoTrader.AutoAcceptGeneration==snapshot.autoAcceptGeneration
+                and State.AutoTrader.ActionInFlight==snapshot.actionInFlight
+                and State.CurrentTrade==snapshot.currentTrade
+                and State.AutoTrader.ManagedPartnerUserId==snapshot.managedPartnerUserId
+                and State.AutoTrader.PendingRequest==snapshot.pendingRequest
+                and State.AutoTrader.RequestLifecycle==snapshot.requestLifecycle
+                and State.AutoTrader.TradeDeclinePending==snapshot.tradeDeclinePending
+                and State.AutoTrader.PostTradeAuditPending==snapshot.postTradeAuditPending
+                and State.AutoTrader.ServerHopInProgress==snapshot.serverHopInProgress
+                and State.AutoTrader.TeleportInProgress==snapshot.teleportInProgress
+                and State.AutoTrader.SelectedTarget==snapshot.selectedTarget
+                and State.AutoTrader.LastTradePartner==snapshot.lastTradePartner
+                and #State.AutoTrader.BackgroundRestore==snapshot.restoreCount
+            local badge=UI.AutoTraderTradeObserveBadge
+            local readOnly=badge and badge:IsA("Frame") and badge.Active==false and badge.Selectable==false
+            if readOnly then
+                for _,descendant in ipairs(badge:GetDescendants()) do
+                    if descendant:IsA("TextButton") or descendant:IsA("ImageButton") or descendant:IsA("TextBox") then
+                        readOnly=false
+                        break
+                    end
+                end
+            end
+            State.AutoTrader.Preferences.automation=savedAutomation
+            State.AutoTrader.SessionFrozen=savedFrozen
+            State.AutoTrader.BackgroundSuppressed=savedMarker
+            return stateSame and readOnly,"observability patch changed planner/transport/audit/hop state or introduced an interactive trade-status control"
         end)
 
         local passed=0;for _,row in ipairs(tests) do if row.ok then passed+=1 end end

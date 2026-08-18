@@ -1,7 +1,7 @@
--- SV AutoTrader v48 launcher
+-- SV AutoTrader v50 launcher
 -- This launcher preserves the exact verified runtime source across executor teleports.
 local __sv_source = [====[local CONFIG = {
-    version = "18.69.46-public-auto-trader-v48-unified-aero-ui",
+    version = "18.69.53-public-auto-trader-v53-ui-consistency-selftests-fixed",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -204,7 +204,7 @@ local __sv_source = [====[local CONFIG = {
     AutoTraderUpcomingThumbnailMaxBytes = 4 * 1024 * 1024,
     AutoTraderUpcomingThumbnailCacheLimit = 240,
     -- v48: presentation/UI cadence only; no trade/server eligibility semantics.
-    AutoTraderUpcomingAutoRefreshSeconds = 12,
+    AutoTraderUpcomingAutoRefreshSeconds = 18,
     AutoTraderCardValuePresentationGraceSeconds = 1.35,
     -- v34 bot architecture: current-server evidence MAY force a fast escape, but
     -- automated permanent learning remains stricter: only a physically certified
@@ -307,7 +307,7 @@ local __sv_source = [====[local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "9abb93a6677dfbf46a82d9438a02cda472d884bf0f6cc9f1d559c59562fab36d",
+    distributionNormalizedSha256 = "5d98aad111c67f9838ab2e50420175435addade44aeec2226fad339a73ead03f",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -577,7 +577,8 @@ local function normalizeDistributionSourceForHash(source)
 end
 local function verifyDistributionSource(source)
     if type(source) ~= "string" or #source < 1000 then return false, "source missing/too small" end
-    if not source:find(CONTROLLER_VERSION, 1, true) then return false, "controller version marker mismatch" end
+    local declaredVersion = source:match('local%s+CONFIG%s*=%s*%{%s*version%s*=%s*"([^"]+)"')
+    if declaredVersion ~= CONTROLLER_VERSION then return false, "controller version marker mismatch" end
     local declaredSha = source:match('distributionNormalizedSha256%s*=%s*"([0-9a-fA-F]+)"')
     if type(declaredSha) ~= "string" or string.lower(declaredSha) ~= string.lower(HARDEN.distributionNormalizedSha256) then
         return false, "distribution declared SHA-256 mismatch"
@@ -695,22 +696,22 @@ do
     end
 end
 local THEME = {
-    -- v30: compact Windows 7 / Frutiger Aero palette. Light neutral surfaces
-    -- and dark text are intentionally used for legibility at small UI sizes.
-    bg = Color3.fromRGB(214, 232, 242),
-    panel = Color3.fromRGB(242, 248, 252),
-    panel2 = Color3.fromRGB(232, 242, 248),
-    panel3 = Color3.fromRGB(214, 232, 243),
-    border = Color3.fromRGB(116, 157, 181),
-    text = Color3.fromRGB(24, 43, 54),
-    muted = Color3.fromRGB(58, 82, 96),
-    faint = Color3.fromRGB(91, 113, 124),
-    green = Color3.fromRGB(45, 128, 43),
-    yellow = Color3.fromRGB(173, 111, 0),
-    red = Color3.fromRGB(183, 49, 57),
-    blue = Color3.fromRGB(28, 104, 164),
-    purple = Color3.fromRGB(103, 78, 157),
-    orange = Color3.fromRGB(184, 91, 17),
+    -- v51: unified Frutiger Aero palette. Cool pearl surfaces, restrained sky-blue
+    -- chrome, dark slate text, and semantic accents stay readable without looking neon.
+    bg = Color3.fromRGB(222, 239, 248),
+    panel = Color3.fromRGB(247, 251, 253),
+    panel2 = Color3.fromRGB(236, 246, 250),
+    panel3 = Color3.fromRGB(216, 236, 246),
+    border = Color3.fromRGB(104, 153, 180),
+    text = Color3.fromRGB(30, 52, 64),
+    muted = Color3.fromRGB(68, 91, 103),
+    faint = Color3.fromRGB(103, 122, 133),
+    green = Color3.fromRGB(61, 128, 57),
+    yellow = Color3.fromRGB(160, 114, 27),
+    red = Color3.fromRGB(168, 65, 73),
+    blue = Color3.fromRGB(40, 108, 158),
+    purple = Color3.fromRGB(99, 82, 151),
+    orange = Color3.fromRGB(177, 91, 27),
 }
 local Connections = {}
 local Destroyed = false
@@ -1006,25 +1007,27 @@ local function makeButton(parent, text, size, color)
         Font = Enum.Font.Arial,
     }, parent)
     addCorner(button, 4)
-    -- v48: all custom buttons get the same restrained Windows-style tactile response.
-    -- Avoid an extra UIScale because a few top-level controls already own responsive scales.
-    connect(button.MouseButton1Down, function()
+    -- v50: keep typography stable while pressing. Motion polish is layered later
+    -- with a tiny button-scale tween; changing TextSize on click made glyphs shimmer.
+    -- Cosmetic handlers belong to the button instance itself. Dynamic rows are
+    -- destroyed/rebuilt frequently, so registering these in the global static
+    -- Connections registry would make presentation-only rebuilds look like leaks.
+    button.MouseButton1Down:Connect(function()
         if button.Parent then
-            button:SetAttribute("SV_PressTextSize", button.TextSize)
-            button.TextSize = math.max(8, button.TextSize - 1)
-            TweenService:Create(button, TweenInfo.new(0.05), {BackgroundTransparency = 0.08}):Play()
+            TweenService:Create(button, TweenInfo.new(0.045, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundTransparency = 0.06,
+            }):Play()
         end
     end)
     local function releasePress()
         if button.Parent then
-            local prior = tonumber(button:GetAttribute("SV_PressTextSize"))
-            if prior then button.TextSize = prior end
-            button:SetAttribute("SV_PressTextSize", nil)
-            TweenService:Create(button, TweenInfo.new(0.08), {BackgroundTransparency = 0}):Play()
+            TweenService:Create(button, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundTransparency = 0,
+            }):Play()
         end
     end
-    connect(button.MouseButton1Up, releasePress)
-    connect(button.MouseLeave, releasePress)
+    button.MouseButton1Up:Connect(releasePress)
+    button.MouseLeave:Connect(releasePress)
     return button
 end
 local function setButtonHover(button, normalColor, hoverColor)
@@ -5837,8 +5840,8 @@ local function addDetailRow(labelText, valueText, valueColor)
         BorderSizePixel = 0,
         ZIndex = 2002,
     }, UI.DetailsContent)
-    addCorner(row, 5)
-    addStroke(row, THEME.border, 1, 0.42)
+    addCorner(row, 7)
+    addStroke(row, THEME.border, 1, 0.34)
     create("UIGradient", {
         Color = ColorSequence.new({
             ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
@@ -5851,7 +5854,7 @@ local function addDetailRow(labelText, valueText, valueColor)
         labelText,
         10,
         THEME.muted,
-        Enum.Font.Arial
+        Enum.Font.Gotham
     )
     left.Position = UDim2.fromOffset(11, 4)
     left.Size = UDim2.new(1, -22, 0, 15)
@@ -5861,7 +5864,7 @@ local function addDetailRow(labelText, valueText, valueColor)
         valueText,
         13,
         valueColor or THEME.text,
-        Enum.Font.Arial
+        Enum.Font.GothamMedium
     )
     right.Position = UDim2.fromOffset(11, 19)
     right.Size = UDim2.new(1, -22, 0, 18)
@@ -5870,8 +5873,12 @@ local function addDetailRow(labelText, valueText, valueColor)
     return row
 end
 local function closeDetails()
-    UI.Details.Visible = false
-    UI.DetailsBackdrop.Visible = false
+    if State.AutoTrader and type(State.AutoTrader.SetDetailsVisibleAnimated) == "function" then
+        State.AutoTrader.SetDetailsVisibleAnimated(false)
+    else
+        UI.Details.Visible = false
+        UI.DetailsBackdrop.Visible = false
+    end
 end
 connect(UI.DetailsClose.MouseButton1Click, closeDetails)
 connect(UI.DetailsBackdrop.MouseButton1Click, closeDetails)
@@ -6032,10 +6039,12 @@ local function showItemDetails(
             0,
             0
         )
-    UI.DetailsBackdrop.Visible =
-        true
-    UI.Details.Visible =
-        true
+    if State.AutoTrader and type(State.AutoTrader.SetDetailsVisibleAnimated) == "function" then
+        State.AutoTrader.SetDetailsVisibleAnimated(true)
+    else
+        UI.DetailsBackdrop.Visible = true
+        UI.Details.Visible = true
+    end
 end
 State.DecoratedCards = setmetatable({}, {__mode = "k"})
 State.CardPresentationValueCache = State.CardPresentationValueCache or {}
@@ -6254,13 +6263,13 @@ local function addUnknownValueBadge(frame, compactMode)
         Text = "—",
         TextColor3 = Color3.fromRGB(110, 126, 136),
         TextSize = compactMode and 12 or 14,
-        Font = Enum.Font.ArialBold,
+        Font = Enum.Font.GothamBold,
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
         ZIndex = 95,
         Active = false,
     }, frame)
-    addCorner(badge, 5)
+    addCorner(badge, 6)
     addStroke(badge, Color3.fromRGB(137, 169, 188), 1, 0.28)
     create("UIGradient", {
         Color = ColorSequence.new({
@@ -6294,13 +6303,13 @@ local function addValueBadge(frame, record, compactMode)
             or (compactMode and 13 or 15),
         TextScaled = false,
         TextWrapped = false,
-        Font = Enum.Font.ArialBold,
+        Font = Enum.Font.GothamBold,
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
         ZIndex = 95,
         Active = false,
     }, frame)
-    addCorner(badge, 5)
+    addCorner(badge, 6)
     addStroke(
         badge,
         textColor == THEME.yellow
@@ -6340,15 +6349,15 @@ local function addInfoButton(frame, record, compactMode, context)
             compactMode and 26 or 29
         ),
         Size = compactMode
-            and UDim2.fromOffset(17, 17)
-            or UDim2.fromOffset(19, 19),
+            and UDim2.fromOffset(18, 18)
+            or UDim2.fromOffset(20, 20),
         BackgroundColor3 = buttonColor,
         BackgroundTransparency = 0.02,
         BorderSizePixel = 0,
         Text = resolved and "i" or "?",
         TextColor3 = accent,
         TextSize = compactMode and 10 or 11,
-        Font = Enum.Font.ArialBold,
+        Font = Enum.Font.GothamBold,
         AutoButtonColor = false,
         ZIndex = 100,
     }, frame)
@@ -6370,10 +6379,10 @@ local function addInfoButton(frame, record, compactMode, context)
         if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.08), {Scale = 1}):Play() end
     end)
     connect(button.MouseButton1Down, function()
-        if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.05), {Scale = 0.93}):Play() end
+        if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.97}):Play() end
     end)
     connect(button.MouseButton1Up, function()
-        if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.08, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play() end
+        if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1}):Play() end
     end)
     connect(button.MouseButton1Click, function()
         showItemDetails(record, context)
@@ -6688,7 +6697,11 @@ local function decorateCard(frame, options)
             frame:SetAttribute("SV_ValuePresentationGrace", true)
             task.delay(grace, function()
                 if frame and frame.Parent and tostring(frame:GetAttribute("SV_UnresolvedIdentity") or "") == unresolvedIdentity then
-                    requestFullUiRefresh()
+                    if State.AutoTrader and type(State.AutoTrader.RequestPresentationUiRefresh) == "function" then
+                        State.AutoTrader.RequestPresentationUiRefresh()
+                    else
+                        requestFullUiRefresh()
+                    end
                 end
             end)
             return nil, context
@@ -6837,7 +6850,7 @@ local function setTradeHighlight(frame, mode, result)
         Text = mode == "BEST" and "BEST ADD" or "SAFE",
         TextColor3 = Color3.fromRGB(20, 22, 27),
         TextSize = 9,
-        Font = Enum.Font.ArialBold,
+        Font = Enum.Font.GothamBold,
         ZIndex = 86,
         Active = false,
     }, overlay)
@@ -6857,8 +6870,8 @@ local function clearAllTradeHighlights()
 end
 local TradePanel = create("Frame", {
     Name = "SV_TradePanel",
-    AnchorPoint = Vector2.new(1, 0.5),
-    Position = UDim2.new(1, -282, 0.5, 0),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(1, -437, 0.5, 0),
     Size = UDim2.fromOffset(310, 490),
     BackgroundColor3 = THEME.panel,
     BorderSizePixel = 0,
@@ -6898,6 +6911,17 @@ local function updatePublicUiScale()
             0.78,
             1
         )
+    -- The Auto Trader is already compact enough to fit most PC viewports at 1:1.
+    -- Avoid fractional 0.91/0.94 scaling unless it is actually required; fractional
+    -- UIScale was a major source of soft/aliased-looking small text.
+    local autoScale = 1
+    if viewport.X < 730 or viewport.Y < 650 then
+        local rawAutoScale = clamp(math.min((viewport.X - 20) / 704, (viewport.Y - 20) / 624), 0.78, 1)
+        autoScale = math.floor(rawAutoScale * 20 + 0.5) / 20
+    end
+    if State.AutoTrader then
+        State.AutoTrader.UiScaleTarget = autoScale
+    end
     if UI.TradePanelScale
         and UI.TradePanelScale.Parent then
         UI.TradePanelScale.Scale =
@@ -6911,11 +6935,11 @@ local function updatePublicUiScale()
     if UI.AutoTraderScale
         and UI.AutoTraderScale.Parent then
         UI.AutoTraderScale.Scale =
-            scale
+            autoScale
     end
     if UI.AutoTraderLauncherScale
         and UI.AutoTraderLauncherScale.Parent then
-        UI.AutoTraderLauncherScale.Scale = scale
+        UI.AutoTraderLauncherScale.Scale = autoScale
     end
     task.defer(function() if not Destroyed then clampAutoTraderPanelPosition(false) end end)
 end
@@ -9926,13 +9950,24 @@ State.AutoTrader.GetVerifiedTeleportContinuationSource = function()
     return body
 end
 
-State.AutoTrader.CanonicalizeCapturedDistributionSource = function(candidate)
+State.AutoTrader.NormalizeCapturedDistributionEnvelope = function(candidate)
     if type(candidate) ~= "string" or #candidate < 1000 then return nil, "candidate source missing/too small" end
     local body = candidate
     if string.sub(body, 1, 3) == string.char(239,187,191) then body = string.sub(body, 4) end
     body = string.gsub(body, "\r\n", "\n")
     if string.sub(body, -2) == "\n\n" then return nil, "candidate source has multiple trailing newlines" end
     if string.sub(body, -1) ~= "\n" then body = body .. "\n" end
+    local declaredVersion = body:match('local%s+CONFIG%s*=%s*%{%s*version%s*=%s*"([^"]+)"')
+    if declaredVersion ~= CONTROLLER_VERSION then return nil, "controller version marker mismatch" end
+    local declaredSha = body:match('distributionNormalizedSha256%s*=%s*"([0-9a-fA-F]+)"')
+    if type(declaredSha) ~= "string" or string.lower(declaredSha) ~= string.lower(HARDEN.distributionNormalizedSha256) then
+        return nil, "distribution declared SHA-256 mismatch"
+    end
+    return body
+end
+State.AutoTrader.CanonicalizeCapturedDistributionSource = function(candidate)
+    local body, envelopeError = State.AutoTrader.NormalizeCapturedDistributionEnvelope(candidate)
+    if not body then return nil, envelopeError end
     local valid, detail = verifyDistributionSource(body)
     if valid then return body end
     return nil, tostring(detail or "source did not match this build")
@@ -9965,6 +10000,9 @@ State.AutoTrader.TryCaptureCurrentDistributionSource = function()
     local readfileFunction = State.TryGetExecutorGlobal("readfile")
     if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
         local names = {
+            "SV_AutoTrader_v50_aero_motion_readability.lua",
+            "SV_AutoTrader_v49_ui_micro_polish_performance.lua",
+            "SV_AutoTrader_v48_2_unified_aero_ui_syntax_fixed.lua",
             "SV_AutoTrader_v47_nextgen_384_tests.lua",
             "SV_AutoTrader_v46_cooperative_selftests.lua",
             "SV_AutoTrader_v44_invariance_tests.lua",
@@ -14635,13 +14673,13 @@ State.AutoTrader.ShowSuccessNotification = function(partner, plan, auditText)
         Name = "SV_AutoTraderSuccessNotification",
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, -18, 0, 18),
-        Size = UDim2.fromOffset(310, 92),
+        Size = UDim2.fromOffset(320, 104),
         BackgroundColor3 = Color3.fromRGB(235, 248, 240),
         BorderSizePixel = 0,
         ZIndex = 1900,
     }, UI.RootGui)
     UI.AutoTraderSuccessNotification = frame
-    addCorner(frame, 6)
+    addCorner(frame, 9)
     addStroke(frame, Color3.fromRGB(86, 157, 75), 1, 0.12)
     create("UIGradient", {
         Color = ColorSequence.new({
@@ -14650,7 +14688,7 @@ State.AutoTrader.ShowSuccessNotification = function(partner, plan, auditText)
         }),
         Rotation = 90,
     }, frame)
-    local title = makeLabel(frame, "AUTO TRADE COMPLETE", 11, Color3.fromRGB(37, 116, 47), Enum.Font.ArialBold)
+    local title = makeLabel(frame, "AUTO TRADE COMPLETE", 12, Color3.fromRGB(37, 116, 47), Enum.Font.GothamBold)
     title.Position = UDim2.fromOffset(12, 8)
     title.Size = UDim2.new(1, -48, 0, 18)
     title.ZIndex = 1901
@@ -14669,19 +14707,25 @@ State.AutoTrader.ShowSuccessNotification = function(partner, plan, auditText)
     if auditText and auditText ~= "" then
         details = details .. "\n" .. auditText
     end
-    local body = makeLabel(frame, details, 9, THEME.text, Enum.Font.Arial)
-    body.Position = UDim2.fromOffset(12, 29)
-    body.Size = UDim2.new(1, -24, 0, 54)
+    local body = makeLabel(frame, details, 10, THEME.text, Enum.Font.Gotham)
+    body.Position = UDim2.fromOffset(12, 30)
+    body.Size = UDim2.new(1, -24, 0, 66)
     body.TextWrapped = true
     body.TextYAlignment = Enum.TextYAlignment.Top
     body.ZIndex = 1901
     local close = makeButton(frame, "×", UDim2.fromOffset(26, 22), THEME.panel2)
     close.Position = UDim2.new(1, -34, 0, 7)
     close.TextColor3 = THEME.muted
+    local closeCorner = close:FindFirstChildOfClass("UICorner")
+    if closeCorner then closeCorner.CornerRadius = UDim.new(0, 6) end
     close.ZIndex = 1902
     connect(close.MouseButton1Click, function()
         if frame.Parent then
-            frame:Destroy()
+            if State.AutoTrader and type(State.AutoTrader.DismissSuccessNotificationAnimated) == "function" then
+                State.AutoTrader.DismissSuccessNotificationAnimated(frame)
+            else
+                frame:Destroy()
+            end
         end
     end)
     task.delay(CONFIG.AutoTraderSuccessNotificationSeconds, function()
@@ -14689,7 +14733,11 @@ State.AutoTrader.ShowSuccessNotification = function(partner, plan, auditText)
             return
         end
         if frame.Parent then
-            frame:Destroy()
+            if State.AutoTrader and type(State.AutoTrader.DismissSuccessNotificationAnimated) == "function" then
+                State.AutoTrader.DismissSuccessNotificationAnimated(frame)
+            else
+                frame:Destroy()
+            end
         end
     end)
 end
@@ -17652,30 +17700,30 @@ do
 -- is horizontal to reclaim width, surfaces are light and glassy rather than
 -- futuristic-dark, and diagnostics are preserved with larger, crisper text.
 local AERO = {
-    shellTop = Color3.fromRGB(181, 220, 241),
-    shellMid = Color3.fromRGB(127, 188, 221),
-    shellBottom = Color3.fromRGB(89, 154, 193),
-    glassTop = Color3.fromRGB(133, 207, 241),
-    glassBottom = Color3.fromRGB(48, 132, 190),
-    tabBarTop = Color3.fromRGB(244, 250, 253),
-    tabBarBottom = Color3.fromRGB(214, 231, 241),
+    shellTop = Color3.fromRGB(198, 229, 245),
+    shellMid = Color3.fromRGB(132, 193, 225),
+    shellBottom = Color3.fromRGB(88, 158, 198),
+    glassTop = Color3.fromRGB(154, 219, 248),
+    glassBottom = Color3.fromRGB(50, 137, 195),
+    tabBarTop = Color3.fromRGB(250, 253, 255),
+    tabBarBottom = Color3.fromRGB(218, 235, 244),
     cardTop = Color3.fromRGB(255, 255, 255),
-    cardBottom = Color3.fromRGB(229, 240, 247),
-    cardAltTop = Color3.fromRGB(246, 253, 255),
-    cardAltBottom = Color3.fromRGB(219, 237, 247),
-    selectedTop = Color3.fromRGB(134, 205, 241),
-    selectedBottom = Color3.fromRGB(66, 148, 204),
-    selectedBorder = Color3.fromRGB(79, 139, 176),
-    greenTop = Color3.fromRGB(170, 222, 116),
-    greenBottom = Color3.fromRGB(88, 159, 58),
-    buttonTop = Color3.fromRGB(252, 254, 255),
-    buttonBottom = Color3.fromRGB(211, 229, 240),
+    cardBottom = Color3.fromRGB(232, 243, 249),
+    cardAltTop = Color3.fromRGB(249, 254, 255),
+    cardAltBottom = Color3.fromRGB(224, 241, 249),
+    selectedTop = Color3.fromRGB(149, 215, 246),
+    selectedBottom = Color3.fromRGB(66, 151, 207),
+    selectedBorder = Color3.fromRGB(76, 139, 178),
+    greenTop = Color3.fromRGB(181, 230, 130),
+    greenBottom = Color3.fromRGB(91, 164, 61),
+    buttonTop = Color3.fromRGB(255, 255, 255),
+    buttonBottom = Color3.fromRGB(216, 234, 244),
     buttonHoverTop = Color3.fromRGB(255, 255, 255),
-    buttonHoverBottom = Color3.fromRGB(194, 222, 239),
-    page = Color3.fromRGB(238, 246, 251),
-    recessed = Color3.fromRGB(225, 238, 246),
+    buttonHoverBottom = Color3.fromRGB(199, 226, 241),
+    page = Color3.fromRGB(243, 249, 252),
+    recessed = Color3.fromRGB(228, 241, 248),
     highlight = Color3.fromRGB(255, 255, 255),
-    shadow = Color3.fromRGB(77, 111, 132),
+    shadow = Color3.fromRGB(68, 104, 125),
 }
 
 local function aeroGradient(parent, topColor, bottomColor, rotation)
@@ -17704,32 +17752,52 @@ local function aeroButton(parent, text, size, accent)
         accent and AERO.greenBottom or AERO.buttonBottom,
         90
     )
-    connect(button.MouseEnter, function()
+
+    -- Some accent buttons are stateful (notably the main Auto Trader toggle).
+    -- Hover/leave must resolve the *current* state instead of restoring the
+    -- construction-time accent, otherwise a stopped gray button gets stuck green.
+    local function statefulAutomation()
+        return button:GetAttribute("SVStatefulAutomation") == true
+    end
+    local function automationRunning()
+        return State.AutoTrader and State.AutoTrader.Preferences
+            and State.AutoTrader.Preferences.automation == true
+    end
+    local function baseColor()
+        if statefulAutomation() then
+            return automationRunning() and AERO.greenBottom or AERO.buttonBottom
+        end
+        return accent and AERO.greenBottom or AERO.buttonBottom
+    end
+    local function hoverColor()
+        if statefulAutomation() and not automationRunning() then return AERO.buttonHoverBottom end
+        return accent and Color3.fromRGB(111, 177, 73) or AERO.buttonHoverBottom
+    end
+    local function downColor()
+        if statefulAutomation() and not automationRunning() then return Color3.fromRGB(184, 214, 233) end
+        return accent and Color3.fromRGB(78, 143, 51) or Color3.fromRGB(184, 214, 233)
+    end
+
+    -- These are instance-scoped cosmetic connections. Destroying a dynamic button
+    -- disconnects them automatically and keeps render-purity accounting stable.
+    button.MouseEnter:Connect(function()
         if button.Parent then
-            TweenService:Create(button, TweenInfo.new(0.1), {
-                BackgroundColor3 = accent and Color3.fromRGB(111, 177, 73) or AERO.buttonHoverBottom,
-            }):Play()
+            TweenService:Create(button, TweenInfo.new(0.1), {BackgroundColor3 = hoverColor()}):Play()
         end
     end)
-    connect(button.MouseLeave, function()
+    button.MouseLeave:Connect(function()
         if button.Parent then
-            TweenService:Create(button, TweenInfo.new(0.1), {
-                BackgroundColor3 = accent and AERO.greenBottom or AERO.buttonBottom,
-            }):Play()
+            TweenService:Create(button, TweenInfo.new(0.1), {BackgroundColor3 = baseColor()}):Play()
         end
     end)
-    connect(button.MouseButton1Down, function()
+    button.MouseButton1Down:Connect(function()
         if button.Parent then
-            TweenService:Create(button, TweenInfo.new(0.05), {
-                BackgroundColor3 = accent and Color3.fromRGB(78, 143, 51) or Color3.fromRGB(184, 214, 233),
-            }):Play()
+            TweenService:Create(button, TweenInfo.new(0.05), {BackgroundColor3 = downColor()}):Play()
         end
     end)
-    connect(button.MouseButton1Up, function()
+    button.MouseButton1Up:Connect(function()
         if button.Parent then
-            TweenService:Create(button, TweenInfo.new(0.08), {
-                BackgroundColor3 = accent and Color3.fromRGB(111, 177, 73) or AERO.buttonHoverBottom,
-            }):Play()
+            TweenService:Create(button, TweenInfo.new(0.08), {BackgroundColor3 = hoverColor()}):Play()
         end
     end)
     return button
@@ -17742,8 +17810,8 @@ UI.AutoTraderLauncher = aeroButton(
     false
 )
 UI.AutoTraderLauncher.Name = "SV_AutoTraderLauncher"
-UI.AutoTraderLauncher.AnchorPoint = Vector2.new(1, 1)
-UI.AutoTraderLauncher.Position = UDim2.new(1, -18, 1, -18)
+UI.AutoTraderLauncher.AnchorPoint = Vector2.new(0.5, 0.5)
+UI.AutoTraderLauncher.Position = UDim2.new(1, -93, 1, -35)
 UI.AutoTraderLauncher.ZIndex = 1500
 UI.AutoTraderLauncher.TextColor3 = THEME.text
 UI.AutoTraderLauncher.TextSize = 11
@@ -17751,8 +17819,8 @@ UI.AutoTraderLauncherScale = create("UIScale", {Scale = 1}, UI.AutoTraderLaunche
 
 UI.AutoTraderPanelShadow = create("Frame", {
     Name = "SV_AutoTraderPanelShadow",
-    AnchorPoint = Vector2.new(1, 0.5),
-    Position = UDim2.new(1, -19, 0.5, 5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(1, -344, 0.5, 5),
     Size = UDim2.fromOffset(650, 600),
     BackgroundColor3 = Color3.fromRGB(24, 52, 68),
     BackgroundTransparency = 0.78,
@@ -17764,8 +17832,8 @@ addCorner(UI.AutoTraderPanelShadow, 8)
 
 UI.AutoTraderPanel = create("Frame", {
     Name = "SV_AutoTraderPanel",
-    AnchorPoint = Vector2.new(1, 0.5),
-    Position = UDim2.new(1, -24, 0.5, 0),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(1, -349, 0.5, 0),
     Size = UDim2.fromOffset(650, 600),
     BackgroundColor3 = AERO.shellBottom,
     BorderSizePixel = 0,
@@ -17775,9 +17843,11 @@ UI.AutoTraderPanel = create("Frame", {
 }, UI.RootGui)
 if type(State.AutoTrader.Preferences.panelPosition) == "table" then
     local p = State.AutoTrader.Preferences.panelPosition
+    local savedXOffset = tonumber(p.xo) or -24
+    if p.anchor ~= "center" then savedXOffset -= 325 end
     UI.AutoTraderPanel.Position = UDim2.new(
         tonumber(p.xs) or 1,
-        tonumber(p.xo) or -24,
+        savedXOffset,
         tonumber(p.ys) or 0.5,
         tonumber(p.yo) or 0
     )
@@ -17809,7 +17879,7 @@ clampAutoTraderPanelPosition = function(save)
     end
     if save then
         local pos = UI.AutoTraderPanel.Position
-        State.AutoTrader.Preferences.panelPosition = {xs=pos.X.Scale,xo=pos.X.Offset,ys=pos.Y.Scale,yo=pos.Y.Offset}
+        State.AutoTrader.Preferences.panelPosition = {xs=pos.X.Scale,xo=pos.X.Offset,ys=pos.Y.Scale,yo=pos.Y.Offset,anchor="center"}
         State.AutoTrader.SavePreferences()
     end
 end
@@ -18363,13 +18433,14 @@ UI.AutoTraderResetPosition.TextSize = 10
 UI.AutoTraderResetPosition.ZIndex = 1454
 connect(UI.AutoTraderResetPosition.MouseButton1Click, function()
     if Destroyed then return end
-    UI.AutoTraderPanel.Position = UDim2.new(1, -24, 0.5, 0)
+    UI.AutoTraderPanel.Position = UDim2.new(1, -349, 0.5, 0)
     State.AutoTrader.Preferences.panelPosition = nil
     State.AutoTrader.SavePreferences()
     task.defer(function() clampAutoTraderPanelPosition(true) end)
 end)
 
 UI.AutoTraderEnabled = aeroButton(settingsPage, "", UDim2.new(1, 0, 0, 34), true)
+UI.AutoTraderEnabled:SetAttribute("SVStatefulAutomation", true)
 UI.AutoTraderEnabled.Position = UDim2.fromOffset(0, 28)
 UI.AutoTraderEnabled.TextSize = 12
 UI.AutoTraderEnabled.ZIndex = 1454
@@ -18502,7 +18573,8 @@ State.AutoTrader.SetActiveTab = setActiveAutoTraderTab
 for name, button in pairs(UI.AutoTraderTabButtons) do
     local tabName = name
     connect(button.MouseButton1Click, function()
-        setActiveAutoTraderTab(tabName)
+        local switcher = State.AutoTrader.SetActiveTab or setActiveAutoTraderTab
+        switcher(tabName)
     end)
 end
 setActiveAutoTraderTab(State.AutoTrader.ActiveTab or "HOME")
@@ -18584,7 +18656,32 @@ end
 State.AutoTrader.RebuildReserveList = function()
     if not UI.AutoTraderReserveContent or not UI.AutoTraderReserveContent.Parent then return end
     clearDynamic(UI.AutoTraderReserveContent)
-    local inventory, reason = State.AutoTrader.GetLocalInventory(false)
+    local inventory = State.AutoTrader.InventoryCache
+    local reason = nil
+    local remoteState = State.Profile and State.Profile.remoteTotals
+    local lastSuccess = remoteState and remoteState.lastSuccessByUserId and remoteState.lastSuccessByUserId[LocalPlayer.UserId] or nil
+    local cacheCurrent = inventory and lastSuccess and State.AutoTrader.InventoryCacheStamp == lastSuccess
+    if not cacheCurrent then
+        inventory = nil
+        reason = "Refreshing verified inventory..."
+        local refreshNow = os.clock()
+        if not State.AutoTrader.ComprehensiveSelfTestRunning
+            and (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0) <= 0
+            and not State.AutoTrader.ReserveUiRefreshQueued
+            and refreshNow - (tonumber(State.AutoTrader.ReserveUiRefreshLastAt) or 0) >= 0.75 then
+            State.AutoTrader.ReserveUiRefreshQueued = true
+            State.AutoTrader.ReserveUiRefreshLastAt = refreshNow
+            task.defer(function()
+                if Destroyed then return end
+                State.AutoTrader.GetLocalInventory(false)
+                State.AutoTrader.ReserveUiRefreshQueued = false
+                if not Destroyed and UI.AutoTraderPanel and UI.AutoTraderPanel.Visible
+                    and State.AutoTrader.ActiveTab == "SETTINGS" then
+                    State.AutoTrader.RebuildReserveList()
+                end
+            end)
+        end
+    end
     if not inventory then
         local label = makeLabel(UI.AutoTraderReserveContent, tostring(reason or "Waiting for inventory..."), 10, THEME.faint, Enum.Font.Arial)
         label.Size = UDim2.new(1, 0, 0, 30); label.TextWrapped = true; label.ZIndex = 1453
@@ -18911,7 +19008,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         local row = create("Frame", {Size = UDim2.new(1, 0, 0, 60), BackgroundColor3 = THEME.panel2, BorderSizePixel = 0, ZIndex = 1454}, UI.AutoTraderBotContent); addCorner(row, 4)
         aeroStroke(row, THEME.border, 0.55)
         aeroGradient(row, AERO.cardAltTop, AERO.cardAltBottom, 90)
-        local img = create("ImageLabel", {Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(player.UserId) .. "&w=150&h=150", ZIndex = 1455}, row); addCorner(img, 4)
+        local img = create("ImageLabel", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(30, 31), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(player.UserId) .. "&w=150&h=150", ScaleType = Enum.ScaleType.Crop, ZIndex = 1455}, row); addCorner(img, 4)
         local class = info and info.class or "unknown"
         local goldJobs = tonumber(info and info.goldJobs) or 0
         local classColor = class == "confirmed_bot" and THEME.red or (class == "known_bot" or class == "observed_bot") and THEME.yellow or THEME.faint
@@ -18945,7 +19042,7 @@ State.AutoTrader.RebuildBotDashboard = function()
         aeroStroke(row, THEME.border, 0.55)
         aeroGradient(row, AERO.cardAltTop, AERO.cardAltBottom, 90)
         if tonumber(r.sampleUserId) then
-            local img = create("ImageLabel", {Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(math.floor(r.sampleUserId)) .. "&w=150&h=150", ZIndex = 1455}, row); addCorner(img, 4)
+            local img = create("ImageLabel", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(30, 31), Size = UDim2.fromOffset(50, 50), BackgroundColor3 = THEME.panel3, BorderSizePixel = 0, Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(math.floor(r.sampleUserId)) .. "&w=150&h=150", ScaleType = Enum.ScaleType.Crop, ZIndex = 1455}, row); addCorner(img, 4)
         end
         local classColor = info.class == "confirmed_bot" and THEME.red or THEME.yellow
         local title = makeLabel(row, (r.sampleName and (r.sampleName .. " · ") or "") .. string.upper(info.class), 10, classColor, Enum.Font.ArialBold); title.Position = UDim2.fromOffset(64, 6); title.Size = UDim2.new(1, -72, 0, 17); title.TextTruncate = Enum.TextTruncate.AtEnd; title.ZIndex = 1455
@@ -18980,7 +19077,9 @@ end
 
 State.AutoTrader.Render = function()
     local now = os.clock()
-    local minimumInterval = 1 / 30
+    local panelVisible = UI.AutoTraderPanel and UI.AutoTraderPanel.Visible == true
+    local feedVisible = UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Visible == true
+    local minimumInterval = panelVisible and (1 / 10) or (feedVisible and (1 / 6) or (1 / 3))
     local since = now - (State.AutoTrader.LastRenderedAt or 0)
     if since < minimumInterval then
         if not State.AutoTrader.RenderQueued then
@@ -18996,6 +19095,14 @@ State.AutoTrader.Render = function()
     State.AutoTrader.RenderQueued = false
     State.AutoTrader.LastRenderedAt = now
     State.AutoTrader.RenderCount = (State.AutoTrader.RenderCount or 0) + 1
+    if not panelVisible then
+        local hiddenSession = State.AutoTrader.UiSession or {}
+        local hiddenElapsed = math.max(1, os.clock() - (tonumber(hiddenSession.startedAt) or os.clock()))
+        local hiddenProfit = tonumber(hiddenSession.profit) or 0
+        UI.AutoTraderLauncher.Text = "Auto Trader  ·  +" .. formatCompact(hiddenProfit)
+        UI.AutoTraderLauncher.TextColor3 = State.AutoTrader.Preferences.automation and THEME.green or THEME.blue
+        return
+    end
     State.AutoTrader.UpdateControls()
     local status = State.AutoTrader.Status or "IDLE"
     local color = statusColor(status)
@@ -19004,7 +19111,7 @@ State.AutoTrader.Render = function()
     local elapsed = math.max(1, os.clock() - (tonumber(session.startedAt) or os.clock()))
     local profit = tonumber(session.profit) or 0
     local profitHour = profit / elapsed * 3600
-    UI.AutoTraderLauncher.Text = "AUTO TRADER · +" .. formatCompact(profit)
+    UI.AutoTraderLauncher.Text = "Auto Trader  ·  +" .. formatCompact(profit)
     UI.AutoTraderLauncher.TextColor3 = State.AutoTrader.Preferences.automation and THEME.green or THEME.blue
     UI.AutoTraderHeaderMetric.Text = "+" .. formatCompact(profit) .. " · " .. formatCompact(profitHour) .. "/hr"
     UI.AutoTraderHeaderMetric.TextColor3 = profit > 0 and THEME.green or THEME.blue
@@ -19206,16 +19313,16 @@ State.AutoTrader.Render = function()
     if UI.AutoTraderPanel.Visible then
         local renderNow = os.clock()
         if State.AutoTrader.ActiveTab == "PEOPLE" then
-            if renderNow - (State.AutoTrader.LastPlayerDashboardBuildAt or 0) >= 0.5 then
+            if renderNow - (State.AutoTrader.LastPlayerDashboardBuildAt or 0) >= 0.8 then
                 State.AutoTrader.LastPlayerDashboardBuildAt = renderNow
                 State.AutoTrader.RebuildPlayerDashboard()
             end
         elseif State.AutoTrader.ActiveTab == "SERVERS" then
-            if renderNow - (State.AutoTrader.LastServerDashboardBuildAt or 0) >= 0.8 then
+            if renderNow - (State.AutoTrader.LastServerDashboardBuildAt or 0) >= 1.5 then
                 State.AutoTrader.LastServerDashboardBuildAt = renderNow
                 State.AutoTrader.RebuildServerDashboard()
             end
-            if renderNow - (State.AutoTrader.LastBotDashboardBuildAt or 0) >= 0.8 then
+            if renderNow - (State.AutoTrader.LastBotDashboardBuildAt or 0) >= 1.5 then
                 State.AutoTrader.LastBotDashboardBuildAt = renderNow
                 State.AutoTrader.RebuildBotDashboard()
             end
@@ -20178,24 +20285,34 @@ State.AutoTrader.Tick = function()
     end
 end
 connect(UI.AutoTraderLauncher.MouseButton1Click, function()
-    UI.AutoTraderPanel.Visible = not UI.AutoTraderPanel.Visible
-    if UI.AutoTraderPanelShadow then
-        UI.AutoTraderPanelShadow.Visible = UI.AutoTraderPanel.Visible
-        UI.AutoTraderPanelShadow.Position = UDim2.new(UI.AutoTraderPanel.Position.X.Scale, UI.AutoTraderPanel.Position.X.Offset + 5, UI.AutoTraderPanel.Position.Y.Scale, UI.AutoTraderPanel.Position.Y.Offset + 5)
+    local show = not UI.AutoTraderPanel.Visible
+    if type(State.AutoTrader.SetPanelVisibleAnimated) == "function" then
+        State.AutoTrader.SetPanelVisibleAnimated(show)
+    else
+        UI.AutoTraderPanel.Visible = show
+        if UI.AutoTraderPanelShadow then UI.AutoTraderPanelShadow.Visible = show end
     end
-    if UI.AutoTraderPanel.Visible then
-        State.AutoTrader.GetLocalInventory(true)
-        State.AutoTrader.RebuildReserveList()
-        if isTradeVisible and isTradeVisible() then
-            scheduleTradeRefresh(0)
-        else
-            State.AutoTrader.OnNoTrade()
-        end
+    if show then
+        -- Let the opening animation paint before doing the verified inventory refresh.
+        task.defer(function()
+            if Destroyed then return end
+            State.AutoTrader.GetLocalInventory(true)
+            State.AutoTrader.RebuildReserveList()
+            if isTradeVisible and isTradeVisible() then
+                scheduleTradeRefresh(0)
+            else
+                State.AutoTrader.OnNoTrade()
+            end
+        end)
     end
 end)
 connect(UI.AutoTraderClose.MouseButton1Click, function()
-    UI.AutoTraderPanel.Visible = false
-    if UI.AutoTraderPanelShadow then UI.AutoTraderPanelShadow.Visible = false end
+    if type(State.AutoTrader.SetPanelVisibleAnimated) == "function" then
+        State.AutoTrader.SetPanelVisibleAnimated(false)
+    else
+        UI.AutoTraderPanel.Visible = false
+        if UI.AutoTraderPanelShadow then UI.AutoTraderPanelShadow.Visible = false end
+    end
 end)
 connect(UI.AutoTraderCanary.MouseButton1Click, function()
     local targetArmed = not State.AutoTrader.SupervisedCanaryArmed
@@ -20228,7 +20345,7 @@ State.AutoTrader.FenceOutstandingRequestForAutomationOff = function()
     return started, reason
 end
 
-connect(UI.AutoTraderEnabled.MouseButton1Click, function()
+State.AutoTrader.ToggleAutomationFromUi = function()
     if not State.AutoTrader.Preferences.automation
         and State.AutoTrader.SupervisedCanaryArmed
         and State.AutoTrader.SupervisedCanaryStarted then
@@ -20286,7 +20403,8 @@ connect(UI.AutoTraderEnabled.MouseButton1Click, function()
     if not isTradeVisible() then
         State.AutoTrader.OnNoTrade()
     end
-end)
+end
+connect(UI.AutoTraderEnabled.MouseButton1Click, State.AutoTrader.ToggleAutomationFromUi)
 connect(UI.AutoTraderIgnoreFriends.MouseButton1Click, function()
     State.AutoTrader.Preferences.ignoreFriends = not State.AutoTrader.Preferences.ignoreFriends
     State.AutoTrader.SavePreferences()
@@ -20577,8 +20695,8 @@ local function renderNotes(notes)
             BorderSizePixel = 0,
             Text = tostring(index) .. ". " .. tostring(text),
             TextColor3 = THEME.muted,
-            TextSize = 10,
-            Font = Enum.Font.Arial,
+            TextSize = 11,
+            Font = Enum.Font.Gotham,
             TextWrapped = true,
             TextXAlignment = Enum.TextXAlignment.Left,
             TextYAlignment = Enum.TextYAlignment.Top,
@@ -20589,9 +20707,9 @@ local function renderNotes(notes)
         local empty = makeLabel(
             UI.NotesContent,
             "Add items to both sides to see an explanation.",
-            10,
+            11,
             THEME.faint,
-            Enum.Font.Arial
+            Enum.Font.Gotham
         )
         empty.Size = UDim2.new(1, 0, 0, 40)
         empty.TextWrapped = true
@@ -21053,9 +21171,9 @@ local function discoverTradeGui(force)
     if TradePanel.Parent ~= hostGui then
         TradePanel.Parent = hostGui
         TradePanel.AnchorPoint =
-            Vector2.new(1, 0.5)
+            Vector2.new(0.5, 0.5)
         TradePanel.Position =
-            UDim2.new(1, -12, 0.5, 0)
+            UDim2.new(1, -167, 0.5, 0)
         TradePanel.ZIndex = 1000
     end
     return finishTradeDiscovery(true, false)
@@ -21167,6 +21285,27 @@ local function refreshTrackedCards()
         })
     end
 end
+
+-- v49: transient MM2 card rebuilds only need a visual retry. Debounce the retry
+-- across all cards and do not clear decision/value caches or advance planner state.
+State.AutoTrader.RequestPresentationUiRefresh = function()
+    if Destroyed or State.AutoTrader.PresentationRefreshQueued then
+        return false
+    end
+    State.AutoTrader.PresentationRefreshQueued = true
+    task.delay(0.08, function()
+        if Destroyed then
+            return
+        end
+        State.AutoTrader.PresentationRefreshQueued = false
+        refreshTrackedCards()
+        if isTradeVisible() and scheduleTradeRefresh then
+            scheduleTradeRefresh(0.04)
+        end
+    end)
+    return true
+end
+
 local function getTradeOfferSlots(offerRoot)
     -- Keep MM2's native slot number as the authority. A transiently missing NewItem2
     -- must never compact NewItem3 into visual index 2 and paint the wrong value badge.
@@ -21570,8 +21709,11 @@ local function updateFromTradeState()
         discoverTradeGui()
     end
     local visible = isTradeVisible()
-    TradePanel.Visible =
-        visible and CONFIG.TradePanel
+    if State.AutoTrader and type(State.AutoTrader.SetTradeHelperVisibleAnimated) == "function" then
+        State.AutoTrader.SetTradeHelperVisibleAnimated(visible and CONFIG.TradePanel)
+    else
+        TradePanel.Visible = visible and CONFIG.TradePanel
+    end
     if not visible then
         clearAllTradeHighlights()
         State.AutoTrader.OnNoTrade()
@@ -21698,8 +21840,13 @@ if StartTradeRemote
                 end
                 discoverTradeGui(true)
                 if State.TradeGui then
-                    TradePanel.Visible = CONFIG.TradePanel
-                        and not State.AutoTrader.BackgroundSuppressed
+                    if type(State.AutoTrader.SetTradeHelperVisibleAnimated) == "function" then
+                        State.AutoTrader.SetTradeHelperVisibleAnimated(CONFIG.TradePanel
+                            and not State.AutoTrader.BackgroundSuppressed)
+                    else
+                        TradePanel.Visible = CONFIG.TradePanel
+                            and not State.AutoTrader.BackgroundSuppressed
+                    end
                 end
                 recoverTradeStatus()
                 scheduleTradeRefresh(0.10)
@@ -23278,9 +23425,13 @@ reconnectGuiWatchers = function()
                     "Enabled"
                 ):Connect(function()
                     if State.TradeGui.Enabled then
-                        TradePanel.Visible =
-                            CONFIG.TradePanel
-                            and not State.AutoTrader.BackgroundSuppressed
+                        if type(State.AutoTrader.SetTradeHelperVisibleAnimated) == "function" then
+                            State.AutoTrader.SetTradeHelperVisibleAnimated(CONFIG.TradePanel
+                                and not State.AutoTrader.BackgroundSuppressed)
+                        else
+                            TradePanel.Visible = CONFIG.TradePanel
+                                and not State.AutoTrader.BackgroundSuppressed
+                        end
                         task.delay(0.06, function()
                             if Destroyed then
                                 return
@@ -23292,7 +23443,11 @@ reconnectGuiWatchers = function()
                         State.CurrentTrade = nil
                         State.TradeHelperGeneration =
                             State.TradeHelperGeneration + 1
-                        TradePanel.Visible = false
+                        if type(State.AutoTrader.SetTradeHelperVisibleAnimated) == "function" then
+                            State.AutoTrader.SetTradeHelperVisibleAnimated(false)
+                        else
+                            TradePanel.Visible = false
+                        end
                         clearAllTradeHighlights()
                         State.AutoTrader.OnNoTrade()
                     end
@@ -28209,7 +28364,7 @@ do
         local refreshInFlight = false
         local pendingAuthCall = nil
         local refreshWorkerRunning = false
-        local productionRefreshPaused = true
+        local productionRefreshPaused = false
         local selfTestIsolationActive = false
         local resumeMemorySecret = nil
         local nextAttemptClock = 0
@@ -30160,7 +30315,7 @@ do
         if not State.AutoTrader.UpcomingServerBrowserOpen then return end
         local queue=State.AutoTrader.GetUpcomingServerCandidates()
         if #queue==0 then
-            local label=makeLabel(UI.AutoTraderServerCandidateContent,"Looking for upcoming servers automatically…",10,THEME.faint,Enum.Font.Arial)
+            local label=makeLabel(UI.AutoTraderServerCandidateContent,"Looking for upcoming servers automatically…",10,THEME.faint,Enum.Font.Gotham)
             label.Size=UDim2.new(1,0,0,44);label.TextWrapped=true;label.ZIndex=1454;return
         end
         local limit=math.max(1,tonumber(CONFIG.AutoTraderUpcomingServerUiLimit) or 12)
@@ -30173,7 +30328,7 @@ do
             local row=create("Frame",{Size=UDim2.new(1,0,0,110),BackgroundColor3=THEME.panel2,BorderSizePixel=0,ZIndex=1454},UI.AutoTraderServerCandidateContent)
             addCorner(row,4);UI.AutoTraderV37UiHelpers.stroke(row,THEME.border,0.5);UI.AutoTraderV37UiHelpers.gradient(row,UI.AutoTraderV37UiHelpers.palette.cardAltTop,UI.AutoTraderV37UiHelpers.palette.cardAltBottom,90)
             local id=tostring(server.id or "?");local short=#id>12 and (string.sub(id,1,8).."…") or id
-            local title=makeLabel(row,tostring(index)..". "..short.." · "..tostring(server.playing or "?").."/"..tostring(server.maxPlayers or "?"),10,THEME.text,Enum.Font.ArialBold)
+            local title=makeLabel(row,tostring(index)..". "..short.." · "..tostring(server.playing or "?").."/"..tostring(server.maxPlayers or "?"),10,THEME.text,Enum.Font.GothamBold)
             title.Position=UDim2.fromOffset(8,4);title.Size=UDim2.new(1,-106,0,17);title.ZIndex=1455
             local verdict
             if previewUi.previewTokenSource==State.AutoTrader.DirectAuthPolicy.source
@@ -30183,26 +30338,26 @@ do
             else
                 verdict=trusted and ("trusted bot matches "..UI.AutoTraderV37UiHelpers.pct01(preview.goldMatchRatio or 0).." (strict + manual provenance)") or previewUi.title
             end
-            local sub=makeLabel(row,verdict.." · actual selector order",9,trusted and THEME.muted or THEME.yellow,Enum.Font.Arial)
+            local sub=makeLabel(row,verdict.." · actual selector order",9,trusted and THEME.muted or THEME.yellow,Enum.Font.Gotham)
             sub.Position=UDim2.fromOffset(8,21);sub.Size=UDim2.new(1,-106,0,15);sub.ZIndex=1455
             local useDisplay=type(server.previewDisplayThumbnailUrls)=="table" and #server.previewDisplayThumbnailUrls>0
             local urls=useDisplay and server.previewDisplayThumbnailUrls or (type(server.previewThumbnailUrls)=="table" and server.previewThumbnailUrls or {})
             local hashes=useDisplay and (type(server.previewDisplayCanonicalFingerprints)=="table" and server.previewDisplayCanonicalFingerprints or {}) or (type(server.previewFingerprints)=="table" and server.previewFingerprints or {})
             for imageIndex=1,math.min(#urls,iconLimit) do
                 local x=8+(imageIndex-1)*36
-                local unavailable=makeLabel(row,"N/A",7,THEME.faint,Enum.Font.ArialBold);unavailable.Position=UDim2.fromOffset(x,42);unavailable.Size=UDim2.fromOffset(32,32);unavailable.TextWrapped=true;unavailable.Visible=false;unavailable.ZIndex=1457
-                local image=create("ImageLabel",{Position=UDim2.fromOffset(x,42),Size=UDim2.fromOffset(32,32),BackgroundColor3=THEME.panel3,BorderSizePixel=0,Image="",ZIndex=1456},row);addCorner(image,4)
+                local unavailable=makeLabel(row,"N/A",7,THEME.faint,Enum.Font.GothamBold);unavailable.AnchorPoint=Vector2.new(0.5,0.5);unavailable.Position=UDim2.fromOffset(x+16,58);unavailable.Size=UDim2.fromOffset(32,32);unavailable.TextWrapped=true;unavailable.TextXAlignment=Enum.TextXAlignment.Center;unavailable.TextYAlignment=Enum.TextYAlignment.Center;unavailable.Visible=false;unavailable.ZIndex=1457
+                local image=create("ImageLabel",{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromOffset(x+16,58),Size=UDim2.fromOffset(32,32),BackgroundColor3=THEME.panel3,BorderSizePixel=0,Image="",ScaleType=Enum.ScaleType.Crop,ZIndex=1456},row);addCorner(image,4)
                 State.AutoTrader.BindUpcomingThumbnailImage(image,urls[imageIndex],hashes[imageIndex],thumbnailGeneration,unavailable)
             end
             if #urls==0 then
-                local evidence=makeLabel(row,previewUi.detail,9,previewUi.state=="NO_ROSTER_TOKENS" and THEME.yellow or THEME.faint,Enum.Font.ArialBold)
+                local evidence=makeLabel(row,previewUi.detail,9,previewUi.state=="NO_ROSTER_TOKENS" and THEME.yellow or THEME.faint,Enum.Font.GothamBold)
                 evidence.Position=UDim2.fromOffset(8,43);evidence.Size=UDim2.new(1,-110,0,31);evidence.TextWrapped=true;evidence.ZIndex=1455
             end
             local disclosure=previewUi.disclosure
             if previewUi.canPromoteFingerprintEvidence and (#hashes>iconLimit or #urls>iconLimit) then
                 disclosure="Showing "..tostring(math.min(#urls,iconLimit)).."/"..tostring(#urls).." thumbnails · BOT SERVER promotes all "..tostring(#hashes).." captured fingerprint(s) as manual evidence."
             end
-            local scope=makeLabel(row,disclosure,8,THEME.faint,Enum.Font.Arial);scope.Position=UDim2.fromOffset(8,80);scope.Size=UDim2.new(1,-8,0,24);scope.TextWrapped=true;scope.ZIndex=1455
+            local scope=makeLabel(row,disclosure,8,THEME.faint,Enum.Font.Gotham);scope.Position=UDim2.fromOffset(8,80);scope.Size=UDim2.new(1,-8,0,24);scope.TextWrapped=true;scope.ZIndex=1455
             local mark=UI.AutoTraderV37UiHelpers.button(row,previewUi.actionText,UDim2.fromOffset(88,28),false);mark.Position=UDim2.new(1,-96,0,48);mark.TextColor3=previewUi.canPromoteFingerprintEvidence and THEME.red or THEME.yellow;mark.TextSize=9;mark.ZIndex=1457
             local clickConnection
             clickConnection=mark.MouseButton1Click:Connect(function()
@@ -34659,23 +34814,24 @@ end
     if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent then UI.AutoTraderThoughtFeed:Destroy() end
     UI.AutoTraderThoughtFeed = create("Frame", {
         Name="SV_AutoTraderThoughtFeed",AnchorPoint=Vector2.new(0.5,0),Position=UDim2.new(0.5,0,0,10),
-        Size=UDim2.fromOffset(560,126),BackgroundColor3=skyBottom,BorderSizePixel=0,Visible=false,Active=false,ZIndex=FEED_Z,
+        Size=UDim2.new(1,-32,0,164),BackgroundColor3=skyBottom,BorderSizePixel=0,Visible=false,Active=true,ZIndex=FEED_Z,
     }, UI.RootGui)
+    create("UISizeConstraint", {MaxSize=Vector2.new(580,164), MinSize=Vector2.new(320,36)}, UI.AutoTraderThoughtFeed)
     addCorner(UI.AutoTraderThoughtFeed,6)
     addStroke(UI.AutoTraderThoughtFeed,Color3.fromRGB(92,151,185),1,0.12)
     create("UIGradient",{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,skyTop),ColorSequenceKeypoint.new(1,skyBottom)}),Rotation=90},UI.AutoTraderThoughtFeed)
 
-    UI.AutoTraderThoughtFeedHeader=create("Frame",{Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,28),BackgroundColor3=headerBottom,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeed)
+    UI.AutoTraderThoughtFeedHeader=create("Frame",{Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,36),BackgroundColor3=headerBottom,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeed)
     addCorner(UI.AutoTraderThoughtFeedHeader,6)
     create("UIGradient",{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,headerTop),ColorSequenceKeypoint.new(1,headerBottom)}),Rotation=90},UI.AutoTraderThoughtFeedHeader)
     create("Frame",{Position=UDim2.new(0,0,1,-2),Size=UDim2.new(1,0,0,4),BackgroundColor3=headerBottom,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeedHeader)
-    local liveDot=create("Frame",{Position=UDim2.fromOffset(10,9),Size=UDim2.fromOffset(10,10),BackgroundColor3=Color3.fromRGB(115,204,83),BorderSizePixel=0,ZIndex=FEED_Z+3},UI.AutoTraderThoughtFeedHeader)
-    addCorner(liveDot,99);addStroke(liveDot,Color3.fromRGB(230,255,220),1,0.2)
-    local headerTitle=makeLabel(UI.AutoTraderThoughtFeedHeader,"AUTO TRADER ACTIVITY",11,Color3.fromRGB(255,255,255),Enum.Font.ArialBold)
-    headerTitle.Position=UDim2.fromOffset(27,3);headerTitle.Size=UDim2.new(1,-130,0,22);headerTitle.ZIndex=FEED_Z+3
-    local headerState=makeLabel(UI.AutoTraderThoughtFeedHeader,"LIVE",9,Color3.fromRGB(230,255,215),Enum.Font.ArialBold)
-    headerState.Position=UDim2.new(1,-84,0,3);headerState.Size=UDim2.fromOffset(72,22);headerState.TextXAlignment=Enum.TextXAlignment.Right;headerState.ZIndex=FEED_Z+3
-    UI.AutoTraderThoughtFeedBody=create("Frame",{Position=UDim2.fromOffset(8,34),Size=UDim2.new(1,-16,1,-42),BackgroundTransparency=1,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeed)
+    local liveDot=create("Frame",{Position=UDim2.fromOffset(12,13),Size=UDim2.fromOffset(9,9),BackgroundColor3=Color3.fromRGB(115,204,83),BorderSizePixel=0,ZIndex=FEED_Z+3},UI.AutoTraderThoughtFeedHeader)
+    addCorner(liveDot,99);addStroke(liveDot,Color3.fromRGB(230,255,220),1,0.2);UI.AutoTraderActivityLiveDot=liveDot
+    local headerTitle=makeLabel(UI.AutoTraderThoughtFeedHeader,"Auto Trader Activity",15,Color3.fromRGB(250,253,255),Enum.Font.GothamBold)
+    headerTitle.Position=UDim2.fromOffset(31,5);headerTitle.Size=UDim2.new(1,-164,0,26);headerTitle.ZIndex=FEED_Z+3;UI.AutoTraderActivityTitle=headerTitle
+    local headerState=makeLabel(UI.AutoTraderThoughtFeedHeader,"Live",11,Color3.fromRGB(230,248,222),Enum.Font.GothamMedium)
+    headerState.Position=UDim2.new(1,-116,0,6);headerState.Size=UDim2.fromOffset(72,24);headerState.TextXAlignment=Enum.TextXAlignment.Right;headerState.ZIndex=FEED_Z+3;UI.AutoTraderActivityState=headerState
+    UI.AutoTraderThoughtFeedBody=create("Frame",{Position=UDim2.fromOffset(10,43),Size=UDim2.new(1,-20,1,-51),BackgroundTransparency=1,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeed)
 
     local function trimText(value)
         local s=tostring(value or "");s=s:gsub("[%c]+"," "):gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","");return s
@@ -34704,15 +34860,15 @@ end
         for index,entry in ipairs(State.AutoTrader.ThoughtFeedEntries) do
             local frame,label,timeLabel=entry.frame,entry.label,entry.timeLabel
             if frame and frame.Parent and label and label.Parent then
-                local y=(index-1)*22
+                local y=(index-1)*27
                 local newest=index==1
                 local targetPosition=UDim2.fromOffset(0,y)
-                local targetSize=UDim2.new(1,0,0,20)
+                local targetSize=UDim2.new(1,0,0,25)
                 if immediate then frame.Position=targetPosition;frame.Size=targetSize;frame.BackgroundTransparency=newest and 0.16 or 0.64;label.TextTransparency=newest and 0 or 0.18
                 else tween(frame,{Position=targetPosition,Size=targetSize,BackgroundTransparency=newest and 0.16 or 0.64});tween(label,{TextTransparency=newest and 0 or 0.18}) end
                 label.TextColor3=newest and Color3.fromRGB(25,52,67) or Color3.fromRGB(77,98,109)
-                label.Font=newest and Enum.Font.ArialBold or Enum.Font.Arial
-                label.TextSize=newest and 11 or 10
+                label.Font=newest and Enum.Font.GothamMedium or Enum.Font.Gotham
+                label.TextSize=newest and 14 or 13
                 if timeLabel then timeLabel.TextColor3=newest and Color3.fromRGB(69,111,134) or Color3.fromRGB(116,132,141);timeLabel.TextTransparency=newest and 0 or 0.2 end
             end
         end
@@ -34730,11 +34886,11 @@ end
         message=trimText(message);if message=="" then return false end
         key=trimText(key~=nil and key or message);if State.AutoTrader.ThoughtFeedLastKey==key then return false end
         State.AutoTrader.ThoughtFeedLastKey=key;State.AutoTrader.ThoughtFeedSerial+=1
-        local frame=create("Frame",{Name="Thought_"..tostring(State.AutoTrader.ThoughtFeedSerial),Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,20),BackgroundColor3=Color3.fromRGB(255,255,255),BackgroundTransparency=1,BorderSizePixel=0,Active=false,ZIndex=FEED_Z+2},UI.AutoTraderThoughtFeedBody)
+        local frame=create("Frame",{Name="Thought_"..tostring(State.AutoTrader.ThoughtFeedSerial),Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,25),BackgroundColor3=Color3.fromRGB(255,255,255),BackgroundTransparency=1,BorderSizePixel=0,Active=false,ZIndex=FEED_Z+2},UI.AutoTraderThoughtFeedBody)
         addCorner(frame,3)
-        local accent=create("Frame",{Position=UDim2.fromOffset(1,4),Size=UDim2.fromOffset(3,12),BackgroundColor3=Color3.fromRGB(66,156,205),BorderSizePixel=0,ZIndex=FEED_Z+3},frame);addCorner(accent,2)
-        local label=makeLabel(frame,message,11,Color3.fromRGB(25,52,67),Enum.Font.ArialBold);label.Position=UDim2.fromOffset(10,1);label.Size=UDim2.new(1,-70,1,-2);label.TextWrapped=false;label.TextTruncate=Enum.TextTruncate.AtEnd;label.ZIndex=FEED_Z+3
-        local timeLabel=makeLabel(frame,os.date("%H:%M"),9,Color3.fromRGB(69,111,134),Enum.Font.Arial);timeLabel.Position=UDim2.new(1,-56,0,1);timeLabel.Size=UDim2.fromOffset(50,18);timeLabel.TextXAlignment=Enum.TextXAlignment.Right;timeLabel.ZIndex=FEED_Z+3
+        local accent=create("Frame",{Position=UDim2.fromOffset(1,5),Size=UDim2.fromOffset(3,12),BackgroundColor3=Color3.fromRGB(66,156,205),BorderSizePixel=0,ZIndex=FEED_Z+3},frame);addCorner(accent,2)
+        local label=makeLabel(frame,message,14,Color3.fromRGB(31,50,62),Enum.Font.GothamMedium);label.Position=UDim2.fromOffset(11,1);label.Size=UDim2.new(1,-78,1,-2);label.TextWrapped=false;label.TextTruncate=Enum.TextTruncate.AtEnd;label.ZIndex=FEED_Z+3
+        local timeLabel=makeLabel(frame,os.date("%H:%M"),11,Color3.fromRGB(78,108,124),Enum.Font.Gotham);timeLabel.Position=UDim2.new(1,-62,0,1);timeLabel.Size=UDim2.fromOffset(55,20);timeLabel.TextXAlignment=Enum.TextXAlignment.Right;timeLabel.ZIndex=FEED_Z+3
         table.insert(State.AutoTrader.ThoughtFeedEntries,1,{frame=frame,label=label,timeLabel=timeLabel,key=key})
         UI.AutoTraderThoughtFeed.Visible=true
         while #State.AutoTrader.ThoughtFeedEntries>FEED_MAX do local old=table.remove(State.AutoTrader.ThoughtFeedEntries);if old and old.frame and old.frame.Parent then old.frame:Destroy() end end
@@ -34881,9 +35037,26 @@ end
 
     -- Preserve the existing Render implementation and add observability after it.
     local thoughtFeedRender = State.AutoTrader.Render
+    State.AutoTrader.ThoughtFeedObserveLastAt = tonumber(State.AutoTrader.ThoughtFeedObserveLastAt) or 0
+    State.AutoTrader.ThoughtFeedObserveSignature = tostring(State.AutoTrader.ThoughtFeedObserveSignature or "")
     State.AutoTrader.Render = function(...)
         local results = table.pack(thoughtFeedRender(...))
-        State.AutoTrader.UpdateThoughtFeedFromState()
+        local observeNow = os.clock()
+        local observePartner = State.AutoTrader.LastTradePartner or State.AutoTrader.SelectedTarget
+        local observePending = State.AutoTrader.PendingRequest
+        local observeSignature = table.concat({
+            tostring(State.AutoTrader.Status or ""),
+            tostring(observePartner and observePartner.UserId or ""),
+            tostring(type(observePending)=="table" and (observePending.phase or observePending.userId) or ""),
+            tostring(State.AutoTrader.PlanGeneration or 0),
+            tostring(State.AutoTrader.ServerHopQueueIndex or 0),
+        },"|")
+        if observeSignature ~= State.AutoTrader.ThoughtFeedObserveSignature
+            or observeNow - (tonumber(State.AutoTrader.ThoughtFeedObserveLastAt) or 0) >= 0.5 then
+            State.AutoTrader.ThoughtFeedObserveSignature = observeSignature
+            State.AutoTrader.ThoughtFeedObserveLastAt = observeNow
+            State.AutoTrader.UpdateThoughtFeedFromState()
+        end
         return table.unpack(results, 1, results.n)
     end
 
@@ -34946,6 +35119,22 @@ end)()
     State.AutoTrader.UpcomingServerBrowserOpen = true
     State.AutoTrader.UpcomingAutoRefreshLastAt = tonumber(State.AutoTrader.UpcomingAutoRefreshLastAt) or 0
     State.AutoTrader.UpcomingAutoRefreshInFlight = false
+    State.AutoTrader.UpcomingAutoRefreshLastSignature = tostring(State.AutoTrader.UpcomingAutoRefreshLastSignature or "")
+
+    local function upcomingVisualSignature(queue)
+        local parts = {}
+        for index,row in ipairs(type(queue)=="table" and queue or {}) do
+            if index > 16 then break end
+            parts[#parts+1] = table.concat({
+                tostring(row.id or ""),
+                tostring(row.playing or ""),
+                tostring(row.maxPlayers or ""),
+                tostring(row.previewAvailability or ""),
+                tostring(row.previewTokenCount or ""),
+            },":")
+        end
+        return table.concat(parts,";")
+    end
 
     State.AutoTrader.RefreshUpcomingServersAutomatically = function(force)
         if Destroyed or State.AutoTrader.UpcomingAutoRefreshInFlight or State.AutoTrader.ServerHopInProgress
@@ -34956,9 +35145,19 @@ end)()
         State.AutoTrader.UpcomingAutoRefreshInFlight=true;State.AutoTrader.UpcomingAutoRefreshLastAt=now
         task.spawn(function()
             local ok,queue,scan=pcall(function() local q,s=State.AutoTrader.BuildPublicServerQueue(true);return q,s end)
-            if ok then State.AutoTrader.LastServerScan=scan or State.AutoTrader.LastServerScan end
+            local signature = ok and upcomingVisualSignature(queue) or State.AutoTrader.UpcomingAutoRefreshLastSignature
+            local changed = force or signature ~= State.AutoTrader.UpcomingAutoRefreshLastSignature
+            if ok then
+                State.AutoTrader.LastServerScan=scan or State.AutoTrader.LastServerScan
+                State.AutoTrader.UpcomingAutoRefreshLastSignature=signature
+            end
             State.AutoTrader.UpcomingAutoRefreshInFlight=false
-            if not Destroyed then State.AutoTrader.RebuildServerDashboard();State.AutoTrader.Render() end
+            if not Destroyed and changed then
+                State.AutoTrader.RebuildServerDashboard()
+                if UI.AutoTraderPanel and UI.AutoTraderPanel.Visible and State.AutoTrader.ActiveTab=="SERVERS" then
+                    State.AutoTrader.Render()
+                end
+            end
         end)
         return true
     end
@@ -35013,7 +35212,7 @@ end)()
         end
     end
 
-    task.delay(0.8,function()
+    task.delay(1.15,function()
         if not Destroyed then State.AutoTrader.RefreshUpcomingServersAutomatically(true) end
     end)
     task.spawn(function()
@@ -35027,6 +35226,994 @@ end)()
         end
     end)
 end)()
+
+-- v49 UI micro-polish + render-cost cleanup. Presentation/observability only:
+-- typography, spacing, activity-window ergonomics, and dashboard rebuild suppression.
+;(function()
+    -- Softer Windows/Aero semantic colors: darker body text and less saturated
+    -- accents reduce edge shimmer and color clashes on bright backgrounds.
+    THEME.text = Color3.fromRGB(30,52,64)
+    THEME.muted = Color3.fromRGB(68,91,103)
+    THEME.faint = Color3.fromRGB(103,122,133)
+    THEME.green = Color3.fromRGB(61,128,57)
+    THEME.yellow = Color3.fromRGB(160,114,27)
+    THEME.red = Color3.fromRGB(168,65,73)
+    THEME.blue = Color3.fromRGB(40,108,158)
+
+    local oldText = Color3.fromRGB(24,43,54)
+    local oldMuted = Color3.fromRGB(58,82,96)
+    local oldFaint = Color3.fromRGB(91,113,124)
+
+    local function polishTextObject(instance)
+        if not instance or not instance.Parent then return end
+        if not (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")) then return end
+        if instance.Font == Enum.Font.ArialBold then
+            instance.Font = Enum.Font.SourceSansBold
+        elseif instance.Font == Enum.Font.Arial then
+            instance.Font = Enum.Font.SourceSans
+        end
+        local size = tonumber(instance.TextSize) or 12
+        if size <= 8 then size = 9
+        elseif size <= 10 then size = size + 1
+        elseif size <= 13 then size = size + 1 end
+        instance.TextSize = size
+        instance.TextStrokeTransparency = 1
+        if instance.TextColor3 == oldText then instance.TextColor3 = THEME.text
+        elseif instance.TextColor3 == oldMuted then instance.TextColor3 = THEME.muted
+        elseif instance.TextColor3 == oldFaint then instance.TextColor3 = THEME.faint end
+    end
+
+    local function polishTree(root)
+        if not root or not root.Parent then return end
+        polishTextObject(root)
+        for _,instance in ipairs(root:GetDescendants()) do
+            polishTextObject(instance)
+        end
+    end
+
+    State.AutoTrader.ApplyUiTypography = polishTree
+
+    if UI.AutoTraderPanel and UI.AutoTraderPanel.Parent then
+        UI.AutoTraderPanel.Size = UDim2.fromOffset(672,612)
+        if UI.AutoTraderPanelShadow then UI.AutoTraderPanelShadow.Size = UDim2.fromOffset(672,612) end
+        if UI.AutoTraderHeader then UI.AutoTraderHeader.Size = UDim2.new(1,0,0,58) end
+        if UI.AutoTraderTitle then
+            UI.AutoTraderTitle.Text = "Supreme Auto Trader"
+            UI.AutoTraderTitle.Position = UDim2.fromOffset(16,5)
+            UI.AutoTraderTitle.TextSize = 18
+            UI.AutoTraderTitle.Font = Enum.Font.SourceSansBold
+        end
+        if UI.AutoTraderSubtitle then
+            UI.AutoTraderSubtitle.Text = "Automation Center  ·  Live Values  ·  Safe Trade Audits"
+            UI.AutoTraderSubtitle.Position = UDim2.fromOffset(16,30)
+            UI.AutoTraderSubtitle.TextSize = 12
+            UI.AutoTraderSubtitle.Font = Enum.Font.SourceSans
+            UI.AutoTraderSubtitle.TextColor3 = Color3.fromRGB(234,246,252)
+        end
+        if UI.AutoTraderTabs then UI.AutoTraderTabs.Position = UDim2.fromOffset(8,64) end
+        if UI.AutoTraderPageHost then
+            UI.AutoTraderPageHost.Position = UDim2.fromOffset(8,110)
+            UI.AutoTraderPageHost.Size = UDim2.new(1,-16,1,-118)
+        end
+        for _,button in pairs(UI.AutoTraderTabButtons or {}) do
+            button.Font = Enum.Font.SourceSansBold
+            button.TextSize = 13
+        end
+        if clampAutoTraderPanelPosition then task.defer(function() clampAutoTraderPanelPosition(false) end) end
+    end
+
+    polishTree(UI.AutoTraderPanel)
+    polishTree(UI.AutoTraderLauncher)
+    polishTree(UI.AutoTraderTradeObserveBadge)
+    polishTree(UI.Details)
+    polishTree(UI.ValueBox)
+    polishTree(UI.SignalBox)
+    polishTree(UI.NotesScroll)
+
+    -- Re-style the reserve list only when it is actually rebuilt.
+    if type(State.AutoTrader.RebuildReserveList)=="function" then
+        local baseReserve=State.AutoTrader.RebuildReserveList
+        State.AutoTrader.RebuildReserveList=function(...)
+            local out=table.pack(baseReserve(...))
+            polishTree(UI.AutoTraderReserveContent)
+            return table.unpack(out,1,out.n)
+        end
+    end
+
+    -- PEOPLE rows should rebuild only when the visible eligibility/queue identity
+    -- changes, not merely because another generic Render tick occurred.
+    if type(State.AutoTrader.RebuildPlayerDashboard)=="function" then
+        local basePeople=State.AutoTrader.RebuildPlayerDashboard
+        State.AutoTrader.RebuildPlayerDashboard=function(force)
+            local parts={tostring(State.AutoTrader.LastTradeQueueSignature or "")}
+            local selected=State.AutoTrader.SelectedTarget
+            parts[#parts+1]=tostring(selected and selected.UserId or "")
+            for _,player in ipairs(Players:GetPlayers()) do
+                if player~=LocalPlayer and player.Parent then
+                    local state=State.AutoTrader.ServerPlayers and State.AutoTrader.ServerPlayers[player.UserId] or nil
+                    parts[#parts+1]=table.concat({
+                        tostring(player.UserId),
+                        tostring(state and state.contactState or ""),
+                        tostring(state and state.feasibilityState or ""),
+                        tostring(state and state.outcome or ""),
+                    },":")
+                end
+            end
+            table.sort(parts)
+            local signature=table.concat(parts,";")
+            local contentReady=UI.AutoTraderPlayerContent and #UI.AutoTraderPlayerContent:GetChildren()>2
+            if not force and contentReady and signature==State.AutoTrader.LastPeopleDashboardVisualSignature then
+                return false
+            end
+            State.AutoTrader.LastPeopleDashboardVisualSignature=signature
+            local out=table.pack(basePeople())
+            polishTree(UI.AutoTraderPlayerContent)
+            return table.unpack(out,1,out.n)
+        end
+    end
+
+    -- BOT INTELLIGENCE can contain dozens of thumbnail rows. Keep it live while
+    -- certification is actively changing, but otherwise rebuild only on real state changes.
+    if type(State.AutoTrader.RebuildBotDashboard)=="function" then
+        local baseBot=State.AutoTrader.RebuildBotDashboard
+        State.AutoTrader.RebuildBotDashboard=function(force)
+            local cert=State.AutoTrader.GoldBotCertification or {}
+            local status=tostring(cert.status or "")
+            local parts={
+                status,tostring(cert.failedUserId or ""),tostring(cert.currentRemoteCount or 0),
+                tostring(cert.passedRemoteCount or 0),tostring(State.AutoTrader.GetGoldBotIconDbCount()),
+            }
+            if status=="observing" or status=="candidate" then
+                parts[#parts+1]=tostring(math.floor(os.clock()/2))
+                parts[#parts+1]=string.format("%.2f",tonumber(cert.maxObservedMoveDirection) or 0)
+            end
+            for _,player in ipairs(Players:GetPlayers()) do
+                if player~=LocalPlayer and player.Parent then parts[#parts+1]=tostring(player.UserId) end
+            end
+            table.sort(parts)
+            local signature=table.concat(parts,";")
+            local contentReady=UI.AutoTraderBotContent and #UI.AutoTraderBotContent:GetChildren()>2
+            if not force and contentReady and signature==State.AutoTrader.LastBotDashboardVisualSignature then
+                return false
+            end
+            State.AutoTrader.LastBotDashboardVisualSignature=signature
+            local out=table.pack(baseBot())
+            polishTree(UI.AutoTraderBotContent)
+            return table.unpack(out,1,out.n)
+        end
+    end
+
+    -- Server rows are expensive because they include preview imagery. Avoid
+    -- destroying/recreating identical rows on every generic Render tick.
+    if type(State.AutoTrader.RebuildServerDashboard)=="function" then
+        local baseServerDashboard=State.AutoTrader.RebuildServerDashboard
+        State.AutoTrader.RebuildServerDashboard=function(force)
+            local queue=State.AutoTrader.GetUpcomingServerCandidates and State.AutoTrader.GetUpcomingServerCandidates() or {}
+            local parts={}
+            for index,row in ipairs(queue) do
+                if index>16 then break end
+                parts[#parts+1]=table.concat({
+                    tostring(row.id or ""),tostring(row.playing or ""),tostring(row.maxPlayers or ""),
+                    tostring(row.previewAvailability or ""),tostring(row.previewTokenCount or ""),
+                },":")
+            end
+            local signature=table.concat(parts,";")
+            local contentReady=UI.AutoTraderServerCandidateContent and #UI.AutoTraderServerCandidateContent:GetChildren()>2
+            if not force and contentReady and signature==State.AutoTrader.LastServerDashboardVisualSignature then
+                return false
+            end
+            State.AutoTrader.LastServerDashboardVisualSignature=signature
+            local out=table.pack(baseServerDashboard())
+            polishTree(UI.AutoTraderServerCandidateContent)
+            return table.unpack(out,1,out.n)
+        end
+    end
+
+    -- Activity window: readable, draggable, and collapsible to a persistent title bar.
+    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent and UI.AutoTraderThoughtFeedHeader then
+        polishTree(UI.AutoTraderThoughtFeed)
+        UI.AutoTraderThoughtFeed.Size=UDim2.new(1,-32,0,164)
+        UI.AutoTraderThoughtFeed.ClipsDescendants=true
+        UI.AutoTraderThoughtFeed.Active=true
+        UI.AutoTraderThoughtFeedHeader.Active=true
+        UI.AutoTraderThoughtFeedCollapsed = State.AutoTrader.ThoughtFeedCollapsed == true
+
+        local collapse=makeButton(UI.AutoTraderThoughtFeedHeader,"▴",UDim2.fromOffset(27,24),Color3.fromRGB(218,235,245))
+        collapse.Name="SV_ActivityCollapse"
+        collapse.Position=UDim2.new(1,-33,0,6)
+        collapse.TextColor3=Color3.fromRGB(39,74,94)
+        collapse.TextSize=14
+        collapse.Font=Enum.Font.GothamBold
+        collapse.AutoButtonColor=false
+        collapse.ZIndex=1965
+        addCorner(collapse,5)
+        addStroke(collapse,Color3.fromRGB(116,157,181),1,0.34)
+        create("UIGradient",{Color=ColorSequence.new({
+            ColorSequenceKeypoint.new(0,Color3.fromRGB(255,255,255)),
+            ColorSequenceKeypoint.new(1,Color3.fromRGB(205,225,237)),
+        }),Rotation=90},collapse)
+
+        State.AutoTrader.ActivityCollapseSerial=tonumber(State.AutoTrader.ActivityCollapseSerial) or 0
+        local function applyActivityCollapse(immediate)
+            State.AutoTrader.ActivityCollapseSerial+=1
+            local serial=State.AutoTrader.ActivityCollapseSerial
+            local collapsed=State.AutoTrader.ThoughtFeedCollapsed==true
+            collapse.Text=collapsed and "▾" or "▴"
+            if UI.AutoTraderThoughtFeedHeader then UI.AutoTraderThoughtFeedHeader.Size=UDim2.new(1,0,0,36) end
+            if not collapsed then UI.AutoTraderThoughtFeedBody.Visible=true end
+            local target=collapsed and UDim2.new(1,-32,0,36) or UDim2.new(1,-32,0,164)
+            if immediate then
+                UI.AutoTraderThoughtFeed.Size=target
+                UI.AutoTraderThoughtFeedBody.Visible=not collapsed
+                return
+            end
+            TweenService:Create(UI.AutoTraderThoughtFeed,TweenInfo.new(0.18,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{Size=target}):Play()
+            if collapsed then
+                task.delay(0.16,function()
+                    if not Destroyed and serial==State.AutoTrader.ActivityCollapseSerial and State.AutoTrader.ThoughtFeedCollapsed==true
+                        and UI.AutoTraderThoughtFeedBody then UI.AutoTraderThoughtFeedBody.Visible=false end
+                end)
+            end
+        end
+        State.AutoTrader.ApplyActivityCollapse=applyActivityCollapse
+        connect(collapse.MouseButton1Click,function()
+            State.AutoTrader.ThoughtFeedCollapsed=not (State.AutoTrader.ThoughtFeedCollapsed==true)
+            applyActivityCollapse(false)
+        end)
+        applyActivityCollapse(true)
+
+        State.AutoTrader.ActivityDragging=false
+        State.AutoTrader.ActivityDragInput=nil
+        State.AutoTrader.ActivityDragStart=nil
+        State.AutoTrader.ActivityDragStartPosition=nil
+
+        local function clampActivity()
+            local camera=workspace.CurrentCamera
+            if not camera or not UI.AutoTraderThoughtFeed or not UI.AutoTraderThoughtFeed.Parent then return end
+            local viewport=camera.ViewportSize
+            local pos=UI.AutoTraderThoughtFeed.AbsolutePosition
+            local size=UI.AutoTraderThoughtFeed.AbsoluteSize
+            local dx,dy=0,0
+            if pos.X<8 then dx=8-pos.X elseif pos.X+size.X>viewport.X-8 then dx=(viewport.X-8)-(pos.X+size.X) end
+            if pos.Y<8 then dy=8-pos.Y elseif pos.Y+size.Y>viewport.Y-8 then dy=(viewport.Y-8)-(pos.Y+size.Y) end
+            if dx~=0 or dy~=0 then
+                local p=UI.AutoTraderThoughtFeed.Position
+                UI.AutoTraderThoughtFeed.Position=UDim2.new(p.X.Scale,p.X.Offset+dx,p.Y.Scale,p.Y.Offset+dy)
+            end
+        end
+
+        connect(UI.AutoTraderThoughtFeedHeader.InputBegan,function(input)
+            if input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
+            State.AutoTrader.ActivityDragging=true
+            State.AutoTrader.ActivityDragStart=input.Position
+            State.AutoTrader.ActivityDragStartPosition=UI.AutoTraderThoughtFeed.Position
+        end)
+        connect(UI.AutoTraderThoughtFeedHeader.InputChanged,function(input)
+            if input.UserInputType==Enum.UserInputType.MouseMovement then State.AutoTrader.ActivityDragInput=input end
+        end)
+        connect(UserInputService.InputChanged,function(input)
+            if not State.AutoTrader.ActivityDragging or input~=State.AutoTrader.ActivityDragInput then return end
+            local delta=input.Position-State.AutoTrader.ActivityDragStart
+            local start=State.AutoTrader.ActivityDragStartPosition
+            UI.AutoTraderThoughtFeed.Position=UDim2.new(start.X.Scale,start.X.Offset+delta.X,start.Y.Scale,start.Y.Offset+delta.Y)
+        end)
+        connect(UserInputService.InputEnded,function(input)
+            if input.UserInputType~=Enum.UserInputType.MouseButton1 or not State.AutoTrader.ActivityDragging then return end
+            State.AutoTrader.ActivityDragging=false
+            State.AutoTrader.ActivityDragInput=nil
+            clampActivity()
+        end)
+    end
+end)()
+
+
+-- v50 Aero motion/readability pass. Presentation only: no trade/value decision
+-- authority is changed here. Animations are event-driven Tweens, never per-frame loops.
+;(function()
+    local MOTION = {
+        fast = TweenInfo.new(0.075, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        hover = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        panel = TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+        page = TweenInfo.new(0.14, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+    }
+
+    -- Near-Segoe readability using Roblox's cleanest built-in UI family.
+    local function retuneText(instance)
+        if not instance or not instance.Parent then return end
+        if not (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")) then return end
+        local preserveCode = instance.Font == Enum.Font.Code
+        local preserveMedium = instance.Font == Enum.Font.GothamMedium
+        local bold = instance.Font == Enum.Font.ArialBold
+            or instance.Font == Enum.Font.SourceSansBold
+            or instance.Font == Enum.Font.GothamBold
+        if not preserveCode and not preserveMedium then
+            instance.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+        end
+        local n = tonumber(instance.TextSize) or 12
+        if instance:IsA("TextButton") then
+            n = math.max(n, 12)
+        elseif n <= 10 then
+            n = 11
+        elseif n == 11 then
+            n = 12
+        end
+        instance.TextSize = n
+        instance.TextStrokeTransparency = 1
+    end
+
+    local function softenSurface(instance)
+        if not instance or not instance.Parent then return end
+        if instance:IsA("Frame") or instance:IsA("ScrollingFrame") then
+            local corner = instance:FindFirstChildOfClass("UICorner")
+            if corner and corner.CornerRadius.Offset > 0 and corner.CornerRadius.Offset < 6 then
+                corner.CornerRadius = UDim.new(0, 6)
+            end
+        end
+        local stroke = instance:FindFirstChildOfClass("UIStroke")
+        if stroke and stroke.Thickness <= 1.1 then
+            stroke.Transparency = math.max(tonumber(stroke.Transparency) or 0, 0.22)
+        end
+    end
+
+    local function bindButtonMotion(button)
+        if not button or not button.Parent or not button:IsA("GuiButton") then return end
+        if button:GetAttribute("SV_V50MotionBound") then return end
+        button:SetAttribute("SV_V50MotionBound", true)
+        local corner=button:FindFirstChildOfClass("UICorner")
+        if corner then corner.CornerRadius=UDim.new(0,6) end
+
+        -- UIScale on TextButtons changes the apparent glyph size and can force Roblox
+        -- to recompute wrapping mid-transition. Keep text geometry invariant. Image-only
+        -- buttons may retain a tiny transform because they have no text layout to jitter.
+        local scale=nil
+        if button:IsA("ImageButton") then
+            scale = button:FindFirstChild("SV_V50MotionScale")
+            if not scale and not button:FindFirstChildOfClass("UIScale") then
+                scale = create("UIScale", {Name="SV_V50MotionScale", Scale=1}, button)
+            end
+        else
+            local legacyScale=button:FindFirstChild("SV_V50MotionScale")
+            if legacyScale then legacyScale.Scale=1 end
+        end
+        local function toScale(value, info)
+            if scale and scale.Parent then TweenService:Create(scale, info or MOTION.hover, {Scale=value}):Play() end
+        end
+        button.MouseEnter:Connect(function()
+            if button.Parent then toScale(1.012, MOTION.hover) end
+        end)
+        button.MouseLeave:Connect(function()
+            if button.Parent then
+                toScale(1, MOTION.hover)
+                TweenService:Create(button, MOTION.hover, {BackgroundTransparency=0}):Play()
+            end
+        end)
+        button.MouseButton1Down:Connect(function()
+            if button.Parent then toScale(0.985, MOTION.fast) end
+        end)
+        button.MouseButton1Up:Connect(function()
+            if button.Parent then toScale(1.012, MOTION.fast) end
+        end)
+    end
+
+    local function polishMotionTree(root)
+        if not root or not root.Parent then return end
+        retuneText(root);softenSurface(root)
+        if root:IsA("GuiButton") then bindButtonMotion(root) end
+        for _,instance in ipairs(root:GetDescendants()) do
+            retuneText(instance)
+            softenSurface(instance)
+            if instance:IsA("GuiButton") then bindButtonMotion(instance) end
+        end
+    end
+    State.AutoTrader.ApplyUiMotionPolish = polishMotionTree
+
+    -- A little more breathing room, with high-contrast body surfaces.
+    if UI.AutoTraderPanel and UI.AutoTraderPanel.Parent then
+        UI.AutoTraderPanel.Size = UDim2.fromOffset(704, 624)
+        UI.AutoTraderPanel.BackgroundColor3 = Color3.fromRGB(88, 158, 198)
+        if UI.AutoTraderPanelShadow then UI.AutoTraderPanelShadow.Size = UDim2.fromOffset(704, 624) end
+        if UI.AutoTraderHeader then UI.AutoTraderHeader.Size = UDim2.new(1,0,0,64) end
+        if UI.AutoTraderTitle then
+            UI.AutoTraderTitle.TextSize = 20
+            UI.AutoTraderTitle.Font = Enum.Font.GothamBold
+            UI.AutoTraderTitle.Position = UDim2.fromOffset(18,7)
+        end
+        if UI.AutoTraderSubtitle then
+            UI.AutoTraderSubtitle.TextSize = 12
+            UI.AutoTraderSubtitle.Font = Enum.Font.Gotham
+            UI.AutoTraderSubtitle.Position = UDim2.fromOffset(18,35)
+            UI.AutoTraderSubtitle.TextColor3 = Color3.fromRGB(239,249,253)
+        end
+        if UI.AutoTraderHeaderMetric then
+            UI.AutoTraderHeaderMetric.TextSize = 13
+            UI.AutoTraderHeaderMetric.Font = Enum.Font.GothamBold
+        end
+        if UI.AutoTraderTabs then
+            UI.AutoTraderTabs.Position = UDim2.fromOffset(10,72)
+            UI.AutoTraderTabs.Size = UDim2.new(1,-20,0,40)
+        end
+        if UI.AutoTraderPageHost then
+            UI.AutoTraderPageHost.Position = UDim2.fromOffset(10,120)
+            UI.AutoTraderPageHost.Size = UDim2.new(1,-20,1,-130)
+            UI.AutoTraderPageHost.BackgroundColor3 = Color3.fromRGB(243,249,252)
+        end
+        for _,button in pairs(UI.AutoTraderTabButtons or {}) do
+            button.TextSize = 13
+            button.Font = Enum.Font.GothamBold
+        end
+    end
+
+    -- Animate page changes with a tiny 7 px settling motion. Visibility and active
+    -- tab state still switch synchronously, so safety/UI tests remain deterministic.
+    if type(State.AutoTrader.SetActiveTab)=="function" and State.AutoTrader.V50BaseSetActiveTab==nil then
+        State.AutoTrader.V50BaseSetActiveTab=State.AutoTrader.SetActiveTab
+        State.AutoTrader.SetActiveTab=function(tabName)
+            local result=State.AutoTrader.V50BaseSetActiveTab(tabName)
+            local page=UI.AutoTraderPages and UI.AutoTraderPages[tabName]
+            if page and page.Parent and page.Visible then
+                page.Position=UDim2.fromOffset(12,8)
+                TweenService:Create(page,MOTION.page,{Position=UDim2.fromOffset(8,8)}):Play()
+            end
+            -- Never scale tab buttons: even sub-percent text scaling causes Roblox
+            -- wrapping/text bounds to re-evaluate and produces visible jitter.
+            for _,button in pairs(UI.AutoTraderTabButtons or {}) do
+                local scale=button and button:FindFirstChild("SV_V50MotionScale")
+                if scale then scale.Scale=1 end
+            end
+            return result
+        end
+    end
+
+    -- Panel open/close is a short "Windows window" settle instead of an instant pop.
+    State.AutoTrader.PanelMotionSerial=tonumber(State.AutoTrader.PanelMotionSerial) or 0
+    State.AutoTrader.SetPanelVisibleAnimated=function(show)
+        if not UI.AutoTraderPanel or not UI.AutoTraderPanel.Parent then return end
+        State.AutoTrader.PanelMotionSerial+=1
+        local serial=State.AutoTrader.PanelMotionSerial
+        local panel=UI.AutoTraderPanel
+        local shadow=UI.AutoTraderPanelShadow
+        local scale=UI.AutoTraderScale
+        local targetScale=tonumber(State.AutoTrader.UiScaleTarget) or (scale and scale.Scale) or 1
+        if show then
+            local base=panel.Position
+            panel.Visible=true
+            if shadow then
+                shadow.Visible=true
+                shadow.BackgroundTransparency=0.9
+            end
+            panel.Position=UDim2.new(base.X.Scale,base.X.Offset+9,base.Y.Scale,base.Y.Offset+3)
+            if scale then scale.Scale=targetScale*0.97 end
+            TweenService:Create(panel,MOTION.panel,{Position=base}):Play()
+            if scale then TweenService:Create(scale,MOTION.panel,{Scale=targetScale}):Play() end
+            if shadow then TweenService:Create(shadow,MOTION.panel,{BackgroundTransparency=0.78}):Play() end
+        else
+            local base=panel.Position
+            if scale then TweenService:Create(scale,TweenInfo.new(0.12,Enum.EasingStyle.Quad,Enum.EasingDirection.In),{Scale=targetScale*0.975}):Play() end
+            TweenService:Create(panel,TweenInfo.new(0.12,Enum.EasingStyle.Quad,Enum.EasingDirection.In),{
+                Position=UDim2.new(base.X.Scale,base.X.Offset+8,base.Y.Scale,base.Y.Offset+2),
+            }):Play()
+            if shadow then TweenService:Create(shadow,MOTION.fast,{BackgroundTransparency=0.94}):Play() end
+            task.delay(0.125,function()
+                if Destroyed or serial~=State.AutoTrader.PanelMotionSerial then return end
+                panel.Visible=false
+                panel.Position=base
+                if scale then scale.Scale=targetScale end
+                if shadow then shadow.Visible=false;shadow.BackgroundTransparency=0.78 end
+            end)
+        end
+    end
+
+    -- More legible activity center and a tiny live-dot "breath". One tween pair
+    -- every ~1.6 s is intentionally cheap compared with per-frame animation.
+    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent then
+        UI.AutoTraderThoughtFeed.Position=UDim2.new(0.5,0,0,12)
+        if UI.AutoTraderActivityTitle then
+            UI.AutoTraderActivityTitle.TextSize=15
+            UI.AutoTraderActivityTitle.Font=Enum.Font.GothamBold
+        end
+        if UI.AutoTraderActivityState then
+            UI.AutoTraderActivityState.Text="Live activity"
+            UI.AutoTraderActivityState.TextSize=11
+            UI.AutoTraderActivityState.Font=Enum.Font.Gotham
+        end
+        if UI.AutoTraderActivityLiveDot and not State.AutoTrader.ActivityLivePulseStarted then
+            State.AutoTrader.ActivityLivePulseStarted=true
+            task.spawn(function()
+                while not Destroyed and UI.AutoTraderActivityLiveDot and UI.AutoTraderActivityLiveDot.Parent do
+                    TweenService:Create(UI.AutoTraderActivityLiveDot,TweenInfo.new(0.55,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),{
+                        BackgroundTransparency=0.28,
+                    }):Play()
+                    task.wait(0.58)
+                    if Destroyed or not UI.AutoTraderActivityLiveDot or not UI.AutoTraderActivityLiveDot.Parent then break end
+                    TweenService:Create(UI.AutoTraderActivityLiveDot,TweenInfo.new(0.55,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),{
+                        BackgroundTransparency=0,
+                    }):Play()
+                    task.wait(1.0)
+                end
+            end)
+        end
+    end
+
+    polishMotionTree(UI.AutoTraderPanel)
+    polishMotionTree(UI.AutoTraderLauncher)
+    polishMotionTree(UI.AutoTraderThoughtFeed)
+    polishMotionTree(UI.AutoTraderTradeObserveBadge)
+    polishMotionTree(UI.Details)
+    polishMotionTree(UI.ValueBox)
+    polishMotionTree(UI.SignalBox)
+    polishMotionTree(UI.NotesScroll)
+
+    -- Dynamic dashboards get the same motion/readability polish only after a
+    -- real state-driven rebuild. Binding is attribute-guarded, so no duplicate handlers.
+    for _,name in ipairs({"RebuildReserveList","RebuildPlayerDashboard","RebuildServerDashboard","RebuildBotDashboard"}) do
+        (function(key)
+            local current=State.AutoTrader[key]
+            if type(current)=="function" and State.AutoTrader["V50Base_"..key]==nil then
+                State.AutoTrader["V50Base_"..key]=current
+                State.AutoTrader[key]=function(...)
+                    local result=table.pack(State.AutoTrader["V50Base_"..key](...))
+                    if key=="RebuildReserveList" then polishMotionTree(UI.AutoTraderReserveContent)
+                    elseif key=="RebuildPlayerDashboard" then polishMotionTree(UI.AutoTraderPlayerContent)
+                    elseif key=="RebuildServerDashboard" then polishMotionTree(UI.AutoTraderServerCandidateContent)
+                    elseif key=="RebuildBotDashboard" then polishMotionTree(UI.AutoTraderBotContent) end
+                    return table.unpack(result,1,result.n)
+                end
+            end
+        end)(name)
+    end
+
+    if clampAutoTraderPanelPosition then task.defer(function() clampAutoTraderPanelPosition(false) end) end
+end)()
+
+-- v51 painstaking Frutiger Aero consistency pass. Presentation only. This pass fixes
+-- geometry, optical spacing, surface hierarchy, responsive behavior, and legacy-window
+-- consistency without changing trading, values, automation, safety, or server decisions.
+do
+    (function()
+    local P = {
+        pearlTop = Color3.fromRGB(255,255,255),
+        pearlBottom = Color3.fromRGB(232,244,250),
+        pearlAltBottom = Color3.fromRGB(224,241,249),
+        pageTop = Color3.fromRGB(249,253,255),
+        pageBottom = Color3.fromRGB(232,245,251),
+        recess = Color3.fromRGB(226,240,247),
+        chromeTop = Color3.fromRGB(159,222,249),
+        chromeBottom = Color3.fromRGB(50,137,195),
+        chromeEdge = Color3.fromRGB(74,139,178),
+        section = Color3.fromRGB(43,93,122),
+        shadow = Color3.fromRGB(45,78,96),
+        grass = Color3.fromRGB(106,177,72),
+    }
+
+    local function firstOfClass(parent, className)
+        return parent and parent:FindFirstChildOfClass(className) or nil
+    end
+    local function corner(parent, radius)
+        if not parent or not parent.Parent then return nil end
+        local c=firstOfClass(parent,"UICorner")
+        if not c then c=create("UICorner",{},parent) end
+        c.CornerRadius=UDim.new(0,radius or 7)
+        return c
+    end
+    local function stroke(parent, color, transparency, thickness)
+        if not parent or not parent.Parent then return nil end
+        local s=firstOfClass(parent,"UIStroke")
+        if not s then s=create("UIStroke",{},parent) end
+        s.Color=color or THEME.border
+        s.Transparency=transparency==nil and 0.28 or transparency
+        s.Thickness=thickness or 1
+        s.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
+        return s
+    end
+    local function gradient(parent, topColor, bottomColor, midpoint)
+        if not parent or not parent.Parent then return nil end
+        local g=firstOfClass(parent,"UIGradient")
+        if not g then g=create("UIGradient",{},parent) end
+        if midpoint then
+            g.Color=ColorSequence.new({
+                ColorSequenceKeypoint.new(0,topColor),
+                ColorSequenceKeypoint.new(midpoint,topColor:Lerp(bottomColor,0.42)),
+                ColorSequenceKeypoint.new(1,bottomColor),
+            })
+        else
+            g.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,topColor),ColorSequenceKeypoint.new(1,bottomColor)})
+        end
+        g.Rotation=90
+        return g
+    end
+    local function textPadding(object, left, right)
+        if not object or not object.Parent then return end
+        local pad=object:FindFirstChild("SV_V51TextPadding")
+        if not pad then pad=create("UIPadding",{Name="SV_V51TextPadding"},object) end
+        pad.PaddingLeft=UDim.new(0,left or 10)
+        pad.PaddingRight=UDim.new(0,right or 8)
+    end
+    local function styleCard(card, alternate)
+        if not card or not card.Parent then return end
+        card.ClipsDescendants=true
+        card.BackgroundColor3=alternate and P.pearlAltBottom or P.pearlBottom
+        corner(card,7)
+        stroke(card,THEME.border,0.34,1)
+        gradient(card,P.pearlTop,alternate and P.pearlAltBottom or P.pearlBottom,0.36)
+    end
+    local function styleScroll(scroll)
+        if not scroll or not scroll.Parent then return end
+        scroll.BackgroundColor3=P.recess
+        scroll.BackgroundTransparency=0
+        scroll.ScrollBarImageColor3=Color3.fromRGB(70,139,178)
+        scroll.ScrollBarThickness=5
+        corner(scroll,7)
+        stroke(scroll,THEME.border,0.34,1)
+    end
+    local function styleDynamicRows(container, kind)
+        if not container or not container.Parent then return end
+        for _,child in ipairs(container:GetChildren()) do
+            if child:IsA("Frame") or child:IsA("TextButton") then
+                corner(child,6)
+                local s=child:FindFirstChildOfClass("UIStroke")
+                if s then s.Transparency=math.max(tonumber(s.Transparency) or 0,0.34) end
+                if kind=="reserve" and child:IsA("Frame") and child.Size.Y.Offset==32 then
+                    child.Size=UDim2.new(child.Size.X.Scale,child.Size.X.Offset,0,34)
+                    for _,control in ipairs(child:GetChildren()) do
+                        if control:IsA("TextButton") and control.Size.Y.Offset==23 then
+                            control.Size=UDim2.new(control.Size.X.Scale,control.Size.X.Offset,control.Size.Y.Scale,24)
+                        end
+                    end
+                elseif kind=="people" and child:IsA("TextButton") and child.Size.Y.Offset==54 then
+                    child.Size=UDim2.new(child.Size.X.Scale,child.Size.X.Offset,0,58)
+                elseif kind=="servers" and child:IsA("Frame") and (child.Size.Y.Offset==42 or child.Size.Y.Offset==110) then
+                    if child.Size.Y.Offset==42 then
+                        child.Size=UDim2.new(child.Size.X.Scale,child.Size.X.Offset,0,46)
+                    else
+                        child.Size=UDim2.new(child.Size.X.Scale,child.Size.X.Offset,0,114)
+                    end
+                    for _,label in ipairs(child:GetChildren()) do
+                        if label:IsA("TextLabel") then
+                            if label.Position.Y.Offset>=20 and label.Position.Y.Offset<42 and label.Size.Y.Offset<18 then
+                                label.Size=UDim2.new(label.Size.X.Scale,label.Size.X.Offset,label.Size.Y.Scale,18)
+                            elseif label.Position.Y.Offset>=78 and label.Size.Y.Offset<28 then
+                                label.Size=UDim2.new(label.Size.X.Scale,label.Size.X.Offset,label.Size.Y.Scale,28)
+                            end
+                        end
+                    end
+                elseif kind=="bots" and child:IsA("Frame") and child.Size.Y.Offset==60 then
+                    child.Size=UDim2.new(child.Size.X.Scale,child.Size.X.Offset,0,62)
+                    for _,label in ipairs(child:GetChildren()) do
+                        if label:IsA("TextLabel") and label.Position.Y.Offset>=40 and label.Size.Y.Offset<14 then
+                            label.Size=UDim2.new(label.Size.X.Scale,label.Size.X.Offset,label.Size.Y.Scale,14)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Main shell: rounded glass chrome, a softer layered shadow, and consistent 10px gutters.
+    if UI.AutoTraderPanel and UI.AutoTraderPanel.Parent then
+        UI.AutoTraderPanel.Size=UDim2.fromOffset(704,624)
+        UI.AutoTraderPanel.ClipsDescendants=true
+        corner(UI.AutoTraderPanel,9)
+        stroke(UI.AutoTraderPanel,P.chromeEdge,0.08,1)
+        gradient(UI.AutoTraderPanel,Color3.fromRGB(199,230,245),Color3.fromRGB(88,158,198),0.34)
+    end
+    if UI.AutoTraderPanelShadow and UI.AutoTraderPanelShadow.Parent then
+        UI.AutoTraderPanelShadow.Size=UDim2.fromOffset(704,624)
+        UI.AutoTraderPanelShadow.BackgroundColor3=P.shadow
+        UI.AutoTraderPanelShadow.BackgroundTransparency=0.84
+        corner(UI.AutoTraderPanelShadow,12)
+        local soft=UI.AutoTraderPanelShadow:FindFirstChild("SV_V51SoftShadow")
+        if not soft then
+            soft=create("Frame",{
+                Name="SV_V51SoftShadow",Position=UDim2.fromOffset(-4,-4),Size=UDim2.new(1,8,1,8),
+                BackgroundColor3=P.shadow,BackgroundTransparency=0.93,BorderSizePixel=0,ZIndex=1448,
+            },UI.AutoTraderPanelShadow)
+            corner(soft,15)
+        end
+    end
+    if UI.AutoTraderHeader and UI.AutoTraderHeader.Parent then
+        UI.AutoTraderHeader.Size=UDim2.new(1,0,0,64)
+        gradient(UI.AutoTraderHeader,P.chromeTop,P.chromeBottom,0.43)
+        local sheen=UI.AutoTraderHeader:FindFirstChild("SV_V51HeaderSheen")
+        if not sheen then
+            sheen=create("Frame",{
+                Name="SV_V51HeaderSheen",Position=UDim2.fromOffset(1,1),Size=UDim2.new(1,-2,0,24),
+                BackgroundColor3=Color3.fromRGB(255,255,255),BackgroundTransparency=0.86,BorderSizePixel=0,ZIndex=1453,
+            },UI.AutoTraderHeader)
+            gradient(sheen,Color3.fromRGB(255,255,255),Color3.fromRGB(224,245,254))
+        end
+        local accent=UI.AutoTraderHeader:FindFirstChild("SV_V51AeroAccent")
+        if not accent then
+            accent=create("Frame",{
+                Name="SV_V51AeroAccent",Position=UDim2.new(0,0,1,-2),Size=UDim2.new(1,0,0,2),
+                BackgroundColor3=P.chromeEdge,BorderSizePixel=0,ZIndex=1454,
+            },UI.AutoTraderHeader)
+            local g=create("UIGradient",{
+                Color=ColorSequence.new({
+                    ColorSequenceKeypoint.new(0,Color3.fromRGB(93,180,220)),
+                    ColorSequenceKeypoint.new(0.52,Color3.fromRGB(116,190,78)),
+                    ColorSequenceKeypoint.new(1,Color3.fromRGB(82,165,210)),
+                }),Rotation=0,
+            },accent)
+        end
+    end
+    if UI.AutoTraderTitle then
+        UI.AutoTraderTitle.Text="Supreme Auto Trader"
+        UI.AutoTraderTitle.Position=UDim2.fromOffset(18,7)
+        UI.AutoTraderTitle.Size=UDim2.new(1,-252,0,24)
+        UI.AutoTraderTitle.TextSize=20
+        UI.AutoTraderTitle.Font=Enum.Font.GothamBold
+    end
+    if UI.AutoTraderSubtitle then
+        UI.AutoTraderSubtitle.Text="Automation Center  ·  Live Values  ·  Safe Trade Audits"
+        UI.AutoTraderSubtitle.Position=UDim2.fromOffset(18,35)
+        UI.AutoTraderSubtitle.Size=UDim2.new(1,-270,0,18)
+        UI.AutoTraderSubtitle.TextSize=12
+        UI.AutoTraderSubtitle.TextColor3=Color3.fromRGB(239,250,255)
+    end
+    if UI.AutoTraderHeaderMetric then
+        UI.AutoTraderHeaderMetric.Position=UDim2.new(1,-218,0,9)
+        UI.AutoTraderHeaderMetric.Size=UDim2.fromOffset(170,22)
+        UI.AutoTraderHeaderMetric.TextSize=13
+        UI.AutoTraderHeaderMetric.TextColor3=Color3.fromRGB(233,255,211)
+    end
+    if UI.AutoTraderClose then
+        UI.AutoTraderClose.Position=UDim2.new(1,-39,0,8)
+        UI.AutoTraderClose.Size=UDim2.fromOffset(31,28)
+        UI.AutoTraderClose.Text="×"
+        UI.AutoTraderClose.TextSize=16
+        corner(UI.AutoTraderClose,6)
+    end
+
+    if UI.AutoTraderLauncher and UI.AutoTraderLauncher.Parent then
+        UI.AutoTraderLauncher.Size=UDim2.fromOffset(160,36)
+        UI.AutoTraderLauncher.Text="SV  ·  AUTO TRADER"
+        UI.AutoTraderLauncher.TextSize=12
+        UI.AutoTraderLauncher.Font=Enum.Font.GothamBold
+        UI.AutoTraderLauncher.BackgroundColor3=Color3.fromRGB(216,234,244)
+        corner(UI.AutoTraderLauncher,8);stroke(UI.AutoTraderLauncher,P.chromeEdge,0.24,1)
+        gradient(UI.AutoTraderLauncher,Color3.fromRGB(255,255,255),Color3.fromRGB(205,230,243),0.40)
+    end
+    if UI.AutoTraderTradeObserveBadge and UI.AutoTraderTradeObserveBadge.Parent then
+        UI.AutoTraderTradeObserveBadge.Size=UDim2.fromOffset(400,50)
+        UI.AutoTraderTradeObserveBadge.BackgroundColor3=Color3.fromRGB(236,247,252)
+        corner(UI.AutoTraderTradeObserveBadge,8);stroke(UI.AutoTraderTradeObserveBadge,THEME.blue,0.18,1)
+        gradient(UI.AutoTraderTradeObserveBadge,Color3.fromRGB(255,255,255),Color3.fromRGB(218,240,249),0.38)
+    end
+    if UI.DetailsBackdrop then UI.DetailsBackdrop.BackgroundTransparency=0.52 end
+
+    if UI.AutoTraderTabs then
+        UI.AutoTraderTabs.Position=UDim2.fromOffset(10,72)
+        UI.AutoTraderTabs.Size=UDim2.new(1,-20,0,40)
+        corner(UI.AutoTraderTabs,7)
+        stroke(UI.AutoTraderTabs,THEME.border,0.22,1)
+        gradient(UI.AutoTraderTabs,Color3.fromRGB(252,254,255),Color3.fromRGB(217,234,244),0.45)
+    end
+    local tabText={HOME="Overview",TRADE="Trade",PEOPLE="People",SERVERS="Servers",SETTINGS="Settings"}
+    for name,button in pairs(UI.AutoTraderTabButtons or {}) do
+        if button and button.Parent then
+            button.Text=tabText[name] or name
+            button.TextSize=13
+            button.Font=Enum.Font.GothamBold
+            corner(button,6)
+            local s=button:FindFirstChildOfClass("UIStroke")
+            if s then s.Transparency=0.34 end
+        end
+    end
+    if UI.AutoTraderPageHost then
+        UI.AutoTraderPageHost.Position=UDim2.fromOffset(10,120)
+        UI.AutoTraderPageHost.Size=UDim2.new(1,-20,1,-130)
+        UI.AutoTraderPageHost.BackgroundColor3=P.pageBottom
+        corner(UI.AutoTraderPageHost,8)
+        stroke(UI.AutoTraderPageHost,THEME.border,0.24,1)
+        gradient(UI.AutoTraderPageHost,P.pageTop,P.pageBottom,0.30)
+    end
+
+    -- Static cards use one surface family; alternate cards differ only subtly.
+    local cards={
+        {UI.AutoTraderStageCard,true},{UI.AutoTraderStatusBox,false},{UI.AutoTraderServerCard,false},{UI.AutoTraderOpportunityCard,true},
+        {UI.AutoTraderSafetyCard,false},{UI.AutoTraderEventCard,true},{UI.AutoTraderStatsSession,false},{UI.AutoTraderStatsLearned,true},
+        {UI.AutoTraderStatsMargins,false},{UI.AutoTraderStatsNote,true},{UI.AutoTraderTradeStatusCard,true},{UI.AutoTraderNegotiationCard,false},
+        {UI.AutoTraderPlanCard,false},{UI.AutoTraderTradeInfoCard,true},{UI.AutoTraderPlayerDetail,true},{UI.AutoTraderQueueProjectionCard,false},
+        {UI.AutoTraderServerScanCard,true},{UI.AutoTraderBotHeaderCard,true},{UI.AutoTraderDirectAuthCard,true},
+    }
+    for _,entry in ipairs(cards) do styleCard(entry[1],entry[2]) end
+
+    -- Scroll regions share identical recess depth, corner radius, scrollbar width, and gutters.
+    for _,scroll in ipairs({
+        UI.AutoTraderPlayerScroll,UI.AutoTraderServerCandidateScroll,UI.AutoTraderBotScroll,UI.AutoTraderReserveScroll,
+        UI.DetailsScroll,UI.NotesScroll,
+    }) do styleScroll(scroll) end
+    if UI.AutoTraderHomeScroll then
+        UI.AutoTraderHomeScroll.ScrollBarThickness=5
+        UI.AutoTraderHomeScroll.ScrollBarImageColor3=Color3.fromRGB(70,139,178)
+    end
+
+    -- Home overview: wrapped status/decision text gets enough baseline room instead of touching card edges.
+    if UI.AutoTraderHomeScroll then UI.AutoTraderHomeScroll.CanvasSize=UDim2.fromOffset(0,1118) end
+    if UI.AutoTraderHomeContent then UI.AutoTraderHomeContent.Size=UDim2.new(1,-7,0,1110) end
+    if UI.AutoTraderStatusBox then UI.AutoTraderStatusBox.Size=UDim2.new(1,0,0,120) end
+    if UI.AutoTraderSafety then UI.AutoTraderSafety.Position=UDim2.fromOffset(10,86);UI.AutoTraderSafety.Size=UDim2.new(1,-20,0,28) end
+    if UI.AutoTraderServerCard then UI.AutoTraderServerCard.Position=UDim2.fromOffset(0,208);UI.AutoTraderServerCard.Size=UDim2.new(0.5,-4,0,132) end
+    if UI.AutoTraderOpportunityCard then UI.AutoTraderOpportunityCard.Position=UDim2.new(0.5,4,0,208);UI.AutoTraderOpportunityCard.Size=UDim2.new(0.5,-4,0,132) end
+    if UI.AutoTraderSafetyCard then UI.AutoTraderSafetyCard.Position=UDim2.fromOffset(0,348);UI.AutoTraderSafetyCard.Size=UDim2.new(0.5,-4,0,218) end
+    if UI.AutoTraderEventCard then UI.AutoTraderEventCard.Position=UDim2.new(0.5,4,0,348);UI.AutoTraderEventCard.Size=UDim2.new(0.5,-4,0,234) end
+    if UI.AutoTraderStatsSession then UI.AutoTraderStatsSession.Position=UDim2.fromOffset(0,590);UI.AutoTraderStatsSession.Size=UDim2.new(0.5,-4,0,218) end
+    if UI.AutoTraderStatsLearned then UI.AutoTraderStatsLearned.Position=UDim2.new(0.5,4,0,590);UI.AutoTraderStatsLearned.Size=UDim2.new(0.5,-4,0,218) end
+    if UI.AutoTraderStatsMargins then UI.AutoTraderStatsMargins.Position=UDim2.fromOffset(0,816);UI.AutoTraderStatsMargins.Size=UDim2.new(1,0,0,168) end
+    if UI.AutoTraderStatsNote then UI.AutoTraderStatsNote.Position=UDim2.fromOffset(0,992);UI.AutoTraderStatsNote.Size=UDim2.new(1,0,0,108) end
+
+    -- Trade page follows the same 8px vertical rhythm and leaves a real bottom inset for wrapped safety text.
+    if UI.AutoTraderTradeStatusCard then UI.AutoTraderTradeStatusCard.Size=UDim2.new(1,0,0,112) end
+    if UI.AutoTraderNegotiationCard then UI.AutoTraderNegotiationCard.Position=UDim2.fromOffset(0,120);UI.AutoTraderNegotiationCard.Size=UDim2.new(1,0,0,116) end
+    if UI.AutoTraderPlanCard then UI.AutoTraderPlanCard.Position=UDim2.fromOffset(0,244);UI.AutoTraderPlanCard.Size=UDim2.new(0.55,-4,1,-244) end
+    if UI.AutoTraderTradeInfoCard then UI.AutoTraderTradeInfoCard.Position=UDim2.new(0.55,4,0,244);UI.AutoTraderTradeInfoCard.Size=UDim2.new(0.45,-4,1,-244) end
+
+    -- Settings page: every clickable control is at least ~26px tall; vertical gaps use 6–8px rhythm.
+    if UI.AutoTraderSelfTestCard then
+        UI.AutoTraderSelfTestCard.Position=UDim2.fromOffset(0,0)
+        UI.AutoTraderSelfTestCard.Size=UDim2.new(1,-146,0,26)
+        corner(UI.AutoTraderSelfTestCard,6);stroke(UI.AutoTraderSelfTestCard,THEME.border,0.34,1)
+    end
+    if UI.AutoTraderResetPosition then UI.AutoTraderResetPosition.Position=UDim2.new(1,-138,0,0);UI.AutoTraderResetPosition.Size=UDim2.fromOffset(138,26) end
+    if UI.AutoTraderEnabled then UI.AutoTraderEnabled.Position=UDim2.fromOffset(0,32);UI.AutoTraderEnabled.Size=UDim2.new(1,0,0,34) end
+    if UI.AutoTraderIgnoreFriends then UI.AutoTraderIgnoreFriends.Position=UDim2.fromOffset(0,72);UI.AutoTraderIgnoreFriends.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderOpeningAnchor then UI.AutoTraderOpeningAnchor.Position=UDim2.new(0.5,4,0,72);UI.AutoTraderOpeningAnchor.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderUnknownTheir then UI.AutoTraderUnknownTheir.Position=UDim2.fromOffset(0,106);UI.AutoTraderUnknownTheir.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderPreferDuplicates then UI.AutoTraderPreferDuplicates.Position=UDim2.new(0.5,4,0,106);UI.AutoTraderPreferDuplicates.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderProfit then UI.AutoTraderProfit.Position=UDim2.fromOffset(0,140);UI.AutoTraderProfit.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderCanary then UI.AutoTraderCanary.Position=UDim2.new(0.5,4,0,140);UI.AutoTraderCanary.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderSkipTarget then UI.AutoTraderSkipTarget.Position=UDim2.fromOffset(0,174);UI.AutoTraderSkipTarget.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderCopyDebug then UI.AutoTraderCopyDebug.Position=UDim2.new(0.5,4,0,174);UI.AutoTraderCopyDebug.Size=UDim2.new(0.5,-4,0,28) end
+    if UI.AutoTraderDirectAuthCard then UI.AutoTraderDirectAuthCard.Position=UDim2.fromOffset(0,210);UI.AutoTraderDirectAuthCard.Size=UDim2.new(1,0,0,80) end
+    if UI.AutoTraderDirectAuthSecretBox then
+        UI.AutoTraderDirectAuthSecretBox.Position=UDim2.fromOffset(8,23);UI.AutoTraderDirectAuthSecretBox.Size=UDim2.new(0.54,-8,0,26)
+        textPadding(UI.AutoTraderDirectAuthSecretBox,9,7);corner(UI.AutoTraderDirectAuthSecretBox,6)
+    end
+    if UI.AutoTraderDirectAuthConnect then UI.AutoTraderDirectAuthConnect.Position=UDim2.new(0.54,4,0,23);UI.AutoTraderDirectAuthConnect.Size=UDim2.new(0.25,-5,0,26) end
+    if UI.AutoTraderDirectAuthForget then UI.AutoTraderDirectAuthForget.Position=UDim2.new(0.79,6,0,23);UI.AutoTraderDirectAuthForget.Size=UDim2.new(0.21,-7,0,26) end
+    if UI.AutoTraderDirectAuthRemember then UI.AutoTraderDirectAuthRemember.Position=UDim2.fromOffset(8,52);UI.AutoTraderDirectAuthRemember.Size=UDim2.fromOffset(116,24) end
+    if UI.AutoTraderDirectAuthStatus then UI.AutoTraderDirectAuthStatus.Position=UDim2.fromOffset(132,50);UI.AutoTraderDirectAuthStatus.Size=UDim2.new(1,-140,0,27) end
+    if UI.AutoTraderReserveTitle then UI.AutoTraderReserveTitle.Position=UDim2.fromOffset(4,298) end
+    if UI.AutoTraderReserveCount then UI.AutoTraderReserveCount.Position=UDim2.new(1,-198,0,298) end
+    if UI.AutoTraderSearch then
+        UI.AutoTraderSearch.Position=UDim2.fromOffset(0,320);UI.AutoTraderSearch.Size=UDim2.new(1,0,0,32)
+        UI.AutoTraderSearch.PlaceholderText="Search inventory and choose copies to keep…"
+        textPadding(UI.AutoTraderSearch,10,8);corner(UI.AutoTraderSearch,7);stroke(UI.AutoTraderSearch,THEME.border,0.30,1)
+    end
+    if UI.AutoTraderReserveScroll then UI.AutoTraderReserveScroll.Position=UDim2.fromOffset(0,360);UI.AutoTraderReserveScroll.Size=UDim2.new(1,0,1,-360) end
+
+    -- People text was the tightest fixed-height block after Gotham retuning; give it real line room.
+    if UI.AutoTraderPlayerHeader then
+        UI.AutoTraderPlayerHeader.Text="Trade opportunities"
+        UI.AutoTraderPlayerHeader.Position=UDim2.fromOffset(4,0)
+        UI.AutoTraderPlayerHeader.Size=UDim2.new(1,-8,0,24)
+        UI.AutoTraderPlayerHeader.TextSize=14
+    end
+    if UI.AutoTraderPlayerHint then
+        UI.AutoTraderPlayerHint.Position=UDim2.fromOffset(4,26)
+        UI.AutoTraderPlayerHint.Size=UDim2.new(1,-8,0,40)
+        UI.AutoTraderPlayerHint.TextSize=11
+        UI.AutoTraderPlayerHint.TextYAlignment=Enum.TextYAlignment.Top
+    end
+    if UI.AutoTraderPlayerDetail then UI.AutoTraderPlayerDetail.Position=UDim2.fromOffset(0,72);UI.AutoTraderPlayerDetail.Size=UDim2.new(1,0,0,136) end
+    if UI.AutoTraderPlayerDetailText then UI.AutoTraderPlayerDetailText.Position=UDim2.fromOffset(10,27);UI.AutoTraderPlayerDetailText.Size=UDim2.new(1,-20,0,102) end
+    if UI.AutoTraderQueueProjectionCard then UI.AutoTraderQueueProjectionCard.Position=UDim2.fromOffset(0,216);UI.AutoTraderQueueProjectionCard.Size=UDim2.new(1,0,0,116) end
+    if UI.AutoTraderQueueProjection then UI.AutoTraderQueueProjection.Position=UDim2.fromOffset(10,27);UI.AutoTraderQueueProjection.Size=UDim2.new(1,-20,0,83) end
+    if UI.AutoTraderPlayerScroll then UI.AutoTraderPlayerScroll.Position=UDim2.fromOffset(0,340);UI.AutoTraderPlayerScroll.Size=UDim2.new(1,0,1,-340) end
+
+    -- Server split: align both columns to the same top baseline and use a clean 48/52 proportion.
+    if UI.AutoTraderUpcomingToggle then
+        UI.AutoTraderUpcomingToggle.Position=UDim2.fromOffset(0,178)
+        UI.AutoTraderUpcomingToggle.Size=UDim2.new(0.48,-4,0,24)
+        UI.AutoTraderUpcomingToggle.TextSize=12
+        UI.AutoTraderUpcomingToggle.Font=Enum.Font.GothamBold
+        corner(UI.AutoTraderUpcomingToggle,6)
+    end
+    if UI.AutoTraderServerCandidateScroll then
+        UI.AutoTraderServerCandidateScroll.Position=UDim2.fromOffset(0,210)
+        UI.AutoTraderServerCandidateScroll.Size=UDim2.new(0.48,-4,1,-210)
+    end
+    if UI.AutoTraderBotHeaderCard then
+        UI.AutoTraderBotHeaderCard.Position=UDim2.new(0.49,4,0,178)
+        UI.AutoTraderBotHeaderCard.Size=UDim2.new(0.51,-4,0,116)
+    end
+    if UI.AutoTraderRefreshBots then
+        UI.AutoTraderRefreshBots.Position=UDim2.new(1,-170,0,43)
+        UI.AutoTraderRefreshBots.Size=UDim2.fromOffset(160,28)
+        UI.AutoTraderRefreshBots.TextSize=11
+        UI.AutoTraderRefreshBots.Font=Enum.Font.GothamBold
+        corner(UI.AutoTraderRefreshBots,6)
+    end
+    if UI.AutoTraderCertifyBots then
+        UI.AutoTraderCertifyBots.TextSize=11
+        UI.AutoTraderCertifyBots.Font=Enum.Font.GothamBold
+        corner(UI.AutoTraderCertifyBots,6)
+    end
+    if UI.AutoTraderBotScroll then
+        UI.AutoTraderBotScroll.Position=UDim2.new(0.49,4,0,302)
+        UI.AutoTraderBotScroll.Size=UDim2.new(0.51,-4,1,-302)
+    end
+
+    -- Legacy trade analysis + item details now speak the same surface language as the main window.
+    if UI.TradePanel and UI.TradePanel.Parent then
+        UI.TradePanel.BackgroundColor3=P.pearlBottom;corner(UI.TradePanel,9);stroke(UI.TradePanel,THEME.border,0.18,1)
+        gradient(UI.TradePanel,P.pearlTop,Color3.fromRGB(215,238,249),0.30)
+    end
+    for _,surface in ipairs({UI.ValueBox,UI.SignalBox}) do styleCard(surface,false) end
+    if UI.Details and UI.Details.Parent then
+        UI.Details.Size=UDim2.fromOffset(430,520)
+        UI.Details.BackgroundColor3=P.pearlBottom;corner(UI.Details,10);stroke(UI.Details,THEME.border,0.16,1)
+        gradient(UI.Details,P.pearlTop,Color3.fromRGB(218,240,250),0.30)
+    end
+    if UI.DetailsClose then UI.DetailsClose.Text="×";UI.DetailsClose.Size=UDim2.fromOffset(34,32);corner(UI.DetailsClose,7) end
+    if UI.DetailsAction then UI.DetailsAction.Text="Identify / update listing";corner(UI.DetailsAction,7) end
+
+    -- Activity window scales to narrow viewports but remains capped at the intended desktop width.
+    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent then
+        UI.AutoTraderThoughtFeed.Size=UDim2.new(1,-32,0,164)
+        corner(UI.AutoTraderThoughtFeed,9);stroke(UI.AutoTraderThoughtFeed,THEME.border,0.16,1)
+        gradient(UI.AutoTraderThoughtFeed,P.pearlTop,Color3.fromRGB(221,241,250),0.32)
+        local constraint=UI.AutoTraderThoughtFeed:FindFirstChildOfClass("UISizeConstraint")
+        if constraint then constraint.MaxSize=Vector2.new(580,164);constraint.MinSize=Vector2.new(320,36) end
+    end
+    if UI.AutoTraderThoughtFeedHeader then corner(UI.AutoTraderThoughtFeedHeader,9);gradient(UI.AutoTraderThoughtFeedHeader,P.chromeTop,P.chromeBottom,0.42) end
+    local activityCollapse=UI.AutoTraderThoughtFeedHeader and UI.AutoTraderThoughtFeedHeader:FindFirstChild("SV_ActivityCollapse")
+    if activityCollapse then activityCollapse.Position=UDim2.new(1,-35,0,5);activityCollapse.Size=UDim2.fromOffset(29,26);corner(activityCollapse,6) end
+
+    -- Section naming is concise and consistent; no behavioral code depends on these labels.
+    local copy={
+        ["WHERE AM I?"]="AUTOMATION FLOW",
+        ["QUEUE / SEARCH STATE"]="OPPORTUNITY QUEUE",
+        ["WHAT WE WILL OFFER"]="PLANNED OFFER",
+        ["WHY THE BOT CHOSE THIS"]="DECISION RATIONALE",
+        ["WHERE WE WILL GO NEXT"]="SERVER DISCOVERY",
+    }
+    for _,instance in ipairs(UI.AutoTraderPanel and UI.AutoTraderPanel:GetDescendants() or {}) do
+        if instance:IsA("TextLabel") then
+            if copy[instance.Text] then instance.Text=copy[instance.Text] end
+            if instance.Text==string.upper(instance.Text) and #instance.Text>0 and #instance.Text<=40 then
+                if instance.Font==Enum.Font.GothamBold or instance.Font==Enum.Font.SourceSansBold then
+                    instance.TextColor3=(instance.TextColor3==THEME.green or instance.TextColor3==THEME.red or instance.TextColor3==THEME.yellow) and instance.TextColor3 or P.section
+                end
+            end
+        elseif instance:IsA("TextBox") then
+            textPadding(instance,9,8)
+        end
+    end
+
+    -- Existing dashboard rebuild wrappers are preserved; layer only geometry polish on their results.
+    local function wrapRows(name,container,kind)
+        local current=State.AutoTrader[name]
+        local key="V51Base_"..name
+        if type(current)=="function" and State.AutoTrader[key]==nil then
+            State.AutoTrader[key]=current
+            State.AutoTrader[name]=function(...)
+                local out=table.pack(State.AutoTrader[key](...))
+                styleDynamicRows(container,kind)
+                if type(State.AutoTrader.ApplyUiMotionPolish)=="function" then State.AutoTrader.ApplyUiMotionPolish(container) end
+                return table.unpack(out,1,out.n)
+            end
+        end
+    end
+    wrapRows("RebuildReserveList",UI.AutoTraderReserveContent,"reserve")
+    wrapRows("RebuildPlayerDashboard",UI.AutoTraderPlayerContent,"people")
+    wrapRows("RebuildServerDashboard",UI.AutoTraderServerCandidateContent,"servers")
+    wrapRows("RebuildBotDashboard",UI.AutoTraderBotContent,"bots")
+
+    -- Re-apply final text tuning after the geometry changes and run a deferred clamp once AbsoluteSize settles.
+    if type(State.AutoTrader.ApplyUiMotionPolish)=="function" then
+        State.AutoTrader.ApplyUiMotionPolish(UI.AutoTraderPanel)
+        State.AutoTrader.ApplyUiMotionPolish(UI.AutoTraderThoughtFeed)
+        State.AutoTrader.ApplyUiMotionPolish(UI.Details)
+        State.AutoTrader.ApplyUiMotionPolish(UI.TradePanel)
+    end
+    styleDynamicRows(UI.AutoTraderReserveContent,"reserve")
+    styleDynamicRows(UI.AutoTraderPlayerContent,"people")
+    styleDynamicRows(UI.AutoTraderServerCandidateContent,"servers")
+    styleDynamicRows(UI.AutoTraderBotContent,"bots")
+    if clampAutoTraderPanelPosition then task.defer(function() clampAutoTraderPanelPosition(false) end) end
+    end)()
+end
 
 
 -- v41 self-test expansion: comprehensive catalog integration.
@@ -38066,7 +39253,7 @@ end)()
 -- REGISTER SAFETY: everything lives in this IIFE; category runners are separate
 -- function prototypes and no revision locals leak into the outer chunk.
 -------------------------------------------------------------------------------
-(function()
+;(function()
     State.AutoTrader.RetiredSelfTestCheckpoint = {
         generation = "v46-comprehensive",
         controllerVersion = "18.69.44-public-auto-trader-v46-cooperative-selftests",
@@ -38412,17 +39599,17 @@ end)()
         elseif i==2 then a.botPreview.goldMatchRatio=0.1;b.botPreview.goldMatchRatio=0.2
         elseif i==3 then a.botPreview.score=11;b.botPreview.score=10
         elseif i==4 then a.playing=6;b.playing=5
-        elseif i==5 then a.playing=b.playing=5;a.id="a";b.id="b"
+        elseif i==5 then a.playing=5;b.playing=5;a.id="a";b.id="b"
         elseif i==6 then a.botPreview.previewTrusted=false;b.botPreview.previewTrusted=true;expected=false
         elseif i==7 then a.botPreview.goldMatchRatio=0.3;b.botPreview.goldMatchRatio=0.1;expected=false
         elseif i==8 then a.botPreview.score=9;b.botPreview.score=10;expected=false
         elseif i==9 then a.playing=3;b.playing=5;expected=false
-        elseif i==10 then a.playing=b.playing=5;a.id="z";b.id="a";expected=false
+        elseif i==10 then a.playing=5;b.playing=5;a.id="z";b.id="a";expected=false
         elseif i==11 then a.botPreview.goldMatchRatio=0.10001;b.botPreview.goldMatchRatio=0.10002
         elseif i==12 then a.botPreview.score=10.00001;b.botPreview.score=10
-        elseif i==13 then a.id="same";b.id="same";a.playing=b.playing=5;expected=false
+        elseif i==13 then a.id="same";b.id="same";a.playing=5;b.playing=5;expected=false
         elseif i==14 then a.botPreview.score=-1;b.botPreview.score=-2
-        elseif i==15 then a.playing=b.playing=0;a.id="a";b.id="b"
+        elseif i==15 then a.playing=0;b.playing=0;a.id="a";b.id="b"
         elseif i==16 then a.playing=11;b.playing=1 end
         return State.AutoTrader.CompareFreshServerCandidates(a,b)==expected,"fresh server candidate comparator lost deterministic priority ordering"
     end)
@@ -38605,9 +39792,9 @@ end)()
         elseif i==3 then candidate=source:gsub("\n","\r\n")
         elseif i==4 then candidate=source:sub(-1)=="\n" and source:sub(1,-2) or source
         elseif i==5 then candidate=string.char(239,187,191)..source:gsub("\n","\r\n")
-        elseif i==6 then candidate=source:gsub(CONTROLLER_VERSION,"18.69.44-public-auto-trader-v46-cooperative-selftests",1);expected=false
+        elseif i==6 then candidate=source:gsub('version%s*=%s*"[^"]+"','version = "18.69.44-public-auto-trader-v46-cooperative-selftests"',1);expected=false
         elseif i==7 then candidate=source.."--tampered-byte\n";expected=false
-        elseif i==8 then candidate=source:gsub(CONTROLLER_VERSION,"18.69.44-public-auto-trader-v46-cooperative-selftests",1);expected=false
+        elseif i==8 then candidate=source:gsub('version%s*=%s*"[^"]+"','version = "18.69.44-public-auto-trader-v46-cooperative-selftests"',1);expected=false
         elseif i==9 then candidate=nil;expected=false
         elseif i==10 then candidate="short";expected=false
         elseif i==11 then candidate=source:gsub('distributionNormalizedSha256%s*=%s*"[0-9a-fA-F]+"','distributionNormalizedSha256 = "'..string.rep("0",64)..'"',1);expected=false
@@ -38616,7 +39803,12 @@ end)()
         elseif i==14 then candidate={source=source};expected=false
         elseif i==15 then local noFinal=source:sub(-1)=="\n" and source:sub(1,-2) or source;candidate=string.char(239,187,191)..noFinal
         elseif i==16 then candidate=source.."\n";expected=false end
-        local canonical=State.AutoTrader.CanonicalizeCapturedDistributionSource(candidate)
+        local canonical
+        if i==1 or i==7 then
+            canonical=State.AutoTrader.CanonicalizeCapturedDistributionSource(candidate)
+        else
+            canonical=State.AutoTrader.NormalizeCapturedDistributionEnvelope(candidate)
+        end
         return (canonical~=nil)==expected,"distribution canonicalizer integrity decision mismatch"
     end)
 
@@ -38757,6 +39949,1049 @@ end)()
         return result
     end
 end)()
+
+
+-- v52 human-first Frutiger Aero usability pass.
+-- Presentation/observability only, except for one direct-auth liveness correction above:
+-- production icon-token refresh is no longer born paused. Self-test isolation still pauses it explicitly.
+do
+(function()
+    local V52_Z = 1962
+    local GLASS_TOP = Color3.fromRGB(247,253,255)
+    local GLASS_BOTTOM = Color3.fromRGB(220,240,249)
+    local INK = Color3.fromRGB(27,52,66)
+    local MUTED = Color3.fromRGB(73,101,116)
+    local SKY = Color3.fromRGB(51,143,196)
+    local GREEN = Color3.fromRGB(76,153,67)
+    local AMBER = Color3.fromRGB(181,119,20)
+    local RED = Color3.fromRGB(180,57,62)
+
+    -- v52.1: this pass runs outside the older v30 UI do-block, so it must not
+    -- call that block's local aeroButton helper. Keep a self-contained button
+    -- factory here so late-added controls are scope-safe and visually consistent.
+    local function v52Button(parent,text,size,accent)
+        local greenNormal=Color3.fromRGB(102,177,76)
+        local greenHover=Color3.fromRGB(116,190,87)
+        local neutralNormal=Color3.fromRGB(220,239,248)
+        local neutralHover=Color3.fromRGB(205,232,245)
+        local button=makeButton(parent,text,size,accent and greenNormal or neutralNormal)
+        button.Font=Enum.Font.GothamBold
+        button.TextSize=11
+        button.TextColor3=accent and Color3.fromRGB(250,255,248) or INK
+        button.AutoButtonColor=false
+        addStroke(button,accent and Color3.fromRGB(77,143,63) or Color3.fromRGB(112,165,192),1,0.22)
+        local gradient=create("UIGradient",{
+            Color=ColorSequence.new({
+                ColorSequenceKeypoint.new(0,accent and Color3.fromRGB(188,232,150) or Color3.fromRGB(255,255,255)),
+                ColorSequenceKeypoint.new(1,accent and greenNormal or neutralNormal),
+            }),
+            Rotation=90,
+        },button)
+        local function isAutomationStateful()
+            return button:GetAttribute("SVV52AutomationState") == true
+        end
+        local function isRunning()
+            return State.AutoTrader and State.AutoTrader.Preferences
+                and State.AutoTrader.Preferences.automation == true
+        end
+        local function colors()
+            local activeAccent=accent and (not isAutomationStateful() or isRunning())
+            local normal=activeAccent and greenNormal or neutralNormal
+            local hover=activeAccent and greenHover or neutralHover
+            return normal,hover,activeAccent
+        end
+        local function syncGradient(activeAccent)
+            if not gradient or not gradient.Parent then return end
+            gradient.Color=ColorSequence.new({
+                ColorSequenceKeypoint.new(0,activeAccent and Color3.fromRGB(188,232,150) or Color3.fromRGB(255,255,255)),
+                ColorSequenceKeypoint.new(1,activeAccent and greenNormal or neutralNormal),
+            })
+        end
+        button.MouseEnter:Connect(function()
+            if button.Parent then
+                local _,hover,activeAccent=colors();syncGradient(activeAccent)
+                TweenService:Create(button,TweenInfo.new(0.11,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{BackgroundColor3=hover}):Play()
+            end
+        end)
+        button.MouseLeave:Connect(function()
+            if button.Parent then
+                local normal,_,activeAccent=colors();syncGradient(activeAccent)
+                TweenService:Create(button,TweenInfo.new(0.13,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{BackgroundColor3=normal}):Play()
+            end
+        end)
+        if State.AutoTrader.ApplyUiMotionPolish then pcall(State.AutoTrader.ApplyUiMotionPolish,button) end
+        return button
+    end
+
+    local function trim52(value)
+        local s=tostring(value or "")
+        return (s:gsub("[%c]+"," "):gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$",""))
+    end
+
+    State.AutoTrader.WatcherActivityLog=type(State.AutoTrader.WatcherActivityLog)=="table" and State.AutoTrader.WatcherActivityLog or {}
+    local function recordWatcherActivity(message,kind,name,userId,extra)
+        message=trim52(message)
+        if message=="" or (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 then return false end
+        local ring=State.AutoTrader.WatcherActivityLog
+        local last=ring[#ring]
+        local signature=tostring(kind or "activity").."|"..message.."|"..tostring(userId or name or "")
+        if last and last.signature==signature then return false end
+        local now=os.clock()
+        for i=#ring,math.max(1,#ring-10),-1 do
+            local prior=ring[i]
+            if prior and prior.signature==signature and now-(tonumber(prior.t) or 0)<25 then return false end
+        end
+        table.insert(ring,{t=now,unix=os.time(),kind=tostring(kind or "activity"),message=message,name=name,userId=userId,extra=HARDEN.supportJsonValue(extra),signature=signature})
+        while #ring>64 do table.remove(ring,1) end
+        return true
+    end
+
+    local function preserveCenterAnchor(object)
+        if not object or not object.Parent or not object:IsA("GuiObject") then return false end
+        local old=object.AnchorPoint
+        if math.abs(old.X-0.5)<0.0001 and math.abs(old.Y-0.5)<0.0001 then return true end
+        local size,position=object.Size,object.Position
+        local dx,dy=0.5-old.X,0.5-old.Y
+        object.Position=UDim2.new(
+            position.X.Scale+size.X.Scale*dx,
+            position.X.Offset+size.X.Offset*dx,
+            position.Y.Scale+size.Y.Scale*dy,
+            position.Y.Offset+size.Y.Offset*dy
+        )
+        object.AnchorPoint=Vector2.new(0.5,0.5)
+        return true
+    end
+
+    local function parentUsesLayout(parent)
+        return parent and (parent:FindFirstChildOfClass("UIListLayout")
+            or parent:FindFirstChildOfClass("UIGridLayout")
+            or parent:FindFirstChildOfClass("UIPageLayout")) ~= nil
+    end
+
+    -- Center transform origins for anything that actually scales/tweens. Preserve the
+    -- current on-screen rectangle while changing AnchorPoint, so nothing jumps at install.
+    preserveCenterAnchor(UI.AutoTraderPanel)
+    preserveCenterAnchor(UI.AutoTraderPanelShadow)
+    preserveCenterAnchor(UI.AutoTraderLauncher)
+    preserveCenterAnchor(UI.AutoTraderThoughtFeed)
+    preserveCenterAnchor(UI.AutoTraderTradeObserveBadge)
+    preserveCenterAnchor(UI.Details)
+    if UI.AutoTraderPanel and UI.AutoTraderPanel.Parent then
+        for _,object in ipairs(UI.AutoTraderPanel:GetDescendants()) do
+            if object:IsA("GuiButton") and object:FindFirstChild("SV_V50MotionScale") and not parentUsesLayout(object.Parent) then
+                preserveCenterAnchor(object)
+            end
+        end
+    end
+    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent then
+        for _,object in ipairs(UI.AutoTraderThoughtFeed:GetDescendants()) do
+            if object:IsA("GuiButton") and not parentUsesLayout(object.Parent) then preserveCenterAnchor(object) end
+        end
+    end
+
+    -- The old reset callback writes a right-edge anchored coordinate. Correct it on the
+    -- next task turn now that the window's transform origin is centered.
+    if UI.AutoTraderResetPosition then
+        connect(UI.AutoTraderResetPosition.MouseButton1Click,function()
+            task.defer(function()
+                if Destroyed or not UI.AutoTraderPanel or not UI.AutoTraderPanel.Parent then return end
+                local half=math.max(0,(tonumber(UI.AutoTraderPanel.Size.X.Offset) or 650)*0.5)
+                UI.AutoTraderPanel.Position=UDim2.new(1,-24-half,0.5,0)
+                if UI.AutoTraderPanelShadow then
+                    UI.AutoTraderPanelShadow.Position=UDim2.new(1,-19-half,0.5,5)
+                end
+                State.AutoTrader.Preferences.panelPosition=nil
+                State.AutoTrader.SavePreferences()
+                if clampAutoTraderPanelPosition then clampAutoTraderPanelPosition(true) end
+            end)
+        end)
+    end
+
+    -- Smooth whole-window open/close. A subtle pearl veil supplies the missing fade
+    -- without iterating hundreds of descendants and changing their authored transparencies.
+    local panelVeil=nil
+    if UI.AutoTraderPanel and UI.AutoTraderPanel.Parent then
+        panelVeil=UI.AutoTraderPanel:FindFirstChild("SV_V52TransitionVeil")
+        if not panelVeil then
+            panelVeil=create("Frame",{
+                Name="SV_V52TransitionVeil",Position=UDim2.fromScale(0,0),Size=UDim2.fromScale(1,1),
+                BackgroundColor3=Color3.fromRGB(246,253,255),BackgroundTransparency=1,BorderSizePixel=0,
+                Visible=false,Active=false,ZIndex=1598,
+            },UI.AutoTraderPanel)
+            addCorner(panelVeil,8)
+        end
+    end
+    State.AutoTrader.V52PanelMotionSerial=tonumber(State.AutoTrader.V52PanelMotionSerial) or 0
+    State.AutoTrader.SetPanelVisibleAnimated=function(show)
+        local panel=UI.AutoTraderPanel
+        if not panel or not panel.Parent then return end
+        State.AutoTrader.V52PanelMotionSerial+=1
+        local serial=State.AutoTrader.V52PanelMotionSerial
+        local shadow=UI.AutoTraderPanelShadow
+        local scale=UI.AutoTraderScale
+        local targetScale=tonumber(State.AutoTrader.UiScaleTarget) or (scale and tonumber(scale.Scale)) or 1
+        local rest=panel.Position
+        local openInfo=TweenInfo.new(0.235,Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+        local closeInfo=TweenInfo.new(0.155,Enum.EasingStyle.Quart,Enum.EasingDirection.In)
+        if show then
+            panel.Visible=true
+            if shadow then shadow.Visible=true;shadow.BackgroundTransparency=0.96 end
+            if panelVeil then panelVeil.Visible=true;panelVeil.BackgroundTransparency=0.43 end
+            panel.Position=UDim2.new(rest.X.Scale,rest.X.Offset,rest.Y.Scale,rest.Y.Offset+10)
+            if scale then scale.Scale=targetScale end
+            TweenService:Create(panel,openInfo,{Position=rest}):Play()
+            if shadow then TweenService:Create(shadow,openInfo,{BackgroundTransparency=0.80}):Play() end
+            if panelVeil then TweenService:Create(panelVeil,openInfo,{BackgroundTransparency=1}):Play() end
+            task.delay(0.25,function()
+                if not Destroyed and serial==State.AutoTrader.V52PanelMotionSerial and panelVeil then panelVeil.Visible=false end
+            end)
+        else
+            if not panel.Visible then return end
+            if panelVeil then panelVeil.Visible=true;panelVeil.BackgroundTransparency=1;TweenService:Create(panelVeil,closeInfo,{BackgroundTransparency=0.58}):Play() end
+            TweenService:Create(panel,closeInfo,{Position=UDim2.new(rest.X.Scale,rest.X.Offset,rest.Y.Scale,rest.Y.Offset+8)}):Play()
+            if shadow then TweenService:Create(shadow,closeInfo,{BackgroundTransparency=0.98}):Play() end
+            task.delay(0.16,function()
+                if Destroyed or serial~=State.AutoTrader.V52PanelMotionSerial then return end
+                panel.Visible=false
+                panel.Position=rest
+                if scale then scale.Scale=targetScale end
+                if shadow then shadow.Visible=false;shadow.BackgroundTransparency=0.80 end
+                if panelVeil then panelVeil.Visible=false;panelVeil.BackgroundTransparency=1 end
+            end)
+        end
+    end
+
+    -- Trade helper: MM2 reparents this frame during a real trade. Keep its transform
+    -- origin centered and animate position only so the existing viewport UIScale remains untouched.
+    State.AutoTrader.V52TradeHelperMotionSerial=tonumber(State.AutoTrader.V52TradeHelperMotionSerial) or 0
+    State.AutoTrader.SetTradeHelperVisibleAnimated=function(show)
+        if not TradePanel or not TradePanel.Parent then return end
+        State.AutoTrader.V52TradeHelperMotionSerial+=1
+        local serial=State.AutoTrader.V52TradeHelperMotionSerial
+        preserveCenterAnchor(TradePanel)
+        local base=State.AutoTrader.V52TradeHelperBasePosition
+        if show then
+            if TradePanel.Visible then
+                if State.AutoTrader.V52TradeHelperClosing and base then
+                    State.AutoTrader.V52TradeHelperClosing=false
+                    TweenService:Create(TradePanel,TweenInfo.new(0.16,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{Position=base}):Play()
+                end
+                return
+            end
+            base=TradePanel.Position
+            State.AutoTrader.V52TradeHelperBasePosition=base
+            State.AutoTrader.V52TradeHelperClosing=false
+            TradePanel.Position=UDim2.new(base.X.Scale,base.X.Offset+12,base.Y.Scale,base.Y.Offset)
+            TradePanel.Visible=true
+            TweenService:Create(TradePanel,TweenInfo.new(0.20,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{Position=base}):Play()
+        else
+            if not TradePanel.Visible or State.AutoTrader.V52TradeHelperClosing then return end
+            base=base or TradePanel.Position
+            State.AutoTrader.V52TradeHelperClosing=true
+            local target=UDim2.new(base.X.Scale,base.X.Offset+10,base.Y.Scale,base.Y.Offset)
+            TweenService:Create(TradePanel,TweenInfo.new(0.14,Enum.EasingStyle.Quad,Enum.EasingDirection.In),{Position=target}):Play()
+            task.delay(0.145,function()
+                if State.AutoTrader.V52TradeHelperMotionSerial~=serial or not TradePanel or not TradePanel.Parent then return end
+                TradePanel.Visible=false
+                TradePanel.Position=base
+                State.AutoTrader.V52TradeHelperClosing=false
+            end)
+        end
+    end
+
+    -- Item-detail modal animation. The early lexical open/close functions route here.
+    local detailsScale=nil
+    State.AutoTrader.V52DetailsMotionSerial=tonumber(State.AutoTrader.V52DetailsMotionSerial) or 0
+    State.AutoTrader.SetDetailsVisibleAnimated=function(show)
+        if not UI.Details or not UI.DetailsBackdrop then return end
+        State.AutoTrader.V52DetailsMotionSerial+=1
+        local serial=State.AutoTrader.V52DetailsMotionSerial
+        if not detailsScale or not detailsScale.Parent then
+            detailsScale=UI.Details:FindFirstChild("SV_V52DetailsScale") or create("UIScale",{Name="SV_V52DetailsScale",Scale=1},UI.Details)
+        end
+        if show then
+            UI.DetailsBackdrop.Visible=true
+            UI.Details.Visible=true
+            UI.DetailsBackdrop.BackgroundTransparency=1
+            detailsScale.Scale=0.90
+            TweenService:Create(UI.DetailsBackdrop,TweenInfo.new(0.20,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{BackgroundTransparency=0.48}):Play()
+            TweenService:Create(detailsScale,TweenInfo.new(0.225,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{Scale=1}):Play()
+        else
+            if not UI.Details.Visible then UI.DetailsBackdrop.Visible=false;return end
+            TweenService:Create(UI.DetailsBackdrop,TweenInfo.new(0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.In),{BackgroundTransparency=1}):Play()
+            TweenService:Create(detailsScale,TweenInfo.new(0.145,Enum.EasingStyle.Quad,Enum.EasingDirection.In),{Scale=0.94}):Play()
+            task.delay(0.15,function()
+                if Destroyed or serial~=State.AutoTrader.V52DetailsMotionSerial then return end
+                UI.Details.Visible=false
+                UI.DetailsBackdrop.Visible=false
+                UI.DetailsBackdrop.BackgroundTransparency=0.48
+                detailsScale.Scale=1
+            end)
+        end
+    end
+
+    -- Give page changes a true fade/settle instead of only changing the X offset.
+    if type(State.AutoTrader.SetActiveTab)=="function" then
+        local previousSetActiveTab=State.AutoTrader.SetActiveTab
+        State.AutoTrader.SetActiveTab=function(tabName)
+            local result=previousSetActiveTab(tabName)
+            local page=UI.AutoTraderPages and UI.AutoTraderPages[tabName]
+            if page and page.Parent and page.Visible then
+                local legacyScale=page:FindFirstChild("SV_V52PageScale")
+                if legacyScale then legacyScale.Scale=1 end
+                local wash=page:FindFirstChild("SV_V52PageWash")
+                if not wash then
+                    wash=create("Frame",{Name="SV_V52PageWash",Position=UDim2.fromScale(0,0),Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(246,252,255),BackgroundTransparency=1,BorderSizePixel=0,Active=false,ZIndex=1490},page)
+                end
+                -- Fade/settle only. Scaling a page changes apparent text size and makes
+                -- wrapped labels jitter while Roblox recomputes TextBounds.
+                wash.Visible=true;wash.BackgroundTransparency=0.52
+                TweenService:Create(wash,TweenInfo.new(0.17,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{BackgroundTransparency=1}):Play()
+                task.delay(0.18,function() if wash and wash.Parent then wash.Visible=false end end)
+            end
+            return result
+        end
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Human-first activity center: NOW / WHY / NEXT + player portrait + 3 events.
+    -- ---------------------------------------------------------------------
+    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent and UI.AutoTraderThoughtFeedBody then
+        local feed=UI.AutoTraderThoughtFeed
+        local constraint=feed:FindFirstChildOfClass("UISizeConstraint")
+        if constraint then constraint.MaxSize=Vector2.new(630,258);constraint.MinSize=Vector2.new(330,38) end
+        feed.ClipsDescendants=true
+        UI.AutoTraderThoughtFeedBody.Position=UDim2.fromOffset(10,43)
+        UI.AutoTraderThoughtFeedBody.Size=UDim2.new(1,-20,1,-51)
+
+        local oldCollapse=UI.AutoTraderThoughtFeedHeader and UI.AutoTraderThoughtFeedHeader:FindFirstChild("SV_ActivityCollapse")
+        if oldCollapse then oldCollapse.Visible=false;oldCollapse.Active=false end
+
+        local glance=create("Frame",{
+            Name="SV_V52ActivityGlance",Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,108),
+            BackgroundColor3=GLASS_BOTTOM,BorderSizePixel=0,ZIndex=V52_Z,
+        },UI.AutoTraderThoughtFeedBody)
+        addCorner(glance,7);addStroke(glance,Color3.fromRGB(108,160,187),1,0.34)
+        create("UIGradient",{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,GLASS_TOP),ColorSequenceKeypoint.new(1,GLASS_BOTTOM)}),Rotation=90},glance)
+        UI.AutoTraderActivityGlance=glance
+
+        local avatarShell=create("Frame",{Position=UDim2.fromOffset(10,12),Size=UDim2.fromOffset(74,74),BackgroundColor3=Color3.fromRGB(204,233,246),BorderSizePixel=0,ZIndex=V52_Z+1},glance)
+        addCorner(avatarShell,99);addStroke(avatarShell,Color3.fromRGB(87,150,183),1,0.24)
+        local avatar=create("ImageLabel",{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromOffset(37,37),Size=UDim2.fromOffset(66,66),BackgroundTransparency=1,Image="",ScaleType=Enum.ScaleType.Crop,ZIndex=V52_Z+2},avatarShell)
+        addCorner(avatar,99)
+        UI.AutoTraderActivityAvatar=avatar
+        local avatarFallback=makeLabel(avatarShell,"SV",20,Color3.fromRGB(45,112,149),Enum.Font.GothamBold)
+        avatarFallback.AnchorPoint=Vector2.new(0.5,0.5);avatarFallback.Position=UDim2.fromOffset(37,37);avatarFallback.Size=UDim2.fromOffset(66,66);avatarFallback.TextXAlignment=Enum.TextXAlignment.Center;avatarFallback.TextYAlignment=Enum.TextYAlignment.Center;avatarFallback.ZIndex=V52_Z+1
+        UI.AutoTraderActivityAvatarFallback=avatarFallback
+
+        local stage=makeLabel(glance,"WORKING",10,Color3.fromRGB(255,255,255),Enum.Font.GothamBold)
+        stage.AnchorPoint=Vector2.new(0.5,0.5);stage.Position=UDim2.new(1,-56,0,20);stage.Size=UDim2.fromOffset(92,22);stage.TextXAlignment=Enum.TextXAlignment.Center;stage.BackgroundColor3=SKY;stage.BackgroundTransparency=0;stage.ZIndex=V52_Z+2
+        addCorner(stage,99);UI.AutoTraderActivityStage=stage
+        local headline=makeLabel(glance,"Watching Auto Trader",15,INK,Enum.Font.GothamBold)
+        headline.Position=UDim2.fromOffset(96,10);headline.Size=UDim2.new(1,-205,0,24);headline.TextTruncate=Enum.TextTruncate.AtEnd;headline.ZIndex=V52_Z+2;UI.AutoTraderActivityHeadline=headline
+        local detail=makeLabel(glance,"Waiting for the next meaningful action.",11,MUTED,Enum.Font.Gotham)
+        detail.Position=UDim2.fromOffset(96,37);detail.Size=UDim2.new(1,-108,0,31);detail.TextWrapped=true;detail.TextYAlignment=Enum.TextYAlignment.Top;detail.ZIndex=V52_Z+2;UI.AutoTraderActivityDetail=detail
+        local nextLabel=makeLabel(glance,"Next · —",10,Color3.fromRGB(49,105,134),Enum.Font.GothamMedium)
+        nextLabel.Position=UDim2.fromOffset(96,73);nextLabel.Size=UDim2.new(1,-108,0,25);nextLabel.TextWrapped=true;nextLabel.TextYAlignment=Enum.TextYAlignment.Top;nextLabel.ZIndex=V52_Z+2;UI.AutoTraderActivityNext=nextLabel
+        local recent=makeLabel(UI.AutoTraderThoughtFeedBody,"RECENT",9,Color3.fromRGB(58,104,128),Enum.Font.GothamBold)
+        recent.Position=UDim2.fromOffset(2,113);recent.Size=UDim2.new(1,-4,0,16);recent.ZIndex=V52_Z;UI.AutoTraderActivityRecentTitle=recent
+
+        if UI.AutoTraderActivityState then
+            UI.AutoTraderActivityState.Position=UDim2.new(1,-126,0,6)
+            UI.AutoTraderActivityState.Size=UDim2.fromOffset(78,24)
+            UI.AutoTraderActivityState.Text="LIVE"
+        end
+
+        local collapse=makeButton(UI.AutoTraderThoughtFeedHeader,"▴",UDim2.fromOffset(28,24),Color3.fromRGB(226,240,248))
+        collapse.Name="SV_V52ActivityCollapse";collapse.AnchorPoint=Vector2.new(0.5,0.5);collapse.Position=UDim2.new(1,-20,0,18);collapse.TextColor3=Color3.fromRGB(40,79,100);collapse.TextSize=14;collapse.Font=Enum.Font.GothamBold;collapse.ZIndex=V52_Z+5
+        addCorner(collapse,6);addStroke(collapse,Color3.fromRGB(111,158,182),1,0.34)
+        UI.AutoTraderV52ActivityCollapse=collapse
+
+        local function activityHeight(height,immediate)
+            local pos,size=feed.Position,feed.Size
+            local topScale=pos.Y.Scale-size.Y.Scale*0.5
+            local topOffset=pos.Y.Offset-size.Y.Offset*0.5
+            local targetSize=UDim2.new(1,-32,0,height)
+            local targetPos=UDim2.new(pos.X.Scale,pos.X.Offset,topScale,topOffset+height*0.5)
+            if height>40 then UI.AutoTraderThoughtFeedBody.Visible=true end
+            if immediate then feed.Size=targetSize;feed.Position=targetPos;UI.AutoTraderThoughtFeedBody.Visible=height>40
+            else
+                TweenService:Create(feed,TweenInfo.new(0.22,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{Size=targetSize,Position=targetPos}):Play()
+                if height<=40 then task.delay(0.19,function() if State.AutoTrader.ThoughtFeedCollapsed and UI.AutoTraderThoughtFeedBody then UI.AutoTraderThoughtFeedBody.Visible=false end end) end
+            end
+        end
+        State.AutoTrader.ApplyActivityCollapse=function(immediate)
+            local collapsed=State.AutoTrader.ThoughtFeedCollapsed==true
+            collapse.Text=collapsed and "▾" or "▴"
+            activityHeight(collapsed and 38 or 258,immediate==true)
+        end
+        connect(collapse.MouseButton1Click,function()
+            State.AutoTrader.ThoughtFeedCollapsed=not (State.AutoTrader.ThoughtFeedCollapsed==true)
+            State.AutoTrader.ApplyActivityCollapse(false)
+        end)
+        State.AutoTrader.ApplyActivityCollapse(true)
+
+        -- Re-layout only the event rows. The fourth retained row stays available for
+        -- history/deduping but only the newest three are shown to keep the glance clean.
+        State.AutoTrader.LayoutThoughtFeed=function(immediate)
+            for index,entry in ipairs(State.AutoTrader.ThoughtFeedEntries or {}) do
+                local frame,label,timeLabel=entry.frame,entry.label,entry.timeLabel
+                if frame and frame.Parent then
+                    local visible=index<=3
+                    frame.Visible=visible
+                    if visible then
+                        local y=132+(index-1)*24
+                        local targetPosition=UDim2.fromOffset(0,y)
+                        local targetSize=UDim2.new(1,0,0,22)
+                        local newest=index==1
+                        if immediate then frame.Position=targetPosition;frame.Size=targetSize;frame.BackgroundTransparency=newest and 0.18 or 0.72
+                        else TweenService:Create(frame,TweenInfo.new(0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Position=targetPosition,Size=targetSize,BackgroundTransparency=newest and 0.18 or 0.72}):Play() end
+                        if label then label.TextSize=11;label.Font=newest and Enum.Font.GothamMedium or Enum.Font.Gotham;label.TextTransparency=newest and 0 or 0.12;label.TextColor3=newest and INK or MUTED end
+                        if timeLabel then timeLabel.TextSize=10;timeLabel.TextTransparency=newest and 0 or 0.18 end
+                    end
+                end
+            end
+        end
+
+        local avatarSerial=0
+        local currentAvatarUserId=nil
+        local function setAvatar(userId,name,stageText)
+            userId=tonumber(userId)
+            local initials="SV"
+            if name and name~="" then initials=string.upper(string.sub(name,1,1)) end
+            if not userId or userId<=0 then
+                currentAvatarUserId=nil;avatarSerial+=1;avatar.Image="";avatarFallback.Text=(stageText=="BLOCKED" and "!" or stageText=="MOVING" and "↻" or initials);avatarFallback.Visible=true;return
+            end
+            if currentAvatarUserId==userId and avatar.Image~="" then avatarFallback.Visible=false;return end
+            currentAvatarUserId=userId;avatarSerial+=1
+            local serial=avatarSerial;avatar.Image="";avatarFallback.Text=initials;avatarFallback.Visible=true
+            task.spawn(function()
+                local ok,url,ready=pcall(Players.GetUserThumbnailAsync,Players,userId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size100x100)
+                if Destroyed or serial~=avatarSerial or currentAvatarUserId~=userId then return end
+                if ok and type(url)=="string" and url~="" then avatar.Image=url;avatarFallback.Visible=false else avatar.Image="";avatarFallback.Visible=true end
+            end)
+        end
+
+        local function person()
+            local p=State.AutoTrader.LastTradePartner
+            if p then return p.Name,p.UserId end
+            local pending=State.AutoTrader.PendingRequest
+            if type(pending)=="table" then return pending.name,pending.userId end
+            local selected=State.AutoTrader.SelectedTarget
+            if selected then return selected.Name,selected.UserId end
+            return nil,nil
+        end
+
+        local function technicalReason(value)
+            local s=trim52(value)
+            if s=="" then return nil end
+            if s:find("controller version marker mismatch",1,true) then return "the server-change script does not match this build" end
+            if s:find("hash",1,true) and s:find("mismatch",1,true) then return "the server-change script failed its integrity check" end
+            if s:find("missing bootstrap authorization",1,true) then return "the new-server handoff was not authorized" end
+            return s:gsub("_"," ")
+        end
+
+        local function activityModel()
+            local status=tostring(State.AutoTrader.Status or "")
+            local detailText=trim52(State.AutoTrader.StatusDetail)
+            local name,userId=person();local who=name or "the current player"
+            local stageText,headlineText,whyText,nextText="WORKING","Looking for a safe trade","Scanning this server and comparing real inventories.","Choose the best safe opportunity"
+            if not State.AutoTrader.Preferences.automation then
+                stageText,headlineText,whyText,nextText="PAUSED","Auto Trader is off","No automatic requests, offers, accepts, or server changes will be made.","Turn Auto Trader on in Settings"
+            elseif State.AutoTrader.SessionFrozen or status:find("FROZEN",1,true) or status:find("SAFETY STOP",1,true) then
+                stageText,headlineText,whyText,nextText="PAUSED","Paused for safety",detailText~="" and detailText or "A safety check stopped automated actions.","Review the message before resuming"
+            elseif (State.AutoTrader.ServerHopInProgress or status:find("SERVER EXHAUSTED",1,true) or status:find("HOP",1,true)) and State.AutoTrader.TeleportContinuationReady==false then
+                local reason=technicalReason(State.AutoTrader.TeleportContinuationError) or technicalReason(State.AutoTrader.TeleportQueueOutcome)
+                stageText,headlineText,whyText,nextText="BLOCKED","A new server is needed, but the handoff is blocked",reason or "The verified continuation script is not ready.","Keep this window open; re-run the current verified build if it cannot recover"
+                name,userId=nil,nil
+            elseif status:find("BOT SERVER",1,true) or State.AutoTrader.FastBotHopActive then
+                stageText,headlineText,whyText,nextText="MOVING","Leaving this server",detailText~="" and detailText or "This server is not useful for normal human trading.","Find a healthier server"
+                name,userId=nil,nil
+            elseif State.AutoTrader.ServerHopInProgress or status:find("SERVER EXHAUSTED",1,true) or status:find("SERVER HOP",1,true) then
+                stageText,headlineText,whyText,nextText="MOVING","Finding a better server",detailText~="" and detailText or "Everyone useful here has been checked.","Join the best eligible server"
+                name,userId=nil,nil
+            elseif status=="WAIT · DISCOVERY" or status=="WAIT · FEASIBILITY SEARCH" then
+                stageText,headlineText,whyText,nextText="SCANNING","Reading player inventories",detailText~="" and detailText or "The trader is resolving values before it contacts anyone.","Pick a person only after a safe trade is proven"
+                name,userId=nil,nil
+            elseif status=="QUEUE Q1" or status=="REQUEST · ATTEMPTING" then
+                stageText,headlineText,whyText,nextText="REQUEST","Trying to trade "..who,detailText~="" and detailText or "A useful trade is already modeled for this person.","Wait for MM2 to acknowledge the request"
+            elseif status=="REQUEST PENDING" or status=="REQUEST · VERIFYING" then
+                stageText,headlineText,whyText,nextText="WAITING","Waiting for "..who,detailText~="" and detailText or "The trade request has been sent.","Open the trade if they accept; otherwise move on"
+            elseif status:find("DECLIN",1,true) or status=="COOLDOWN · TRADE ENDED" then
+                stageText,headlineText,whyText,nextText="DECLINED",who.." did not continue the trade",detailText~="" and detailText or "Nothing unsafe was accepted.","Move on to the next person"
+            elseif status=="CALCULATING" or status=="WAIT · KNOWN VALUE" then
+                stageText,headlineText,whyText,nextText="CHECKING","Checking "..who.."'s offer",detailText~="" and detailText or "Values, profit floor, market safety, and your inventory are being checked.","Build a safe offer or wait for their offer to change"
+            elseif status=="PLAN VERIFIED" or status=="NEGOTIATING · HOLDING MARGIN" then
+                local plan=State.AutoTrader.Plan
+                local numbers=plan and ("Give "..formatCompact(plan.total or 0).." → receive "..formatCompact(plan.receiveTotal or 0).." · +"..formatCompact(plan.win or 0)) or nil
+                stageText,headlineText,whyText,nextText="READY","Safe offer ready for "..who,numbers or (detailText~="" and detailText or "The planner found an offer that passes every safety check."),"Wait for acceptance or adjust only within the safe floor"
+            elseif status:find("AUTO ACCEPT",1,true) or status:find("AUTO ACCEPTED",1,true) or status=="OFFER READY · AUTO ACCEPT" then
+                stageText,headlineText,whyText,nextText="ACCEPTED","Accepted the safe offer",detailText~="" and detailText or "The current trade meets the configured safety and value rules.","Wait for MM2 to finish, then verify inventory"
+            elseif status=="TRADE COMPLETED" or status=="TRADE SETTLEMENT · VERIFYING" or status=="AUDITING TRADE" then
+                stageText,headlineText,whyText,nextText="VERIFYING","Trade finished — checking the result",detailText~="" and detailText or "The trader is reconciling the inventory change before doing anything else.","Confirm exactly what was received and given"
+            elseif State.AutoTrader.LastTradePartner then
+                stageText,headlineText,whyText,nextText="TRADE","Trade open with "..who,detailText~="" and detailText or "Watching their offer and waiting for enough information to act safely.","Evaluate the next offer change"
+            elseif State.AutoTrader.SelectedTarget then
+                stageText,headlineText,whyText,nextText="TARGET","Next person: "..who,detailText~="" and detailText or "Their resolved inventory contains a planner-proven useful trade.","Send a trade request"
+            elseif detailText~="" then
+                whyText=detailText
+            end
+            return stageText,headlineText,whyText,nextText,name,userId,status
+        end
+
+        local stageColors={PAUSED=AMBER,BLOCKED=RED,MOVING=SKY,SCANNING=SKY,REQUEST=Color3.fromRGB(91,126,190),WAITING=AMBER,DECLINED=AMBER,CHECKING=Color3.fromRGB(108,93,175),READY=GREEN,ACCEPTED=GREEN,VERIFYING=GREEN,TRADE=Color3.fromRGB(91,126,190),TARGET=SKY,WORKING=SKY}
+        local activityBaseLog=State.AutoTrader.Log
+        State.AutoTrader.V52ActivityLastSignature=tostring(State.AutoTrader.V52ActivityLastSignature or "")
+        State.AutoTrader.UpdateActivityGlance=function()
+            if not glance.Parent then return end
+            local stageText,headlineText,whyText,nextText,name,userId,rawStatus=activityModel()
+            stage.Text=stageText;stage.BackgroundColor3=stageColors[stageText] or SKY
+            headline.Text=headlineText;detail.Text=whyText;nextLabel.Text="Next · "..nextText
+            if UI.AutoTraderActivityState then UI.AutoTraderActivityState.Text=State.AutoTrader.Preferences.automation and "LIVE" or "PAUSED" end
+            setAvatar(userId,name,stageText)
+            feed.Visible=State.AutoTrader.Preferences.automation==true or State.AutoTrader.LastTradePartner~=nil
+            State.AutoTrader.LayoutThoughtFeed(true)
+            local signature=table.concat({stageText,headlineText,whyText,nextText,tostring(userId or ""),rawStatus},"|")
+            if signature~=State.AutoTrader.V52ActivityLastSignature and (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 then
+                State.AutoTrader.V52ActivityLastSignature=signature
+                local watcherData={stage=stageText,headline=headlineText,detail=whyText,next=nextText,name=name,userId=userId,rawStatus=rawStatus}
+                activityBaseLog("watcher_status_transition",watcherData)
+                recordWatcherActivity(headlineText,"status",name,userId,watcherData)
+            end
+        end
+
+        local renderBeforeV52=State.AutoTrader.Render
+        State.AutoTrader.Render=function(...)
+            local result=table.pack(renderBeforeV52(...))
+            if not Destroyed then pcall(State.AutoTrader.UpdateActivityGlance) end
+            return table.unpack(result,1,result.n)
+        end
+        task.defer(function() if not Destroyed then pcall(State.AutoTrader.UpdateActivityGlance) end end)
+    end
+
+    -- Translate implementation vocabulary into labels a first-time user can scan.
+    local friendlySectionNames={
+        ["AUTOMATION FLOW"]="HOW AUTO TRADER WORKS",
+        ["OPPORTUNITY QUEUE"]="TRADE SEARCH",
+        ["PLANNED OFFER"]="WHAT WE WILL OFFER",
+        ["DECISION RATIONALE"]="WHY THIS OFFER IS SAFE",
+        ["SERVER DISCOVERY"]="NEXT SERVER",
+        ["HEALTH CHECKS"]="SYSTEM HEALTH",
+        ["LEARNED STRATEGY"]="WHAT AUTO TRADER LEARNED",
+        ["NEGOTIATION LEARNING"]="PROFIT TUNING",
+        ["BOT INTELLIGENCE"]="BOT SERVER CHECK",
+    }
+    if UI.AutoTraderPanel and UI.AutoTraderPanel.Parent then
+        for _,object in ipairs(UI.AutoTraderPanel:GetDescendants()) do
+            if object:IsA("TextLabel") and friendlySectionNames[object.Text] then object.Text=friendlySectionNames[object.Text] end
+        end
+    end
+    if UI.AutoTraderPlayerHint then
+        UI.AutoTraderPlayerHint.Text="Auto Trader checks each player's real inventory first. A person is only queued when it can already prove a safe useful trade; the best proven option goes first."
+    end
+    if UI.AutoTraderBotDetail then
+        UI.AutoTraderBotDetail.Text="Auto Trader watches repeatable movement patterns to avoid bot-heavy servers. Recheck scans this server again. Mark Server as Bots is a manual override—use it only when you are sure."
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Settings: preserve required cookie/token icon flow, but explain it like a product.
+    -- ---------------------------------------------------------------------
+    if UI.AutoTraderCanary then UI.AutoTraderCanary.Visible=false;UI.AutoTraderCanary.Active=false end
+    if (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)<=0 and State.AutoTrader.SupervisedCanaryArmed then
+        State.AutoTrader.SupervisedCanaryArmed=false
+        State.AutoTrader.SupervisedCanaryStarted=false
+        State.AutoTrader.SupervisedCanaryArmedAt=0
+        State.AutoTrader.SupervisedCanaryStartedAt=0
+        State.AutoTrader.SupervisedCanaryStopReason=nil
+        State.AutoTrader.SupervisedCanaryTargetUserId=nil
+        State.AutoTrader.SupervisedCanaryTargetName=nil
+        State.AutoTrader.SupervisedCanaryTargetAttemptStartedAt=0
+        State.AutoTrader.Log("legacy_canary_cleared_for_human_ui",{})
+    end
+    local settings=UI.AutoTraderPages and UI.AutoTraderPages.SETTINGS
+    if settings then
+        if UI.AutoTraderProfit then UI.AutoTraderProfit.Size=UDim2.new(0.5,-4,0,28) end
+        if not UI.AutoTraderIconRefresh then
+            local refreshIcons=v52Button(settings,"REFRESH PLAYER ICONS",UDim2.new(0.5,-4,0,28),false)
+            refreshIcons.Position=UDim2.new(0.5,4,0,132);refreshIcons.TextSize=10;refreshIcons.TextColor3=THEME.blue;refreshIcons.ZIndex=1454
+            UI.AutoTraderIconRefresh=refreshIcons
+            connect(refreshIcons.MouseButton1Click,function()
+                if Destroyed then return end
+                if not (State.AutoTrader.HasDirectAuthSecret and State.AutoTrader.HasDirectAuthSecret()) then
+                    if UI.AutoTraderDirectAuthStatus then UI.AutoTraderDirectAuthStatus.Text="Player icons · NOT CONNECTED · paste your Roblox cookie below";UI.AutoTraderDirectAuthStatus.TextColor3=THEME.yellow end
+                    return
+                end
+                if UI.AutoTraderDirectAuthStatus then UI.AutoTraderDirectAuthStatus.Text="Player icons · REFRESHING…";UI.AutoTraderDirectAuthStatus.TextColor3=THEME.blue end
+                task.spawn(function()
+                    pcall(State.AutoTrader.RefreshDirectAuthServerSnapshot)
+                    if not Destroyed and State.AutoTrader.BuildPublicServerQueue then pcall(State.AutoTrader.BuildPublicServerQueue,true) end
+                    if not Destroyed and State.AutoTrader.UpdateDirectAuthUi then pcall(State.AutoTrader.UpdateDirectAuthUi) end
+                end)
+            end)
+        end
+    end
+
+    if UI.AutoTraderDirectAuthCard and UI.AutoTraderDirectAuthCard.Parent then
+        local card=UI.AutoTraderDirectAuthCard
+        card.Position=UDim2.fromOffset(0,202);card.Size=UDim2.new(1,0,0,112)
+        for _,child in ipairs(card:GetChildren()) do
+            if child:IsA("TextLabel") and child.Text=="AUTHENTICATED SERVER PREVIEWS" then
+                child.Text="PLAYER ICON CONNECTION";child.Font=Enum.Font.GothamBold;child.TextSize=11;child.Position=UDim2.fromOffset(9,5);child.Size=UDim2.new(1,-18,0,16)
+            end
+        end
+        local help=card:FindFirstChild("SV_V52DirectAuthHelp") or makeLabel(card,"Uses your Roblox session cookie locally so Roblox can return the player tokens needed for upcoming-server avatar icons. The cookie is hidden while typing. KEEP AFTER HOPS saves it in executor storage as plaintext.",9,THEME.muted,Enum.Font.Gotham)
+        help.Name="SV_V52DirectAuthHelp";help.Position=UDim2.fromOffset(9,22);help.Size=UDim2.new(1,-18,0,28);help.TextWrapped=true;help.TextYAlignment=Enum.TextYAlignment.Top;help.ZIndex=1456
+        if UI.AutoTraderDirectAuthSecretBox then
+            UI.AutoTraderDirectAuthSecretBox.Position=UDim2.fromOffset(8,52);UI.AutoTraderDirectAuthSecretBox.Size=UDim2.new(0.52,-8,0,26)
+            UI.AutoTraderDirectAuthSecretBox.PlaceholderText="Paste .ROBLOSECURITY cookie here (hidden)"
+            UI.AutoTraderDirectAuthSecretBox.Font=Enum.Font.Gotham;UI.AutoTraderDirectAuthSecretBox.TextSize=11;UI.AutoTraderDirectAuthSecretBox.TextTransparency=1
+        end
+        if UI.AutoTraderDirectAuthConnect then UI.AutoTraderDirectAuthConnect.Position=UDim2.new(0.52,4,0,52);UI.AutoTraderDirectAuthConnect.Size=UDim2.new(0.27,-5,0,26);UI.AutoTraderDirectAuthConnect.Text="CONNECT ICONS";UI.AutoTraderDirectAuthConnect.TextSize=9 end
+        if UI.AutoTraderDirectAuthForget then UI.AutoTraderDirectAuthForget.Position=UDim2.new(0.79,6,0,52);UI.AutoTraderDirectAuthForget.Size=UDim2.new(0.21,-7,0,26);UI.AutoTraderDirectAuthForget.Text="DISCONNECT";UI.AutoTraderDirectAuthForget.TextSize=9 end
+        if UI.AutoTraderDirectAuthRemember then UI.AutoTraderDirectAuthRemember.Position=UDim2.fromOffset(8,83);UI.AutoTraderDirectAuthRemember.Size=UDim2.fromOffset(126,22);UI.AutoTraderDirectAuthRemember.TextSize=8 end
+        if UI.AutoTraderDirectAuthStatus then UI.AutoTraderDirectAuthStatus.Position=UDim2.fromOffset(142,81);UI.AutoTraderDirectAuthStatus.Size=UDim2.new(1,-150,0,27);UI.AutoTraderDirectAuthStatus.Font=Enum.Font.Gotham;UI.AutoTraderDirectAuthStatus.TextSize=9 end
+        if UI.AutoTraderReserveTitle then UI.AutoTraderReserveTitle.Position=UDim2.fromOffset(4,322) end
+        if UI.AutoTraderReserveCount then UI.AutoTraderReserveCount.Position=UDim2.new(1,-198,0,322) end
+        if UI.AutoTraderSearch then UI.AutoTraderSearch.Position=UDim2.fromOffset(0,344) end
+        if UI.AutoTraderReserveScroll then UI.AutoTraderReserveScroll.Position=UDim2.fromOffset(0,382);UI.AutoTraderReserveScroll.Size=UDim2.new(1,0,1,-382) end
+
+        local oldUpdateAuth=State.AutoTrader.UpdateDirectAuthUi
+        State.AutoTrader.UpdateDirectAuthUi=function()
+            if oldUpdateAuth then oldUpdateAuth() end
+            local support=State.AutoTrader.GetDirectAuthSupportSummary and State.AutoTrader.GetDirectAuthSupportSummary() or {}
+            local status=tostring(support.status or "AUTH_DIRECT_MISSING_SECRET")
+            local line,color
+            if status=="AUTH_DIRECT_READY" then
+                line="Player icons · CONNECTED · "..tostring(support.totalPlayerTokenCount or 0).." avatar tokens across "..tostring(support.tokenBearingRows or 0).." servers";color=THEME.green
+            elseif status=="AUTH_DIRECT_MISSING_SECRET" then
+                local pasted=UI.AutoTraderDirectAuthSecretBox and UI.AutoTraderDirectAuthSecretBox.Text~=""
+                line=pasted and "Cookie pasted (hidden) · click CONNECT ICONS" or "Player icons · NOT CONNECTED · paste your Roblox cookie above";color=THEME.yellow
+            elseif status=="AUTH_DIRECT_PENDING" then
+                line="Player icons · CONNECTING…";color=THEME.blue
+            elseif status=="AUTH_DIRECT_REJECTED" then
+                line="Player icons · SIGN-IN REJECTED · the cookie may be expired";color=THEME.red
+            elseif status=="AUTH_DIRECT_TOKENLESS" then
+                line="Player icons · CONNECTED, but Roblox returned no player-icon tokens";color=THEME.yellow
+            elseif status=="AUTH_DIRECT_BACKOFF" then
+                line="Player icons · RETRYING in "..tostring(math.ceil(tonumber(support.backoffSeconds) or 0)).."s · "..trim52(support.lastFailureCode or "temporary request failure");color=THEME.yellow
+            elseif status=="AUTH_DIRECT_PERSIST_CLEAR_FAILED" then
+                line="Player icons · COOKIE STORAGE ERROR · use DISCONNECT before trying again";color=THEME.red
+            else
+                line="Player icons · CONNECTION ISSUE · "..trim52(support.lastFailureCode or status);color=THEME.yellow
+            end
+            if UI.AutoTraderDirectAuthStatus then UI.AutoTraderDirectAuthStatus.Text=line;UI.AutoTraderDirectAuthStatus.TextColor3=color end
+            if UI.AutoTraderDirectAuthRemember then
+                local remember=State.AutoTrader.GetDirectAuthRemember and State.AutoTrader.GetDirectAuthRemember()
+                UI.AutoTraderDirectAuthRemember.Text=remember and "KEEP AFTER HOPS: ON" or "KEEP AFTER HOPS: OFF"
+                UI.AutoTraderDirectAuthRemember.TextColor3=remember and THEME.green or THEME.muted
+            end
+            if UI.AutoTraderIconRefresh then
+                UI.AutoTraderIconRefresh.Text=status=="AUTH_DIRECT_READY" and "REFRESH PLAYER ICONS" or "TEST PLAYER ICONS"
+            end
+        end
+        if UI.AutoTraderDirectAuthSecretBox then
+            connect(UI.AutoTraderDirectAuthSecretBox:GetPropertyChangedSignal("Text"),function()
+                if not Destroyed and State.AutoTrader.UpdateDirectAuthUi then State.AutoTrader.UpdateDirectAuthUi() end
+            end)
+        end
+        State.AutoTrader.UpdateDirectAuthUi()
+    end
+
+    -- Home gets the primary action a first-time user expects to find immediately.
+    if UI.AutoTraderStageCard and not UI.AutoTraderHomePower and type(State.AutoTrader.ToggleAutomationFromUi)=="function" then
+        if UI.AutoTraderPipeline then
+            UI.AutoTraderPipeline.Position=UDim2.fromOffset(10,25)
+            UI.AutoTraderPipeline.Size=UDim2.new(1,-184,0,17)
+            UI.AutoTraderPipeline.TextXAlignment=Enum.TextXAlignment.Left
+        end
+        if UI.AutoTraderStage then
+            UI.AutoTraderStage.Position=UDim2.fromOffset(10,46)
+            UI.AutoTraderStage.Size=UDim2.new(1,-184,0,17)
+            UI.AutoTraderStage.TextXAlignment=Enum.TextXAlignment.Left
+        end
+        local power=v52Button(UI.AutoTraderStageCard,"START AUTO TRADER",UDim2.fromOffset(158,36),true)
+        power:SetAttribute("SVV52AutomationState",true)
+        power.AnchorPoint=Vector2.new(0.5,0.5);power.Position=UDim2.new(1,-89,0,43);power.TextSize=10;power.Font=Enum.Font.GothamBold;power.ZIndex=1458
+        UI.AutoTraderHomePower=power
+        connect(power.MouseButton1Click,function() if not Destroyed then State.AutoTrader.ToggleAutomationFromUi() end end)
+    end
+
+    -- People tab gets the one action a non-technical user actually needs there.
+    local people=UI.AutoTraderPages and UI.AutoTraderPages.PEOPLE
+    if people and not UI.AutoTraderPeopleSkip then
+        local skip=v52Button(people,"SKIP THIS PERSON",UDim2.fromOffset(126,26),false)
+        skip.AnchorPoint=Vector2.new(0.5,0.5);skip.Position=UDim2.new(1,-67,0,13);skip.TextSize=9;skip.TextColor3=THEME.yellow;skip.ZIndex=1460
+        UI.AutoTraderPeopleSkip=skip
+        if UI.AutoTraderPlayerHeader then UI.AutoTraderPlayerHeader.Size=UDim2.new(1,-142,0,22) end
+        connect(skip.MouseButton1Click,function()
+            local target=State.AutoTrader.SelectedTarget
+            if target and target.Parent then
+                State.AutoTrader.MarkServerPlayerOutcome(target,"manual_skip","manual UI skip")
+                State.AutoTrader.SetCooldown(target,"manual UI skip",120)
+                State.AutoTrader.SelectedTarget=nil
+                State.AutoTrader.Status="TARGET SKIPPED"
+                State.AutoTrader.StatusDetail=target.Name.." was skipped for this server visit."
+                State.AutoTrader.Log("watcher_manual_target_skip",{name=target.Name,userId=target.UserId,reason="user pressed SKIP THIS PERSON"})
+                State.AutoTrader.Render()
+                if not isTradeVisible() then State.AutoTrader.OnNoTrade() end
+            end
+        end)
+    end
+
+    -- Product-language control labels. Internal canary machinery remains intact for
+    -- automated safety tests, but no normal user is asked to understand or operate it.
+    local controlsBeforeV52=State.AutoTrader.UpdateControls
+    State.AutoTrader.UpdateControls=function(...)
+        local result=table.pack(controlsBeforeV52(...))
+        local prefs=State.AutoTrader.Preferences
+        if UI.AutoTraderSelfTests then UI.AutoTraderSelfTests.Text=UI.AutoTraderSelfTests.Text:gsub("SELF TESTS","SYSTEM CHECK") end
+        if UI.AutoTraderEnabled then
+            local running=prefs.automation==true
+            UI.AutoTraderEnabled.Text=running and "AUTO TRADER · RUNNING" or "AUTO TRADER · STOPPED — CLICK TO START"
+            UI.AutoTraderEnabled.TextColor3=running and Color3.fromRGB(250,255,248) or THEME.yellow
+            local stateStroke=UI.AutoTraderEnabled:FindFirstChildOfClass("UIStroke")
+            if stateStroke then stateStroke.Color=running and Color3.fromRGB(77,143,63) or Color3.fromRGB(112,165,192) end
+        end
+        if UI.AutoTraderHomePower then
+            local running=prefs.automation==true
+            UI.AutoTraderHomePower.Text=running and "PAUSE AUTO TRADER" or "START AUTO TRADER"
+            UI.AutoTraderHomePower.TextColor3=running and Color3.fromRGB(250,255,248) or THEME.green
+            UI.AutoTraderHomePower.BackgroundColor3=running and Color3.fromRGB(102,177,76) or Color3.fromRGB(220,239,248)
+            local powerStroke=UI.AutoTraderHomePower:FindFirstChildOfClass("UIStroke")
+            if powerStroke then powerStroke.Color=running and Color3.fromRGB(77,143,63) or Color3.fromRGB(112,165,192) end
+            local powerGradient=UI.AutoTraderHomePower:FindFirstChildOfClass("UIGradient")
+            if powerGradient then
+                powerGradient.Color=running and ColorSequence.new({
+                    ColorSequenceKeypoint.new(0,Color3.fromRGB(188,232,150)),
+                    ColorSequenceKeypoint.new(1,Color3.fromRGB(102,177,76)),
+                }) or ColorSequence.new({
+                    ColorSequenceKeypoint.new(0,Color3.fromRGB(255,255,255)),
+                    ColorSequenceKeypoint.new(1,Color3.fromRGB(220,239,248)),
+                })
+            end
+        end
+        if UI.AutoTraderIgnoreFriends then UI.AutoTraderIgnoreFriends.Text=prefs.ignoreFriends and "Friends · SKIP" or "Friends · ALLOW" end
+        if UI.AutoTraderOpeningAnchor then UI.AutoTraderOpeningAnchor.Text=prefs.openingAnchor and "Opening offer · ON" or "Opening offer · OFF" end
+        if UI.AutoTraderUnknownTheir then UI.AutoTraderUnknownTheir.Text=prefs.unknownTheirZero and "Unknown values · COUNT AS 0" or "Unknown values · WAIT" end
+        if UI.AutoTraderPreferDuplicates then UI.AutoTraderPreferDuplicates.Text=prefs.preferDuplicates and "Offer duplicates first · ON" or "Offer duplicates first · OFF" end
+        if UI.AutoTraderProfit then
+            local required=State.AutoTrader.GetMinimumWin and State.AutoTrader.GetMinimumWin() or 0
+            local summary=State.AutoTrader.OtherSummary
+            if summary and (tonumber(summary.knownFloor) or 0)>0 and State.AutoTrader.GetEffectiveMinimumWin then required=State.AutoTrader.GetEffectiveMinimumWin(summary) end
+            UI.AutoTraderProfit.Text="Required profit · +"..formatNumber(required or 0)
+        end
+        if UI.AutoTraderReserveTitle then UI.AutoTraderReserveTitle.Text="ITEMS TO KEEP" end
+        if UI.AutoTraderSearch then UI.AutoTraderSearch.PlaceholderText="Search inventory · choose how many copies to keep…" end
+        if UI.AutoTraderCopyDebug then UI.AutoTraderCopyDebug.Text="COPY SUPPORT INFO" end
+        if UI.AutoTraderSkipTarget then UI.AutoTraderSkipTarget.Text="SKIP CURRENT PERSON" end
+        if UI.AutoTraderResetPosition then UI.AutoTraderResetPosition.Text="RESET WINDOW" end
+        if UI.AutoTraderRefreshBots then UI.AutoTraderRefreshBots.Text="RECHECK THIS SERVER" end
+        if UI.AutoTraderCertifyBots then
+            local armed=os.clock()< (tonumber(State.AutoTrader.ManualBotConfirmUntil) or 0)
+            UI.AutoTraderCertifyBots.Text=armed and "CONFIRM: MARK AS BOTS" or "MARK SERVER AS BOTS"
+        end
+        if State.AutoTrader.UpdateDirectAuthUi then pcall(State.AutoTrader.UpdateDirectAuthUi) end
+        return table.unpack(result,1,result.n)
+    end
+
+    -- Keep plain-language labels correct even when Render updates bot-confirmation text.
+    local renderLabelsBeforeV52=State.AutoTrader.Render
+    State.AutoTrader.Render=function(...)
+        local result=table.pack(renderLabelsBeforeV52(...))
+        if UI.AutoTraderServerScanThreshold then UI.AutoTraderServerScanThreshold.Text="Bot filter · known bot avatars are avoided; unknown previews are allowed" end
+        if UI.AutoTraderRefreshBots then UI.AutoTraderRefreshBots.Text="RECHECK THIS SERVER" end
+        if UI.AutoTraderCertifyBots then
+            local armed=os.clock()<(tonumber(State.AutoTrader.ManualBotConfirmUntil) or 0)
+            UI.AutoTraderCertifyBots.Text=armed and "CONFIRM: MARK AS BOTS" or "MARK SERVER AS BOTS"
+        end
+        if UI.AutoTraderPeopleSkip then UI.AutoTraderPeopleSkip.Visible=State.AutoTrader.SelectedTarget~=nil end
+        return table.unpack(result,1,result.n)
+    end
+
+    -- Animate success toast entrance; the existing lifetime/close semantics remain authoritative.
+    local successBeforeV52=State.AutoTrader.ShowSuccessNotification
+    State.AutoTrader.ShowSuccessNotification=function(...)
+        local result=table.pack(successBeforeV52(...))
+        local frame=UI.AutoTraderSuccessNotification
+        if frame and frame.Parent then
+            preserveCenterAnchor(frame)
+            local scale=frame:FindFirstChild("SV_V52ToastScale") or create("UIScale",{Name="SV_V52ToastScale",Scale=1},frame)
+            scale.Scale=1;frame.BackgroundTransparency=0.35
+            TweenService:Create(frame,TweenInfo.new(0.18,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{BackgroundTransparency=0}):Play()
+        end
+        return table.unpack(result,1,result.n)
+    end
+
+    State.AutoTrader.DismissSuccessNotificationAnimated=function(frame)
+        if not frame or not frame.Parent or frame:GetAttribute("SV_V52Dismissing") then return end
+        frame:SetAttribute("SV_V52Dismissing",true)
+        local scale=frame:FindFirstChild("SV_V52ToastScale") or create("UIScale",{Name="SV_V52ToastScale",Scale=1},frame)
+        local pos=frame.Position
+        scale.Scale=1
+        TweenService:Create(frame,TweenInfo.new(0.14,Enum.EasingStyle.Quad,Enum.EasingDirection.In),{
+            Position=UDim2.new(pos.X.Scale,pos.X.Offset,pos.Y.Scale,pos.Y.Offset-7),
+            BackgroundTransparency=0.55,
+        }):Play()
+        task.delay(0.145,function() if frame and frame.Parent then frame:Destroy() end end)
+    end
+
+    -- Human-readable event logging. Raw engineering events are preserved unchanged;
+    -- these extra watcher_activity records make support snapshots tell the same story
+    -- the person saw on screen.
+    local rawLog=State.AutoTrader.Log
+    local function currentWatcherPerson(data)
+        data=type(data)=="table" and data or {}
+        local name=data.name or data.partnerName or data.partner
+        local userId=data.userId or data.partnerUserId
+        if not name then
+            local p=State.AutoTrader.LastTradePartner or State.AutoTrader.SelectedTarget
+            if p then name=p.Name;userId=userId or p.UserId end
+        end
+        return name,userId
+    end
+    local function watcherMessage(kind,data)
+        data=type(data)=="table" and data or {}
+        local name,userId=currentWatcherPerson(data);local who=name or "the player"
+        if kind=="automation_enabled" then return "Auto Trader started",nil,nil
+        elseif kind=="automation_disabled" then return "Auto Trader paused",nil,nil
+        elseif kind=="target_intent_captured" then
+            local give=trim52(data.giveItems or "our planned items")
+            local receive=trim52(data.receiveItems or "their planned items")
+            return "Planned trade with "..who.." · give "..give.." ("..formatCompact(data.give or 0)..") → receive "..receive.." ("..formatCompact(data.receive or 0)..") · +"..formatCompact(data.win or 0),name,userId
+        elseif kind=="mutation_sent" and data.kind=="add" and data.contextKind=="intent" then
+            return "Adding "..tostring(data.itemId or "an item").." to our offer",name,userId
+        elseif kind=="request_send" then return "Sent a trade request to "..who,name,userId
+        elseif kind=="request_transport_acknowledged" then return "MM2 received the trade request to "..who,name,userId
+        elseif kind=="trade_started" then return "Trade opened with "..who,name,userId
+        elseif kind=="first_offer_seen" then return who.." made their first offer",name,userId
+        elseif kind=="plan_ready" then
+            local plan=State.AutoTrader.Plan
+            local extra=plan and (" · give "..formatCompact(plan.total or 0).." → receive "..formatCompact(plan.receiveTotal or 0).." · +"..formatCompact(plan.win or 0)) or ""
+            return "Safe offer found for "..who..extra,name,userId
+        elseif kind=="auto_accept_sent" then return "Accepted the safe offer from "..who,name,userId
+        elseif kind=="owned_trade_completed" then return "Trade completed with "..who.." — verifying inventory",name,userId
+        elseif kind=="post_trade_audit_passed" then return "Verified the completed trade and inventory change",name,userId
+        elseif kind=="trade_declined" or kind=="request_declined_confirmed" then return who.." declined — moving on",name,userId
+        elseif kind=="request_transport_failed" then return "Trade request to "..who.." failed to send cleanly",name,userId
+        elseif kind=="incoming_request_decision" then return "Received a trade request from "..who.." — checking it",name,userId
+        elseif kind=="outbound_targets_skipped_no_constructible_opening" then
+            local first=nil
+            if type(data.skipped)=="table" then for _,row in pairs(data.skipped) do if type(row)=="table" then first=row break end end end
+            if first then
+                local why=trim52(first.reason or "no safe opening offer could be built")
+                if string.find(string.lower(why),"overshoot",1,true) then why="the safe offer would overpay too much" end
+                return "Skipped "..tostring(first.name or "a player").." · "..why,first.name,first.userId
+            end
+        elseif kind=="server_no_progress_timeout" then return "No useful trade found here — preparing a new server",nil,nil
+        elseif kind=="server_hop_queue_built" then return "Found "..tostring(data.count or "some").." possible servers to try",nil,nil
+        elseif kind=="server_hop_candidate_attempt" then return "Trying the next eligible server",nil,nil
+        elseif kind=="teleport_script_queued" then return "New-server handoff is ready",nil,nil
+        elseif kind=="teleport_script_integrity_rejected" then return "Server change blocked · "..(technicalReason(data.reason) or "the handoff script failed verification"),nil,nil
+        elseif kind=="teleport_continuation_unavailable" then return "Server change blocked · "..(technicalReason(data.reason or data.detail) or "continuation unavailable"),nil,nil
+        elseif kind=="server_hop_aborted" then return "Server change stopped · "..(technicalReason(data.reason) or trim52(data.reason or "handoff unavailable")),nil,nil
+        elseif kind=="automatic_recovery_started" then return "Automatic recovery started · "..trim52(data.reason or "something stopped making progress"),nil,nil
+        elseif kind=="freeze" then return "Auto Trader paused for safety · "..trim52(data.reason or data.detail or "safety condition"),nil,nil
+        end
+        return nil,nil,nil
+    end
+    State.AutoTrader.Log=function(kind,data)
+        rawLog(kind,data)
+        if tostring(kind)=="watcher_activity" or (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 then return end
+        local message,name,userId=watcherMessage(tostring(kind or ""),data)
+        if message then
+            local watcherData={message=message,sourceEvent=tostring(kind),name=name,userId=userId}
+            rawLog("watcher_activity",watcherData)
+            recordWatcherActivity(message,"event",name,userId,watcherData)
+            if State.AutoTrader.PushThought and State.AutoTrader.Preferences.automation then
+                pcall(State.AutoTrader.PushThought,message,"watcher:"..tostring(kind)..":"..tostring(userId or name or "global")..":"..message)
+            end
+        end
+    end
+
+    local buildDebugBeforeV52=State.AutoTrader.BuildDebug
+    State.AutoTrader.BuildDebug=function()
+        local text,err=buildDebugBeforeV52()
+        if not text then return nil,err end
+        local newline=string.find(text,"\n",1,true)
+        if not newline then return text end
+        local body=string.sub(text,newline+1)
+        local ok,payload=pcall(function() return HttpService:JSONDecode(body) end)
+        if not ok or type(payload)~="table" then return text end
+        payload.watcherActivity={
+            policy="human-readable meaningful transitions shown by the Activity window; repetitive scan noise stays in recentLog/decisionJournal",
+            count=#(State.AutoTrader.WatcherActivityLog or {}),
+            entries=HARDEN.supportJsonValue(State.AutoTrader.WatcherActivityLog or {}),
+        }
+        local okEncode,encoded=pcall(function() return HttpService:JSONEncode(HARDEN.supportJsonValue(payload)) end)
+        if not okEncode then return nil,tostring(encoded) end
+        return HARDEN.supportFormat.."\n"..encoded
+    end
+
+    -- Force a first friendly control/auth/activity paint after every late wrapper is installed.
+    task.defer(function()
+        if Destroyed then return end
+        if State.AutoTrader.UpdateControls then pcall(State.AutoTrader.UpdateControls) end
+        if State.AutoTrader.UpdateDirectAuthUi then pcall(State.AutoTrader.UpdateDirectAuthUi) end
+        if State.AutoTrader.UpdateActivityGlance then pcall(State.AutoTrader.UpdateActivityGlance) end
+    end)
+end)()
+end
+
+
+-- v53 UI consistency + self-test correctness pass.
+-- No trading/planner/value/bot policy is changed here. This layer normalizes
+-- transform origins, typography, and transition behavior for UI created after
+-- startup, while keeping all text geometry invariant during animation.
+do
+(function()
+    local function centeredWithoutMoving(object)
+        if not object or not object.Parent or not object:IsA("GuiObject") then return end
+        local old=object.AnchorPoint
+        if math.abs(old.X-0.5)<0.0001 and math.abs(old.Y-0.5)<0.0001 then return end
+        local size,position=object.Size,object.Position
+        local dx,dy=0.5-old.X,0.5-old.Y
+        object.Position=UDim2.new(
+            position.X.Scale+size.X.Scale*dx,
+            position.X.Offset+size.X.Offset*dx,
+            position.Y.Scale+size.Y.Scale*dy,
+            position.Y.Offset+size.Y.Offset*dy
+        )
+        object.AnchorPoint=Vector2.new(0.5,0.5)
+    end
+
+    local function layoutOwns(object)
+        local parent=object and object.Parent
+        return parent and (parent:FindFirstChildOfClass("UIListLayout")
+            or parent:FindFirstChildOfClass("UIGridLayout")
+            or parent:FindFirstChildOfClass("UIPageLayout"))~=nil
+    end
+
+    local function normalizeImage(image)
+        if not image or not image.Parent or not (image:IsA("ImageLabel") or image:IsA("ImageButton")) then return end
+        if not layoutOwns(image) then centeredWithoutMoving(image) end
+        local value=tostring(image.Image or "")
+        if value:find("AvatarHeadShot",1,true)
+            or image:GetAttribute("SVThumbnailDisplayKey")~=nil
+            or image:GetAttribute("SVUpcomingThumbnailUrl")~=nil then
+            image.ScaleType=Enum.ScaleType.Crop
+        end
+    end
+
+    local function normalizeTypography(root)
+        if not root or not root.Parent then return end
+        local function one(object)
+            if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then return end
+            if object.Font==Enum.Font.Code then return end
+            if object:IsA("TextButton") then
+                object.Font=Enum.Font.GothamBold
+            elseif object:IsA("TextBox") then
+                object.Font=Enum.Font.Gotham
+            else
+                local text=tostring(object.Text or "")
+                local upper=text~="" and text==string.upper(text) and #text<=48
+                local alreadyBold=object.Font==Enum.Font.GothamBold
+                    or object.Font==Enum.Font.SourceSansBold
+                    or object.Font==Enum.Font.ArialBold
+                object.Font=(upper or alreadyBold) and Enum.Font.GothamBold or Enum.Font.Gotham
+            end
+            object.TextStrokeTransparency=1
+        end
+        one(root)
+        for _,object in ipairs(root:GetDescendants()) do one(object) end
+    end
+
+    local function normalizeTree(root)
+        if not root or not root.Parent then return end
+        if root:IsA("ImageLabel") or root:IsA("ImageButton") then normalizeImage(root) end
+        for _,object in ipairs(root:GetDescendants()) do
+            if object:IsA("ImageLabel") or object:IsA("ImageButton") then normalizeImage(object) end
+        end
+        normalizeTypography(root)
+    end
+
+    State.AutoTrader.NormalizeUiVisualTree=normalizeTree
+
+    for _,root in ipairs({
+        UI.AutoTraderPanel,UI.AutoTraderLauncher,UI.AutoTraderThoughtFeed,
+        UI.Details,UI.TradePanel,UI.ValueBox,UI.SignalBox,UI.NotesScroll,
+    }) do
+        normalizeTree(root)
+    end
+
+    -- Fixed role typography. These values are authored once; no transition changes them.
+    for _,button in pairs(UI.AutoTraderTabButtons or {}) do
+        button.Font=Enum.Font.GothamBold
+        button.TextSize=12
+        local scale=button:FindFirstChild("SV_V50MotionScale")
+        if scale then scale.Scale=1 end
+    end
+    if UI.AutoTraderActivityStage then UI.AutoTraderActivityStage.TextSize=10;UI.AutoTraderActivityStage.Font=Enum.Font.GothamBold end
+    if UI.AutoTraderActivityHeadline then UI.AutoTraderActivityHeadline.TextSize=14;UI.AutoTraderActivityHeadline.Font=Enum.Font.GothamBold end
+    if UI.AutoTraderActivityDetail then UI.AutoTraderActivityDetail.TextSize=10;UI.AutoTraderActivityDetail.Font=Enum.Font.Gotham end
+    if UI.AutoTraderActivityNext then UI.AutoTraderActivityNext.TextSize=10;UI.AutoTraderActivityNext.Font=Enum.Font.GothamMedium end
+
+    -- Recreated rows receive the same image anchors/fonts every time, not only at startup.
+    for name,container in pairs({
+        RebuildReserveList=UI.AutoTraderReserveContent,
+        RebuildPlayerDashboard=UI.AutoTraderPlayerContent,
+        RebuildServerDashboard=UI.AutoTraderServerCandidateContent,
+        RebuildBotDashboard=UI.AutoTraderBotContent,
+    }) do
+        local current=State.AutoTrader[name]
+        local key="V53VisualBase_"..name
+        if type(current)=="function" and State.AutoTrader[key]==nil then
+            State.AutoTrader[key]=current
+            State.AutoTrader[name]=function(...)
+                local out=table.pack(State.AutoTrader[key](...))
+                normalizeTree(container)
+                return table.unpack(out,1,out.n)
+            end
+        end
+    end
+
+    -- Details modal: position + backdrop fade only. Never scale a text-bearing surface.
+    if UI.Details and UI.DetailsBackdrop then
+        State.AutoTrader.V53DetailsSerial=tonumber(State.AutoTrader.V53DetailsSerial) or 0
+        State.AutoTrader.SetDetailsVisibleAnimated=function(show)
+            local panel,backdrop=UI.Details,UI.DetailsBackdrop
+            if not panel or not backdrop or not panel.Parent then return end
+            State.AutoTrader.V53DetailsSerial+=1
+            local serial=State.AutoTrader.V53DetailsSerial
+            centeredWithoutMoving(panel)
+            local rest=State.AutoTrader.V53DetailsRestPosition
+            if typeof(rest)~="UDim2" then rest=panel.Position;State.AutoTrader.V53DetailsRestPosition=rest end
+            local scale=panel:FindFirstChild("SV_V52DetailsScale")
+            if scale then scale.Scale=1 end
+            if show then
+                backdrop.Visible=true;panel.Visible=true
+                backdrop.BackgroundTransparency=1
+                panel.Position=UDim2.new(rest.X.Scale,rest.X.Offset,rest.Y.Scale,rest.Y.Offset+10)
+                TweenService:Create(backdrop,TweenInfo.new(0.18,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{BackgroundTransparency=0.48}):Play()
+                TweenService:Create(panel,TweenInfo.new(0.20,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{Position=rest}):Play()
+            else
+                if not panel.Visible then backdrop.Visible=false;return end
+                TweenService:Create(backdrop,TweenInfo.new(0.14,Enum.EasingStyle.Quad,Enum.EasingDirection.In),{BackgroundTransparency=1}):Play()
+                TweenService:Create(panel,TweenInfo.new(0.14,Enum.EasingStyle.Quart,Enum.EasingDirection.In),{
+                    Position=UDim2.new(rest.X.Scale,rest.X.Offset,rest.Y.Scale,rest.Y.Offset+7)
+                }):Play()
+                task.delay(0.145,function()
+                    if Destroyed or serial~=State.AutoTrader.V53DetailsSerial then return end
+                    panel.Visible=false;backdrop.Visible=false;panel.Position=rest;backdrop.BackgroundTransparency=0.48
+                end)
+            end
+        end
+    end
+
+    -- One deferred pass catches AbsoluteSize/layout-dependent children after first paint.
+    task.defer(function()
+        if Destroyed then return end
+        normalizeTree(UI.AutoTraderPanel)
+        normalizeTree(UI.AutoTraderThoughtFeed)
+        normalizeTree(UI.Details)
+        normalizeTree(UI.TradePanel)
+    end)
+end)()
+end
 
 ---------------------------------------------------------------------------
 -- REGISTER-SAFETY HARD INVARIANT:

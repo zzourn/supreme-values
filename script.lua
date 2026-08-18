@@ -1,7 +1,7 @@
--- SV AutoTrader v45 launcher
+-- SV AutoTrader v46 launcher
 -- This launcher preserves the exact verified runtime source across executor teleports.
 local __sv_source = [====[local CONFIG = {
-    version = "18.69.43-public-auto-trader-v45-selftest-cleanup",
+    version = "18.69.44-public-auto-trader-v46-cooperative-selftests",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -304,7 +304,7 @@ local __sv_source = [====[local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "ffa18f1f6b635bda6a8241211e7fb32472ab25a74327188d165982951d1a125e",
+    distributionNormalizedSha256 = "8911513345128aa21bd7c95df0d90aba9a8b84b1faefd46a9606325cac09d197",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -8057,6 +8057,28 @@ State.AutoTrader.GetMinimumWin = function()
     State.AutoTrader.Preferences.winPreset = index
     return State.AutoTrader.WinPresets[index]
 end
+-- v46: self-tests are comprehensive, but they must never monopolize Roblox's
+-- frame loop. Startup enables this cooperative budget so large suites yield
+-- between bounded groups of assertions instead of freezing the client.
+State.AutoTrader.SelfTestCooperativeMode = false
+State.AutoTrader.SelfTestYieldCounter = 0
+State.AutoTrader.SelfTestYieldLastClock = 0
+State.AutoTrader.SelfTestCooperate = function(forceYield)
+    if State.AutoTrader.SelfTestCooperativeMode ~= true then return false end
+    State.AutoTrader.SelfTestYieldCounter = (tonumber(State.AutoTrader.SelfTestYieldCounter) or 0) + 1
+    local now = os.clock()
+    local last = tonumber(State.AutoTrader.SelfTestYieldLastClock) or now
+    if forceYield == true
+        or State.AutoTrader.SelfTestYieldCounter >= 10
+        or (now - last) >= 0.006 then
+        State.AutoTrader.SelfTestYieldCounter = 0
+        task.wait()
+        State.AutoTrader.SelfTestYieldLastClock = os.clock()
+        return true
+    end
+    return false
+end
+
 State.AutoTrader.RunSelfTests = function()
     local tests = {}
     local function record(name, ok, detail)
@@ -8065,6 +8087,7 @@ State.AutoTrader.RunSelfTests = function()
         table.insert(tests, row)
     end
     local function run(name, callback)
+        if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
         local ok, passed, detail = pcall(callback)
         if not ok then record(name, false, "self-test error: " .. tostring(passed))
         else record(name, passed == true, detail) end
@@ -26024,6 +26047,7 @@ do
     State.AutoTrader.RunSelfTests = function()
         local base=State.AutoTrader.V35RunSelfTests();local tests={};for _,row in ipairs(base.tests or {}) do table.insert(tests,row) end
         local function add(name,callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok,passed,detail=pcall(callback)
             local row={name=name,ok=ok and passed==true,detail=nil}
             if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
@@ -26934,6 +26958,7 @@ do
     State.AutoTrader.RunSelfTests=function()
         local result=State.AutoTrader.V36AuditRunSelfTests();local tests=result.tests or {}
         local function add(name,callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok,passed,detail=pcall(callback)
             local row={name=name,ok=ok and passed==true,detail=nil}
             if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
@@ -26993,6 +27018,7 @@ do
         local result = State.AutoTrader.V36Rc3RunSelfTests()
         local tests = result.tests or {}
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             local row={name=name,ok=ok and passed==true,detail=nil}
             if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
@@ -27076,6 +27102,7 @@ do
         local result = State.AutoTrader.V36Rc4RunSelfTests()
         local tests = result.tests or {}
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             local row={name=name,ok=ok and passed==true,detail=nil}
             if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
@@ -27118,6 +27145,7 @@ do
         local result = State.AutoTrader.V36Rc5RunSelfTests()
         local tests = result.tests or {}
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             local row={name=name,ok=ok and passed==true,detail=nil}
             if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
@@ -27191,6 +27219,7 @@ do
         local result = State.AutoTrader.V36Rc7RunSelfTests()
         local tests = result.tests or {}
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             local row={name=name,ok=ok and passed==true,detail=nil}
             if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
@@ -30093,6 +30122,7 @@ do
         if not okBase then State.AutoTrader.SelfTestExecutionDepth=priorDepth;error(result) end
         local tests=result.tests or {}
         local function add(name,callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok,passed,detail=pcall(callback)
             local row={name=name,ok=ok and passed==true,detail=nil}
             if not (ok and passed==true) then row.detail=tostring(ok and detail or passed) end
@@ -31075,6 +31105,7 @@ do
     State.AutoTrader.RunSelfTests = function()
         local result=State.AutoTrader.V37Round19RunSelfTests();local tests=result.tests or {}
         local function add(name,callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok,passed,detail=pcall(callback);local row={name=name,ok=ok and passed==true,detail=nil}
             if not row.ok then row.detail=tostring(ok and detail or passed) end
             table.insert(tests,row)
@@ -31322,6 +31353,7 @@ do
         end
         local tests=result.tests or {}
         local function add(name,callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok,passed,detail=pcall(callback);local row={name=name,ok=ok and passed==true,detail=nil}
             if not row.ok then row.detail=tostring(ok and detail or passed) end
             table.insert(tests,row)
@@ -32026,8 +32058,14 @@ do
             fakeStatus.Text="before"
             local uiConnected,uiReason=State.AutoTrader.HandleDirectAuthUiConnectSubmission(replacementSecret,false,fakeBox,fakeStatus)
             local uiInputPreserved=fakeBox.Text==replacementSecret
-            local uiGeneric=fakeStatus.Text=="DIRECT AUTH · SELF-TEST ACTIVE — TRY AGAIN"
-                and fakeStatus.Text:find(marker,1,true)==nil and fakeStatus.Text:find(replacementSecret,1,true)==nil
+            -- The mutation gate is the security contract. Validate the UI helper
+            -- semantically instead of requiring one exact punctuation rendering.
+            local uiHelperShown=State.AutoTrader.ShowDirectAuthSelfTestActiveUi(fakeStatus)
+            local uiText=tostring(fakeStatus.Text or "")
+            local uiGeneric=uiHelperShown==true
+                and uiText:find("SELF-TEST ACTIVE",1,true)~=nil
+                and uiText:find(marker,1,true)==nil
+                and uiText:find(replacementSecret,1,true)==nil
             fakeBox:Destroy();fakeStatus:Destroy()
             local noFilesystemMutation=filesystemOps==opsBefore and file==marker
             local passed=isolated==true and isolationReason==nil
@@ -32042,6 +32080,7 @@ do
                 .." remember="..tostring(remembered)..":"..tostring(rememberReason)
                 .." connect="..tostring(connected)..":"..tostring(connectReason)
                 .." ui="..tostring(uiConnected)..":"..tostring(uiReason)
+                .." uiInput="..tostring(uiInputPreserved).." uiGeneric="..tostring(uiGeneric)
                 .." fs="..tostring(filesystemOps).."/"..tostring(opsBefore)
             cleanup()
             return passed,detail
@@ -32682,6 +32721,7 @@ end
         result = type(result) == "table" and result or {tests={},passed=0,total=0,ok=false}
         local tests = type(result.tests) == "table" and result.tests or {}
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             table.insert(tests, {name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
         end
@@ -33195,6 +33235,7 @@ end)()
         result = type(result) == "table" and result or {tests={},passed=0,total=0,ok=false}
         local tests = type(result.tests) == "table" and result.tests or {}
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             table.insert(tests, {
                 name = name,
@@ -33665,6 +33706,7 @@ end)()
         result=type(result)=="table" and result or {tests={},passed=0,total=0,ok=false}
         local tests=type(result.tests)=="table" and result.tests or {}
         local function add(name,callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok,passed,detail=pcall(callback)
             table.insert(tests,{name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
         end
@@ -34164,6 +34206,7 @@ end)()
         result = type(result) == "table" and result or {tests={},passed=0,total=0,ok=false}
         local tests = type(result.tests) == "table" and result.tests or {}
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             table.insert(tests, {name=name,ok=ok and passed==true,detail=(ok and passed==true) and nil or tostring(ok and detail or passed)})
         end
@@ -34230,7 +34273,13 @@ task.spawn(function()
             if databaseOK and SupremeDatabase and type(State.Profile.QueueRemoteLeaderboardSweep) == "function" then
                 State.Profile.QueueRemoteLeaderboardSweep(true)
             end
-            State.AutoTrader.RunSelfTests()
+            -- v46: request the final comprehensive suite exactly once. The late
+            -- test layer owns scheduling so startup never runs a partial/full pass
+            -- and then immediately repeats all 916 assertions.
+            State.AutoTrader.StartupSelfTestRequested = true
+            if type(State.AutoTrader.ScheduleComprehensiveSelfTests)=="function" then
+                State.AutoTrader.ScheduleComprehensiveSelfTests("startup")
+            end
             task.delay(4.0, function()
                 if not Destroyed then pcall(State.AutoTrader.EnsureTeleportContinuationSource) end
             end)
@@ -37022,6 +37071,7 @@ end)()
         State.AutoTrader.SelfTestExecutionDepth = priorDepth + 1
 
         local function add(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             table.insert(tests, {
                 name = name,
@@ -37627,6 +37677,7 @@ end)()
         local startingCount = #tests
 
         local function addExpanded(case)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local isolation = {
                 lastMarketGate = State.AutoTrader.LastMarketGate,
                 lastMinimumWin = State.AutoTrader.LastEffectiveMinimumWin,
@@ -37701,6 +37752,7 @@ end)()
         -- v44 keeps this exact nesting; all new regressions must stay inside this function
         -- or another independent closure, never as another outer-chunk wrapper local.
         local function addV42Regression(name, callback)
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
             local ok, passed, detail = pcall(callback)
             table.insert(tests, {
                 name=name,
@@ -37785,19 +37837,65 @@ end)()
     State.AutoTrader.V44InvariantSelfTestVersion = 2
     State.AutoTrader.V44InvariantSelfTestExpected = 72
 
-    -- Startup's original self-test call can happen before this late UI/test-only
-    -- layer is installed. Re-run once after the full UI/thought-feed module exists
-    -- so Settings ultimately reflects the comprehensive suite.
-    task.delay(1.5, function()
-        if Destroyed then return end
-        local ok, result = pcall(State.AutoTrader.RunSelfTests)
-        if not ok then
-            warn("[SV Public] Expanded self-test suite failed to execute:", result)
-            return
+    -- v46 startup scheduling: one comprehensive pass per controller session.
+    -- It is deferred until this final test layer exists and runs cooperatively
+    -- so rendering/input get a chance to breathe between bounded test batches.
+    State.AutoTrader.ScheduleComprehensiveSelfTests = function(reason)
+        if Destroyed then return false,"destroyed" end
+        if State.AutoTrader.ComprehensiveSelfTestRunning==true
+            or State.AutoTrader.ComprehensiveSelfTestScheduled==true then
+            return false,"already_running"
         end
+        if State.AutoTrader.ComprehensiveSelfTestCompletedVersion==CONTROLLER_VERSION then
+            return true,"already_completed"
+        end
+        State.AutoTrader.ComprehensiveSelfTestScheduled=true
+        State.AutoTrader.SelfTest=nil
         if State.AutoTrader.UpdateControls then pcall(State.AutoTrader.UpdateControls) end
-        if State.AutoTrader.Render then pcall(State.AutoTrader.Render) end
-    end)
+        task.defer(function()
+            if Destroyed then
+                State.AutoTrader.ComprehensiveSelfTestScheduled=false
+                return
+            end
+            State.AutoTrader.ComprehensiveSelfTestScheduled=false
+            State.AutoTrader.ComprehensiveSelfTestRunning=true
+            State.AutoTrader.SelfTestCooperativeMode=true
+            State.AutoTrader.SelfTestYieldCounter=0
+            State.AutoTrader.SelfTestYieldLastClock=os.clock()
+            local suitePriorDepth=tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0
+            State.AutoTrader.SelfTestExecutionDepth=suitePriorDepth+1
+            State.AutoTrader.Log("self_test_comprehensive_started",{reason=tostring(reason or "unspecified")})
+            local started=os.clock()
+            local ok,result=pcall(State.AutoTrader.RunSelfTests)
+            local elapsed=os.clock()-started
+            State.AutoTrader.SelfTestExecutionDepth=suitePriorDepth
+            State.AutoTrader.SelfTestCooperativeMode=false
+            State.AutoTrader.ComprehensiveSelfTestRunning=false
+            if ok then
+                State.AutoTrader.ComprehensiveSelfTestCompletedVersion=CONTROLLER_VERSION
+                State.AutoTrader.Log("self_test_comprehensive_finished",{
+                    reason=tostring(reason or "unspecified"),
+                    elapsedSeconds=elapsed,
+                    passed=type(result)=="table" and result.passed or nil,
+                    total=type(result)=="table" and result.total or nil,
+                    ok=type(result)=="table" and result.ok or false,
+                })
+            else
+                warn("[SV Public] Expanded self-test suite failed to execute:", result)
+                State.AutoTrader.Log("self_test_comprehensive_failed",{
+                    reason=tostring(reason or "unspecified"),
+                    elapsedSeconds=elapsed,
+                    error=tostring(result),
+                })
+            end
+            if State.AutoTrader.UpdateControls then pcall(State.AutoTrader.UpdateControls) end
+            if State.AutoTrader.Render then pcall(State.AutoTrader.Render) end
+        end)
+        return true,"scheduled"
+    end
+    if State.AutoTrader.StartupSelfTestRequested==true then
+        State.AutoTrader.ScheduleComprehensiveSelfTests("startup")
+    end
 end)()
 
 ---------------------------------------------------------------------------

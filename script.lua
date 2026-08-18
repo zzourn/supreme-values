@@ -1,7 +1,7 @@
--- SV AutoTrader v46 launcher
+-- SV AutoTrader v48 launcher
 -- This launcher preserves the exact verified runtime source across executor teleports.
 local __sv_source = [====[local CONFIG = {
-    version = "18.69.44-public-auto-trader-v46-cooperative-selftests",
+    version = "18.69.46-public-auto-trader-v48-unified-aero-ui",
     Enabled = true,
     JsonUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/supremevalues_output.json",
     LinkedImagesUrl = "https://raw.githubusercontent.com/zzourn/supreme-values/main/linked_images.json",
@@ -203,6 +203,9 @@ local __sv_source = [====[local CONFIG = {
     AutoTraderUpcomingThumbnailRetrySeconds = 20,
     AutoTraderUpcomingThumbnailMaxBytes = 4 * 1024 * 1024,
     AutoTraderUpcomingThumbnailCacheLimit = 240,
+    -- v48: presentation/UI cadence only; no trade/server eligibility semantics.
+    AutoTraderUpcomingAutoRefreshSeconds = 12,
+    AutoTraderCardValuePresentationGraceSeconds = 1.35,
     -- v34 bot architecture: current-server evidence MAY force a fast escape, but
     -- automated permanent learning remains stricter: only a physically certified
     -- 100%-of-current-remotes bot server may add automated trusted hashes.
@@ -282,8 +285,8 @@ local __sv_source = [====[local CONFIG = {
     ConservativeResolution = true,
     ProfileRequireTrustedMatches = true,
     UseDecompiledSyncFallback = true,
-    SafeColor = Color3.fromRGB(83, 218, 142),
-    BestColor = Color3.fromRGB(255, 210, 74),
+    SafeColor = Color3.fromRGB(105, 181, 92),
+    BestColor = Color3.fromRGB(224, 176, 58),
     Weights = {
         valuePerPercent = 1.5,
         valueCap = 60,
@@ -304,7 +307,7 @@ local __sv_source = [====[local CONFIG = {
 local CONTROLLER_VERSION = CONFIG.version
 local HARDEN = {
     supportFormat = "SV_AUTO_TRADER_SUPPORT_V40",
-    distributionNormalizedSha256 = "8911513345128aa21bd7c95df0d90aba9a8b84b1faefd46a9606325cac09d197",
+    distributionNormalizedSha256 = "9abb93a6677dfbf46a82d9438a02cda472d884bf0f6cc9f1d559c59562fab36d",
     readyGlobalCurrent = "__SV_AUTO_TRADER_V40_READY",
     readyGlobalLegacy = "__SV_AUTO_TRADER_V14_READY",
     subsystemHealth = {},
@@ -575,9 +578,13 @@ end
 local function verifyDistributionSource(source)
     if type(source) ~= "string" or #source < 1000 then return false, "source missing/too small" end
     if not source:find(CONTROLLER_VERSION, 1, true) then return false, "controller version marker mismatch" end
+    local declaredSha = source:match('distributionNormalizedSha256%s*=%s*"([0-9a-fA-F]+)"')
+    if type(declaredSha) ~= "string" or string.lower(declaredSha) ~= string.lower(HARDEN.distributionNormalizedSha256) then
+        return false, "distribution declared SHA-256 mismatch"
+    end
     local normalized = normalizeDistributionSourceForHash(source)
     if not normalized then return false, "distribution hash field missing" end
-    local digest = sha256Hex(normalized)
+    local digest = sha256Hex(normalized, true)
     if not digest then return false, "SHA-256 unavailable" end
     if string.lower(digest) ~= string.lower(HARDEN.distributionNormalizedSha256) then
         return false, "distribution SHA-256 mismatch"
@@ -999,6 +1006,25 @@ local function makeButton(parent, text, size, color)
         Font = Enum.Font.Arial,
     }, parent)
     addCorner(button, 4)
+    -- v48: all custom buttons get the same restrained Windows-style tactile response.
+    -- Avoid an extra UIScale because a few top-level controls already own responsive scales.
+    connect(button.MouseButton1Down, function()
+        if button.Parent then
+            button:SetAttribute("SV_PressTextSize", button.TextSize)
+            button.TextSize = math.max(8, button.TextSize - 1)
+            TweenService:Create(button, TweenInfo.new(0.05), {BackgroundTransparency = 0.08}):Play()
+        end
+    end)
+    local function releasePress()
+        if button.Parent then
+            local prior = tonumber(button:GetAttribute("SV_PressTextSize"))
+            if prior then button.TextSize = prior end
+            button:SetAttribute("SV_PressTextSize", nil)
+            TweenService:Create(button, TweenInfo.new(0.08), {BackgroundTransparency = 0}):Play()
+        end
+    end
+    connect(button.MouseButton1Up, releasePress)
+    connect(button.MouseLeave, releasePress)
     return button
 end
 local function setButtonHover(button, normalColor, hoverColor)
@@ -5716,18 +5742,18 @@ UI.Details = create("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.fromScale(0.5, 0.5),
     Size = UDim2.fromOffset(410, 510),
-    BackgroundColor3 = THEME.bg,
+    BackgroundColor3 = THEME.panel,
     BorderSizePixel = 0,
     Visible = false,
     ZIndex = 2001,
 }, UI.RootGui)
 addCorner(UI.Details, 6)
-addStroke(UI.Details, THEME.border, 1, 0.1)
+addStroke(UI.Details, THEME.border, 1, 0.08)
 create("UIGradient", {
     Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(23, 103, 153)),
-        ColorSequenceKeypoint.new(0.16, Color3.fromRGB(10, 66, 102)),
-        ColorSequenceKeypoint.new(1, THEME.bg),
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(253, 255, 255)),
+        ColorSequenceKeypoint.new(0.18, Color3.fromRGB(232, 246, 253)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(211, 234, 247)),
     }),
     Rotation = 90,
 }, UI.Details)
@@ -5755,15 +5781,16 @@ UI.DetailsClose = makeButton(
     UI.Details,
     "X",
     UDim2.fromOffset(34, 34),
-    Color3.fromRGB(55, 34, 40)
+    Color3.fromRGB(235, 241, 245)
 )
 UI.DetailsClose.Position = UDim2.new(1, -49, 0, 14)
-UI.DetailsClose.TextColor3 = THEME.red
+UI.DetailsClose.TextColor3 = Color3.fromRGB(135, 46, 52)
 UI.DetailsClose.ZIndex = 2003
+addStroke(UI.DetailsClose, Color3.fromRGB(156, 177, 189), 1, 0.25)
 setButtonHover(
     UI.DetailsClose,
-    Color3.fromRGB(55, 34, 40),
-    Color3.fromRGB(78, 42, 50)
+    Color3.fromRGB(235, 241, 245),
+    Color3.fromRGB(255, 229, 229)
 )
 UI.DetailsAction = makeButton(
     UI.Details,
@@ -5810,7 +5837,15 @@ local function addDetailRow(labelText, valueText, valueColor)
         BorderSizePixel = 0,
         ZIndex = 2002,
     }, UI.DetailsContent)
-    addCorner(row, 8)
+    addCorner(row, 5)
+    addStroke(row, THEME.border, 1, 0.42)
+    create("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 240, 248)),
+        }),
+        Rotation = 90,
+    }, row)
     local left = makeLabel(
         row,
         labelText,
@@ -6003,6 +6038,7 @@ local function showItemDetails(
         true
 end
 State.DecoratedCards = setmetatable({}, {__mode = "k"})
+State.CardPresentationValueCache = State.CardPresentationValueCache or {}
 local function looksLikeItemCard(frame)
     if not frame or not frame:IsA("GuiObject") then
         return false
@@ -6212,20 +6248,28 @@ local function addUnknownValueBadge(frame, compactMode)
         Size = compactMode
             and UDim2.new(0.76, 0, 0, 19)
             or UDim2.new(0.84, 0, 0, 22),
-        BackgroundColor3 = Color3.fromRGB(36, 18, 21),
-        BackgroundTransparency = 0.02,
+        BackgroundColor3 = Color3.fromRGB(230, 241, 247),
+        BackgroundTransparency = 0.04,
         BorderSizePixel = 0,
-        Text = "?",
-        TextColor3 = THEME.red,
-        TextSize = compactMode and 14 or 16,
+        Text = "—",
+        TextColor3 = Color3.fromRGB(110, 126, 136),
+        TextSize = compactMode and 12 or 14,
         Font = Enum.Font.ArialBold,
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
         ZIndex = 95,
         Active = false,
     }, frame)
-    addCorner(badge, 6)
-    addStroke(badge, THEME.red, 1, 0.08)
+    addCorner(badge, 5)
+    addStroke(badge, Color3.fromRGB(137, 169, 188), 1, 0.28)
+    create("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(211, 231, 242)),
+        }),
+        Rotation = 90,
+    }, badge)
+    badge:SetAttribute("SV_UnresolvedPresentation", true)
 end
 local function addValueBadge(frame, record, compactMode)
     local existing = frame:FindFirstChild("SV_ValueBadge")
@@ -6240,11 +6284,11 @@ local function addValueBadge(frame, record, compactMode)
         Size = compactMode
             and UDim2.new(0.76, 0, 0, 19)
             or UDim2.new(0.84, 0, 0, 22),
-        BackgroundColor3 = Color3.fromRGB(10, 12, 16),
+        BackgroundColor3 = Color3.fromRGB(235, 246, 251),
         BackgroundTransparency = 0.03,
         BorderSizePixel = 0,
         Text = text,
-        TextColor3 = textColor,
+        TextColor3 = textColor == THEME.yellow and Color3.fromRGB(147, 94, 0) or Color3.fromRGB(25, 68, 91),
         TextSize = longText
             and (compactMode and 10 or 11)
             or (compactMode and 13 or 15),
@@ -6256,15 +6300,22 @@ local function addValueBadge(frame, record, compactMode)
         ZIndex = 95,
         Active = false,
     }, frame)
-    addCorner(badge, 6)
+    addCorner(badge, 5)
     addStroke(
         badge,
         textColor == THEME.yellow
-            and Color3.fromRGB(167, 137, 47)
-            or Color3.fromRGB(86, 95, 112),
+            and Color3.fromRGB(184, 146, 65)
+            or Color3.fromRGB(91, 151, 183),
         1,
-        0.12
+        0.22
     )
+    create("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(1, textColor == THEME.yellow and Color3.fromRGB(246, 235, 193) or Color3.fromRGB(207, 234, 247)),
+        }),
+        Rotation = 90,
+    }, badge)
     badge:SetAttribute("SV_RecordName", record.name)
     badge:SetAttribute("SV_Category", record.category)
 end
@@ -6277,12 +6328,8 @@ local function addInfoButton(frame, record, compactMode, context)
         existing:Destroy()
     end
     local resolved = record ~= nil
-    local buttonColor =
-        resolved
-        and Color3.fromRGB(19, 23, 30)
-        or Color3.fromRGB(105, 35, 43)
-    local accent =
-        resolved and THEME.blue or THEME.red
+    local buttonColor = resolved and Color3.fromRGB(224, 241, 250) or Color3.fromRGB(244, 239, 215)
+    local accent = resolved and Color3.fromRGB(29, 105, 158) or Color3.fromRGB(151, 101, 15)
     local button = create("TextButton", {
         Name = "SV_InfoButton",
         AnchorPoint = Vector2.new(0.5, 0),
@@ -6306,7 +6353,28 @@ local function addInfoButton(frame, record, compactMode, context)
         ZIndex = 100,
     }, frame)
     addCorner(button, 99)
-    addStroke(button, accent, resolved and 1 or 2, 0.12)
+    addStroke(button, accent, 1, 0.25)
+    create("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(1, buttonColor),
+        }),
+        Rotation = 90,
+    }, button)
+    local scale = create("UIScale", {Scale = 1}, button)
+    connect(button.MouseEnter, function()
+        if button.Parent then TweenService:Create(button, TweenInfo.new(0.08), {BackgroundTransparency = 0}):Play() end
+    end)
+    connect(button.MouseLeave, function()
+        if button.Parent then TweenService:Create(button, TweenInfo.new(0.08), {BackgroundTransparency = 0.02}):Play() end
+        if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.08), {Scale = 1}):Play() end
+    end)
+    connect(button.MouseButton1Down, function()
+        if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.05), {Scale = 0.93}):Play() end
+    end)
+    connect(button.MouseButton1Up, function()
+        if scale.Parent then TweenService:Create(scale, TweenInfo.new(0.08, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play() end
+    end)
     connect(button.MouseButton1Click, function()
         showItemDetails(record, context)
     end)
@@ -6572,33 +6640,89 @@ local function decorateCard(frame, options)
             or nil,
     }
     if not record then
-        removeCardDecoration(frame)
-        State.UnresolvedCards[
-            frame
-        ] = context
-        if options.showValue
-            ~= false then
-            addUnknownValueBadge(
-                frame,
-                options.compactMode
-                    == true
-            )
+        local genericId = not itemId or itemId=="Item" or itemId=="NewItem" or tostring(itemId):match("^NewItem%d+$")~=nil
+        local presentationKey = (not genericId) and (normalizeTradeItemType(itemType).."\0"..tostring(itemId).."\0"..tostring(variantHint or ""))
+            or (displayName and rawImageKey and (normalizeTradeItemType(itemType).."\0display:"..normalize(displayName).."\0image:"..tostring(rawImageKey).."\0"..tostring(variantHint or "")))
+        local cachedPresentation = presentationKey and State.CardPresentationValueCache[presentationKey] or nil
+        if options.showValue~=false and type(cachedPresentation)=="table" and cachedPresentation.record
+            and cachedPresentation.supremeRevision==HARDEN.supremeDataRevision
+            and cachedPresentation.mappingRevision==State.Mapping.Revision
+            and os.clock()-(tonumber(cachedPresentation.at) or 0)<=8 then
+            -- Same exact UI identity + same value/mapping revision: retain only the visual label.
+            -- Returning nil preserves unresolved-zero semantics for every decision path.
+            State.UnresolvedCards[frame]=context
+            addValueBadge(frame,cachedPresentation.record,options.compactMode==true)
+            if options.showInfo~=false then addInfoButton(frame,cachedPresentation.record,options.compactMode==true,context) end
+            State.DecoratedCards[frame]={itemId=itemId,itemType=itemType,record=cachedPresentation.record,displayName=displayName,variant=variantHint,
+                showValue=options.showValue,showInfo=options.showInfo,compactMode=options.compactMode==true,context=context,resolutionMeta=resolutionMeta,presentationOnly=true}
+            frame:SetAttribute("SV_LastResolvedValueAt",tonumber(cachedPresentation.at) or os.clock())
+            frame:SetAttribute("SV_ValuePresentationGrace",true)
+            return nil,context
         end
-        if options.showInfo
-            ~= false then
-            addInfoButton(
-                frame,
-                nil,
-                options.compactMode
-                    == true,
-                context
+        local previous = State.DecoratedCards[frame]
+        local sameConcreteIdentity = previous and previous.record and previous.itemType == itemType
+            and tostring(previous.variant or "") == tostring(variantHint or "")
+            and (
+                (itemId and previous.itemId and tostring(previous.itemId) == tostring(itemId))
+                or (displayName and previous.displayName and normalize(previous.displayName) == normalize(displayName))
             )
+        local lastResolvedAt = tonumber(frame:GetAttribute("SV_LastResolvedValueAt")) or 0
+        local grace = math.max(0.25, tonumber(CONFIG.AutoTraderCardValuePresentationGraceSeconds) or 1.35)
+        if sameConcreteIdentity and os.clock() - lastResolvedAt <= grace
+            and frame:FindFirstChild("SV_ValueBadge") then
+            -- v48 presentation grace: MM2 frequently tears/rebuilds card descendants for a frame.
+            -- Keep the previously verified badge visible for the *same* identity while resolution
+            -- catches up. Decision code still receives nil here and therefore gains no stale value authority.
+            State.UnresolvedCards[frame] = context
+            frame:SetAttribute("SV_ValuePresentationGrace", true)
+            return nil, context
+        end
+        local unresolvedIdentity = tostring(presentationKey or (normalizeTradeItemType(itemType).."\0"..tostring(itemId or displayName or "" ).."\0"..tostring(variantHint or "")))
+        local priorUnresolvedIdentity = tostring(frame:GetAttribute("SV_UnresolvedIdentity") or "")
+        local unresolvedSince = tonumber(frame:GetAttribute("SV_UnresolvedSince"))
+        local now = os.clock()
+        if priorUnresolvedIdentity ~= unresolvedIdentity or not unresolvedSince then
+            frame:SetAttribute("SV_UnresolvedIdentity", unresolvedIdentity)
+            frame:SetAttribute("SV_UnresolvedSince", now)
+            State.UnresolvedCards[frame] = context
+            frame:SetAttribute("SV_ValuePresentationGrace", true)
+            task.delay(grace, function()
+                if frame and frame.Parent and tostring(frame:GetAttribute("SV_UnresolvedIdentity") or "") == unresolvedIdentity then
+                    requestFullUiRefresh()
+                end
+            end)
+            return nil, context
+        elseif now - unresolvedSince < grace then
+            State.UnresolvedCards[frame] = context
+            frame:SetAttribute("SV_ValuePresentationGrace", true)
+            return nil, context
+        end
+        removeCardDecoration(frame)
+        State.UnresolvedCards[frame] = context
+        frame:SetAttribute("SV_ValuePresentationGrace", false)
+        if options.showValue ~= false then
+            addUnknownValueBadge(frame, options.compactMode == true)
+        end
+        if options.showInfo ~= false then
+            addInfoButton(frame, nil, options.compactMode == true, context)
         end
         return nil, context
     end
     State.UnresolvedCards[
         frame
     ] = nil
+    frame:SetAttribute("SV_UnresolvedSince", nil)
+    frame:SetAttribute("SV_UnresolvedIdentity", nil)
+    frame:SetAttribute("SV_LastResolvedValueAt", os.clock())
+    frame:SetAttribute("SV_ValuePresentationGrace", false)
+    do
+        local genericId = not itemId or itemId=="Item" or itemId=="NewItem" or tostring(itemId):match("^NewItem%d+$")~=nil
+        local presentationKey = (not genericId) and (normalizeTradeItemType(itemType).."\0"..tostring(itemId).."\0"..tostring(variantHint or ""))
+            or (displayName and rawImageKey and (normalizeTradeItemType(itemType).."\0display:"..normalize(displayName).."\0image:"..tostring(rawImageKey).."\0"..tostring(variantHint or "")))
+        if presentationKey then
+            State.CardPresentationValueCache[presentationKey]={record=record,supremeRevision=HARDEN.supremeDataRevision,mappingRevision=State.Mapping.Revision,at=os.clock()}
+        end
+    end
     local previous =
         State.DecoratedCards[
             frame
@@ -6736,18 +6860,19 @@ local TradePanel = create("Frame", {
     AnchorPoint = Vector2.new(1, 0.5),
     Position = UDim2.new(1, -282, 0.5, 0),
     Size = UDim2.fromOffset(310, 490),
-    BackgroundColor3 = THEME.bg,
+    BackgroundColor3 = THEME.panel,
     BorderSizePixel = 0,
     Visible = false,
     ZIndex = 1000,
 }, UI.RootGui)
+UI.TradePanel = TradePanel
 addCorner(TradePanel, 6)
-addStroke(TradePanel, THEME.border, 1, 0.1)
+addStroke(TradePanel, THEME.border, 1, 0.08)
 create("UIGradient", {
     Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(24, 105, 154)),
-        ColorSequenceKeypoint.new(0.18, Color3.fromRGB(11, 68, 104)),
-        ColorSequenceKeypoint.new(1, THEME.bg),
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(251, 254, 255)),
+        ColorSequenceKeypoint.new(0.17, Color3.fromRGB(224, 243, 252)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(207, 232, 245)),
     }),
     Rotation = 90,
 }, TradePanel)
@@ -6829,15 +6954,15 @@ UI.ToggleHelper = makeButton(
     TradePanel,
     "",
     UDim2.new(1, -28, 0, 34),
-    Color3.fromRGB(30, 45, 39)
+    Color3.fromRGB(226, 241, 232)
 )
 UI.ToggleHelper.Position = UDim2.fromOffset(14, 84)
 UI.ToggleHelper.ZIndex = 1001
 local function refreshToggleText()
     if State.TradeHelperEnabled then
         UI.ToggleHelper.Text = "Trade Helper: ON"
-        UI.ToggleHelper.BackgroundColor3 = Color3.fromRGB(30, 55, 43)
-        UI.ToggleHelper.TextColor3 = THEME.green
+        UI.ToggleHelper.BackgroundColor3 = Color3.fromRGB(218, 242, 218)
+        UI.ToggleHelper.TextColor3 = Color3.fromRGB(37, 112, 43)
     else
         UI.ToggleHelper.Text = "Trade Helper: OFF"
         UI.ToggleHelper.BackgroundColor3 = THEME.panel2
@@ -7438,6 +7563,9 @@ State.AutoTrader.IsAuthorizedTeleportBootstrap = function(bootstrap, authorizati
         return false, "missing bootstrap authorization"
     end
     if authorization.armed ~= true then return false, "bootstrap authorization is not armed" end
+    if tostring(bootstrap.controllerVersion or "") ~= tostring(CONTROLLER_VERSION) then
+        return false, "bootstrap controller version mismatch"
+    end
     local bootstrapId = tostring(bootstrap.bootstrapId or "")
     if bootstrapId == "" or tostring(authorization.bootstrapId or "") ~= bootstrapId then
         return false, "bootstrap authorization id mismatch"
@@ -9800,31 +9928,15 @@ end
 
 State.AutoTrader.CanonicalizeCapturedDistributionSource = function(candidate)
     if type(candidate) ~= "string" or #candidate < 1000 then return nil, "candidate source missing/too small" end
-    local variants, seen = {}, {}
-    local function add(value)
-        if type(value) ~= "string" or seen[value] then return end
-        seen[value] = true
-        table.insert(variants, value)
-    end
-    add(candidate)
-    local withoutBom = candidate
-    if string.sub(withoutBom, 1, 3) == string.char(239,187,191) then
-        withoutBom = string.sub(withoutBom, 4)
-        add(withoutBom)
-    end
-    local lf = string.gsub(withoutBom, "\r\n", "\n")
-    add(lf)
-    if string.sub(lf, -1) ~= "\n" then add(lf .. "\n") end
-    if string.sub(lf, -1) == "\n" then add(string.sub(lf, 1, -2)) end
-    local lastDetail = "source did not match this build"
-    for _, body in ipairs(variants) do
-        local valid, detail = verifyDistributionSource(body)
-        if valid then return body end
-        lastDetail = tostring(detail or lastDetail)
-    end
-    return nil, lastDetail
+    local body = candidate
+    if string.sub(body, 1, 3) == string.char(239,187,191) then body = string.sub(body, 4) end
+    body = string.gsub(body, "\r\n", "\n")
+    if string.sub(body, -2) == "\n\n" then return nil, "candidate source has multiple trailing newlines" end
+    if string.sub(body, -1) ~= "\n" then body = body .. "\n" end
+    local valid, detail = verifyDistributionSource(body)
+    if valid then return body end
+    return nil, tostring(detail or "source did not match this build")
 end
-
 State.AutoTrader.TryCaptureCurrentDistributionSource = function()
     local existing = State.AutoTrader.GetVerifiedTeleportContinuationSource()
     if existing then return true, State.AutoTrader.TeleportContinuationSource end
@@ -9853,6 +9965,8 @@ State.AutoTrader.TryCaptureCurrentDistributionSource = function()
     local readfileFunction = State.TryGetExecutorGlobal("readfile")
     if type(isfileFunction) == "function" and type(readfileFunction) == "function" then
         local names = {
+            "SV_AutoTrader_v47_nextgen_384_tests.lua",
+            "SV_AutoTrader_v46_cooperative_selftests.lua",
             "SV_AutoTrader_v44_invariance_tests.lua",
             "SV_AutoTrader_v43_fixed.lua",
             "SV_AutoTrader_v43_core.lua",
@@ -14522,14 +14636,21 @@ State.AutoTrader.ShowSuccessNotification = function(partner, plan, auditText)
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, -18, 0, 18),
         Size = UDim2.fromOffset(310, 92),
-        BackgroundColor3 = THEME.bg,
+        BackgroundColor3 = Color3.fromRGB(235, 248, 240),
         BorderSizePixel = 0,
         ZIndex = 1900,
     }, UI.RootGui)
     UI.AutoTraderSuccessNotification = frame
-    addCorner(frame, 5)
-    addStroke(frame, THEME.green, 1, 0.05)
-    local title = makeLabel(frame, "AUTO TRADE COMPLETE", 11, THEME.green, Enum.Font.ArialBold)
+    addCorner(frame, 6)
+    addStroke(frame, Color3.fromRGB(86, 157, 75), 1, 0.12)
+    create("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(207, 238, 216)),
+        }),
+        Rotation = 90,
+    }, frame)
+    local title = makeLabel(frame, "AUTO TRADE COMPLETE", 11, Color3.fromRGB(37, 116, 47), Enum.Font.ArialBold)
     title.Position = UDim2.fromOffset(12, 8)
     title.Size = UDim2.new(1, -48, 0, 18)
     title.ZIndex = 1901
@@ -17597,6 +17718,20 @@ local function aeroButton(parent, text, size, accent)
             }):Play()
         end
     end)
+    connect(button.MouseButton1Down, function()
+        if button.Parent then
+            TweenService:Create(button, TweenInfo.new(0.05), {
+                BackgroundColor3 = accent and Color3.fromRGB(78, 143, 51) or Color3.fromRGB(184, 214, 233),
+            }):Play()
+        end
+    end)
+    connect(button.MouseButton1Up, function()
+        if button.Parent then
+            TweenService:Create(button, TweenInfo.new(0.08), {
+                BackgroundColor3 = accent and Color3.fromRGB(111, 177, 73) or AERO.buttonHoverBottom,
+            }):Play()
+        end
+    end)
     return button
 end
 
@@ -17613,6 +17748,19 @@ UI.AutoTraderLauncher.ZIndex = 1500
 UI.AutoTraderLauncher.TextColor3 = THEME.text
 UI.AutoTraderLauncher.TextSize = 11
 UI.AutoTraderLauncherScale = create("UIScale", {Scale = 1}, UI.AutoTraderLauncher)
+
+UI.AutoTraderPanelShadow = create("Frame", {
+    Name = "SV_AutoTraderPanelShadow",
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -19, 0.5, 5),
+    Size = UDim2.fromOffset(650, 600),
+    BackgroundColor3 = Color3.fromRGB(24, 52, 68),
+    BackgroundTransparency = 0.78,
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 1449,
+}, UI.RootGui)
+addCorner(UI.AutoTraderPanelShadow, 8)
 
 UI.AutoTraderPanel = create("Frame", {
     Name = "SV_AutoTraderPanel",
@@ -17654,6 +17802,10 @@ clampAutoTraderPanelPosition = function(save)
     if math.abs(dx) > 0.5 or math.abs(dy) > 0.5 then
         local pos = UI.AutoTraderPanel.Position
         UI.AutoTraderPanel.Position = UDim2.new(pos.X.Scale, pos.X.Offset + dx, pos.Y.Scale, pos.Y.Offset + dy)
+    end
+    if UI.AutoTraderPanelShadow and UI.AutoTraderPanelShadow.Parent then
+        local pos = UI.AutoTraderPanel.Position
+        UI.AutoTraderPanelShadow.Position = UDim2.new(pos.X.Scale, pos.X.Offset + 5, pos.Y.Scale, pos.Y.Offset + 5)
     end
     if save then
         local pos = UI.AutoTraderPanel.Position
@@ -17697,7 +17849,7 @@ UI.AutoTraderTitle.Size = UDim2.new(1, -250, 0, 22)
 UI.AutoTraderTitle.ZIndex = 1454
 UI.AutoTraderSubtitle = makeLabel(
     UI.AutoTraderHeader,
-    "OVERNIGHT CONTROL · LIVE AUDITS · AUTO RECOVERY",
+    "AUTOMATION CENTER · LIVE VALUES · SAFE TRADE AUDITS",
     11,
     Color3.fromRGB(235, 249, 255),
     Enum.Font.Arial
@@ -18093,7 +18245,7 @@ UI.AutoTraderServerScanReason.ZIndex = 1456
 UI.AutoTraderForceServer = aeroButton(serversPage, "FIND A NEW SERVER", UDim2.new(0.5, -4, 0, 36), true)
 UI.AutoTraderForceServer.Position = UDim2.fromOffset(0, 134)
 UI.AutoTraderForceServer.ZIndex = 1454
-UI.AutoTraderRefreshServerScan = aeroButton(serversPage, "REFRESH SERVER LIST", UDim2.new(0.5, -4, 0, 36), false)
+UI.AutoTraderRefreshServerScan = aeroButton(serversPage, "REFRESH NOW", UDim2.new(0.5, -4, 0, 36), false)
 UI.AutoTraderRefreshServerScan.Position = UDim2.new(0.5, 4, 0, 134)
 UI.AutoTraderRefreshServerScan.TextColor3 = THEME.blue
 UI.AutoTraderRefreshServerScan.ZIndex = 1454
@@ -20027,6 +20179,10 @@ State.AutoTrader.Tick = function()
 end
 connect(UI.AutoTraderLauncher.MouseButton1Click, function()
     UI.AutoTraderPanel.Visible = not UI.AutoTraderPanel.Visible
+    if UI.AutoTraderPanelShadow then
+        UI.AutoTraderPanelShadow.Visible = UI.AutoTraderPanel.Visible
+        UI.AutoTraderPanelShadow.Position = UDim2.new(UI.AutoTraderPanel.Position.X.Scale, UI.AutoTraderPanel.Position.X.Offset + 5, UI.AutoTraderPanel.Position.Y.Scale, UI.AutoTraderPanel.Position.Y.Offset + 5)
+    end
     if UI.AutoTraderPanel.Visible then
         State.AutoTrader.GetLocalInventory(true)
         State.AutoTrader.RebuildReserveList()
@@ -20039,6 +20195,7 @@ connect(UI.AutoTraderLauncher.MouseButton1Click, function()
 end)
 connect(UI.AutoTraderClose.MouseButton1Click, function()
     UI.AutoTraderPanel.Visible = false
+    if UI.AutoTraderPanelShadow then UI.AutoTraderPanelShadow.Visible = false end
 end)
 connect(UI.AutoTraderCanary.MouseButton1Click, function()
     local targetArmed = not State.AutoTrader.SupervisedCanaryArmed
@@ -20215,6 +20372,12 @@ connect(UserInputService.InputChanged, function(input)
         start.Y.Scale,
         start.Y.Offset + delta.Y
     )
+    if UI.AutoTraderPanelShadow and UI.AutoTraderPanelShadow.Parent then
+        UI.AutoTraderPanelShadow.Position = UDim2.new(
+            UI.AutoTraderPanel.Position.X.Scale, UI.AutoTraderPanel.Position.X.Offset + 5,
+            UI.AutoTraderPanel.Position.Y.Scale, UI.AutoTraderPanel.Position.Y.Offset + 5
+        )
+    end
 end)
 connect(UserInputService.InputEnded, function(input)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
@@ -29974,10 +30137,15 @@ do
             UI.AutoTraderUpcomingToggle=UI.AutoTraderV37UiHelpers.button(parent,"UPCOMING SERVERS ▼",UDim2.new(0.48,-4,0,20),false)
             UI.AutoTraderUpcomingToggle.Position=UDim2.fromOffset(0,178);UI.AutoTraderUpcomingToggle.TextSize=10;UI.AutoTraderUpcomingToggle.ZIndex=1460
             connect(UI.AutoTraderUpcomingToggle.MouseButton1Click,function()
-                State.AutoTrader.UpcomingServerBrowserOpen=not State.AutoTrader.UpcomingServerBrowserOpen
-                UI.AutoTraderServerCandidateScroll.Visible=State.AutoTrader.UpcomingServerBrowserOpen
-                UI.AutoTraderUpcomingToggle.Text=State.AutoTrader.UpcomingServerBrowserOpen and "UPCOMING SERVERS ▼" or "UPCOMING SERVERS ▶"
-                if State.AutoTrader.UpcomingServerBrowserOpen then State.AutoTrader.RebuildServerDashboard() end
+                -- v48: Upcoming Servers stays visible; the header is now a lightweight refresh affordance.
+                State.AutoTrader.UpcomingServerBrowserOpen=true
+                UI.AutoTraderServerCandidateScroll.Visible=true
+                UI.AutoTraderUpcomingToggle.Text="UPCOMING SERVERS · AUTO ▼"
+                if State.AutoTrader.RefreshUpcomingServersAutomatically then
+                    State.AutoTrader.RefreshUpcomingServersAutomatically(true)
+                else
+                    State.AutoTrader.RebuildServerDashboard()
+                end
             end)
         end
     end
@@ -29992,7 +30160,7 @@ do
         if not State.AutoTrader.UpcomingServerBrowserOpen then return end
         local queue=State.AutoTrader.GetUpcomingServerCandidates()
         if #queue==0 then
-            local label=makeLabel(UI.AutoTraderServerCandidateContent,"No selector candidates are currently lined up. Refresh the server list or wait for a hop scan.",10,THEME.faint,Enum.Font.Arial)
+            local label=makeLabel(UI.AutoTraderServerCandidateContent,"Looking for upcoming servers automatically…",10,THEME.faint,Enum.Font.Arial)
             label.Size=UDim2.new(1,0,0,44);label.TextWrapped=true;label.ZIndex=1454;return
         end
         local limit=math.max(1,tonumber(CONFIG.AutoTraderUpcomingServerUiLimit) or 12)
@@ -34472,204 +34640,105 @@ do
     )
 end
 
--- v40 UI polish: plain-English top-center AUTO thought feed.
+-- v48 UI polish: unified Windows 7 / Frutiger Aero activity center.
 -- UI/observability only. It reads existing controller state and never changes
 -- planner, transport, learning, bot classification, mutation, or safety decisions.
 ;(function()
     local FEED_MAX = 4
     local FEED_Z = 1960
-    State.AutoTrader.ThoughtFeedEntries = type(State.AutoTrader.ThoughtFeedEntries) == "table"
-        and State.AutoTrader.ThoughtFeedEntries or {}
+    local palette = type(UI.AutoTraderV37UiHelpers)=="table" and UI.AutoTraderV37UiHelpers.palette or nil
+    local skyTop = palette and palette.cardTop or Color3.fromRGB(255,255,255)
+    local skyBottom = palette and palette.cardAltBottom or Color3.fromRGB(220,239,248)
+    local headerTop = palette and palette.glassTop or Color3.fromRGB(133,207,241)
+    local headerBottom = palette and palette.glassBottom or Color3.fromRGB(48,132,190)
+    State.AutoTrader.ThoughtFeedEntries = type(State.AutoTrader.ThoughtFeedEntries) == "table" and State.AutoTrader.ThoughtFeedEntries or {}
     State.AutoTrader.ThoughtFeedSerial = tonumber(State.AutoTrader.ThoughtFeedSerial) or 0
     State.AutoTrader.ThoughtFeedLastKey = State.AutoTrader.ThoughtFeedLastKey
     State.AutoTrader.ThoughtFeedAutomationWasOn = false
 
-    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent then
-        UI.AutoTraderThoughtFeed:Destroy()
-    end
+    if UI.AutoTraderThoughtFeed and UI.AutoTraderThoughtFeed.Parent then UI.AutoTraderThoughtFeed:Destroy() end
     UI.AutoTraderThoughtFeed = create("Frame", {
-        Name = "SV_AutoTraderThoughtFeed",
-        AnchorPoint = Vector2.new(0.5, 0),
-        Position = UDim2.new(0.5, 0, 0, 10),
-        Size = UDim2.fromOffset(660, 150),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        Visible = false,
-        Active = false,
-        ZIndex = FEED_Z,
+        Name="SV_AutoTraderThoughtFeed",AnchorPoint=Vector2.new(0.5,0),Position=UDim2.new(0.5,0,0,10),
+        Size=UDim2.fromOffset(560,126),BackgroundColor3=skyBottom,BorderSizePixel=0,Visible=false,Active=false,ZIndex=FEED_Z,
     }, UI.RootGui)
+    addCorner(UI.AutoTraderThoughtFeed,6)
+    addStroke(UI.AutoTraderThoughtFeed,Color3.fromRGB(92,151,185),1,0.12)
+    create("UIGradient",{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,skyTop),ColorSequenceKeypoint.new(1,skyBottom)}),Rotation=90},UI.AutoTraderThoughtFeed)
+
+    UI.AutoTraderThoughtFeedHeader=create("Frame",{Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,28),BackgroundColor3=headerBottom,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeed)
+    addCorner(UI.AutoTraderThoughtFeedHeader,6)
+    create("UIGradient",{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,headerTop),ColorSequenceKeypoint.new(1,headerBottom)}),Rotation=90},UI.AutoTraderThoughtFeedHeader)
+    create("Frame",{Position=UDim2.new(0,0,1,-2),Size=UDim2.new(1,0,0,4),BackgroundColor3=headerBottom,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeedHeader)
+    local liveDot=create("Frame",{Position=UDim2.fromOffset(10,9),Size=UDim2.fromOffset(10,10),BackgroundColor3=Color3.fromRGB(115,204,83),BorderSizePixel=0,ZIndex=FEED_Z+3},UI.AutoTraderThoughtFeedHeader)
+    addCorner(liveDot,99);addStroke(liveDot,Color3.fromRGB(230,255,220),1,0.2)
+    local headerTitle=makeLabel(UI.AutoTraderThoughtFeedHeader,"AUTO TRADER ACTIVITY",11,Color3.fromRGB(255,255,255),Enum.Font.ArialBold)
+    headerTitle.Position=UDim2.fromOffset(27,3);headerTitle.Size=UDim2.new(1,-130,0,22);headerTitle.ZIndex=FEED_Z+3
+    local headerState=makeLabel(UI.AutoTraderThoughtFeedHeader,"LIVE",9,Color3.fromRGB(230,255,215),Enum.Font.ArialBold)
+    headerState.Position=UDim2.new(1,-84,0,3);headerState.Size=UDim2.fromOffset(72,22);headerState.TextXAlignment=Enum.TextXAlignment.Right;headerState.ZIndex=FEED_Z+3
+    UI.AutoTraderThoughtFeedBody=create("Frame",{Position=UDim2.fromOffset(8,34),Size=UDim2.new(1,-16,1,-42),BackgroundTransparency=1,BorderSizePixel=0,ZIndex=FEED_Z+1},UI.AutoTraderThoughtFeed)
 
     local function trimText(value)
-        local s = tostring(value or "")
-        s = s:gsub("[%c]+", " "):gsub("%s+", " ")
-        s = s:gsub("^%s+", ""):gsub("%s+$", "")
-        return s
+        local s=tostring(value or "");s=s:gsub("[%c]+"," "):gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","");return s
     end
-
     local function itemDisplayName(entry)
-        if type(entry) ~= "table" then return nil end
-        local name = entry.name
-            or (entry.record and entry.record.name)
-            or entry.itemId
-        name = trimText(name)
-        return name ~= "" and name or nil
+        if type(entry)~="table" then return nil end
+        local name=trimText(entry.name or (entry.record and entry.record.name) or entry.itemId)
+        return name~="" and name or nil
     end
-
-    local function itemNames(items, limit)
-        local names, seen = {}, {}
-        limit = math.max(1, math.floor(tonumber(limit) or 3))
-        for _, entry in ipairs(type(items) == "table" and items or {}) do
-            local name = itemDisplayName(entry)
-            if name and not seen[name] then
-                seen[name] = true
-                table.insert(names, name)
-            end
-        end
-        if #names == 0 then return nil end
-        local shown = {}
-        for i = 1, math.min(#names, limit) do shown[i] = names[i] end
-        local text
-        if #shown == 1 then
-            text = shown[1]
-        elseif #shown == 2 then
-            text = shown[1] .. " and " .. shown[2]
-        else
-            text = table.concat(shown, ", ", 1, #shown - 1) .. ", and " .. shown[#shown]
-        end
-        if #names > limit then text = text .. " and " .. tostring(#names - limit) .. " more" end
-        return text
+    local function itemNames(items,limit)
+        local names,seen={},{};limit=math.max(1,math.floor(tonumber(limit) or 3))
+        for _,entry in ipairs(type(items)=="table" and items or {}) do local name=itemDisplayName(entry);if name and not seen[name] then seen[name]=true;names[#names+1]=name end end
+        if #names==0 then return nil end
+        local shown={};for i=1,math.min(#names,limit) do shown[i]=names[i] end
+        local result
+        if #shown==1 then result=shown[1] elseif #shown==2 then result=shown[1].." and "..shown[2] else result=table.concat(shown,", ",1,#shown-1)..", and "..shown[#shown] end
+        if #names>limit then result=result.." and "..tostring(#names-limit).." more" end
+        return result
     end
-
-    local function tween(instance, properties)
+    local function tween(instance,properties,duration)
         if not instance or not instance.Parent then return end
-        pcall(function()
-            TweenService:Create(
-                instance,
-                TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-                properties
-            ):Play()
-        end)
+        pcall(function() TweenService:Create(instance,TweenInfo.new(duration or 0.16,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),properties):Play() end)
     end
 
-    State.AutoTrader.LayoutThoughtFeed = function(immediate)
-        local feed = State.AutoTrader.ThoughtFeedEntries
-        local bottom = 144
-        for index = 1, #feed do
-            local entry = feed[index]
-            local frame = entry and entry.frame
-            local label = entry and entry.label
+    State.AutoTrader.LayoutThoughtFeed=function(immediate)
+        for index,entry in ipairs(State.AutoTrader.ThoughtFeedEntries) do
+            local frame,label,timeLabel=entry.frame,entry.label,entry.timeLabel
             if frame and frame.Parent and label and label.Parent then
-                local age = index - 1
-                local height = math.max(22, 38 - age * 4)
-                local width = math.max(390, 620 - age * 52)
-                local y = bottom - height
-                local bgTransparency = math.min(0.90, 0.10 + age * 0.20)
-                local textTransparency = math.min(0.82, age * 0.18)
-                local textSize = math.max(10, 16 - age * 2)
-                local targetPosition = UDim2.new(0.5, 0, 0, y)
-                local targetSize = UDim2.fromOffset(width, height)
-                if immediate then
-                    frame.Position = targetPosition
-                    frame.Size = targetSize
-                    frame.BackgroundTransparency = bgTransparency
-                    label.TextTransparency = textTransparency
-                    label.TextSize = textSize
-                    if entry.stroke then entry.stroke.Transparency = math.min(0.95, 0.52 + age * 0.12) end
-                else
-                    tween(frame, {
-                        Position = targetPosition,
-                        Size = targetSize,
-                        BackgroundTransparency = bgTransparency,
-                    })
-                    tween(label, {
-                        TextTransparency = textTransparency,
-                        TextSize = textSize,
-                    })
-                    if entry.stroke then
-                        tween(entry.stroke, {Transparency = math.min(0.95, 0.52 + age * 0.12)})
-                    end
-                end
-                bottom = y - 6
+                local y=(index-1)*22
+                local newest=index==1
+                local targetPosition=UDim2.fromOffset(0,y)
+                local targetSize=UDim2.new(1,0,0,20)
+                if immediate then frame.Position=targetPosition;frame.Size=targetSize;frame.BackgroundTransparency=newest and 0.16 or 0.64;label.TextTransparency=newest and 0 or 0.18
+                else tween(frame,{Position=targetPosition,Size=targetSize,BackgroundTransparency=newest and 0.16 or 0.64});tween(label,{TextTransparency=newest and 0 or 0.18}) end
+                label.TextColor3=newest and Color3.fromRGB(25,52,67) or Color3.fromRGB(77,98,109)
+                label.Font=newest and Enum.Font.ArialBold or Enum.Font.Arial
+                label.TextSize=newest and 11 or 10
+                if timeLabel then timeLabel.TextColor3=newest and Color3.fromRGB(69,111,134) or Color3.fromRGB(116,132,141);timeLabel.TextTransparency=newest and 0 or 0.2 end
             end
         end
     end
-
-    State.AutoTrader.ClearThoughtFeed = function(immediate)
-        State.AutoTrader.ThoughtFeedLastKey = nil
-        local feed = State.AutoTrader.ThoughtFeedEntries
-        for index = #feed, 1, -1 do
-            local entry = feed[index]
-            local frame = entry and entry.frame
-            local label = entry and entry.label
-            table.remove(feed, index)
-            if frame and frame.Parent then
-                if immediate then
-                    frame:Destroy()
-                else
-                    tween(frame, {BackgroundTransparency = 1})
-                    if label and label.Parent then tween(label, {TextTransparency = 1}) end
-                    task.delay(0.24, function()
-                        if frame and frame.Parent then frame:Destroy() end
-                    end)
-                end
-            end
+    State.AutoTrader.ClearThoughtFeed=function(immediate)
+        State.AutoTrader.ThoughtFeedLastKey=nil
+        for index=#State.AutoTrader.ThoughtFeedEntries,1,-1 do
+            local entry=table.remove(State.AutoTrader.ThoughtFeedEntries,index);local frame=entry and entry.frame
+            if frame and frame.Parent then if immediate then frame:Destroy() else tween(frame,{BackgroundTransparency=1},0.12);task.delay(0.14,function() if frame and frame.Parent then frame:Destroy() end end) end end
         end
-        if UI.AutoTraderThoughtFeed then UI.AutoTraderThoughtFeed.Visible = false end
+        if UI.AutoTraderThoughtFeed then UI.AutoTraderThoughtFeed.Visible=false end
     end
-
-    State.AutoTrader.PushThought = function(message, key)
+    State.AutoTrader.PushThought=function(message,key)
         if not State.AutoTrader.Preferences.automation then return false end
-        message = trimText(message)
-        if message == "" then return false end
-        key = trimText(key ~= nil and key or message)
-        if State.AutoTrader.ThoughtFeedLastKey == key then return false end
-        State.AutoTrader.ThoughtFeedLastKey = key
-        State.AutoTrader.ThoughtFeedSerial += 1
-        local frame = create("Frame", {
-            Name = "Thought_" .. tostring(State.AutoTrader.ThoughtFeedSerial),
-            AnchorPoint = Vector2.new(0.5, 0),
-            Position = UDim2.new(0.5, 0, 0, 118),
-            Size = UDim2.fromOffset(620, 38),
-            BackgroundColor3 = Color3.fromRGB(8, 15, 22),
-            BackgroundTransparency = 1,
-            BorderSizePixel = 0,
-            Active = false,
-            ZIndex = FEED_Z + 1,
-        }, UI.AutoTraderThoughtFeed)
-        addCorner(frame, 8)
-        local stroke = addStroke(frame, THEME.blue, 1, 1)
-        local label = makeLabel(frame, message, 16, THEME.text, Enum.Font.ArialBold)
-        label.Position = UDim2.fromOffset(12, 2)
-        label.Size = UDim2.new(1, -24, 1, -4)
-        label.TextWrapped = true
-        label.TextXAlignment = Enum.TextXAlignment.Center
-        label.TextYAlignment = Enum.TextYAlignment.Center
-        label.TextTransparency = 1
-        label.ZIndex = FEED_Z + 2
-        table.insert(State.AutoTrader.ThoughtFeedEntries, 1, {
-            frame = frame,
-            label = label,
-            stroke = stroke,
-            key = key,
-        })
-        UI.AutoTraderThoughtFeed.Visible = true
-        while #State.AutoTrader.ThoughtFeedEntries > FEED_MAX do
-            local old = table.remove(State.AutoTrader.ThoughtFeedEntries)
-            if old and old.frame and old.frame.Parent then
-                tween(old.frame, {BackgroundTransparency = 1})
-                if old.label and old.label.Parent then tween(old.label, {TextTransparency = 1}) end
-                task.delay(0.24, function()
-                    if old.frame and old.frame.Parent then old.frame:Destroy() end
-                end)
-            end
-        end
-        State.AutoTrader.LayoutThoughtFeed(false)
-        -- Newest thought fades into the fixed bottom slot while previous thoughts
-        -- simultaneously move upward, shrink, and fade.
-        tween(frame, {BackgroundTransparency = 0.10})
-        tween(label, {TextTransparency = 0})
-        tween(stroke, {Transparency = 0.52})
-        return true
+        message=trimText(message);if message=="" then return false end
+        key=trimText(key~=nil and key or message);if State.AutoTrader.ThoughtFeedLastKey==key then return false end
+        State.AutoTrader.ThoughtFeedLastKey=key;State.AutoTrader.ThoughtFeedSerial+=1
+        local frame=create("Frame",{Name="Thought_"..tostring(State.AutoTrader.ThoughtFeedSerial),Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,20),BackgroundColor3=Color3.fromRGB(255,255,255),BackgroundTransparency=1,BorderSizePixel=0,Active=false,ZIndex=FEED_Z+2},UI.AutoTraderThoughtFeedBody)
+        addCorner(frame,3)
+        local accent=create("Frame",{Position=UDim2.fromOffset(1,4),Size=UDim2.fromOffset(3,12),BackgroundColor3=Color3.fromRGB(66,156,205),BorderSizePixel=0,ZIndex=FEED_Z+3},frame);addCorner(accent,2)
+        local label=makeLabel(frame,message,11,Color3.fromRGB(25,52,67),Enum.Font.ArialBold);label.Position=UDim2.fromOffset(10,1);label.Size=UDim2.new(1,-70,1,-2);label.TextWrapped=false;label.TextTruncate=Enum.TextTruncate.AtEnd;label.ZIndex=FEED_Z+3
+        local timeLabel=makeLabel(frame,os.date("%H:%M"),9,Color3.fromRGB(69,111,134),Enum.Font.Arial);timeLabel.Position=UDim2.new(1,-56,0,1);timeLabel.Size=UDim2.fromOffset(50,18);timeLabel.TextXAlignment=Enum.TextXAlignment.Right;timeLabel.ZIndex=FEED_Z+3
+        table.insert(State.AutoTrader.ThoughtFeedEntries,1,{frame=frame,label=label,timeLabel=timeLabel,key=key})
+        UI.AutoTraderThoughtFeed.Visible=true
+        while #State.AutoTrader.ThoughtFeedEntries>FEED_MAX do local old=table.remove(State.AutoTrader.ThoughtFeedEntries);if old and old.frame and old.frame.Parent then old.frame:Destroy() end end
+        State.AutoTrader.LayoutThoughtFeed(false);tween(frame,{BackgroundTransparency=0.16},0.14);return true
     end
 
     local function currentName()
@@ -34868,6 +34937,95 @@ end
     -- If AUTO was restored only through the explicit teleport bootstrap, install
     -- the feed against whatever state already exists after startup.
     State.AutoTrader.UpdateThoughtFeedFromState()
+end)()
+
+
+-- v48 UI/runtime presentation conveniences. No trade eligibility, planner, bot,
+-- valuation, mutation, or teleport decision rule is changed here.
+;(function()
+    State.AutoTrader.UpcomingServerBrowserOpen = true
+    State.AutoTrader.UpcomingAutoRefreshLastAt = tonumber(State.AutoTrader.UpcomingAutoRefreshLastAt) or 0
+    State.AutoTrader.UpcomingAutoRefreshInFlight = false
+
+    State.AutoTrader.RefreshUpcomingServersAutomatically = function(force)
+        if Destroyed or State.AutoTrader.UpcomingAutoRefreshInFlight or State.AutoTrader.ServerHopInProgress
+            or State.AutoTrader.ComprehensiveSelfTestRunning==true
+            or (tonumber(State.AutoTrader.SelfTestExecutionDepth) or 0)>0 then return false end
+        local now=os.clock();local cadence=math.max(6,tonumber(CONFIG.AutoTraderUpcomingAutoRefreshSeconds) or 12)
+        if not force and now-(tonumber(State.AutoTrader.UpcomingAutoRefreshLastAt) or 0)<cadence then return false end
+        State.AutoTrader.UpcomingAutoRefreshInFlight=true;State.AutoTrader.UpcomingAutoRefreshLastAt=now
+        task.spawn(function()
+            local ok,queue,scan=pcall(function() local q,s=State.AutoTrader.BuildPublicServerQueue(true);return q,s end)
+            if ok then State.AutoTrader.LastServerScan=scan or State.AutoTrader.LastServerScan end
+            State.AutoTrader.UpcomingAutoRefreshInFlight=false
+            if not Destroyed then State.AutoTrader.RebuildServerDashboard();State.AutoTrader.Render() end
+        end)
+        return true
+    end
+
+    -- Upcoming servers are a live dashboard now, not a manually populated drawer.
+    if UI.AutoTraderUpcomingToggle then
+        UI.AutoTraderUpcomingToggle.Text="UPCOMING SERVERS · AUTO ▼"
+        UI.AutoTraderUpcomingToggle.TextColor3=Color3.fromRGB(28,104,164)
+    end
+    if UI.AutoTraderServerCandidateScroll then UI.AutoTraderServerCandidateScroll.Visible=true end
+    if UI.AutoTraderRefreshServerScan then UI.AutoTraderRefreshServerScan.Text="REFRESH NOW" end
+    if type(State.AutoTrader.SetActiveTab)=="function" and State.AutoTrader.V48BaseSetActiveTab==nil then
+        State.AutoTrader.V48BaseSetActiveTab=State.AutoTrader.SetActiveTab
+        State.AutoTrader.SetActiveTab=function(tabName)
+            local result=State.AutoTrader.V48BaseSetActiveTab(tabName)
+            if tabName=="SERVERS" then State.AutoTrader.RefreshUpcomingServersAutomatically(false) end
+            return result
+        end
+    end
+
+    -- Finish the older helper windows with the same light glass-card language.
+    for _,surface in ipairs({UI.ValueBox,UI.SignalBox,UI.NotesScroll}) do
+        if surface and surface.Parent then
+            addStroke(surface,THEME.border,1,0.38)
+            if not surface:FindFirstChildOfClass("UIGradient") then
+                create("UIGradient",{Color=ColorSequence.new({
+                    ColorSequenceKeypoint.new(0,Color3.fromRGB(255,255,255)),
+                    ColorSequenceKeypoint.new(1,Color3.fromRGB(224,240,248)),
+                }),Rotation=90},surface)
+            end
+        end
+    end
+    if UI.DetailsAction and UI.DetailsAction.Parent then
+        addStroke(UI.DetailsAction,THEME.border,1,0.32)
+        create("UIGradient",{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(255,255,255)),ColorSequenceKeypoint.new(1,Color3.fromRGB(214,233,244))}),Rotation=90},UI.DetailsAction)
+    end
+    if UI.ToggleHelper and UI.ToggleHelper.Parent then
+        addStroke(UI.ToggleHelper,THEME.border,1,0.32)
+        if not UI.ToggleHelper:FindFirstChildOfClass("UIGradient") then
+            create("UIGradient",{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(255,255,255)),ColorSequenceKeypoint.new(1,Color3.fromRGB(215,238,222))}),Rotation=90},UI.ToggleHelper)
+        end
+    end
+
+    -- Give the root custom surfaces a consistent Aero scrollbar/color language.
+    for _,instance in ipairs(UI.RootGui:GetDescendants()) do
+        if instance:IsA("ScrollingFrame") then
+            instance.ScrollBarImageColor3=Color3.fromRGB(66,139,180)
+            instance.ScrollBarThickness=math.max(4,instance.ScrollBarThickness)
+        elseif instance:IsA("TextBox") then
+            instance.TextColor3=THEME.text
+            instance.PlaceholderColor3=THEME.faint
+        end
+    end
+
+    task.delay(0.8,function()
+        if not Destroyed then State.AutoTrader.RefreshUpcomingServersAutomatically(true) end
+    end)
+    task.spawn(function()
+        while not Destroyed do
+            task.wait(math.max(6,tonumber(CONFIG.AutoTraderUpcomingAutoRefreshSeconds) or 12))
+            if Destroyed then break end
+            if State.AutoTrader.UpcomingServerBrowserOpen and UI.AutoTraderPanel and UI.AutoTraderPanel.Visible
+                and State.AutoTrader.ActiveTab=="SERVERS" then
+                State.AutoTrader.RefreshUpcomingServersAutomatically(false)
+            end
+        end
+    end)
 end)()
 
 
@@ -37895,6 +38053,708 @@ end)()
     end
     if State.AutoTrader.StartupSelfTestRequested==true then
         State.AutoTrader.ScheduleComprehensiveSelfTests("startup")
+    end
+end)()
+
+
+
+-------------------------------------------------------------------------------
+-- v47 NEXT-GENERATION SELF-TESTS
+-- The v46 comprehensive suite is retired after a verified 916/916 runtime pass.
+-- This generation intentionally does NOT call the old runner chain. It exercises
+-- 24 new adversarial/metamorphic domains x 16 cases = 384 tests, cooperatively.
+-- REGISTER SAFETY: everything lives in this IIFE; category runners are separate
+-- function prototypes and no revision locals leak into the outer chunk.
+-------------------------------------------------------------------------------
+(function()
+    State.AutoTrader.RetiredSelfTestCheckpoint = {
+        generation = "v46-comprehensive",
+        controllerVersion = "18.69.44-public-auto-trader-v46-cooperative-selftests",
+        passed = 916,
+        total = 916,
+        failed = 0,
+        status = "RUNTIME_VERIFIED_PASS",
+    }
+
+    -- Drop strong runtime references to the retired runner chain/catalog so the
+    -- old suite cannot execute accidentally and its closures can be collected.
+    for _, key in ipairs({
+        "V35RunSelfTests", "V36AuditRunSelfTests", "V36Rc3RunSelfTests",
+        "V36Rc4RunSelfTests", "V36Rc5RunSelfTests", "V36Rc7RunSelfTests",
+        "V37RunSelfTests", "V37Round19RunSelfTests", "V37Round22RunSelfTests",
+        "RunV44InvariantSelfTests", "ExpandedSelfTestCatalog",
+        "ExpandedSelfTestCatalogVersion", "ExpandedSelfTestExpectedAdditions",
+        "V44InvariantSelfTestVersion", "V44InvariantSelfTestExpected",
+    }) do
+        State.AutoTrader[key] = nil
+    end
+
+    local categories = {}
+    local function addCategory(id, title, labels, runner)
+        categories[#categories+1] = {id=id, title=title, labels=labels, run=runner}
+    end
+    local function clone(value)
+        return State.AutoTrader.ClonePlainTable(value)
+    end
+    local function makeEntry(id, value, quantity, options)
+        options = type(options)=="table" and options or {}
+        local q = quantity == nil and 1 or quantity
+        local e = {
+            itemType = options.itemType or "Weapons",
+            itemId = id,
+            nativeKey = options.nativeKey == false and nil or (options.nativeKey or id),
+            name = options.name or ("Display " .. tostring(id)),
+            quantity = q,
+            maxQuantity = options.maxQuantity == nil and q or options.maxQuantity,
+            unitValue = value == nil and 10 or value,
+            demand = options.demand,
+            variant = options.variant,
+            numericItemId = options.numericItemId,
+            identityHint = options.identityHint,
+            gameData = options.gameData or {},
+            record = options.record or {
+                name = "Supreme " .. tostring(id),
+                category = options.category or "godlies",
+                key = options.recordKey or ("nextgen::" .. string.lower(tostring(id))),
+                data = {value = value == nil and 10 or value},
+            },
+        }
+        return e
+    end
+    local function deepEqual(a,b,seen)
+        if type(a)~=type(b) then return false end
+        if type(a)~="table" then return a==b end
+        if a==b then return true end
+        seen=seen or {};seen[a]=seen[a] or {}
+        if seen[a][b] then return true end
+        seen[a][b]=true
+        for k,v in pairs(a) do if not deepEqual(v,b[k],seen) then return false end end
+        for k in pairs(b) do if a[k]==nil then return false end end
+        return true
+    end
+    local function tablesAreIndependent(a,b,seen)
+        if type(a)~="table" or type(b)~="table" then return true end
+        if a==b then return false end
+        seen=seen or {};seen[a]=seen[a] or {}
+        if seen[a][b] then return true end
+        seen[a][b]=true
+        for k,v in pairs(a) do
+            if type(v)=="table" and type(b[k])=="table" and not tablesAreIndependent(v,b[k],seen) then return false end
+        end
+        return true
+    end
+    local function quantityOf(entries,itemId,variant)
+        local total=0
+        for _,e in ipairs(entries or {}) do
+            if tostring(e.itemId)==tostring(itemId)
+                and tostring(e.variant or (e.identityHint and e.identityHint.variant) or "")==tostring(variant or "") then
+                total += math.max(0,math.floor(tonumber(e.quantity or e.maxQuantity) or 0))
+            end
+        end
+        return total
+    end
+    local function sortedUniqueBounded(values,maximum)
+        local prior=0;local seen={}
+        for _,v in ipairs(values or {}) do
+            if type(v)~="number" or v%1~=0 or v<1 or v>maximum or seen[v] or v<prior then return false end
+            seen[v]=true;prior=v
+        end
+        return true
+    end
+
+    -- 01. Canonical identity must ignore presentation/quantity-only changes.
+    addCategory("identity_preserve","Canonical identity preservation",{
+        "deep_clone","quantity_change","max_quantity_change","display_name_change",
+        "demand_change","unit_value_change","record_numeric_value_change","record_market_metadata_change",
+        "irrelevant_identity_hint","irrelevant_game_data","extra_nested_metadata","native_key_fallback_to_itemid",
+        "itemtype_case_change","numeric_quantity_string","record_display_name_change","record_stability_metadata_change",
+    },function(i)
+        local base=makeEntry("Alpha",17,1,{recordKey="identity-alpha"})
+        local probe=clone(base)
+        if i==2 then probe.quantity=9
+        elseif i==3 then probe.maxQuantity=9
+        elseif i==4 then probe.name="Totally Different UI Label"
+        elseif i==5 then probe.demand=99
+        elseif i==6 then probe.unitValue=999
+        elseif i==7 then probe.record.data.value=999
+        elseif i==8 then probe.record.data.demand=7
+        elseif i==9 then probe.identityHint={note="presentation-only"}
+        elseif i==10 then probe.gameData.Cosmetic="yes"
+        elseif i==11 then probe.extra={nested={anything=true}}
+        elseif i==12 then probe.nativeKey=nil
+        elseif i==13 then probe.itemType="weapons"
+        elseif i==14 then probe.quantity="7"
+        elseif i==15 then probe.record.name="Renamed Supreme display"
+        elseif i==16 then probe.record.data.stability="Stable" end
+        local a=State.AutoTrader.BuildCanonicalValueIdentityKey(base)
+        local b=State.AutoTrader.BuildCanonicalValueIdentityKey(probe)
+        return a~=nil and a==b,"presentation-only mutation changed canonical value identity"
+    end)
+
+    -- 02. Canonical identity must distinguish materially different native/value identities.
+    addCategory("identity_distinct","Canonical identity collision resistance",{
+        "itemid_change","nativekey_change","entry_variant_change","hint_variant_change",
+        "event_change","year_change","ancestry_change","numeric_native_id_change",
+        "supreme_category_change","supreme_record_key_change","gamedata_chroma_change","gamedata_event_change",
+        "gamedata_year_change","gamedata_numeric_id_change","itemtype_change","chroma_native_name_change",
+    },function(i)
+        local base=makeEntry("Alpha",17,1,{recordKey="identity-alpha"})
+        local probe=clone(base)
+        if i==1 then probe.itemId="Beta";probe.nativeKey="Beta"
+        elseif i==2 then probe.nativeKey="BetaNative"
+        elseif i==3 then probe.variant="Chroma"
+        elseif i==4 then probe.identityHint={variant="Chroma"}
+        elseif i==5 then probe.identityHint={event="Halloween"}
+        elseif i==6 then probe.identityHint={year=2024}
+        elseif i==7 then probe.identityHint={ancestryPath="Holiday>2024"}
+        elseif i==8 then probe.numericItemId=12345
+        elseif i==9 then probe.record.category="chromas"
+        elseif i==10 then probe.record.key="identity-beta"
+        elseif i==11 then probe.gameData={Chroma=true}
+        elseif i==12 then probe.gameData={Event="Christmas"}
+        elseif i==13 then probe.gameData={Year=2025}
+        elseif i==14 then probe.gameData={ItemID=555}
+        elseif i==15 then probe.itemType="Pets"
+        elseif i==16 then probe.itemId="AlphaChroma";probe.nativeKey="AlphaChroma" end
+        local a=State.AutoTrader.BuildCanonicalValueIdentityKey(base)
+        local b=State.AutoTrader.BuildCanonicalValueIdentityKey(probe)
+        return a~=nil and b~=nil and a~=b,"materially different identity collapsed onto the same canonical key"
+    end)
+
+    -- 03. Offer hashing must ignore row ordering and presentation-only metadata.
+    addCategory("offerhash_preserve","Offer hash representation invariance",{
+        "reverse_order","bac_order","cab_order","deep_clone","itemtype_case",
+        "display_names","unit_values","records","demand_metadata","max_quantity_metadata",
+        "event_hint_metadata","game_data_metadata","extra_fields","integer_float_quantity",
+        "table_key_order","minimal_equivalent_rows",
+    },function(i)
+        local base={makeEntry("A",10,1),makeEntry("B",20,2),makeEntry("C",30,3)}
+        local probe=clone(base)
+        if i==1 then probe={probe[3],probe[2],probe[1]}
+        elseif i==2 then probe={probe[2],probe[1],probe[3]}
+        elseif i==3 then probe={probe[3],probe[1],probe[2]}
+        elseif i==5 then for _,e in ipairs(probe) do e.itemType="weapons" end
+        elseif i==6 then for n,e in ipairs(probe) do e.name="UI-"..n end
+        elseif i==7 then for n,e in ipairs(probe) do e.unitValue=1000+n end
+        elseif i==8 then for _,e in ipairs(probe) do e.record={name="Other",category="x",key="y",data={value=1}} end
+        elseif i==9 then for n,e in ipairs(probe) do e.demand=n end
+        elseif i==10 then for n,e in ipairs(probe) do e.maxQuantity=99+n end
+        elseif i==11 then for _,e in ipairs(probe) do e.identityHint={event="ignored-by-offerhash"} end
+        elseif i==12 then for _,e in ipairs(probe) do e.gameData={Cosmetic=true} end
+        elseif i==13 then for _,e in ipairs(probe) do e.extra={foo="bar"} end
+        elseif i==14 then for _,e in ipairs(probe) do e.quantity=tonumber(e.quantity)+0.0 end
+        elseif i==15 then probe={ [1]=probe[1],[2]=probe[2],[3]=probe[3],note="ignored" }
+        elseif i==16 then probe={{itemType="Weapons",itemId="A",quantity=1},{itemType="Weapons",itemId="B",quantity=2},{itemType="Weapons",itemId="C",quantity=3}} end
+        return State.AutoTrader.OfferHash(base)==State.AutoTrader.OfferHash(probe),"equivalent offer representation changed offer hash"
+    end)
+
+    -- 04. Offer hashing must change when economically/materially relevant offer identity changes.
+    addCategory("offerhash_sensitive","Offer hash material-change sensitivity",{
+        "item_a_id","item_b_id","item_c_id","item_a_quantity","item_b_quantity","item_c_quantity",
+        "item_a_variant","item_b_variant","item_c_variant","remove_item","add_item","itemtype_change",
+        "hint_variant_change","all_quantities_change","empty_native_id","duplicate_extra_row",
+    },function(i)
+        local base={{itemType="Weapons",itemId="A",quantity=1},{itemType="Weapons",itemId="B",quantity=2},{itemType="Weapons",itemId="C",quantity=3}}
+        local probe=clone(base)
+        if i<=3 then probe[i].itemId=probe[i].itemId.."X"
+        elseif i<=6 then probe[i-3].quantity=probe[i-3].quantity+1
+        elseif i<=9 then probe[i-6].variant="Chroma"
+        elseif i==10 then table.remove(probe,3)
+        elseif i==11 then table.insert(probe,{itemType="Weapons",itemId="D",quantity=1})
+        elseif i==12 then probe[1].itemType="Pets"
+        elseif i==13 then probe[1].identityHint={variant="Chroma"}
+        elseif i==14 then for _,e in ipairs(probe) do e.quantity=e.quantity+1 end
+        elseif i==15 then probe[1].itemId=""
+        elseif i==16 then table.insert(probe,{itemType="Weapons",itemId="A",quantity=1}) end
+        return State.AutoTrader.OfferHash(base)~=State.AutoTrader.OfferHash(probe),"material offer change failed to change offer hash"
+    end)
+
+    -- 05. Offer quantity lookup: exact item/variant semantics across odd encodings.
+    addCategory("offer_quantity","Offer quantity exactness",{
+        "exact_a","exact_b","exact_chroma","missing_item","wrong_variant","itemtype_case",
+        "wrong_itemtype","zero_quantity","negative_quantity","fractional_quantity","numeric_string_quantity",
+        "missing_quantity","duplicate_first_match","hint_variant","nil_variant_vs_chroma","numeric_itemid",
+    },function(i)
+        local entries={
+            {itemType="Weapons",itemId="A",quantity=1},
+            {itemType="Weapons",itemId="B",quantity=2},
+            {itemType="Weapons",itemId="C",variant="Chroma",quantity=3},
+        }
+        local t,id,v,expected="Weapons","A",nil,1
+        if i==2 then id="B";expected=2
+        elseif i==3 then id="C";v="Chroma";expected=3
+        elseif i==4 then id="D";expected=0
+        elseif i==5 then id="C";v="Normal";expected=0
+        elseif i==6 then t="weapons";expected=1
+        elseif i==7 then t="Pets";expected=0
+        elseif i==8 then entries[1].quantity=0;expected=0
+        elseif i==9 then entries[1].quantity=-3;expected=0
+        elseif i==10 then entries[1].quantity=2.9;expected=2
+        elseif i==11 then entries[1].quantity="4";expected=4
+        elseif i==12 then entries[1].quantity=nil;expected=0
+        elseif i==13 then table.insert(entries,1,{itemType="Weapons",itemId="A",quantity=5});expected=5
+        elseif i==14 then entries[1].identityHint={variant="Chroma"};v="Chroma";expected=1
+        elseif i==15 then id="C";v=nil;expected=0
+        elseif i==16 then entries={{itemType="Weapons",itemId=123,quantity=6}};id=123;expected=6 end
+        return State.AutoTrader.GetOfferQuantity(entries,t,id,v)==expected,"offer quantity lookup violated exact item/variant semantics"
+    end)
+
+    -- 06. Clone isolation across increasingly nested production-like shapes.
+    addCategory("clone_isolation","Plain-table clone isolation",{
+        "empty","scalar","nested","dense_array","deep_nested","mixed_scalars","array_of_tables","nested_arrays",
+        "record_shape","identity_hint_shape","queue_shape","preferences_shape","server_row_shape","support_shape",
+        "five_level_depth","mixed_numeric_string_keys",
+    },function(i)
+        local shapes={
+            {},{a=1},{a={b=2}},{1,2,3},{a={b={c={d=4}}}},{a=true,b=false,c="x"},
+            {{a=1},{b=2}},{{1,{2,{3}}}},{record={category="g",data={value=10}}},
+            {identityHint={variant="Chroma",year=2024}},{rows={{score=1},{score=2}},meta={n=2}},
+            {automation=false,reserves={A=2},panelPosition={x=1,y=2}},
+            {id="job",preview={hashes={"a","b"}},playing=4},{runtime={health={hung=0}},history={{kind="x"}}},
+            {a={b={c={d={e=5}}}}},{[1]="a",[2]={x=2},named={y=3}},
+        }
+        local source=shapes[i];local copied=clone(source)
+        return copied~=source and deepEqual(source,copied) and tablesAreIndependent(source,copied),"plain-table clone shared nested identity or changed data"
+    end)
+
+    -- 07. Feasibility cache signatures: irrelevant table order is stable; every authority field is sensitive.
+    addCategory("feasibility_signature","Feasibility signature authority sensitivity",{
+        "clone_same","extra_irrelevant_field","user_id","presence_generation","remote_stamp","local_stamp",
+        "local_identity","unresolved_units","nonnumeric_units","partial_flag","mapping_revision","supreme_revision",
+        "supreme_hash","game_data_revision","reserve_signature","policy_signature",
+    },function(i)
+        local base={userId=1,presenceGeneration=2,remoteStamp=3,localStamp=4,localIdentity="L",unresolvedUnits=5,nonNumericUnits=6,
+            partial=false,mappingRevision=7,supremeRevision=8,supremeHash="H",gameDataRevision=9,reserveSignature="R",policySignature="P"}
+        local probe=clone(base)
+        if i==2 then probe.irrelevant="ignored" end
+        local fields={"userId","presenceGeneration","remoteStamp","localStamp","localIdentity","unresolvedUnits","nonNumericUnits","partial","mappingRevision","supremeRevision","supremeHash","gameDataRevision","reserveSignature","policySignature"}
+        if i>=3 then
+            local field=fields[i-2]
+            if field=="partial" then probe[field]=not probe[field]
+            elseif type(probe[field])=="number" then probe[field]=probe[field]+100
+            else probe[field]=tostring(probe[field]).."X" end
+        end
+        local a=State.AutoTrader.BuildFeasibilitySignatureFromParts(base)
+        local b=State.AutoTrader.BuildFeasibilitySignatureFromParts(probe)
+        if i<=2 then return a==b,"irrelevant feasibility representation changed cache signature" end
+        return a~=b,"authority field failed to invalidate feasibility signature"
+    end)
+
+    -- 08. Avatar hash canonicalization across URL/path/case formats and invalid impostors.
+    addCategory("avatar_hash","Avatar headshot fingerprint canonicalization",{
+        "raw_lower","raw_upper","https_150","https_48","http_webp","query_suffix","mixed_case_label","extra_path",
+        "31_hex_invalid","33_hex_invalid","nonhex_invalid","empty_invalid","nil_invalid","headshot_without_marker_invalid",
+        "double_marker_valid_first","different_hash_distinct",
+    },function(i)
+        local h="0123456789abcdef0123456789abcdef"
+        local cases={
+            {h,h},{string.upper(h),h},{"https://tr.rbxcdn.com/180DAY-AvatarHeadshot-"..h.."-Png/150/150/AvatarHeadshot/Webp/noFilter",h},
+            {"https://tr.rbxcdn.com/X-AvatarHeadshot-"..h.."-Png/48/48/AvatarHeadshot/Png/noFilter",h},
+            {"http://x/AvatarHeadshot-"..h.."-Jpeg/150/150",h},{"https://x/avatarheadshot-"..h.."-png/a?x=1",h},
+            {"HTTPS://X/AVATARHEADSHOT-"..string.upper(h).."-PNG/A",h},{"prefix/path/avatarheadshot-"..h.."-png/extra/path",h},
+            {string.sub(h,1,31),nil},{h.."0",nil},{"z"..string.sub(h,2),nil},{"",nil},{nil,nil},{"https://x/headshot-"..h.."-png",nil},
+            {"avatarheadshot-"..h.."-png/avatarheadshot-ffffffffffffffffffffffffffffffff-png",h},{"ffffffffffffffffffffffffffffffff","ffffffffffffffffffffffffffffffff"},
+        }
+        local got=State.AutoTrader.ExtractAvatarHeadshotHash(cases[i][1])
+        return got==cases[i][2],"avatar headshot fingerprint canonicalization mismatch"
+    end)
+
+    -- 09. Direct-auth player-token validation against control characters/size/type attacks.
+    addCategory("auth_token","Direct-auth player-token validation",{
+        "plain","max_512","too_long_513","empty","newline","carriage_return","nul","number_type",
+        "table_type","unicode","spaces","punctuation","urlish","jsonish","tab_allowed","leading_trailing_spaces",
+    },function(i)
+        local cases={
+            {"abc",true},{string.rep("a",512),true},{string.rep("a",513),false},{"",false},{"a\nb",false},{"a\rb",false},{"a\0b",false},{123,false},
+            {{},false},{"雪",true},{"a b c",true},{"a:b/c?d=e",true},{"https://example/token",true},{'{"x":1}',true},{"a\tb",true},{"  token  ",true},
+        }
+        return State.AutoTrader.IsValidDirectAuthPlayerToken(cases[i][1])==cases[i][2],"direct-auth token validation accepted/rejected the wrong shape"
+    end)
+
+    -- 10. Server-candidate cache normalization and preview-evidence sanitization.
+    addCategory("server_cache","Server candidate cache sanitization",{
+        "base_valid","jobid_alias","negative_playing_clamped","numeric_strings","fingerprint_dedup","fingerprint_cap10",
+        "thumbnail_dedup","companion_evidence_stripped","nil_invalid","empty_id_invalid","zero_stamp_invalid","missing_playing_invalid",
+        "missing_maxplayers_invalid","zero_maxplayers_invalid","nontable_invalid","numeric_jobid_invalid",
+    },function(i)
+        local h="0123456789abcdef0123456789abcdef"
+        local base={id="job-a",scannedAt=100,playing=4,maxPlayers=12,previewFingerprints={h},previewThumbnailUrls={"u1"}}
+        local input=clone(base)
+        local check=function(row) return row~=nil end
+        if i==2 then input.jobId=input.id;input.id=nil;check=function(r) return r and r.id=="job-a" end
+        elseif i==3 then input.playing=-5;check=function(r) return r and r.playing==0 end
+        elseif i==4 then input.scannedAt="100";input.playing="4";input.maxPlayers="12";check=function(r) return r and r.playing==4 and r.maxPlayers==12 end
+        elseif i==5 then input.previewFingerprints={h,h,string.upper(h)};check=function(r) return r and #r.previewFingerprints==1 end
+        elseif i==6 then input.previewFingerprints={};for n=1,12 do input.previewFingerprints[n]=string.format("%032x",n) end;check=function(r) return r and #r.previewFingerprints==10 end
+        elseif i==7 then input.previewThumbnailUrls={"u1","u1","u2"};check=function(r) return r and #r.previewThumbnailUrls==2 end
+        elseif i==8 then input.previewTokenSource="browser_companion_authenticated";input.previewCoverage="SAMPLED_NOT_FULL_ROSTER";input.previewFingerprints={h};input.previewThumbnailUrls={"u"};input.previewTokenCount=1;check=function(r) return r and #r.previewFingerprints==0 and #r.previewThumbnailUrls==0 and r.previewTokenCount==0 and r.previewTokenSource==nil end
+        elseif i==9 then input=nil;check=function(r) return r==nil end
+        elseif i==10 then input.id="";check=function(r) return r==nil end
+        elseif i==11 then input.scannedAt=0;check=function(r) return r==nil end
+        elseif i==12 then input.playing=nil;check=function(r) return r==nil end
+        elseif i==13 then input.maxPlayers=nil;check=function(r) return r==nil end
+        elseif i==14 then input.maxPlayers=0;check=function(r) return r==nil end
+        elseif i==15 then input="not-table";check=function(r) return r==nil end
+        elseif i==16 then input.id=123;check=function(r) return r==nil end end
+        return check(State.AutoTrader.NormalizeServerCandidateCacheEntry(input)),"server candidate cache normalization violated schema/evidence policy"
+    end)
+
+    -- 11. Candidate comparator must be deterministic and prioritize trust/risk/score/occupancy/id in order.
+    addCategory("server_compare","Fresh server candidate deterministic ordering",{
+        "trusted_over_untrusted","lower_gold_ratio","higher_score","higher_playing","lexical_id","trusted_reverse",
+        "gold_reverse","score_reverse","playing_reverse","id_reverse","tiny_gold_delta","tiny_score_delta","equal_same_id",
+        "negative_scores","zero_playing_tie","large_playing_difference",
+    },function(i)
+        local a={id="a",playing=5,botPreview={previewTrusted=true,goldMatchRatio=0.1,score=10}}
+        local b={id="b",playing=4,botPreview={previewTrusted=true,goldMatchRatio=0.1,score=10}}
+        local expected=true
+        if i==1 then b.botPreview.previewTrusted=false
+        elseif i==2 then a.botPreview.goldMatchRatio=0.1;b.botPreview.goldMatchRatio=0.2
+        elseif i==3 then a.botPreview.score=11;b.botPreview.score=10
+        elseif i==4 then a.playing=6;b.playing=5
+        elseif i==5 then a.playing=b.playing=5;a.id="a";b.id="b"
+        elseif i==6 then a.botPreview.previewTrusted=false;b.botPreview.previewTrusted=true;expected=false
+        elseif i==7 then a.botPreview.goldMatchRatio=0.3;b.botPreview.goldMatchRatio=0.1;expected=false
+        elseif i==8 then a.botPreview.score=9;b.botPreview.score=10;expected=false
+        elseif i==9 then a.playing=3;b.playing=5;expected=false
+        elseif i==10 then a.playing=b.playing=5;a.id="z";b.id="a";expected=false
+        elseif i==11 then a.botPreview.goldMatchRatio=0.10001;b.botPreview.goldMatchRatio=0.10002
+        elseif i==12 then a.botPreview.score=10.00001;b.botPreview.score=10
+        elseif i==13 then a.id="same";b.id="same";a.playing=b.playing=5;expected=false
+        elseif i==14 then a.botPreview.score=-1;b.botPreview.score=-2
+        elseif i==15 then a.playing=b.playing=0;a.id="a";b.id="b"
+        elseif i==16 then a.playing=11;b.playing=1 end
+        return State.AutoTrader.CompareFreshServerCandidates(a,b)==expected,"fresh server candidate comparator lost deterministic priority ordering"
+    end)
+
+    -- 12. Portfolio simulation algebra: representation order and inverse exchanges must behave consistently.
+    addCategory("portfolio_algebra","Portfolio exchange algebra",{
+        "noop","give_receive_inverse","receive_increments","give_decrements","give_all_removes","receive_new_adds","base_order_invariant",
+        "give_order_invariant","receive_order_invariant","both_order_invariant","zero_value_receive_ignored","zero_value_base_ignored",
+        "overgive_removes","string_quantity","fractional_quantity_floor","variant_does_not_merge",
+    },function(i)
+        local base={makeEntry("A",10,2),makeEntry("B",20,1),makeEntry("C",30,1)}
+        local before=State.AutoTrader.GetPortfolioIdentitySignature(clone(base))
+        if i==1 then return State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,{},{}))==before,"no-op exchange changed portfolio" end
+        if i==2 then local out=State.AutoTrader.SimulatePortfolioExchange(base,{makeEntry("A",10,1)},{makeEntry("A",10,1)});return State.AutoTrader.GetPortfolioIdentitySignature(out)==before,"inverse give/receive failed to cancel" end
+        if i==3 then local out=State.AutoTrader.SimulatePortfolioExchange(base,{}, {makeEntry("A",10,1)});return quantityOf(out,"A")==3,"receive did not increment quantity" end
+        if i==4 then local out=State.AutoTrader.SimulatePortfolioExchange(base,{makeEntry("A",10,1)},{});return quantityOf(out,"A")==1,"give did not decrement quantity" end
+        if i==5 then local out=State.AutoTrader.SimulatePortfolioExchange(base,{makeEntry("A",10,2)},{});return quantityOf(out,"A")==0,"giving all copies did not remove identity" end
+        if i==6 then local out=State.AutoTrader.SimulatePortfolioExchange(base,{}, {makeEntry("D",40,2)});return quantityOf(out,"D")==2,"new received identity was not added" end
+        if i==7 then local rev={base[3],base[2],base[1]};return State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(rev,{},{}))==before,"base row order changed portfolio result" end
+        if i==8 then local g1={makeEntry("A",10,1),makeEntry("B",20,1)};local g2={g1[2],g1[1]};return State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,g1,{}))==State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,g2,{})),"give order changed exchange result" end
+        if i==9 then local r1={makeEntry("D",40,1),makeEntry("E",50,1)};local r2={r1[2],r1[1]};return State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,{},r1))==State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,{},r2)),"receive order changed exchange result" end
+        if i==10 then local g={makeEntry("A",10,1),makeEntry("B",20,1)};local r={makeEntry("D",40,1),makeEntry("E",50,1)};return State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,g,r))==State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,{g[2],g[1]},{r[2],r[1]})),"combined exchange order changed result" end
+        if i==11 then local zero=makeEntry("Z",0,5);zero.unitValue=0;zero.record.data.value=0;return State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(base,{}, {zero}))==before,"zero-value receive changed numeric portfolio" end
+        if i==12 then local zero=makeEntry("Z",0,5);zero.unitValue=0;zero.record.data.value=0;local withZero={base[1],base[2],base[3],zero};return State.AutoTrader.GetPortfolioIdentitySignature(State.AutoTrader.SimulatePortfolioExchange(withZero,{},{}))==before,"zero-value base entry survived numeric portfolio simulation" end
+        if i==13 then local out=State.AutoTrader.SimulatePortfolioExchange(base,{makeEntry("A",10,99)},{});return quantityOf(out,"A")==0,"over-give created negative/phantom quantity" end
+        if i==14 then local g=makeEntry("A",10,"1");local out=State.AutoTrader.SimulatePortfolioExchange(base,{g},{});return quantityOf(out,"A")==1,"numeric-string quantity changed exchange semantics" end
+        if i==15 then local g=makeEntry("A",10,1.9);local out=State.AutoTrader.SimulatePortfolioExchange(base,{g},{});return quantityOf(out,"A")==1,"fractional quantity did not floor deterministically" end
+        local chroma=makeEntry("A",10,1,{variant="Chroma"});local out=State.AutoTrader.SimulatePortfolioExchange(base,{}, {chroma});return quantityOf(out,"A")==2 and quantityOf(out,"A","Chroma")==1,"variant identity merged with base identity"
+    end)
+
+    -- 13. Value-band classifier exact boundaries and coercion behavior.
+    addCategory("value_band","Value-band boundary classification",{
+        "negative","zero","99_999","100","499_999","500","1999_999","2000",
+        "huge","numeric_string_99","numeric_string_100","nil","nonnumeric","fraction_0_5","fraction_499_5","fraction_1999_5",
+    },function(i)
+        local cases={{-1,"lt100"},{0,"lt100"},{99.999,"lt100"},{100,"100_499"},{499.999,"100_499"},{500,"500_1999"},{1999.999,"500_1999"},{2000,"2000_plus"},
+            {1e9,"2000_plus"},{"99","lt100"},{"100","100_499"},{nil,"lt100"},{"abc","lt100"},{0.5,"lt100"},{499.5,"100_499"},{1999.5,"500_1999"}}
+        return State.AutoTrader.GetValueBand(cases[i][1])==cases[i][2],"value-band boundary classification mismatch"
+    end)
+
+    -- 14. Quantity candidate generator must be sorted/unique/bounded and exact when the domain is small.
+    addCategory("quantity_options","Quantity-option boundedness",{
+        "none_upper_zero","single","small_exact_5","small_exact_20","unit_fraction","tight_upper","lower_above_upper","large_81",
+        "large_200","large_1000","high_unit","fractional_upper","lower_zero","midrange_window","upper_smaller_than_unit","exact_limit_boundary",
+    },function(i)
+        local cases={
+            {10,2,0,0},{10,2,0,2},{5,2,0,10},{20,1,0,20},{20,0.5,0,5},{100,5,0,17},{100,5,30,20},{81,1,10,81},
+            {200,2,50,300},{1000,0.5,100,300},{500,25,50,250},{100,3,4.5,19.5},{100,2,0,50},{500,4,80,140},{10,100,0,50},{CONFIG.AutoTraderExactQuantityLimit,1,0,CONFIG.AutoTraderExactQuantityLimit},
+        }
+        local c=cases[i];local maxQ,unit,lower,upper=c[1],c[2],c[3],c[4]
+        local values=State.AutoTrader.QuantityOptions(maxQ,unit,lower,upper)
+        local maximum=math.min(math.floor(maxQ),math.max(0,math.floor(upper/unit+0.000001)))
+        if not sortedUniqueBounded(values,maximum) then return false,"quantity options were unsorted/duplicated/out of bounds" end
+        if maximum<=0 then return #values==0,"zero feasible quantity domain returned candidates" end
+        if maximum<=CONFIG.AutoTraderExactQuantityLimit then return #values==maximum and values[1]==1 and values[#values]==maximum,"small quantity domain was not enumerated exactly" end
+        return #values>0 and values[1]>=1 and values[#values]<=maximum,"large quantity domain produced no bounded candidates"
+    end)
+
+    -- 15. Offer mutation cost is an L1 distance over exact item+variant quantities.
+    addCategory("mutation_cost","Offer mutation-cost algebra",{
+        "same","reordered","add_one","remove_one","increase_by_two","swap_identity","add_two_new","remove_two_rows",
+        "variant_swap","itemtype_swap","deep_clone","irrelevant_metadata","numeric_string_quantity","nil_quantity_default",
+        "empty_to_three","three_to_empty",
+    },function(i)
+        local base={{itemType="Weapons",itemId="A",quantity=1},{itemType="Weapons",itemId="B",quantity=1}}
+        local target=clone(base);local expected=0
+        if i==2 then target={target[2],target[1]}
+        elseif i==3 then target[1].quantity=2;expected=1
+        elseif i==4 then target[1].quantity=0;expected=1
+        elseif i==5 then target[1].quantity=3;expected=2
+        elseif i==6 then target[1].itemId="C";expected=2
+        elseif i==7 then table.insert(target,{itemType="Weapons",itemId="C",quantity=2});expected=2
+        elseif i==8 then target={};expected=2
+        elseif i==9 then target[1].variant="Chroma";expected=2
+        elseif i==10 then target[1].itemType="Pets";expected=2
+        elseif i==11 then target=clone(base)
+        elseif i==12 then target[1].name="ignored";target[1].unitValue=999
+        elseif i==13 then target[1].quantity="1"
+        elseif i==14 then target[1].quantity=nil
+        elseif i==15 then base={};target={{itemType="Weapons",itemId="A",quantity=3}};expected=3
+        elseif i==16 then base={{itemType="Weapons",itemId="A",quantity=3}};target={};expected=3 end
+        return State.AutoTrader.GetOfferMutationCost(base,target)==expected,"offer mutation cost violated exact L1 quantity distance"
+    end)
+
+    -- 16. UI main-page topology under 16 tab sequences.
+    addCategory("ui_tabs","UI tab topology invariance",{
+        "home","trade","people","servers","settings","home_trade_home","trade_people_trade","servers_settings_servers",
+        "all_forward","all_reverse","zigzag_a","zigzag_b","repeat_home","repeat_trade","alternating_home_settings","alternating_people_servers",
+    },function(i)
+        local sequences={
+            {"HOME"},{"TRADE"},{"PEOPLE"},{"SERVERS"},{"SETTINGS"},{"HOME","TRADE","HOME"},{"TRADE","PEOPLE","TRADE"},{"SERVERS","SETTINGS","SERVERS"},
+            {"HOME","TRADE","PEOPLE","SERVERS","SETTINGS"},{"SETTINGS","SERVERS","PEOPLE","TRADE","HOME"},{"HOME","PEOPLE","TRADE","SERVERS"},{"TRADE","SETTINGS","PEOPLE","HOME"},
+            {"HOME","HOME","HOME"},{"TRADE","TRADE","TRADE"},{"HOME","SETTINGS","HOME","SETTINGS"},{"PEOPLE","SERVERS","PEOPLE","SERVERS"},
+        }
+        if type(UI.AutoTraderPages)~="table" or type(State.AutoTrader.SetActiveTab)~="function" then return false,"tab test surface unavailable" end
+        local old=State.AutoTrader.ActiveTab;local before=#Connections;local ok=true
+        for _,name in ipairs(sequences[i]) do
+            State.AutoTrader.SetActiveTab(name)
+            local visible=0
+            for _,page in pairs(UI.AutoTraderPages) do if page.Visible then visible+=1 end end
+            if visible~=1 or not UI.AutoTraderPages[name] or UI.AutoTraderPages[name].Visible~=true or State.AutoTrader.ActiveTab~=name then ok=false;break end
+        end
+        State.AutoTrader.SetActiveTab(old)
+        return ok and #Connections==before,"tab sequence produced multi-page visibility, wrong active tab, or connection growth"
+    end)
+
+    -- 17. Render/control operations must remain presentation-pure across varied sequences.
+    addCategory("render_purity","Render/control state purity",{
+        "render_once","render_three","controls_once","home_render","trade_render","people_controls","servers_render_controls","settings_controls_render",
+        "tab_cycle_render","render_tab_render","controls_tab_controls","mixed_a","mixed_b","mixed_c","rebuild_reserves","thought_layout",
+    },function(i)
+        local oldTab=State.AutoTrader.ActiveTab
+        local before={connections=#Connections,action=State.AutoTrader.ActionGeneration,plan=State.AutoTrader.PlanGeneration,stamp=State.AutoTrader.InventoryCacheStamp,
+            mapping=State.Mapping.Revision,supremeRev=HARDEN.supremeDataRevision,supremeHash=HARDEN.supremeDataHash,automation=State.AutoTrader.Preferences.automation}
+        local ops={
+            function() State.AutoTrader.Render() end,
+            function() State.AutoTrader.Render();State.AutoTrader.Render();State.AutoTrader.Render() end,
+            function() State.AutoTrader.UpdateControls() end,
+            function() State.AutoTrader.SetActiveTab("HOME");State.AutoTrader.Render() end,
+            function() State.AutoTrader.SetActiveTab("TRADE");State.AutoTrader.Render() end,
+            function() State.AutoTrader.SetActiveTab("PEOPLE");State.AutoTrader.UpdateControls() end,
+            function() State.AutoTrader.SetActiveTab("SERVERS");State.AutoTrader.Render();State.AutoTrader.UpdateControls() end,
+            function() State.AutoTrader.SetActiveTab("SETTINGS");State.AutoTrader.UpdateControls();State.AutoTrader.Render() end,
+            function() for _,n in ipairs({"HOME","TRADE","PEOPLE","SERVERS","SETTINGS"}) do State.AutoTrader.SetActiveTab(n) end;State.AutoTrader.Render() end,
+            function() State.AutoTrader.Render();State.AutoTrader.SetActiveTab("HOME");State.AutoTrader.Render() end,
+            function() State.AutoTrader.UpdateControls();State.AutoTrader.SetActiveTab("SETTINGS");State.AutoTrader.UpdateControls() end,
+            function() State.AutoTrader.SetActiveTab("TRADE");State.AutoTrader.Render();State.AutoTrader.SetActiveTab("HOME");State.AutoTrader.UpdateControls() end,
+            function() State.AutoTrader.SetActiveTab("PEOPLE");State.AutoTrader.UpdateControls();State.AutoTrader.Render() end,
+            function() State.AutoTrader.SetActiveTab("SERVERS");State.AutoTrader.Render();State.AutoTrader.SetActiveTab("SETTINGS");State.AutoTrader.Render() end,
+            function() if State.AutoTrader.RebuildReserveList then State.AutoTrader.RebuildReserveList() end end,
+            function() if State.AutoTrader.LayoutThoughtFeed then State.AutoTrader.LayoutThoughtFeed() end end,
+        }
+        local ok,err=pcall(ops[i])
+        State.AutoTrader.SetActiveTab(oldTab)
+        if not ok then return false,"presentation operation errored: "..tostring(err) end
+        return #Connections==before.connections and State.AutoTrader.ActionGeneration==before.action and State.AutoTrader.PlanGeneration==before.plan
+            and State.AutoTrader.InventoryCacheStamp==before.stamp and State.Mapping.Revision==before.mapping
+            and HARDEN.supremeDataRevision==before.supremeRev and HARDEN.supremeDataHash==before.supremeHash
+            and State.AutoTrader.Preferences.automation==before.automation,
+            "presentation operation mutated transaction/planner/value authority or leaked connections"
+    end)
+
+    -- 18. One-shot teleport authorization matrix.
+    addCategory("teleport_auth","Teleport bootstrap authorization matrix",{
+        "valid","missing_bootstrap","missing_auth","not_armed","id_mismatch","foreign_controller_version","auth_version_mismatch","destination_mismatch",
+        "expired","future_too_far","missing_preferences","empty_bootstrap_id","missing_destination","age_120_boundary","future_5_boundary","automation_false_still_authorized",
+    },function(i)
+        local now=1000;local job="job-destination"
+        local b={bootstrapId="id",controllerVersion=CONTROLLER_VERSION,preferences={automation=true}}
+        local a={armed=true,bootstrapId="id",controllerVersion=CONTROLLER_VERSION,destinationJobId=job,armedAtUnix=now}
+        local expected=true
+        if i==2 then b=nil;expected=false
+        elseif i==3 then a=nil;expected=false
+        elseif i==4 then a.armed=false;expected=false
+        elseif i==5 then a.bootstrapId="other";expected=false
+        elseif i==6 then b.controllerVersion="other";a.controllerVersion="other";expected=false
+        elseif i==7 then a.controllerVersion="other";expected=false
+        elseif i==8 then a.destinationJobId="other";expected=false
+        elseif i==9 then a.armedAtUnix=now-121;expected=false
+        elseif i==10 then a.armedAtUnix=now+6;expected=false
+        elseif i==11 then b.preferences=nil;expected=false
+        elseif i==12 then b.bootstrapId="";a.bootstrapId="";expected=false
+        elseif i==13 then a.destinationJobId="";expected=false
+        elseif i==14 then a.armedAtUnix=now-120
+        elseif i==15 then a.armedAtUnix=now+5
+        elseif i==16 then b.preferences.automation=false end
+        local got=State.AutoTrader.IsAuthorizedTeleportBootstrap(b,a,now,job)
+        return got==expected,"teleport authorization matrix accepted/rejected the wrong bootstrap"
+    end)
+
+    -- 19. Current-build source capture/canonicalization integrity, including declared-hash tampering.
+    addCategory("distribution_integrity","Distribution source canonicalization integrity",{
+        "exact","bom","crlf","remove_final_newline","bom_crlf","wrong_version","body_tamper","old_version_with_current_hash",
+        "nil","too_small","declared_hash_tamper","placeholder_declared_hash","number_input","table_input","bom_without_final_newline","double_final_newline_rejected",
+    },function(i)
+        local source=rawget(ExecutorEnvironment,"__SV_AUTO_TRADER_CURRENT_SOURCE") or rawget(_G,"__SV_AUTO_TRADER_CURRENT_SOURCE")
+        if type(source)~="string" then return false,"current distribution source unavailable" end
+        local candidate=source;local expected=true
+        if i==2 then candidate=string.char(239,187,191)..source
+        elseif i==3 then candidate=source:gsub("\n","\r\n")
+        elseif i==4 then candidate=source:sub(-1)=="\n" and source:sub(1,-2) or source
+        elseif i==5 then candidate=string.char(239,187,191)..source:gsub("\n","\r\n")
+        elseif i==6 then candidate=source:gsub(CONTROLLER_VERSION,"18.69.44-public-auto-trader-v46-cooperative-selftests",1);expected=false
+        elseif i==7 then candidate=source.."--tampered-byte\n";expected=false
+        elseif i==8 then candidate=source:gsub(CONTROLLER_VERSION,"18.69.44-public-auto-trader-v46-cooperative-selftests",1);expected=false
+        elseif i==9 then candidate=nil;expected=false
+        elseif i==10 then candidate="short";expected=false
+        elseif i==11 then candidate=source:gsub('distributionNormalizedSha256%s*=%s*"[0-9a-fA-F]+"','distributionNormalizedSha256 = "'..string.rep("0",64)..'"',1);expected=false
+        elseif i==12 then candidate=source:gsub('distributionNormalizedSha256%s*=%s*"[0-9a-fA-F]+"','distributionNormalizedSha256 = "__BUILD_SHA256_PLACEHOLDER__"',1);expected=false
+        elseif i==13 then candidate=123;expected=false
+        elseif i==14 then candidate={source=source};expected=false
+        elseif i==15 then local noFinal=source:sub(-1)=="\n" and source:sub(1,-2) or source;candidate=string.char(239,187,191)..noFinal
+        elseif i==16 then candidate=source.."\n";expected=false end
+        local canonical=State.AutoTrader.CanonicalizeCapturedDistributionSource(candidate)
+        return (canonical~=nil)==expected,"distribution canonicalizer integrity decision mismatch"
+    end)
+
+    -- 20. Human movement veto boundary matrix around epsilon, including NaN-ish coercion inputs.
+    addCategory("movement_veto","Bot MoveDirection human-veto boundaries",{
+        "zero","tiny","half_epsilon","epsilon_minus","epsilon_exact","epsilon_plus","double_epsilon","one",
+        "negative","numeric_string_zero","numeric_string_above","nil","nonnumeric","huge","epsilon_plus_1e6","epsilon_minus_1e6",
+    },function(i)
+        local e=CONFIG.AutoTraderGoldMoveDirectionEpsilon
+        local cases={{0,false},{1e-9,false},{e/2,false},{e-1e-6,false},{e,false},{e+1e-6,true},{e*2,true},{1,true},
+            {-1,false},{"0",false},{tostring(e+0.01),true},{nil,false},{"abc",false},{1e6,true},{e+1e-6,true},{math.max(0,e-1e-6),false}}
+        return State.AutoTrader.IsBotMoveDirectionContradiction(cases[i][1])==cases[i][2],"MoveDirection human-veto boundary mismatch"
+    end)
+
+    -- 21. Session-critical and terminal-outcome classification corpus.
+    addCategory("event_classifiers","Lifecycle event/outcome classification",{
+        "recovery_declined","freeze_noresponse","fatal_traded","teleport_unavailable","settlement_trade_unavailable","audit_trade_declined","queue_idle","bot_escape_manual_skip",
+        "bot_trust_nonterminal","manual_bot_nonterminal","server_outcome_nonterminal","mutation_nonterminal","ordinary_nonterminal","eligibility_nonterminal","render_nonterminal","unknown_nonterminal",
+    },function(i)
+        local cases={
+            {"recovery_started","declined",true,true},{"freeze_entered","no_response",true,true},{"fatal_integrity","traded",true,true},{"teleport_started","unavailable",true,true},
+            {"settlement_done","trade_unavailable",true,true},{"audit_failed","trade_declined",true,true},{"trade_queue_changed","idle",true,true},{"bot_escape_committed","manual_skip",true,true},
+            {"bot_trust_commit","deferred",true,false},{"manual_bot_marked","local_cancel",true,false},{"server_player_outcome","success",true,false},{"mutation_identity_ambiguity","pending",true,false},
+            {"ordinary","ordinary",false,false},{"eligibility_decision","retry_later",false,false},{"render","active",false,false},{"unknown","unknown",false,false},
+        }
+        local c=cases[i];local critical=not not State.AutoTrader.IsCriticalSessionEvent(c[1]);local terminal=State.AutoTrader.IsTerminalServerOutcome(c[2])==true
+        return critical==c[3] and terminal==c[4],"critical-event or terminal-outcome classifier mismatch"
+    end)
+
+    -- 22. Partner correlation must be exact by numeric UserId and reject shape/type confusion.
+    addCategory("partner_correlation","Expected trade-partner identity correlation",{
+        "exact_number","numeric_string_expected","numeric_string_player","both_numeric_strings","different","nil_expected","nil_player","missing_userid",
+        "zero_zero","negative_equal","negative_different","large_equal","large_different","name_irrelevant","displayname_irrelevant","table_extra_fields",
+    },function(i)
+        local expected=123;local player={UserId=123,Name="A"};local want=true
+        if i==2 then expected="123"
+        elseif i==3 then player.UserId="123"
+        elseif i==4 then expected="123";player.UserId="123"
+        elseif i==5 then player.UserId=124;want=false
+        elseif i==6 then expected=nil;want=false
+        elseif i==7 then player=nil;want=false
+        elseif i==8 then player={Name="A"};want=false
+        elseif i==9 then expected=0;player.UserId=0
+        elseif i==10 then expected=-1;player.UserId=-1
+        elseif i==11 then expected=-1;player.UserId=-2;want=false
+        elseif i==12 then expected=99999999999;player.UserId=99999999999
+        elseif i==13 then expected=99999999999;player.UserId=99999999998;want=false
+        elseif i==14 then player.Name="TotallyDifferent"
+        elseif i==15 then player.DisplayName="Anything"
+        elseif i==16 then player.extra={nested=true} end
+        return State.AutoTrader.IsExpectedPartner(expected,player)==want,"expected-partner correlation crossed or lost UserId identity"
+    end)
+
+    -- 23. Dense bounded-array validator against sparse/mixed/out-of-range schemas.
+    addCategory("dense_array","Dense bounded-array schema validation",{
+        "empty","one","five","at_max","sparse","zero_index","negative_index","fractional_index",
+        "string_key","beyond_max","mixed_key","gap_middle","only_index_two","max_zero_empty","max_zero_nonempty","nontable",
+    },function(i)
+        local value={};local maximum=5;local expected=true;local expectedCount=0
+        if i==2 then value={"a"};expectedCount=1
+        elseif i==3 then value={1,2,3,4,5};expectedCount=5
+        elseif i==4 then maximum=1;value={"x"};expectedCount=1
+        elseif i==5 then value={[1]="a",[3]="c"};expected=false
+        elseif i==6 then value={[0]="z"};expected=false
+        elseif i==7 then value={[-1]="z"};expected=false
+        elseif i==8 then value={[1.5]="x"};expected=false
+        elseif i==9 then value={a=1};expected=false
+        elseif i==10 then value={[6]="x"};expected=false
+        elseif i==11 then value={[1]="a",a=2};expected=false
+        elseif i==12 then value={[1]="a",[2]="b",[4]="d"};expected=false
+        elseif i==13 then value={[2]="b"};expected=false
+        elseif i==14 then maximum=0;value={};expectedCount=0
+        elseif i==15 then maximum=0;value={1};expected=false
+        elseif i==16 then value="not-table";expected=false end
+        local ok,count=State.AutoTrader.IsDenseBoundedArray(value,maximum)
+        return ok==expected and (not expected or count==expectedCount),"dense bounded-array schema decision mismatch"
+    end)
+
+    -- 24. Strategy bucket normalization: negative/invalid counters cannot leak into learning telemetry.
+    addCategory("strategy_bucket","Strategy bucket numeric normalization",{
+        "requests","responses","trades","successes","declines","trade_declines","ignored","idle",
+        "terminal_outcomes","total_profit","total_response_seconds","total_trade_seconds","terminal_seconds","numeric_string",
+        "last_event_numeric_string","nontable_input",
+    },function(i)
+        local fields={"requests","responses","trades","successes","declines","tradeDeclines","ignored","idle","terminalOutcomes","totalProfit","totalResponseSeconds","totalTradeSeconds","terminalSeconds"}
+        if i<=13 then
+            local row={[fields[i]]=-5};local out=State.AutoTrader.NormalizeStrategyBucket(row)
+            return out[fields[i]]==0,"negative strategy telemetry counter survived normalization"
+        elseif i==14 then
+            local out=State.AutoTrader.NormalizeStrategyBucket({requests="7"});return out.requests==7,"numeric-string strategy counter did not normalize"
+        elseif i==15 then
+            local out=State.AutoTrader.NormalizeStrategyBucket({lastEventUnix="123"});return out.lastEventUnix==123,"lastEventUnix numeric string did not normalize"
+        end
+        local out=State.AutoTrader.NormalizeStrategyBucket(nil)
+        return type(out)=="table" and out.requests==0 and out.terminalSeconds==0 and out.lastEventUnix==0,"non-table strategy bucket did not normalize to a zeroed bucket"
+    end)
+
+    State.AutoTrader.NextGenSelfTestGeneration = 1
+    State.AutoTrader.NextGenSelfTestCategoryCount = #categories
+    State.AutoTrader.NextGenSelfTestExpected = #categories * 16
+    State.AutoTrader.NextGenSelfTestManifest = {}
+    for _,category in ipairs(categories) do
+        State.AutoTrader.NextGenSelfTestManifest[#State.AutoTrader.NextGenSelfTestManifest+1] = {
+            id=category.id,title=category.title,count=#category.labels,labels=clone(category.labels),
+        }
+    end
+
+    State.AutoTrader.RunSelfTests = function()
+        local tests={}
+        local passed=0
+        local started=os.clock()
+        for _,category in ipairs(categories) do
+            for caseIndex,label in ipairs(category.labels) do
+                if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate() end
+                local ok,result,detail=pcall(category.run,caseIndex,label)
+                local success=ok and result==true
+                if success then passed+=1 end
+                tests[#tests+1]={
+                    name="v47-"..category.id.."-"..string.format("%02d",caseIndex).."-"..label,
+                    ok=success,
+                    detail=success and nil or tostring(ok and detail or result),
+                    nextGen=true,category=category.id,categoryTitle=category.title,caseIndex=caseIndex,
+                }
+            end
+            if State.AutoTrader.SelfTestCooperate then State.AutoTrader.SelfTestCooperate(true) end
+        end
+        local result={
+            passed=passed,total=#tests,failed=#tests-passed,ok=passed==#tests,tests=tests,
+            atUnix=os.time(),controllerVersion=CONTROLLER_VERSION,nextGenGeneration=1,
+            categoryCount=#categories,expected=#categories*16,elapsedSeconds=os.clock()-started,
+            retiredCheckpoint=clone(State.AutoTrader.RetiredSelfTestCheckpoint),
+        }
+        State.AutoTrader.SelfTest=result
+        State.AutoTrader.Log("self_test_nextgen_finished",{
+            passed=result.passed,total=result.total,failed=result.failed,ok=result.ok,
+            generation=result.nextGenGeneration,categories=result.categoryCount,elapsedSeconds=result.elapsedSeconds,
+        })
+        return result
     end
 end)()
 
